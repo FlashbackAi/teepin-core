@@ -5,7 +5,7 @@ Official Go client library for the TEEPIN API.
 ## Installation
 
 ```bash
-go get github.com/teepin/teepin-core/pkg/sdk
+go get github.com/FlashbackAi/teepin-core/pkg/sdk
 ```
 
 ## Quick Start
@@ -18,7 +18,7 @@ import (
     "fmt"
     "log"
 
-    "github.com/teepin/teepin-core/pkg/sdk"
+    "github.com/FlashbackAi/teepin-core/pkg/sdk"
 )
 
 func main() {
@@ -218,7 +218,7 @@ import (
     "fmt"
     "sync"
 
-    "github.com/teepin/teepin-core/pkg/sdk"
+    "github.com/FlashbackAi/teepin-core/pkg/sdk"
 )
 
 func main() {

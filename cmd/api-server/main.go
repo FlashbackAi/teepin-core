@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -18,8 +19,11 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
-	"github.com/teepin/teepin-core/pkg/api"
-	"github.com/teepin/teepin-core/pkg/gpu"
+	"github.com/FlashbackAi/teepin-core/pkg/api"
+	"github.com/FlashbackAi/teepin-core/pkg/auth"
+	"github.com/FlashbackAi/teepin-core/pkg/billing"
+	"github.com/FlashbackAi/teepin-core/pkg/database"
+	"github.com/FlashbackAi/teepin-core/pkg/gpu"
 )
 
 const (
@@ -28,6 +32,43 @@ const (
 
 func main() {
 	log.Printf("Starting TEEPIN API Server v%s\n", version)
+
+	// Initialize database client
+	dbClient, err := initDatabaseClient()
+	if err != nil {
+		log.Printf("⚠️  Database client not available: %v", err)
+		log.Println("⚠️  Authentication and persistence disabled")
+	} else {
+		log.Println("✅ Connected to PostgreSQL database")
+	}
+
+	// Initialize auth service
+	jwtSecret := getEnv("JWT_SECRET", "change_me_in_production_super_secret_key_12345")
+	var authService *auth.Service
+	var authHandler *api.AuthHandler
+	var authMiddleware *auth.Middleware
+
+	if dbClient != nil {
+		authService = auth.NewService(dbClient.DB(), jwtSecret)
+		authHandler = api.NewAuthHandler(authService)
+		authMiddleware = auth.NewMiddleware(authService, jwtSecret)
+		log.Println("✅ Authentication system initialized")
+	}
+
+	// Initialize billing service
+	var billingService *billing.Service
+	var billingHandler *api.BillingHandler
+	var usageCollector *billing.UsageCollector
+
+	if dbClient != nil && authService != nil {
+		billingService = billing.NewService(dbClient.DB())
+		billingHandler = api.NewBillingHandler(billingService, authService)
+		usageCollector = billing.NewUsageCollector(dbClient.DB(), billingService)
+		log.Println("✅ Billing system initialized")
+
+		// Start usage collector in background
+		go usageCollector.Start(context.Background())
+	}
 
 	// Initialize Kubernetes client (optional for standalone mode)
 	k8sClient, err := initKubernetesClient()
@@ -47,11 +88,12 @@ func main() {
 	apiServer := api.NewServer(k8sClient, gpuAllocator)
 
 	// Setup router
-	router := setupRouter(apiServer)
+	router := setupRouter(apiServer, authHandler, authMiddleware, billingHandler)
 
 	// Create HTTP server
+	port := getEnv("PORT", "8080")
 	srv := &http.Server{
-		Addr:    ":8080",
+		Addr:    ":" + port,
 		Handler: router,
 	}
 
@@ -78,7 +120,43 @@ func main() {
 		log.Fatalf("Server forced to shutdown: %v", err)
 	}
 
+	// Close database connection
+	if dbClient != nil {
+		dbClient.Close()
+	}
+
 	log.Println("Server exited")
+}
+
+func initDatabaseClient() (*database.Client, error) {
+	// Get database config from environment
+	host := getEnv("DB_HOST", "postgres.teepin.svc.cluster.local")
+	portStr := getEnv("DB_PORT", "5432")
+	user := getEnv("DB_USER", "teepin")
+	password := getEnv("DB_PASSWORD", "teepin_local_password_change_in_prod")
+	dbname := getEnv("DB_NAME", "teepin_db")
+	sslmode := getEnv("DB_SSLMODE", "disable")
+
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		port = 5432
+	}
+
+	cfg := database.Config{
+		Host:     host,
+		Port:     port,
+		User:     user,
+		Password: password,
+		DBName:   dbname,
+		SSLMode:  sslmode,
+	}
+
+	client, err := database.NewClient(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to database: %w", err)
+	}
+
+	return client, nil
 }
 
 func initKubernetesClient() (*kubernetes.Clientset, error) {
@@ -108,7 +186,14 @@ func initKubernetesClient() (*kubernetes.Clientset, error) {
 	return clientset, nil
 }
 
-func setupRouter(apiServer *api.Server) *gin.Engine {
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler) *gin.Engine {
 	// Set Gin to release mode in production
 	if os.Getenv("GIN_MODE") == "" {
 		gin.SetMode(gin.ReleaseMode)
@@ -128,8 +213,47 @@ func setupRouter(apiServer *api.Server) *gin.Engine {
 	// API v1
 	v1 := router.Group("/v1")
 	{
-		// Compute endpoints
+		// Authentication endpoints (public)
+		if authHandler != nil {
+			authRoutes := v1.Group("/auth")
+			{
+				authRoutes.POST("/register", authHandler.Register)
+				authRoutes.POST("/login", authHandler.Login)
+				authRoutes.GET("/me", authMiddleware.RequireAuth(), authHandler.GetCurrentUser)
+			}
+
+			// Project endpoints (require auth)
+			projects := v1.Group("/projects")
+			projects.Use(authMiddleware.RequireAuth())
+			{
+				projects.POST("", authHandler.CreateProject)
+				projects.GET("", authHandler.ListProjects)
+				projects.GET("/:id", authHandler.GetProject)
+				projects.POST("/:id/api-keys", authHandler.CreateAPIKey)
+				projects.GET("/:id/api-keys", authHandler.ListAPIKeys)
+				projects.DELETE("/:id/api-keys/:key_id", authHandler.RevokeAPIKey)
+			}
+		}
+
+		// Billing endpoints (require auth)
+		if billingHandler != nil && authMiddleware != nil {
+			billing := v1.Group("/billing")
+			billing.Use(authMiddleware.RequireAuth())
+			{
+				billing.GET("/usage", billingHandler.GetUsageSummary)
+				billing.GET("/usage/records", billingHandler.GetUsageRecords)
+				billing.GET("/current-month", billingHandler.GetCurrentMonthUsage)
+				billing.GET("/invoices", billingHandler.ListInvoices)
+				billing.GET("/invoices/:id", billingHandler.GetInvoice)
+				billing.POST("/invoices", billingHandler.CreateInvoice)
+			}
+		}
+
+		// Compute endpoints (optional auth for now, will be required later)
 		compute := v1.Group("/compute")
+		if authMiddleware != nil {
+			compute.Use(authMiddleware.OptionalAuth())
+		}
 		{
 			compute.GET("/instance-types", apiServer.ListInstanceTypes)
 			compute.POST("/instances", apiServer.CreateInstance)
@@ -142,6 +266,9 @@ func setupRouter(apiServer *api.Server) *gin.Engine {
 
 		// SDL deployment endpoint
 		deployments := v1.Group("/deployments")
+		if authMiddleware != nil {
+			deployments.Use(authMiddleware.OptionalAuth())
+		}
 		{
 			deployments.POST("/sdl", apiServer.DeploySDL)
 		}

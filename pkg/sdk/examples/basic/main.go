@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/teepin/teepin-core/pkg/sdk"
+	"github.com/FlashbackAi/teepin-core/pkg/sdk"
 )
 
 func main() {

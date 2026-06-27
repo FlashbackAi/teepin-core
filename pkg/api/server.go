@@ -16,8 +16,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/teepin/teepin-core/pkg/gpu"
-	"github.com/teepin/teepin-core/pkg/models"
+	"github.com/FlashbackAi/teepin-core/pkg/gpu"
+	"github.com/FlashbackAi/teepin-core/pkg/models"
 )
 
 // Server represents the API server

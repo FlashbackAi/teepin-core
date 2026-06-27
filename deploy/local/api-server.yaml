@@ -63,6 +63,23 @@ spec:
         env:
         - name: GIN_MODE
           value: "release"
+        - name: DB_HOST
+          value: "postgres.teepin.svc.cluster.local"
+        - name: DB_PORT
+          value: "5432"
+        - name: DB_USER
+          value: "teepin"
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: POSTGRES_PASSWORD
+        - name: DB_NAME
+          value: "teepin_db"
+        - name: DB_SSLMODE
+          value: "disable"
+        - name: JWT_SECRET
+          value: "change_me_in_production_super_secret_jwt_key_12345"
         resources:
           requests:
             memory: "128Mi"

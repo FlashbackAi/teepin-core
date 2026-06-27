@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/teepin/teepin-core/pkg/models"
+	"github.com/FlashbackAi/teepin-core/pkg/models"
 	"gopkg.in/yaml.v3"
 )
 

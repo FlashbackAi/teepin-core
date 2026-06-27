@@ -6,7 +6,7 @@ package main
 import (
 	"os"
 
-	"github.com/teepin/teepin-core/cmd/teepin/cmd"
+	"github.com/FlashbackAi/teepin-core/cmd/teepin/cmd"
 )
 
 func main() {
