@@ -24,6 +24,7 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/billing"
 	"github.com/FlashbackAi/teepin-core/pkg/database"
 	"github.com/FlashbackAi/teepin-core/pkg/gpu"
+	"github.com/FlashbackAi/teepin-core/pkg/harbor"
 )
 
 const (
@@ -80,6 +81,30 @@ func main() {
 		log.Println("✅ Connected to Kubernetes cluster")
 	}
 
+	// Initialize Harbor service (container registry integration)
+	var harborClient *harbor.Client
+	var harborService *harbor.Service
+	var registryHandler *api.RegistryHandler
+
+	if dbClient != nil && authService != nil && k8sClient != nil {
+		harborConfig := harbor.Config{
+			BaseURL:  getEnv("HARBOR_URL", "https://registry.teepin.cloud"),
+			Username: getEnv("HARBOR_ADMIN_USERNAME", "admin"),
+			Password: getEnv("HARBOR_ADMIN_PASSWORD", "Harbor12345"),
+		}
+
+		harborClient, err = harbor.NewClient(harborConfig)
+		if err != nil {
+			log.Printf("⚠️  Harbor client initialization failed: %v", err)
+			log.Println("⚠️  Container registry features disabled")
+		} else {
+			encryptionKey := getEnv("ENCRYPTION_KEY", jwtSecret)
+			harborService = harbor.NewService(harborClient, k8sClient, dbClient.DB(), encryptionKey)
+			registryHandler = api.NewRegistryHandler(harborService, authService)
+			log.Println("✅ Harbor container registry integration initialized")
+		}
+	}
+
 	// Initialize GPU allocator
 	gpuAllocator := gpu.NewAllocator(k8sClient)
 	log.Println("✅ GPU allocator initialized")
@@ -88,7 +113,7 @@ func main() {
 	apiServer := api.NewServer(k8sClient, gpuAllocator)
 
 	// Setup router
-	router := setupRouter(apiServer, authHandler, authMiddleware, billingHandler)
+	router := setupRouter(apiServer, authHandler, authMiddleware, billingHandler, registryHandler)
 
 	// Create HTTP server
 	port := getEnv("PORT", "8080")
@@ -193,7 +218,7 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
-func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler) *gin.Engine {
+func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler, registryHandler *api.RegistryHandler) *gin.Engine {
 	// Set Gin to release mode in production
 	if os.Getenv("GIN_MODE") == "" {
 		gin.SetMode(gin.ReleaseMode)
@@ -232,6 +257,14 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, authMiddle
 				projects.POST("/:id/api-keys", authHandler.CreateAPIKey)
 				projects.GET("/:id/api-keys", authHandler.ListAPIKeys)
 				projects.DELETE("/:id/api-keys/:key_id", authHandler.RevokeAPIKey)
+
+				// Registry endpoints (if Harbor integration enabled)
+				if registryHandler != nil {
+					projects.POST("/:id/registry", registryHandler.ProvisionRegistry)
+					projects.GET("/:id/registry", registryHandler.GetRegistryCredentials)
+					projects.DELETE("/:id/registry", registryHandler.RevokeRegistry)
+					projects.GET("/:id/registry/login-command", registryHandler.GetDockerLoginCommand)
+				}
 			}
 		}
 
