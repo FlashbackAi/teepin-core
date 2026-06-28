@@ -7,19 +7,23 @@ import "time"
 
 // Instance represents a compute instance
 type Instance struct {
-	ID           string            `json:"id"`
-	Name         string            `json:"name"`
-	Image        string            `json:"image"`
-	Status       string            `json:"status"`
-	GPUVRAM      string            `json:"gpu_vram,omitempty"`
-	AllocatedVRAM string           `json:"allocated_vram,omitempty"`
-	CPUUnits     int               `json:"cpu_units"`
-	Memory       string            `json:"memory"`
-	Endpoint     string            `json:"endpoint,omitempty"`
-	InternalIP   string            `json:"internal_ip,omitempty"`
-	CreatedAt    time.Time         `json:"created_at"`
-	UpdatedAt    time.Time         `json:"updated_at"`
-	Labels       map[string]string `json:"labels,omitempty"`
+	ID            string            `json:"id"`
+	Name          string            `json:"name"`
+	Image         string            `json:"image"`
+	Status        string            `json:"status"`
+	GPUVRAM       string            `json:"gpu_vram,omitempty"`
+	AllocatedVRAM string            `json:"allocated_vram,omitempty"`
+	CPUUnits      int               `json:"cpu_units"`
+	Memory        string            `json:"memory"`
+	Endpoint      string            `json:"endpoint,omitempty"`       // HTTPS endpoint URL
+	PublicIP      string            `json:"public_ip,omitempty"`      // LoadBalancer IP
+	DNSName       string            `json:"dns_name,omitempty"`       // DNS hostname
+	TLSEnabled    bool              `json:"tls_enabled,omitempty"`    // SSL/TLS configured
+	TLSReady      bool              `json:"tls_ready,omitempty"`      // SSL certificate provisioned
+	InternalIP    string            `json:"internal_ip,omitempty"`
+	CreatedAt     time.Time         `json:"created_at"`
+	UpdatedAt     time.Time         `json:"updated_at"`
+	Labels        map[string]string `json:"labels,omitempty"`
 }
 
 // CreateInstanceRequest represents a request to create an instance

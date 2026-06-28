@@ -18,19 +18,22 @@ import (
 
 	"github.com/FlashbackAi/teepin-core/pkg/gpu"
 	"github.com/FlashbackAi/teepin-core/pkg/models"
+	"github.com/FlashbackAi/teepin-core/pkg/networking"
 )
 
 // Server represents the API server
 type Server struct {
-	k8sClient    *kubernetes.Clientset
-	gpuAllocator *gpu.Allocator
+	k8sClient         *kubernetes.Clientset
+	gpuAllocator      *gpu.Allocator
+	networkingService *networking.Service
 }
 
 // NewServer creates a new API server
-func NewServer(k8sClient *kubernetes.Clientset, gpuAllocator *gpu.Allocator) *Server {
+func NewServer(k8sClient *kubernetes.Clientset, gpuAllocator *gpu.Allocator, networkingService *networking.Service) *Server {
 	return &Server{
-		k8sClient:    k8sClient,
-		gpuAllocator: gpuAllocator,
+		k8sClient:         k8sClient,
+		gpuAllocator:      gpuAllocator,
+		networkingService: networkingService,
 	}
 }
 
@@ -64,8 +67,9 @@ func (s *Server) CreateInstance(c *gin.Context) {
 		return
 	}
 
-	// Generate instance ID
-	instanceID := fmt.Sprintf("inst-%s", uuid.New().String()[:8])
+	// Generate instance UUID
+	instanceUUID := uuid.New()
+	instanceID := fmt.Sprintf("inst-%s", instanceUUID.String()[:8])
 
 	// Parse VRAM requirement
 	var vramGB int
@@ -89,10 +93,25 @@ func (s *Server) CreateInstance(c *gin.Context) {
 	}
 
 	// Create Kubernetes pod
-	pod, err := s.createPod(c.Request.Context(), instanceID, &req, allocation)
+	pod, err := s.createPod(c.Request.Context(), instanceID, instanceUUID, &req, allocation)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to create pod: %v", err)})
 		return
+	}
+
+	// Provision networking endpoint (LoadBalancer + Ingress + TLS)
+	var endpointInfo *networking.EndpointInfo
+	if s.networkingService != nil && len(req.Ports) > 0 {
+		// Use first exposed port for LoadBalancer
+		exposedPort := int32(req.Ports[0].Container)
+
+		endpointInfo, err = s.networkingService.ProvisionEndpoint(c.Request.Context(), instanceUUID, exposedPort)
+		if err != nil {
+			// Cleanup: delete pod if networking provisioning fails
+			_ = s.k8sClient.CoreV1().Pods("default").Delete(c.Request.Context(), pod.Name, metav1.DeleteOptions{})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to provision endpoint: %v", err)})
+			return
+		}
 	}
 
 	// Build response
@@ -113,8 +132,14 @@ func (s *Server) CreateInstance(c *gin.Context) {
 		instance.AllocatedVRAM = fmt.Sprintf("%dGB", allocation.AllocatedVRAM)
 	}
 
-	// In production, endpoint would be LoadBalancer IP
-	instance.Endpoint = fmt.Sprintf("https://%s.teepin.cloud", instanceID)
+	// Add endpoint information
+	if endpointInfo != nil {
+		instance.Endpoint = endpointInfo.HTTPSURL
+		instance.PublicIP = endpointInfo.PublicIP
+		instance.DNSName = endpointInfo.DNSName
+		instance.TLSEnabled = endpointInfo.TLSEnabled
+		instance.TLSReady = endpointInfo.TLSReady
+	}
 
 	c.JSON(http.StatusCreated, instance)
 }
@@ -167,6 +192,35 @@ func (s *Server) GetInstance(c *gin.Context) {
 // DeleteInstance deletes an instance
 func (s *Server) DeleteInstance(c *gin.Context) {
 	instanceID := c.Param("id")
+
+	// Parse instance UUID from ID (format: inst-abc12345)
+	// Extract the short UUID part
+	var instanceUUID uuid.UUID
+	if len(instanceID) >= 13 && instanceID[:5] == "inst-" {
+		shortID := instanceID[5:]
+		// We need the full UUID to revoke networking
+		// For now, we'll use a workaround: find the pod and extract UUID from labels
+		pods, err := s.k8sClient.CoreV1().Pods("default").List(c.Request.Context(), metav1.ListOptions{
+			LabelSelector: fmt.Sprintf("app.teepin.cloud/instance-id=%s", instanceID),
+		})
+		if err == nil && len(pods.Items) > 0 {
+			// Try to get full UUID from pod labels if available
+			if fullUUID, exists := pods.Items[0].Labels["teepin.io/instance-uuid"]; exists {
+				instanceUUID, _ = uuid.Parse(fullUUID)
+			} else {
+				// Fallback: construct UUID with short ID (not ideal but works for cleanup)
+				instanceUUID = uuid.MustParse(fmt.Sprintf("%s-0000-0000-0000-000000000000", shortID))
+			}
+		}
+	}
+
+	// Revoke networking endpoint (LoadBalancer + Ingress)
+	if s.networkingService != nil && instanceUUID != uuid.Nil {
+		if err := s.networkingService.RevokeEndpoint(c.Request.Context(), instanceUUID); err != nil {
+			// Log error but continue with pod deletion
+			c.Header("X-Warning", fmt.Sprintf("Failed to cleanup networking: %v", err))
+		}
+	}
 
 	// Delete pod
 	err := s.k8sClient.CoreV1().Pods("default").DeleteCollection(c.Request.Context(), metav1.DeleteOptions{}, metav1.ListOptions{
@@ -234,7 +288,10 @@ func (s *Server) DeploySDL(c *gin.Context) {
 
 // Helper functions
 
-func (s *Server) createPod(ctx context.Context, instanceID string, req *models.CreateInstanceRequest, allocation *gpu.Allocation) (*corev1.Pod, error) {
+func (s *Server) createPod(ctx context.Context, instanceID string, instanceUUID uuid.UUID, req *models.CreateInstanceRequest, allocation *gpu.Allocation) (*corev1.Pod, error) {
+	// Generate pod selector for networking
+	podSelector := fmt.Sprintf("inst-%s", instanceID[5:]) // Remove "inst-" prefix
+
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("%s-%s", req.Name, uuid.New().String()[:5]),
@@ -243,6 +300,8 @@ func (s *Server) createPod(ctx context.Context, instanceID string, req *models.C
 				"app.teepin.cloud/managed":     "true",
 				"app.teepin.cloud/instance-id": instanceID,
 				"app.teepin.cloud/name":        req.Name,
+				"teepin.io/instance":           podSelector,    // For LoadBalancer selector
+				"teepin.io/instance-uuid":      instanceUUID.String(), // For cleanup
 			},
 		},
 		Spec: corev1.PodSpec{

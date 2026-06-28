@@ -25,6 +25,7 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/database"
 	"github.com/FlashbackAi/teepin-core/pkg/gpu"
 	"github.com/FlashbackAi/teepin-core/pkg/harbor"
+	"github.com/FlashbackAi/teepin-core/pkg/networking"
 )
 
 const (
@@ -105,12 +106,26 @@ func main() {
 		}
 	}
 
+	// Initialize networking service (LoadBalancer, DNS, SSL)
+	var networkingService *networking.Service
+
+	if k8sClient != nil {
+		networkingConfig := networking.Config{
+			Domain:    getEnv("TEEPIN_DOMAIN", "teepin.io"),
+			Namespace: getEnv("TEEPIN_NAMESPACE", "teepin"),
+			UseTLS:    getEnv("ENABLE_TLS", "true") == "true",
+			TLSIssuer: getEnv("TLS_ISSUER", "letsencrypt-prod"),
+		}
+		networkingService = networking.NewService(k8sClient, networkingConfig)
+		log.Println("✅ Networking stack initialized (LoadBalancer, DNS, SSL)")
+	}
+
 	// Initialize GPU allocator
 	gpuAllocator := gpu.NewAllocator(k8sClient)
 	log.Println("✅ GPU allocator initialized")
 
-	// Initialize API server
-	apiServer := api.NewServer(k8sClient, gpuAllocator)
+	// Initialize API server with networking integration
+	apiServer := api.NewServer(k8sClient, gpuAllocator, networkingService)
 
 	// Setup router
 	router := setupRouter(apiServer, authHandler, authMiddleware, billingHandler, registryHandler)
