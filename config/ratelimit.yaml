@@ -1,0 +1,191 @@
+# Copyright 2026 TEEPIN Project
+# Licensed under the Apache License, Version 2.0
+
+# Rate Limiting Configuration
+# Based on industry best practices from AWS API Gateway, Google Cloud, Stripe
+# See: docs/rate-limiting-governance.md for approval workflow
+
+# Redis connection (for distributed rate limiting)
+# For local dev: redis://localhost:6379 (with port-forward)
+# For production: redis://redis.rate-limit.svc.cluster.local:6379
+redis_url: "redis://localhost:6379"
+redis_password: "teepin_redis_local_dev_password_change_in_prod"  # Must match secret in redis.yaml
+
+# Global settings
+default_rps: 50     # Default requests per second
+default_burst: 100  # Default burst capacity
+enabled: true       # Enable/disable rate limiting globally
+dry_run_mode: false # If true, log violations but don't block (for testing)
+return_headers: true # Return X-RateLimit-* headers
+
+# Tier-based limits
+# Changes to tier limits require:
+# - PR approval from 2 senior engineers
+# - Load testing in staging
+# - 24-hour monitoring after production deployment
+tiers:
+  # Free tier - Conservative limits to prevent abuse
+  # Target: Unauthenticated users, trial accounts
+  free:
+    name: "Free"
+    requests_per_second: 10
+    requests_per_minute: 100
+    requests_per_hour: 1000
+    burst: 20
+
+  # Authenticated tier - Default for paying customers
+  # Target: Standard paying customers
+  # Changes: Self-service via dashboard (auto-approved if < 5000/hr)
+  authenticated:
+    name: "Authenticated"
+    requests_per_second: 50
+    requests_per_minute: 1000
+    requests_per_hour: 10000
+    burst: 100
+
+  # Power tier - Approved via support ticket
+  # Target: High-volume customers with legitimate use case
+  # Changes: Manual approval by support team (24-48 hours)
+  # Criteria: Active paying customer, no abuse history
+  power:
+    name: "Power User"
+    requests_per_second: 100
+    requests_per_minute: 2000
+    requests_per_hour: 20000
+    burst: 200
+
+  # Enterprise tier - Custom negotiated limits
+  # Target: Enterprise contracts, dedicated support
+  # Changes: Account manager + VP Engineering approval (1 week)
+  # Criteria: Revenue > $10k/month, enterprise contract
+  enterprise:
+    name: "Enterprise"
+    requests_per_second: 200
+    requests_per_minute: 5000
+    requests_per_hour: 50000
+    burst: 500
+
+# Per-endpoint rate limits
+# These override tier limits for specific operations
+# Changes require code deployment and PR approval
+endpoints:
+  # Expensive operations - Strict limits
+  # Kubernetes pod creation is expensive, limit aggressively
+  "POST /v1/compute/instances":
+    rate: 10
+    period: 1m
+    burst: 5
+
+  # Security-critical endpoints - Prevent brute force attacks
+  "POST /v1/auth/login":
+    rate: 5
+    period: 1m
+    burst: 3
+
+  "POST /v1/auth/register":
+    rate: 3
+    period: 1h  # Only 3 registrations per hour to prevent spam
+    burst: 5
+
+  # Registry provisioning - Harbor API calls are moderate cost
+  "POST /v1/projects/:id/registry":
+    rate: 5
+    period: 1m
+    burst: 3
+
+  "DELETE /v1/projects/:id/registry":
+    rate: 5
+    period: 1m
+    burst: 3
+
+  # Instance deletion - Kubernetes cleanup operations
+  "DELETE /v1/compute/instances/:id":
+    rate: 20
+    period: 1m
+    burst: 10
+
+  # Moderate cost operations
+  "POST /v1/projects":
+    rate: 10
+    period: 1m
+    burst: 5
+
+  "POST /v1/projects/:id/api-keys":
+    rate: 10
+    period: 1m
+    burst: 5
+
+  # Read operations - More permissive (cheap database queries)
+  "GET /v1/compute/instances":
+    rate: 60
+    period: 1m
+    burst: 20
+
+  "GET /v1/compute/instances/:id":
+    rate: 100
+    period: 1m
+    burst: 30
+
+  "GET /v1/compute/instances/:id/logs":
+    rate: 30
+    period: 1m
+    burst: 10
+
+  "GET /v1/compute/instances/:id/metrics":
+    rate: 30
+    period: 1m
+    burst: 10
+
+  "GET /v1/projects":
+    rate: 60
+    period: 1m
+    burst: 20
+
+  "GET /v1/projects/:id":
+    rate: 100
+    period: 1m
+    burst: 30
+
+  "GET /v1/billing/usage":
+    rate: 30
+    period: 1m
+    burst: 10
+
+  "GET /v1/billing/usage/records":
+    rate: 30
+    period: 1m
+    burst: 10
+
+  "GET /v1/billing/invoices":
+    rate: 30
+    period: 1m
+    burst: 10
+
+  # Health checks - NO LIMIT (monitoring must always work)
+  "GET /health":
+    disabled: true
+
+  "GET /version":
+    disabled: true
+
+# Governance Notes:
+# -----------------
+# 1. Default tier limits: Require PR approval + load testing
+# 2. Per-user limit increases: Support ticket → auto-approved if reasonable
+# 3. Emergency rate limit (abuse): On-call can set to 0 instantly
+# 4. Endpoint limits: Require code deployment (PR approval process)
+# 5. All changes tracked in audit log (database)
+#
+# Monitoring:
+# -----------
+# - Alert if global 429 rate > 5% (limits too strict)
+# - Alert if user hits limit > 10 times/hour (notify support)
+# - Alert if single user > 50% of traffic (investigate abuse)
+# - Dashboard: Real-time usage, top users, hot endpoints
+#
+# References:
+# -----------
+# - AWS API Gateway: 10,000 RPS default, 5,000 burst
+# - Google Cloud: 100 QPS default, increase via approval
+# - Stripe: 100 RPS for reads, undisclosed for writes
+# - Azure: Configurable via policy, token bucket algorithm

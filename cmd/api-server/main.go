@@ -26,6 +26,7 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/gpu"
 	"github.com/FlashbackAi/teepin-core/pkg/harbor"
 	"github.com/FlashbackAi/teepin-core/pkg/networking"
+	"github.com/FlashbackAi/teepin-core/pkg/ratelimit"
 )
 
 const (
@@ -124,11 +125,27 @@ func main() {
 	gpuAllocator := gpu.NewAllocator(k8sClient)
 	log.Println("✅ GPU allocator initialized")
 
+	// Initialize rate limiting
+	var rateLimitMiddleware *ratelimit.Middleware
+	rateLimitConfig := initRateLimiting()
+	if rateLimitConfig != nil && rateLimitConfig.Enabled {
+		limiter, err := ratelimit.NewLimiter(rateLimitConfig)
+		if err != nil {
+			log.Printf("⚠️  Failed to initialize rate limiter: %v", err)
+			log.Println("⚠️  Rate limiting disabled")
+		} else {
+			rateLimitMiddleware = ratelimit.NewMiddleware(limiter, rateLimitConfig)
+			log.Println("✅ Rate limiting initialized (Redis 7.2)")
+		}
+	} else {
+		log.Println("⚠️  Rate limiting disabled (enable in config)")
+	}
+
 	// Initialize API server with networking integration
 	apiServer := api.NewServer(k8sClient, gpuAllocator, networkingService)
 
 	// Setup router
-	router := setupRouter(apiServer, authHandler, authMiddleware, billingHandler, registryHandler)
+	router := setupRouter(apiServer, authHandler, authMiddleware, billingHandler, registryHandler, rateLimitMiddleware)
 
 	// Create HTTP server
 	port := getEnv("PORT", "8080")
@@ -233,7 +250,35 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
-func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler, registryHandler *api.RegistryHandler) *gin.Engine {
+func initRateLimiting() *ratelimit.Config {
+	// Try to load from config file
+	configPath := getEnv("RATELIMIT_CONFIG", "config/ratelimit.yaml")
+	config, err := ratelimit.LoadConfig(configPath)
+	if err != nil {
+		log.Printf("⚠️  Failed to load rate limit config from %s: %v", configPath, err)
+		log.Println("⚠️  Using default rate limit configuration")
+		config = ratelimit.DefaultConfig()
+	}
+
+	// Override Redis URL from environment if set
+	if redisURL := os.Getenv("REDIS_URL"); redisURL != "" {
+		config.RedisURL = redisURL
+	}
+
+	// Override Redis password from environment if set
+	if redisPassword := os.Getenv("REDIS_PASSWORD"); redisPassword != "" {
+		config.RedisPassword = redisPassword
+	}
+
+	// Allow disabling via environment variable
+	if getEnv("RATE_LIMIT_ENABLED", "true") == "false" {
+		config.Enabled = false
+	}
+
+	return config
+}
+
+func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler, registryHandler *api.RegistryHandler, rateLimitMiddleware *ratelimit.Middleware) *gin.Engine {
 	// Set Gin to release mode in production
 	if os.Getenv("GIN_MODE") == "" {
 		gin.SetMode(gin.ReleaseMode)
@@ -241,10 +286,16 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, authMiddle
 
 	router := gin.Default()
 
-	// Middleware
+	// Middleware (order matters!)
 	router.Use(gin.Recovery())
 	router.Use(corsMiddleware())
 	router.Use(requestIDMiddleware())
+
+	// Rate limiting middleware (applies to all routes)
+	// Note: Applied AFTER auth middleware so we can use user tier
+	if rateLimitMiddleware != nil {
+		router.Use(rateLimitMiddleware.Handler())
+	}
 
 	// Health checks
 	router.GET("/health", healthHandler)
