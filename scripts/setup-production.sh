@@ -164,7 +164,7 @@ if [ "$GPU_PRESENT" = true ]; then
     helm repo update
 
     # Install GPU Operator
-    helm install gpu-operator nvidia/gpu-operator \
+    helm upgrade --install gpu-operator nvidia/gpu-operator \
         --namespace gpu-operator \
         --create-namespace \
         --set mig.strategy=mixed \
@@ -236,11 +236,22 @@ log_info "Step 6/10: Installing Ingress NGINX..."
 helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
 helm repo update
 
-helm install ingress-nginx ingress-nginx/ingress-nginx \
+# Service type: LoadBalancer requires a provider (MetalLB or a cloud LB)
+# — without one, helm --wait hangs forever waiting for an external IP.
+# Default to NodePort on fixed ports (30080/30443) which works on any
+# bare metal; set INGRESS_SERVICE_TYPE=LoadBalancer once MetalLB exists.
+INGRESS_SERVICE_TYPE="${INGRESS_SERVICE_TYPE:-NodePort}"
+log_info "Ingress service type: $INGRESS_SERVICE_TYPE"
+
+# helm upgrade --install makes re-runs idempotent (a previously failed
+# release would otherwise abort with 'cannot re-use a name').
+helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
     --namespace ingress-nginx \
     --create-namespace \
-    --set controller.service.type=LoadBalancer \
-    --wait
+    --set controller.service.type="$INGRESS_SERVICE_TYPE" \
+    --set controller.service.nodePorts.http=30080 \
+    --set controller.service.nodePorts.https=30443 \
+    --wait --timeout 10m
 
 kubectl wait --for=condition=available --timeout=300s deployment/ingress-nginx-controller -n ingress-nginx
 
@@ -264,13 +275,18 @@ log_info "Step 8/10: Installing monitoring stack..."
 helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
 helm repo update
 
-helm install prometheus prometheus-community/kube-prometheus-stack \
+# No default credentials: generate a Grafana admin password unless provided.
+GRAFANA_PASSWORD="${GRAFANA_PASSWORD:-$(openssl rand -base64 16)}"
+
+helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
     --namespace monitoring \
     --create-namespace \
     --set prometheus.prometheusSpec.retention=30d \
     --set prometheus.prometheusSpec.resources.requests.memory=2Gi \
-    --set grafana.adminPassword=admin \
-    --wait
+    --set grafana.adminPassword="$GRAFANA_PASSWORD" \
+    --wait --timeout 15m
+
+log_info "Grafana admin password: $GRAFANA_PASSWORD — SAVE THIS to your password manager"
 
 log_info "✅ Monitoring stack installed"
 
