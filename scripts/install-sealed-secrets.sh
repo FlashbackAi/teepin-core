@@ -2,6 +2,11 @@
 # Copyright 2026 TEEPIN Project
 # Licensed under the Apache License, Version 2.0
 
+# This is a bash script: re-exec with bash when invoked via `sh`.
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec bash "$0" "$@"
+fi
+
 # Install Sealed Secrets for encrypting Kubernetes secrets
 # Usage: ./scripts/install-sealed-secrets.sh
 

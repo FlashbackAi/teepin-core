@@ -1,6 +1,11 @@
 #!/bin/bash
 set -e
 
+
+# This is a bash script: re-exec with bash when invoked via `sh`.
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec bash "$0" "$@"
+fi
 echo "Running database migrations..."
 
 # PostgreSQL connection details

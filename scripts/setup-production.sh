@@ -5,6 +5,12 @@
 # Complete Production Setup Script for TEEPIN Platform
 # Run this on a fresh bare metal server with Ubuntu 22.04 LTS
 
+# This is a bash script: re-exec with bash when invoked via `sh`
+# (dash lacks $EUID, read -s, arrays, ...).
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec bash "$0" "$@"
+fi
+
 set -e
 
 # Colors for output
@@ -56,11 +62,21 @@ apt-get install -y \
     wget \
     git \
     jq \
+    pciutils \
     apt-transport-https \
     ca-certificates \
     software-properties-common \
     gnupg \
     lsb-release
+# pciutils provides lspci — without it GPU detection silently fails and
+# a GPU server would be misconfigured as GPU-less.
+
+# Helm is needed by BOTH the GPU Operator (Step 4) and Ingress NGINX
+# (Step 6) — it must be installed unconditionally, not only on GPU nodes.
+if ! command -v helm > /dev/null; then
+    log_info "Installing Helm..."
+    curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+fi
 
 log_info "✅ Prerequisites installed"
 
@@ -143,10 +159,7 @@ fi
 if [ "$GPU_PRESENT" = true ]; then
     log_info "Step 4/10: Installing NVIDIA GPU Operator..."
 
-    # Install Helm
-    curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-
-    # Add NVIDIA Helm repo
+    # Add NVIDIA Helm repo (Helm itself is installed in Step 1)
     helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
     helm repo update
 
