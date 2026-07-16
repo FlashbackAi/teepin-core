@@ -1,0 +1,11 @@
+# Copyright 2026 TEEPIN Project
+# Licensed under the Apache License, Version 2.0
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: teepin-prod
+  labels:
+    name: teepin-prod
+    environment: production
+    app.teepin.io/managed-by: teepin

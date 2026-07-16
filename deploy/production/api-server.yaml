@@ -1,0 +1,239 @@
+# Copyright 2026 TEEPIN Project
+# Licensed under the Apache License, Version 2.0
+
+# Production API Server Deployment
+# Optimized for high availability and zero-downtime updates
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-server
+  namespace: teepin-prod
+  labels:
+    app: api-server
+    app.teepin.io/component: api
+    app.teepin.io/environment: production
+spec:
+  replicas: 3  # High availability
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1        # Create 1 extra pod during update
+      maxUnavailable: 0  # Never go below 3 running pods
+
+  selector:
+    matchLabels:
+      app: api-server
+
+  template:
+    metadata:
+      labels:
+        app: api-server
+        app.teepin.io/component: api
+
+    spec:
+      serviceAccountName: api-server
+
+      # Pod anti-affinity (spread across nodes)
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - api-server
+                topologyKey: kubernetes.io/hostname
+
+      containers:
+        - name: api-server
+          # Single-node bootstrap: the image is built on the server and
+          # imported into containerd by setup-production.sh (pulling
+          # from in-cluster Harbor would be a chicken-and-egg on first
+          # install). Multi-node clusters should push to a registry and
+          # switch this back to registry.teepin.io/teepin/api-server.
+          image: teepin/api-server:latest
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          # Environment variables
+          env:
+            # Database connection (from sealed secret)
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql-credentials
+                  key: connection-string
+
+            # Redis connection (from sealed secret)
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: redis-credentials
+                  key: url
+
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-credentials
+                  key: password
+
+            # Harbor registry (from sealed secret)
+            - name: HARBOR_URL
+              valueFrom:
+                secretKeyRef:
+                  name: harbor-credentials
+                  key: url
+
+            - name: HARBOR_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: harbor-credentials
+                  key: username
+
+            - name: HARBOR_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: harbor-credentials
+                  key: password
+
+            # JWT authentication
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: jwt-secret
+                  key: secret
+
+            # Encryption key
+            - name: ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: encryption-key
+                  key: key
+
+            # Application config
+            - name: PORT
+              value: "8080"
+
+            - name: GIN_MODE
+              value: "release"
+
+            - name: TEEPIN_DOMAIN
+              value: "teepin.io"
+
+            - name: TEEPIN_NAMESPACE
+              value: "teepin-prod"
+
+            - name: ENABLE_TLS
+              value: "true"
+
+            - name: TLS_ISSUER
+              value: "letsencrypt-prod"
+
+            - name: RATE_LIMIT_ENABLED
+              value: "true"
+
+          # Resource limits
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: 2000m
+              memory: 2Gi
+
+          # Health checks
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          # Graceful shutdown
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 15"]
+
+          # Security context
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: api-server
+  namespace: teepin-prod
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-server
+  namespace: teepin-prod
+  labels:
+    app: api-server
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP
+      name: http
+  selector:
+    app: api-server
+
+---
+# Horizontal Pod Autoscaler (optional - for scaling)
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-server
+  namespace: teepin-prod
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-server
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80

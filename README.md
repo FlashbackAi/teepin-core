@@ -1,13 +1,13 @@
 # TEEPIN Core
 
-Open-source GPU cloud platform for deploying AI workloads with exact VRAM allocation and transparent pricing.
+Open-source core of **Teepin Web Services (TWS)** — a cloud services platform built service by service, starting with GPU compute: exact VRAM allocation and transparent pricing for AI workloads.
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?logo=go)](https://go.dev/)
 
 ## Overview
 
-TEEPIN is a GPU-accelerated cloud infrastructure platform that enables developers to deploy containerized AI/ML workloads with:
+TEEPIN (Teepin Web Services) is a cloud services platform. Its first service is GPU-accelerated compute, which enables developers to deploy containerized AI/ML workloads with:
 
 - **Exact VRAM Allocation**: Request 25GB, get exactly 25GB (no over-provisioning)
 - **NVIDIA MIG Support**: Hardware-isolated GPU slicing for multi-tenancy

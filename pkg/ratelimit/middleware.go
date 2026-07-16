@@ -153,10 +153,10 @@ func (m *Middleware) handleRateLimitExceeded(c *gin.Context, limiterCtx *limiter
 			retryAfter,
 		),
 		"details": gin.H{
-			"tier":           tier,
-			"limit":          limiterCtx.Limit,
-			"retry_after":    retryAfter,
-			"reset_at":       limiterCtx.Reset,
+			"tier":          tier,
+			"limit":         limiterCtx.Limit,
+			"retry_after":   retryAfter,
+			"reset_at":      limiterCtx.Reset,
 			"documentation": "https://docs.teepin.io/api/rate-limits",
 		},
 	})
@@ -207,10 +207,10 @@ func extractPathTemplate(c *gin.Context) string {
 		pattern string
 		replace string
 	}{
-		{"/inst-", "/:id"},       // instance IDs
-		{"/proj-", "/:id"},       // project IDs
-		{"/key-", "/:key_id"},    // API key IDs
-		{"/inv-", "/:id"},        // invoice IDs
+		{"/inst-", "/:id"},    // instance IDs
+		{"/proj-", "/:id"},    // project IDs
+		{"/key-", "/:key_id"}, // API key IDs
+		{"/inv-", "/:id"},     // invoice IDs
 	}
 
 	normalized := rawPath

@@ -22,6 +22,7 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/api"
 	"github.com/FlashbackAi/teepin-core/pkg/auth"
 	"github.com/FlashbackAi/teepin-core/pkg/billing"
+	"github.com/FlashbackAi/teepin-core/pkg/compute"
 	"github.com/FlashbackAi/teepin-core/pkg/database"
 	"github.com/FlashbackAi/teepin-core/pkg/gpu"
 	"github.com/FlashbackAi/teepin-core/pkg/harbor"
@@ -43,10 +44,24 @@ func main() {
 		log.Println("⚠️  Authentication and persistence disabled")
 	} else {
 		log.Println("✅ Connected to PostgreSQL database")
+
+		// Apply embedded schema migrations (idempotent). Disable with
+		// TEEPIN_AUTO_MIGRATE=false when migrations are managed
+		// externally.
+		if getEnv("TEEPIN_AUTO_MIGRATE", "true") == "true" {
+			if err := database.Migrate(dbClient.DB()); err != nil {
+				log.Fatalf("❌ Database migration failed: %v", err)
+			}
+		}
 	}
 
-	// Initialize auth service
-	jwtSecret := getEnv("JWT_SECRET", "change_me_in_production_super_secret_key_12345")
+	// Initialize auth service.
+	// Security: never run authentication on a default secret — when the
+	// database (and therefore auth) is enabled, JWT_SECRET must be set.
+	jwtSecret := os.Getenv("JWT_SECRET")
+	if dbClient != nil && jwtSecret == "" {
+		log.Fatal("❌ JWT_SECRET must be set when the database is enabled — refusing to start with a default secret")
+	}
 	var authService *auth.Service
 	var authHandler *api.AuthHandler
 	var authMiddleware *auth.Middleware
@@ -89,28 +104,46 @@ func main() {
 	var registryHandler *api.RegistryHandler
 
 	if dbClient != nil && authService != nil && k8sClient != nil {
-		harborConfig := harbor.Config{
-			BaseURL:  getEnv("HARBOR_URL", "https://registry.teepin.cloud"),
-			Username: getEnv("HARBOR_ADMIN_USERNAME", "admin"),
-			Password: getEnv("HARBOR_ADMIN_PASSWORD", "Harbor12345"),
-		}
+		// Security: no default registry credentials and no key reuse.
+		// Harbor integration only activates with an explicit admin
+		// password and a dedicated credential-encryption key.
+		harborPassword := os.Getenv("HARBOR_ADMIN_PASSWORD")
+		encryptionKey := os.Getenv("ENCRYPTION_KEY")
 
-		harborClient, err = harbor.NewClient(harborConfig)
-		if err != nil {
-			log.Printf("⚠️  Harbor client initialization failed: %v", err)
-			log.Println("⚠️  Container registry features disabled")
-		} else {
-			encryptionKey := getEnv("ENCRYPTION_KEY", jwtSecret)
-			harborService = harbor.NewService(harborClient, k8sClient, dbClient.DB(), encryptionKey)
-			registryHandler = api.NewRegistryHandler(harborService, authService)
-			log.Println("✅ Harbor container registry integration initialized")
+		switch {
+		case harborPassword == "":
+			log.Println("⚠️  HARBOR_ADMIN_PASSWORD not set — container registry features disabled (defaults are not accepted)")
+		case encryptionKey == "":
+			log.Println("⚠️  ENCRYPTION_KEY not set — container registry features disabled (credential encryption requires a dedicated key)")
+		default:
+			harborConfig := harbor.Config{
+				BaseURL:  getEnv("HARBOR_URL", "https://registry.teepin.io"),
+				Username: getEnv("HARBOR_ADMIN_USERNAME", "admin"),
+				Password: harborPassword,
+			}
+
+			harborClient, err = harbor.NewClient(harborConfig)
+			if err != nil {
+				log.Printf("⚠️  Harbor client initialization failed: %v", err)
+				log.Println("⚠️  Container registry features disabled")
+			} else {
+				harborService = harbor.NewService(harborClient, k8sClient, dbClient.DB(), encryptionKey)
+				registryHandler = api.NewRegistryHandler(harborService, authService)
+				log.Println("✅ Harbor container registry integration initialized")
+			}
 		}
 	}
 
-	// Initialize networking service (LoadBalancer, DNS, SSL)
+	// Initialize networking service (LoadBalancer, DNS, SSL).
+	// TEEPIN_DISABLE_ENDPOINTS=true skips public endpoint provisioning
+	// entirely — for single-node tests without MetalLB/DNS, where a
+	// LoadBalancer Service would hang Pending and fail instance
+	// creation. Instances are then reached via kubectl port-forward.
 	var networkingService *networking.Service
 
-	if k8sClient != nil {
+	if getEnv("TEEPIN_DISABLE_ENDPOINTS", "false") == "true" {
+		log.Println("⚠️  Public endpoint provisioning DISABLED (TEEPIN_DISABLE_ENDPOINTS=true) — access instances via port-forward")
+	} else if k8sClient != nil {
 		networkingConfig := networking.Config{
 			Domain:    getEnv("TEEPIN_DOMAIN", "teepin.io"),
 			Namespace: getEnv("TEEPIN_NAMESPACE", "teepin"),
@@ -121,9 +154,23 @@ func main() {
 		log.Println("✅ Networking stack initialized (LoadBalancer, DNS, SSL)")
 	}
 
-	// Initialize GPU allocator
-	gpuAllocator := gpu.NewAllocator(k8sClient)
-	log.Println("✅ GPU allocator initialized")
+	// Initialize GPU inventory and allocator.
+	// Capacity is discovered at runtime from NVIDIA GPU Operator node
+	// labels, so any NVIDIA GPU works (MIG-capable or not). Set
+	// TEEPIN_GPU_SIMULATION=true for local development without GPUs.
+	gpuSimulated := getEnv("TEEPIN_GPU_SIMULATION", "false") == "true"
+	var gpuInventory *gpu.Inventory
+	if k8sClient != nil {
+		gpuInventory = gpu.NewInventory(k8sClient, gpuSimulated)
+	} else {
+		gpuInventory = gpu.NewInventory(nil, gpuSimulated)
+	}
+	gpuAllocator := gpu.NewAllocator(gpuInventory)
+	if gpuSimulated {
+		log.Println("✅ GPU allocator initialized (SIMULATION mode — no real GPU hardware)")
+	} else {
+		log.Println("✅ GPU allocator initialized (hardware discovery via GPU Operator labels)")
+	}
 
 	// Initialize rate limiting
 	var rateLimitMiddleware *ratelimit.Middleware
@@ -141,8 +188,28 @@ func main() {
 		log.Println("⚠️  Rate limiting disabled (enable in config)")
 	}
 
+	// Initialize instance persistence — the billing source of truth.
+	// The usage collector meters compute.instances, so instances must
+	// be persisted there or they are never billed.
+	var instanceStore *compute.Store
+	if dbClient != nil {
+		instanceStore = compute.NewStore(dbClient.DB())
+		log.Println("✅ Instance persistence initialized")
+	} else {
+		log.Println("⚠️  Instance persistence disabled (no database) — instances will NOT be billed")
+	}
+
+	// Reconciler keeps DB state in sync with the cluster: pod phase
+	// changes update status, vanished pods stop billing.
+	if instanceStore != nil && k8sClient != nil {
+		reconciler := compute.NewReconciler(instanceStore, k8sClient,
+			getEnv("TEEPIN_INSTANCE_NAMESPACE", "default"))
+		go reconciler.Start(context.Background())
+		log.Println("✅ Instance reconciler started")
+	}
+
 	// Initialize API server with networking integration
-	apiServer := api.NewServer(k8sClient, gpuAllocator, networkingService)
+	apiServer := api.NewServer(k8sClient, gpuAllocator, networkingService, instanceStore)
 
 	// Setup router
 	router := setupRouter(apiServer, authHandler, authMiddleware, billingHandler, registryHandler, rateLimitMiddleware)
@@ -378,14 +445,14 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, authMiddle
 
 func healthHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
-		"status": "healthy",
+		"status":    "healthy",
 		"timestamp": time.Now().UTC().Format(time.RFC3339),
 	})
 }
 
 func versionHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
-		"version": version,
+		"version":     version,
 		"api_version": "v1",
 	})
 }

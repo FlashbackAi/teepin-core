@@ -11,8 +11,8 @@ import (
 	"os"
 	"text/tabwriter"
 
-	"github.com/spf13/cobra"
 	"github.com/FlashbackAi/teepin-core/pkg/models"
+	"github.com/spf13/cobra"
 )
 
 var listCmd = &cobra.Command{
@@ -49,7 +49,7 @@ func runList(cmd *cobra.Command, args []string) {
 
 	// Make API request
 	apiURL := config.APIURL + "/v1/compute/instances"
-	resp, err := http.Get(apiURL)
+	resp, err := apiDo(http.MethodGet, apiURL, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Error connecting to API: %v\n", err)
 		fmt.Fprintf(os.Stderr, "   Make sure the API server is running at: %s\n", config.APIURL)
@@ -62,7 +62,7 @@ func runList(cmd *cobra.Command, args []string) {
 	if resp.StatusCode != http.StatusOK {
 		fmt.Fprintf(os.Stderr, "❌ Failed to list instances\n")
 		fmt.Fprintf(os.Stderr, "   Status: %d\n", resp.StatusCode)
-		fmt.Fprintf(os.Stderr, "   Response: %s\n", string(body))
+		fmt.Fprintf(os.Stderr, "   Response: %s%s\n", string(body), authHint(resp.StatusCode))
 		os.Exit(1)
 	}
 

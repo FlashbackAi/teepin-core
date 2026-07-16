@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/spf13/cobra"
 	"github.com/FlashbackAi/teepin-core/pkg/models"
+	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 )
 
@@ -145,7 +145,7 @@ func runDeploy(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	resp, err := http.Post(apiURL, "application/json", bytes.NewBuffer(reqBody))
+	resp, err := apiDo(http.MethodPost, apiURL, bytes.NewBuffer(reqBody))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Error connecting to API: %v\n", err)
 		fmt.Fprintf(os.Stderr, "   Make sure the API server is running at: %s\n", config.APIURL)
@@ -158,7 +158,7 @@ func runDeploy(cmd *cobra.Command, args []string) {
 	if resp.StatusCode != http.StatusCreated {
 		fmt.Fprintf(os.Stderr, "❌ Failed to create instance\n")
 		fmt.Fprintf(os.Stderr, "   Status: %d\n", resp.StatusCode)
-		fmt.Fprintf(os.Stderr, "   Response: %s\n", string(body))
+		fmt.Fprintf(os.Stderr, "   Response: %s%s\n", string(body), authHint(resp.StatusCode))
 		os.Exit(1)
 	}
 

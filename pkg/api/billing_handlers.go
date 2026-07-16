@@ -8,10 +8,10 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 	"github.com/FlashbackAi/teepin-core/pkg/auth"
 	"github.com/FlashbackAi/teepin-core/pkg/billing"
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 // BillingHandler handles billing-related requests
@@ -289,10 +289,10 @@ func (h *BillingHandler) GetCurrentMonthUsage(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"summary":      summary,
-		"period_start": start,
-		"period_end":   end,
-		"days_in_month": now.Day(),
+		"summary":         summary,
+		"period_start":    start,
+		"period_end":      end,
+		"days_in_month":   now.Day(),
 		"projected_total": summary.TotalCost / float64(now.Day()) * float64(daysInMonth(now)),
 	})
 }

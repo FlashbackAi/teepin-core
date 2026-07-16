@@ -167,7 +167,14 @@ func createProjectWithKey(apiKey, name, description string) (string, error) {
 	return project["id"].(string), nil
 }
 
+// loadAPIKey returns the credential for API calls: the TEEPIN_API_KEY
+// environment variable (useful for CI/scripts), or the key saved by
+// `teepin login` / `teepin auth login` in ~/.teepin/credentials.
 func loadAPIKey() (string, error) {
+	if key := os.Getenv("TEEPIN_API_KEY"); key != "" {
+		return key, nil
+	}
+
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err

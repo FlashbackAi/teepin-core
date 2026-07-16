@@ -13,11 +13,11 @@ import (
 
 // Service handles networking operations for TEEPIN instances
 type Service struct {
-	k8sClient  kubernetes.Interface
-	domain     string // Base domain for instances (e.g., "teepin.cloud")
-	namespace  string // Kubernetes namespace for instances
-	useTLS     bool   // Whether to provision SSL certificates
-	tlsIssuer  string // cert-manager ClusterIssuer name
+	k8sClient kubernetes.Interface
+	domain    string // Base domain for instances (e.g., "teepin.cloud")
+	namespace string // Kubernetes namespace for instances
+	useTLS    bool   // Whether to provision SSL certificates
+	tlsIssuer string // cert-manager ClusterIssuer name
 }
 
 // Config holds networking service configuration
@@ -46,11 +46,11 @@ type EndpointInfo struct {
 // NewService creates a new networking service
 func NewService(k8sClient kubernetes.Interface, config Config) *Service {
 	return &Service{
-		k8sClient:  k8sClient,
-		domain:     config.Domain,
-		namespace:  config.Namespace,
-		useTLS:     config.UseTLS,
-		tlsIssuer:  config.TLSIssuer,
+		k8sClient: k8sClient,
+		domain:    config.Domain,
+		namespace: config.Namespace,
+		useTLS:    config.UseTLS,
+		tlsIssuer: config.TLSIssuer,
 	}
 }
 

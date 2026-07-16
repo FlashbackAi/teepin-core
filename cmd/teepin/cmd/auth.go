@@ -61,9 +61,9 @@ Examples:
 }
 
 var (
-	email        string
-	fullName     string
-	stdinReader  *bufio.Reader
+	email       string
+	fullName    string
+	stdinReader *bufio.Reader
 )
 
 func init() {

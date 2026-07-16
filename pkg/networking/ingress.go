@@ -66,7 +66,7 @@ func (s *Service) createIngress(ctx context.Context, instanceID uuid.UUID, dnsNa
 		ingress.Annotations["cert-manager.io/cluster-issuer"] = s.tlsIssuer
 		ingress.Spec.TLS = []networkingv1.IngressTLS{
 			{
-				Hosts: []string{dnsName},
+				Hosts:      []string{dnsName},
 				SecretName: fmt.Sprintf("%s-tls", ingressName),
 			},
 		}

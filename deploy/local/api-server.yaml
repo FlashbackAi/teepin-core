@@ -80,6 +80,10 @@ spec:
           value: "disable"
         - name: JWT_SECRET
           value: "change_me_in_production_super_secret_jwt_key_12345"
+        # Local dev has no real GPUs: treat nodes labeled "gpu-type" as
+        # simulated H100s. NEVER set this in production.
+        - name: TEEPIN_GPU_SIMULATION
+          value: "true"
         resources:
           requests:
             memory: "128Mi"

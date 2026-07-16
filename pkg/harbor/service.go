@@ -29,14 +29,14 @@ type Service struct {
 
 // RegistryAccess contains registry access details for a project
 type RegistryAccess struct {
-	ProjectID        uuid.UUID `json:"project_id"`
-	RegistryURL      string    `json:"registry_url"`
-	HarborProjectName string   `json:"harbor_project_name"`
-	Username         string    `json:"username"`
-	Password         string    `json:"password"` // Only returned on creation
-	ImagePrefix      string    `json:"image_prefix"`
-	DockerLoginCmd   string    `json:"docker_login_command"`
-	CreatedAt        time.Time `json:"created_at"`
+	ProjectID         uuid.UUID `json:"project_id"`
+	RegistryURL       string    `json:"registry_url"`
+	HarborProjectName string    `json:"harbor_project_name"`
+	Username          string    `json:"username"`
+	Password          string    `json:"password"` // Only returned on creation
+	ImagePrefix       string    `json:"image_prefix"`
+	DockerLoginCmd    string    `json:"docker_login_command"`
+	CreatedAt         time.Time `json:"created_at"`
 }
 
 // NewService creates a new Harbor service

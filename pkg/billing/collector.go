@@ -15,19 +15,19 @@ import (
 
 // UsageCollector periodically collects usage metrics
 type UsageCollector struct {
-	db              *sql.DB
-	billingService  *Service
+	db                 *sql.DB
+	billingService     *Service
 	collectionInterval time.Duration
-	stopChan        chan struct{}
+	stopChan           chan struct{}
 }
 
 // NewUsageCollector creates a new usage collector
 func NewUsageCollector(db *sql.DB, billingService *Service) *UsageCollector {
 	return &UsageCollector{
-		db:              db,
-		billingService:  billingService,
+		db:                 db,
+		billingService:     billingService,
 		collectionInterval: 1 * time.Hour, // Collect every hour
-		stopChan:        make(chan struct{}),
+		stopChan:           make(chan struct{}),
 	}
 }
 
@@ -83,6 +83,13 @@ func (c *UsageCollector) collectUsage(ctx context.Context) error {
 	var recordedCount int
 
 	for _, inst := range instances {
+		// Only GPU usage is metered for now; CPU-only instances get
+		// their own meter (CPU/memory rates) in a later milestone.
+		// Skipping avoids writing zero-cost records every hour.
+		if inst.GPUVRAMGB <= 0 {
+			continue
+		}
+
 		// Get last collection time for this instance
 		lastCollectionTime, err := c.getLastCollectionTime(ctx, inst.ID)
 		if err != nil {
@@ -104,9 +111,10 @@ func (c *UsageCollector) collectUsage(ctx context.Context) error {
 			continue
 		}
 
-		// Calculate cost based on instance type
-		cost := c.billingService.CalculateInstanceCost(inst.InstanceType, hours)
-		unitPrice := c.getUnitPrice(inst.InstanceType)
+		// GPU cost is linear on allocated VRAM ($0.10/GB-hour) —
+		// model-agnostic and correct for custom sizes too.
+		cost := c.billingService.CalculateVRAMCost(inst.GPUVRAMGB, hours)
+		unitPrice := c.billingService.VRAMUnitPrice(inst.GPUVRAMGB)
 
 		// Record usage
 		record := &UsageRecord{
@@ -138,13 +146,15 @@ type runningInstance struct {
 	ID           string
 	ProjectID    uuid.UUID
 	InstanceType string
+	GPUVRAMGB    int
 	CreatedAt    time.Time
 }
 
 // getRunningInstances gets all currently running instances
 func (c *UsageCollector) getRunningInstances(ctx context.Context) ([]runningInstance, error) {
 	query := `
-		SELECT id, project_id, instance_type_id, created_at
+		SELECT id, project_id, COALESCE(instance_type_id, ''),
+		       COALESCE(gpu_vram_gb, 0), created_at
 		FROM compute.instances
 		WHERE status = 'running' AND terminated_at IS NULL
 	`
@@ -158,13 +168,13 @@ func (c *UsageCollector) getRunningInstances(ctx context.Context) ([]runningInst
 	var instances []runningInstance
 	for rows.Next() {
 		var inst runningInstance
-		if err := rows.Scan(&inst.ID, &inst.ProjectID, &inst.InstanceType, &inst.CreatedAt); err != nil {
+		if err := rows.Scan(&inst.ID, &inst.ProjectID, &inst.InstanceType, &inst.GPUVRAMGB, &inst.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan failed: %w", err)
 		}
 		instances = append(instances, inst)
 	}
 
-	return instances, nil
+	return instances, rows.Err()
 }
 
 // getLastCollectionTime gets the last time usage was collected for an instance
@@ -186,22 +196,4 @@ func (c *UsageCollector) getLastCollectionTime(ctx context.Context, instanceID s
 	}
 
 	return time.Time{}, nil
-}
-
-// getUnitPrice returns the hourly price for an instance type
-func (c *UsageCollector) getUnitPrice(instanceType string) float64 {
-	pricing := c.billingService.pricing
-
-	switch instanceType {
-	case "gpu.h100.1g.10gb":
-		return pricing.GPU10GB
-	case "gpu.h100.2g.20gb":
-		return pricing.GPU20GB
-	case "gpu.h100.4g.40gb":
-		return pricing.GPU40GB
-	case "gpu.h100.7g.80gb":
-		return pricing.GPU80GB
-	default:
-		return 0
-	}
 }

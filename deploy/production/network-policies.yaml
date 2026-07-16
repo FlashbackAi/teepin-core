@@ -1,0 +1,204 @@
+# Copyright 2026 TEEPIN Project
+# Licensed under the Apache License, Version 2.0
+
+# Cilium Network Policies for Production
+# Implements zero-trust networking and pod-to-pod isolation
+
+---
+# Policy 1: API Server Egress
+# API server can only talk to: PostgreSQL (RDS), Redis, Harbor, Kubernetes API, Customer instances
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: api-server-egress
+  namespace: teepin-prod
+spec:
+  endpointSelector:
+    matchLabels:
+      app: api-server
+  egress:
+    # Allow DNS (CoreDNS)
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+
+    # Allow Kubernetes API
+    - toEntities:
+        - kube-apiserver
+
+    # Allow AWS RDS PostgreSQL (external)
+    - toFQDNs:
+        - matchPattern: "*.rds.amazonaws.com"
+      toPorts:
+        - ports:
+            - port: "5432"
+              protocol: TCP
+
+    # Allow Redis (within cluster)
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: rate-limit
+            app: redis
+      toPorts:
+        - ports:
+            - port: "6379"
+              protocol: TCP
+
+    # Allow Harbor registry (if internal)
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: registry
+      toPorts:
+        - ports:
+            - port: "80"
+              protocol: TCP
+            - port: "443"
+              protocol: TCP
+
+    # Allow access to customer GPU instances
+    - toEndpoints:
+        - matchLabels:
+            app.teepin.cloud/managed: "true"
+      toPorts:
+        - ports:
+            - port: "1-65535"
+              protocol: TCP
+
+---
+# Policy 2: API Server Ingress
+# API server can receive traffic from: Ingress controller, Prometheus
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: api-server-ingress
+  namespace: teepin-prod
+spec:
+  endpointSelector:
+    matchLabels:
+      app: api-server
+  ingress:
+    # Allow from Ingress controller
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: ingress-nginx
+            app.kubernetes.io/name: ingress-nginx
+
+    # Allow from Prometheus (monitoring)
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: monitoring
+            app: prometheus
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+
+---
+# Policy 3: Customer Instance Isolation
+# Customer instances CANNOT talk to each other (tenant isolation)
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: customer-instance-isolation
+  namespace: default
+spec:
+  endpointSelector:
+    matchLabels:
+      app.teepin.cloud/managed: "true"
+
+  ingress:
+    # Only allow from API server (for health checks, logs)
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: teepin-prod
+            app: api-server
+
+    # Allow from Ingress (for customer-exposed endpoints)
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: ingress-nginx
+
+    # Allow from within same instance (multi-container pods)
+    - fromEndpoints:
+        - matchLabels:
+            app.teepin.cloud/managed: "true"
+
+  egress:
+    # Allow DNS
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+
+    # Allow internet access (customer workloads need external access)
+    - toEntities:
+        - world
+
+    # Block access to Kubernetes API (security)
+    - toEntities:
+        - kube-apiserver
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+          rules:
+            http:
+              - method: "DENY"
+
+    # Block access to other customer instances
+    # (Implicit: no rule = deny by default)
+
+---
+# Policy 4: Redis Isolation
+# Redis can only be accessed by API server
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: redis-isolation
+  namespace: rate-limit
+spec:
+  endpointSelector:
+    matchLabels:
+      app: redis
+
+  ingress:
+    # Only API server can access Redis
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: teepin-prod
+            app: api-server
+      toPorts:
+        - ports:
+            - port: "6379"
+              protocol: TCP
+
+---
+# Policy 5: Default Deny All (for new namespaces)
+# Any new pods without explicit allow rules are blocked
+apiVersion: cilium.io/v2
+kind: CiliumClusterwideNetworkPolicy
+metadata:
+  name: default-deny-egress
+spec:
+  endpointSelector: {}
+  egress:
+    # Allow DNS (required for everything)
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+
+    # Everything else requires explicit allow

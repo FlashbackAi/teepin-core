@@ -53,28 +53,28 @@ type InvoiceLineItem struct {
 
 // PaymentMethod represents a stored payment method
 type PaymentMethod struct {
-	ID                     uuid.UUID `json:"id"`
-	ProjectID              uuid.UUID `json:"project_id"`
-	StripeCustomerID       string    `json:"stripe_customer_id"`
-	StripePaymentMethodID  string    `json:"stripe_payment_method_id"`
-	Type                   string    `json:"type"` // card, bank_account
-	Last4                  *string   `json:"last4,omitempty"`
-	Brand                  *string   `json:"brand,omitempty"`
-	ExpMonth               *int      `json:"exp_month,omitempty"`
-	ExpYear                *int      `json:"exp_year,omitempty"`
-	IsDefault              bool      `json:"is_default"`
-	CreatedAt              time.Time `json:"created_at"`
-	UpdatedAt              time.Time `json:"updated_at"`
+	ID                    uuid.UUID `json:"id"`
+	ProjectID             uuid.UUID `json:"project_id"`
+	StripeCustomerID      string    `json:"stripe_customer_id"`
+	StripePaymentMethodID string    `json:"stripe_payment_method_id"`
+	Type                  string    `json:"type"` // card, bank_account
+	Last4                 *string   `json:"last4,omitempty"`
+	Brand                 *string   `json:"brand,omitempty"`
+	ExpMonth              *int      `json:"exp_month,omitempty"`
+	ExpYear               *int      `json:"exp_year,omitempty"`
+	IsDefault             bool      `json:"is_default"`
+	CreatedAt             time.Time `json:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
 }
 
 // ResourcePricing defines pricing for different resource types
 type ResourcePricing struct {
-	GPU10GB  float64 // H100 MIG 10GB per hour
-	GPU20GB  float64 // H100 MIG 20GB per hour
-	GPU40GB  float64 // H100 MIG 40GB per hour
-	GPU80GB  float64 // H100 Full GPU per hour
-	CPUCore  float64 // Per vCPU per hour
-	MemoryGB float64 // Per GB RAM per hour
+	GPU10GB   float64 // H100 MIG 10GB per hour
+	GPU20GB   float64 // H100 MIG 20GB per hour
+	GPU40GB   float64 // H100 MIG 40GB per hour
+	GPU80GB   float64 // H100 Full GPU per hour
+	CPUCore   float64 // Per vCPU per hour
+	MemoryGB  float64 // Per GB RAM per hour
 	StorageGB float64 // Per GB storage per month
 }
 

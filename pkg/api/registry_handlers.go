@@ -6,10 +6,10 @@ package api
 import (
 	"net/http"
 
-	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 	"github.com/FlashbackAi/teepin-core/pkg/auth"
 	"github.com/FlashbackAi/teepin-core/pkg/harbor"
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 // RegistryHandler handles container registry operations
@@ -194,9 +194,9 @@ func (h *RegistryHandler) GetDockerLoginCommand(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"registry_url":       registryAccess.RegistryURL,
-		"username":           registryAccess.Username,
-		"image_prefix":       registryAccess.ImagePrefix,
+		"registry_url":         registryAccess.RegistryURL,
+		"username":             registryAccess.Username,
+		"image_prefix":         registryAccess.ImagePrefix,
 		"docker_login_command": registryAccess.DockerLoginCmd,
 		"instructions": []string{
 			"1. Use your TEEPIN API key as the password",

@@ -33,7 +33,7 @@ type APIKey struct {
 	ProjectID  uuid.UUID  `json:"project_id"`
 	UserID     uuid.UUID  `json:"user_id"`
 	Name       string     `json:"name"`
-	KeyHash    string     `json:"-"` // Never expose
+	KeyHash    string     `json:"-"`          // Never expose
 	KeyPrefix  string     `json:"key_prefix"` // tpk_12345678
 	Scopes     []string   `json:"scopes"`
 	LastUsedAt *time.Time `json:"last_used_at,omitempty"`

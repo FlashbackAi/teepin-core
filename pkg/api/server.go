@@ -7,6 +7,9 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -16,6 +19,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/FlashbackAi/teepin-core/pkg/auth"
+	"github.com/FlashbackAi/teepin-core/pkg/compute"
 	"github.com/FlashbackAi/teepin-core/pkg/gpu"
 	"github.com/FlashbackAi/teepin-core/pkg/models"
 	"github.com/FlashbackAi/teepin-core/pkg/networking"
@@ -23,39 +28,54 @@ import (
 
 // Server represents the API server
 type Server struct {
-	k8sClient         *kubernetes.Clientset
+	k8sClient         kubernetes.Interface
 	gpuAllocator      *gpu.Allocator
 	networkingService *networking.Service
+	store             *compute.Store // nil in standalone mode (no database)
 }
 
-// NewServer creates a new API server
-func NewServer(k8sClient *kubernetes.Clientset, gpuAllocator *gpu.Allocator, networkingService *networking.Service) *Server {
+// NewServer creates a new API server. store may be nil when the
+// platform runs without a database (local standalone mode); in that
+// case instances are not persisted and not billed.
+func NewServer(k8sClient kubernetes.Interface, gpuAllocator *gpu.Allocator, networkingService *networking.Service, store *compute.Store) *Server {
 	return &Server{
 		k8sClient:         k8sClient,
 		gpuAllocator:      gpuAllocator,
 		networkingService: networkingService,
+		store:             store,
 	}
 }
 
-// ListInstanceTypes returns available instance types
+// ListInstanceTypes returns available instance types derived from the
+// cluster's live GPU inventory. Custom VRAM sizes are always available
+// via the gpu_vram request field and are not enumerated here.
 func (s *Server) ListInstanceTypes(c *gin.Context) {
-	profiles := s.gpuAllocator.GetAvailableProfiles()
+	types, err := s.gpuAllocator.AvailableInstanceTypes(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": fmt.Sprintf("GPU discovery failed: %v", err)})
+		return
+	}
 
-	instanceTypes := make([]models.InstanceType, 0, len(profiles))
-	for _, profile := range profiles {
+	instanceTypes := make([]models.InstanceType, 0, len(types))
+	for _, t := range types {
+		isolation := "shared GPU, exact VRAM accounting"
+		if t.Isolation == gpu.AllocationMIG {
+			isolation = "MIG hardware isolation"
+		}
 		instanceTypes = append(instanceTypes, models.InstanceType{
-			Name:         fmt.Sprintf("gpu.h100.%s", profile.Name),
-			GPUVRAM:      fmt.Sprintf("%dGB", profile.MemoryGB),
-			GPUMemoryGB:  profile.MemoryGB,
-			CPUUnits:     8,  // Default
-			Memory:       "32GB",  // Default
-			PricePerHour: profile.Price,
-			Description:  fmt.Sprintf("H100 GPU with %dGB VRAM (MIG %s)", profile.MemoryGB, profile.Name),
+			Name:         t.Name,
+			GPUVRAM:      fmt.Sprintf("%dGB", t.MemoryGB),
+			GPUMemoryGB:  t.MemoryGB,
+			CPUUnits:     8,      // Default
+			Memory:       "32GB", // Default
+			PricePerHour: t.PricePerHour,
+			Description:  fmt.Sprintf("%s GPU with %dGB VRAM (%s)", strings.ToUpper(t.GPUModel), t.MemoryGB, isolation),
 		})
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"instance_types": instanceTypes,
+		"pricing":        fmt.Sprintf("$%.2f per GB-hour, exact allocation (custom sizes supported via gpu_vram)", gpu.PricePerGBHour),
 	})
 }
 
@@ -66,6 +86,15 @@ func (s *Server) CreateInstance(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+
+	// Billing integrity: when persistence is enabled, every instance
+	// must belong to a project so its usage can be metered. Refuse to
+	// run unbilled workloads.
+	projectID, ok := s.requireProjectScope(c)
+	if !ok {
+		return
+	}
+	userID, _ := auth.GetUserID(c)
 
 	// Generate instance UUID
 	instanceUUID := uuid.New()
@@ -93,7 +122,7 @@ func (s *Server) CreateInstance(c *gin.Context) {
 	}
 
 	// Create Kubernetes pod
-	pod, err := s.createPod(c.Request.Context(), instanceID, instanceUUID, &req, allocation)
+	pod, err := s.createPod(c.Request.Context(), instanceID, instanceUUID, projectID, &req, allocation)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to create pod: %v", err)})
 		return
@@ -114,6 +143,39 @@ func (s *Server) CreateInstance(c *gin.Context) {
 		}
 	}
 
+	// Persist the instance — this is what billing meters. If it fails
+	// the workload must not keep running unbilled: roll back.
+	if s.store != nil {
+		record := &compute.InstanceRecord{
+			ID:           instanceID,
+			ProjectID:    projectID,
+			UserID:       userID,
+			Name:         req.Name,
+			Image:        req.Image,
+			Status:       compute.StatusPending,
+			CPUUnits:     req.CPUUnits,
+			MemoryGB:     parseMemoryGB(req.Memory),
+			K8sPodName:   pod.Name,
+			K8sNamespace: pod.Namespace,
+		}
+		if allocation != nil {
+			record.InstanceType = allocation.InstanceType
+			record.GPUVRAMGB = allocation.AllocatedVRAM
+		}
+		if endpointInfo != nil {
+			record.Endpoint = endpointInfo.HTTPSURL
+		}
+
+		if err := s.store.Create(c.Request.Context(), record); err != nil {
+			if s.networkingService != nil && endpointInfo != nil {
+				_ = s.networkingService.RevokeEndpoint(c.Request.Context(), instanceUUID)
+			}
+			_ = s.k8sClient.CoreV1().Pods(pod.Namespace).Delete(c.Request.Context(), pod.Name, metav1.DeleteOptions{})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to persist instance: %v", err)})
+			return
+		}
+	}
+
 	// Build response
 	instance := models.Instance{
 		ID:        instanceID,
@@ -130,6 +192,14 @@ func (s *Server) CreateInstance(c *gin.Context) {
 	if allocation != nil {
 		instance.GPUVRAM = fmt.Sprintf("%dGB", allocation.RequestedVRAM)
 		instance.AllocatedVRAM = fmt.Sprintf("%dGB", allocation.AllocatedVRAM)
+		instance.InstanceType = allocation.InstanceType
+		instance.PricePerHour = gpu.GetPriceForVRAM(allocation.AllocatedVRAM)
+		if allocation.AllocatedVRAM > allocation.RequestedVRAM {
+			instance.AllocationNote = fmt.Sprintf(
+				"requested %dGB; allocated %dGB — the smallest isolation unit that fits (billed for %dGB at $%.2f/hr). Exact custom sizes arrive with software VRAM partitioning.",
+				allocation.RequestedVRAM, allocation.AllocatedVRAM,
+				allocation.AllocatedVRAM, instance.PricePerHour)
+		}
 	}
 
 	// Add endpoint information
@@ -144,11 +214,21 @@ func (s *Server) CreateInstance(c *gin.Context) {
 	c.JSON(http.StatusCreated, instance)
 }
 
-// ListInstances lists all instances
+// ListInstances lists the caller's instances. With tenancy active the
+// result is scoped to the caller's project — never other tenants'.
 func (s *Server) ListInstances(c *gin.Context) {
-	// In MVP, list all pods in default namespace
+	projectID, ok := s.requireProjectScope(c)
+	if !ok {
+		return
+	}
+
+	selector := "app.teepin.cloud/managed=true"
+	if projectID != uuid.Nil {
+		selector += fmt.Sprintf(",%s=%s", LabelProjectID, projectID)
+	}
+
 	pods, err := s.k8sClient.CoreV1().Pods("default").List(c.Request.Context(), metav1.ListOptions{
-		LabelSelector: "app.teepin.cloud/managed=true",
+		LabelSelector: selector,
 	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -167,13 +247,18 @@ func (s *Server) ListInstances(c *gin.Context) {
 	})
 }
 
-// GetInstance gets details of a specific instance
+// GetInstance gets details of a specific instance. Another tenant's
+// instance is indistinguishable from a nonexistent one (404).
 func (s *Server) GetInstance(c *gin.Context) {
 	instanceID := c.Param("id")
 
-	// Find pod by ID
+	projectID, ok := s.requireProjectScope(c)
+	if !ok {
+		return
+	}
+
 	pods, err := s.k8sClient.CoreV1().Pods("default").List(c.Request.Context(), metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("app.teepin.cloud/instance-id=%s", instanceID),
+		LabelSelector: instanceSelector(instanceID, projectID),
 	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -189,46 +274,58 @@ func (s *Server) GetInstance(c *gin.Context) {
 	c.JSON(http.StatusOK, instance)
 }
 
-// DeleteInstance deletes an instance
+// DeleteInstance deletes an instance. Scoped to the caller's project:
+// another tenant's instance is a 404, and deleting a nonexistent
+// instance is a 404 (not a silent success).
 func (s *Server) DeleteInstance(c *gin.Context) {
 	instanceID := c.Param("id")
 
-	// Parse instance UUID from ID (format: inst-abc12345)
-	// Extract the short UUID part
-	var instanceUUID uuid.UUID
-	if len(instanceID) >= 13 && instanceID[:5] == "inst-" {
-		shortID := instanceID[5:]
-		// We need the full UUID to revoke networking
-		// For now, we'll use a workaround: find the pod and extract UUID from labels
-		pods, err := s.k8sClient.CoreV1().Pods("default").List(c.Request.Context(), metav1.ListOptions{
-			LabelSelector: fmt.Sprintf("app.teepin.cloud/instance-id=%s", instanceID),
-		})
-		if err == nil && len(pods.Items) > 0 {
-			// Try to get full UUID from pod labels if available
-			if fullUUID, exists := pods.Items[0].Labels["teepin.io/instance-uuid"]; exists {
-				instanceUUID, _ = uuid.Parse(fullUUID)
-			} else {
-				// Fallback: construct UUID with short ID (not ideal but works for cleanup)
-				instanceUUID = uuid.MustParse(fmt.Sprintf("%s-0000-0000-0000-000000000000", shortID))
-			}
-		}
+	projectID, ok := s.requireProjectScope(c)
+	if !ok {
+		return
 	}
+	selector := instanceSelector(instanceID, projectID)
 
-	// Revoke networking endpoint (LoadBalancer + Ingress)
-	if s.networkingService != nil && instanceUUID != uuid.Nil {
-		if err := s.networkingService.RevokeEndpoint(c.Request.Context(), instanceUUID); err != nil {
-			// Log error but continue with pod deletion
-			c.Header("X-Warning", fmt.Sprintf("Failed to cleanup networking: %v", err))
-		}
-	}
-
-	// Delete pod
-	err := s.k8sClient.CoreV1().Pods("default").DeleteCollection(c.Request.Context(), metav1.DeleteOptions{}, metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("app.teepin.cloud/instance-id=%s", instanceID),
+	pods, err := s.k8sClient.CoreV1().Pods("default").List(c.Request.Context(), metav1.ListOptions{
+		LabelSelector: selector,
 	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
+	}
+	if len(pods.Items) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "instance not found"})
+		return
+	}
+
+	// Revoke networking endpoint (LoadBalancer + Ingress) using the
+	// full instance UUID carried on the pod.
+	if s.networkingService != nil {
+		if fullUUID, exists := pods.Items[0].Labels["teepin.io/instance-uuid"]; exists {
+			if instanceUUID, err := uuid.Parse(fullUUID); err == nil {
+				if err := s.networkingService.RevokeEndpoint(c.Request.Context(), instanceUUID); err != nil {
+					// Log error but continue with pod deletion
+					c.Header("X-Warning", fmt.Sprintf("Failed to cleanup networking: %v", err))
+				}
+			}
+		}
+	}
+
+	// Delete pod(s)
+	err = s.k8sClient.CoreV1().Pods("default").DeleteCollection(c.Request.Context(), metav1.DeleteOptions{}, metav1.ListOptions{
+		LabelSelector: selector,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Stop billing: stamp terminated_at. Idempotent; the reconciler
+	// would also catch this within a minute if it failed here.
+	if s.store != nil {
+		if err := s.store.MarkTerminated(c.Request.Context(), instanceID); err != nil {
+			c.Header("X-Warning", fmt.Sprintf("failed to finalize billing record: %v", err))
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -241,9 +338,13 @@ func (s *Server) DeleteInstance(c *gin.Context) {
 func (s *Server) GetInstanceLogs(c *gin.Context) {
 	instanceID := c.Param("id")
 
-	// Find pod
+	projectID, ok := s.requireProjectScope(c)
+	if !ok {
+		return
+	}
+
 	pods, err := s.k8sClient.CoreV1().Pods("default").List(c.Request.Context(), metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("app.teepin.cloud/instance-id=%s", instanceID),
+		LabelSelector: instanceSelector(instanceID, projectID),
 	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -254,27 +355,59 @@ func (s *Server) GetInstanceLogs(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "instance not found"})
 		return
 	}
+	pod := &pods.Items[0]
 
-	// TODO: Stream logs
+	// Tail size: ?tail=N (default 100, capped to keep responses sane).
+	tail := int64(100)
+	if t, err := strconv.ParseInt(c.Query("tail"), 10, 64); err == nil && t > 0 && t <= 10000 {
+		tail = t
+	}
+
+	opts := &corev1.PodLogOptions{
+		TailLines:  &tail,
+		Timestamps: c.Query("timestamps") == "true",
+	}
+	raw, err := s.k8sClient.CoreV1().Pods(pod.Namespace).
+		GetLogs(pod.Name, opts).Do(c.Request.Context()).Raw()
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("failed to fetch logs: %v", err)})
+		return
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"message": "Logs endpoint - to be implemented with streaming",
-		"pod":     pods.Items[0].Name,
+		"instance_id": instanceID,
+		"tail":        tail,
+		"logs":        string(raw),
 	})
 }
 
-// GetInstanceMetrics gets metrics from an instance
+// GetInstanceMetrics gets metrics from an instance.
+// Not implemented yet: returning made-up numbers to customers is worse
+// than admitting the gap. Real metrics arrive with the Prometheus/DCGM
+// integration milestone.
 func (s *Server) GetInstanceMetrics(c *gin.Context) {
 	instanceID := c.Param("id")
 
-	// TODO: Query Prometheus for metrics
-	c.JSON(http.StatusOK, gin.H{
+	projectID, ok := s.requireProjectScope(c)
+	if !ok {
+		return
+	}
+
+	pods, err := s.k8sClient.CoreV1().Pods("default").List(c.Request.Context(), metav1.ListOptions{
+		LabelSelector: instanceSelector(instanceID, projectID),
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if len(pods.Items) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "instance not found"})
+		return
+	}
+
+	c.JSON(http.StatusNotImplemented, gin.H{
+		"error":       "instance metrics are not available yet (Prometheus/DCGM integration is planned before GA)",
 		"instance_id": instanceID,
-		"metrics": gin.H{
-			"gpu_utilization": 85,
-			"gpu_memory_used": "18.5GB",
-			"cpu_utilization": 45,
-			"memory_used":     "24GB",
-		},
 	})
 }
 
@@ -288,21 +421,63 @@ func (s *Server) DeploySDL(c *gin.Context) {
 
 // Helper functions
 
-func (s *Server) createPod(ctx context.Context, instanceID string, instanceUUID uuid.UUID, req *models.CreateInstanceRequest, allocation *gpu.Allocation) (*corev1.Pod, error) {
+// LabelProjectID scopes a pod to the owning TEEPIN project; every
+// tenant-facing read/delete filters on it.
+const LabelProjectID = "teepin.io/project-id"
+
+// annotationInstanceType records the hardware-derived instance type on
+// the pod so reads can report it without a database lookup.
+const annotationInstanceType = "teepin.io/instance-type"
+
+// requireProjectScope returns the caller's project ID. When
+// persistence is enabled every compute operation must be scoped to a
+// project (billing + tenant isolation); unauthenticated calls get 401.
+// In standalone mode (no database) there is no tenancy and uuid.Nil is
+// returned with ok=true.
+func (s *Server) requireProjectScope(c *gin.Context) (uuid.UUID, bool) {
+	if s.store == nil {
+		return uuid.Nil, true
+	}
+	projectID, ok := auth.GetProjectID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": "authentication with a project is required (use an API key: Authorization: Bearer tpk_...)",
+		})
+		return uuid.Nil, false
+	}
+	return projectID, true
+}
+
+// instanceSelector builds the label selector for one instance,
+// restricted to the caller's project when tenancy is active.
+func instanceSelector(instanceID string, projectID uuid.UUID) string {
+	selector := fmt.Sprintf("app.teepin.cloud/instance-id=%s", instanceID)
+	if projectID != uuid.Nil {
+		selector += fmt.Sprintf(",%s=%s", LabelProjectID, projectID)
+	}
+	return selector
+}
+
+func (s *Server) createPod(ctx context.Context, instanceID string, instanceUUID, projectID uuid.UUID, req *models.CreateInstanceRequest, allocation *gpu.Allocation) (*corev1.Pod, error) {
 	// Generate pod selector for networking
 	podSelector := fmt.Sprintf("inst-%s", instanceID[5:]) // Remove "inst-" prefix
+
+	labels := map[string]string{
+		"app.teepin.cloud/managed":     "true",
+		"app.teepin.cloud/instance-id": instanceID,
+		"app.teepin.cloud/name":        req.Name,
+		"teepin.io/instance":           podSelector,           // For LoadBalancer selector
+		"teepin.io/instance-uuid":      instanceUUID.String(), // For cleanup
+	}
+	if projectID != uuid.Nil {
+		labels[LabelProjectID] = projectID.String()
+	}
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("%s-%s", req.Name, uuid.New().String()[:5]),
 			Namespace: "default",
-			Labels: map[string]string{
-				"app.teepin.cloud/managed":     "true",
-				"app.teepin.cloud/instance-id": instanceID,
-				"app.teepin.cloud/name":        req.Name,
-				"teepin.io/instance":           podSelector,    // For LoadBalancer selector
-				"teepin.io/instance-uuid":      instanceUUID.String(), // For cleanup
-			},
+			Labels:    labels,
 		},
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{
@@ -326,14 +501,29 @@ func (s *Server) createPod(ctx context.Context, instanceID string, instanceUUID 
 
 	// Add GPU resources if allocated
 	if allocation != nil {
-		// In production, this would be the actual MIG device
-		// For local dev, we just label the node selector
-		pod.Spec.NodeSelector = map[string]string{
-			"gpu-type": "h100-simulated",
+		// VRAM annotations drive capacity accounting (inventory) and
+		// billing reconciliation.
+		pod.ObjectMeta.Annotations = map[string]string{
+			gpu.AnnotationVRAMGB:      strconv.Itoa(allocation.AllocatedVRAM),
+			gpu.AnnotationGPUResource: allocation.ResourceName,
+			annotationInstanceType:    allocation.InstanceType,
 		}
 
-		// Simulated GPU resource request
-		pod.Spec.Containers[0].Resources.Limits["nvidia.com/gpu"] = resource.MustParse("1")
+		// Pin to the node whose capacity the allocator accounted against.
+		if allocation.NodeName != "" {
+			pod.Spec.NodeSelector = map[string]string{
+				"kubernetes.io/hostname": allocation.NodeName,
+			}
+		}
+
+		// Request the allocated device: a MIG slice (e.g.
+		// nvidia.com/mig-2g.20gb) or a shared GPU (nvidia.com/gpu).
+		// Simulated allocations skip this — local Kind nodes expose no
+		// GPU extended resources and the pod would be unschedulable.
+		if !allocation.Simulated {
+			pod.Spec.Containers[0].Resources.Limits[corev1.ResourceName(allocation.ResourceName)] =
+				resource.MustParse(strconv.Itoa(allocation.Quantity))
+		}
 	}
 
 	// Add environment variables
@@ -370,18 +560,50 @@ func (s *Server) createPod(ctx context.Context, instanceID string, instanceUUID 
 }
 
 func podToInstance(pod *corev1.Pod) models.Instance {
-	instanceID := pod.Labels["app.teepin.cloud/instance-id"]
-	name := pod.Labels["app.teepin.cloud/name"]
-
-	return models.Instance{
-		ID:         instanceID,
-		Name:       name,
+	instance := models.Instance{
+		ID:         pod.Labels["app.teepin.cloud/instance-id"],
+		Name:       pod.Labels["app.teepin.cloud/name"],
 		Status:     string(pod.Status.Phase),
 		CreatedAt:  pod.CreationTimestamp.Time,
 		UpdatedAt:  pod.CreationTimestamp.Time,
 		InternalIP: pod.Status.PodIP,
 	}
+
+	if len(pod.Spec.Containers) > 0 {
+		instance.Image = pod.Spec.Containers[0].Image
+	}
+
+	// GPU details from the allocation annotations.
+	if v, err := strconv.Atoi(pod.Annotations[gpu.AnnotationVRAMGB]); err == nil && v > 0 {
+		instance.GPUVRAM = fmt.Sprintf("%dGB", v)
+		instance.AllocatedVRAM = instance.GPUVRAM
+		instance.PricePerHour = gpu.GetPriceForVRAM(v)
+	}
+	if t := pod.Annotations[annotationInstanceType]; t != "" {
+		instance.InstanceType = t
+	}
+
+	return instance
 }
+
+// parseMemoryGB parses memory strings like "32GB" or "512MB" to whole
+// GB (rounded up) for persistence. Unparseable input yields 0.
+func parseMemoryGB(memory string) int {
+	m := memoryRe.FindStringSubmatch(memory)
+	if m == nil {
+		return 0
+	}
+	value, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0
+	}
+	if strings.EqualFold(m[2], "MB") || strings.EqualFold(m[2], "M") {
+		value = (value + 1023) / 1024
+	}
+	return value
+}
+
+var memoryRe = regexp.MustCompile(`^(\d+)\s*([GgMm][Bb]?)$`)
 
 // convertMemoryToK8sFormat converts memory strings like "16GB" to Kubernetes format "16Gi"
 func convertMemoryToK8sFormat(memory string) string {

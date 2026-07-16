@@ -28,8 +28,8 @@ type Config struct {
 	Endpoints map[string]*EndpointConfig `yaml:"endpoints" json:"endpoints"`
 
 	// Feature flags
-	Enabled      bool `yaml:"enabled" json:"enabled"`
-	DryRunMode   bool `yaml:"dry_run_mode" json:"dry_run_mode"` // Log violations but don't block
+	Enabled       bool `yaml:"enabled" json:"enabled"`
+	DryRunMode    bool `yaml:"dry_run_mode" json:"dry_run_mode"`     // Log violations but don't block
 	ReturnHeaders bool `yaml:"return_headers" json:"return_headers"` // X-RateLimit-* headers
 }
 
