@@ -18,10 +18,19 @@ FROM alpine:latest
 
 RUN apk --no-cache add ca-certificates
 
-WORKDIR /root/
+# Run as a dedicated non-root user (UID 1000 — must match the
+# runAsUser in deploy/production/api-server.yaml). The binary must NOT
+# live in /root/: that directory is 0700 and a non-root user cannot
+# exec from it.
+RUN adduser -D -u 1000 teepin
+
+WORKDIR /app
 
 # Copy binary from builder
 COPY --from=builder /app/api-server .
+
+RUN chown -R teepin:teepin /app
+USER teepin
 
 EXPOSE 8080
 
