@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -114,11 +115,27 @@ func (s *Service) GetUserByID(ctx context.Context, userID uuid.UUID) (*User, err
 	return &user, nil
 }
 
-// CreateProject creates a new project/workspace
+// CreateProject creates a new project/workspace.
+// Slugs are globally unique: the first project to claim a name gets
+// the clean slug; later projects with the same name (from any owner)
+// get a short random suffix — customers must never be blocked because
+// someone else already named a project "production".
 func (s *Service) CreateProject(ctx context.Context, ownerID uuid.UUID, name, description string) (*Project, error) {
-	// Generate slug from name
 	slug := strings.ToLower(strings.ReplaceAll(name, " ", "-"))
 
+	project, err := s.insertProject(ctx, ownerID, name, slug, description)
+	if isUniqueViolation(err) {
+		suffixed := fmt.Sprintf("%s-%s", slug, uuid.New().String()[:6])
+		project, err = s.insertProject(ctx, ownerID, name, suffixed, description)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to create project: %w", err)
+	}
+
+	return project, nil
+}
+
+func (s *Service) insertProject(ctx context.Context, ownerID uuid.UUID, name, slug, description string) (*Project, error) {
 	var project Project
 	query := `
 		INSERT INTO auth.projects (owner_id, name, slug, description)
@@ -130,15 +147,18 @@ func (s *Service) CreateProject(ctx context.Context, ownerID uuid.UUID, name, de
 		&project.ID, &project.OwnerID, &project.Name, &project.Slug,
 		&project.Description, &project.CreatedAt, &project.UpdatedAt,
 	)
-
 	if err != nil {
-		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
-			return nil, fmt.Errorf("project with this name already exists")
-		}
-		return nil, fmt.Errorf("failed to create project: %w", err)
+		return nil, err
 	}
 
 	return &project, nil
+}
+
+// isUniqueViolation reports whether err is a PostgreSQL unique
+// constraint violation (SQLSTATE 23505).
+func isUniqueViolation(err error) bool {
+	var pqErr *pq.Error
+	return errors.As(err, &pqErr) && pqErr.Code == "23505"
 }
 
 // ListProjects lists all projects for a user

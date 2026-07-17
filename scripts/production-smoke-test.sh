@@ -77,15 +77,17 @@ TOKEN=$(curl -s -X POST "$API_URL/v1/auth/login" -H "Content-Type: application/j
 [ -n "$TOKEN" ] && ok "Login returned JWT" || { bad "Login failed"; exit 1; }
 
 # --- 2. Project + API key ----------------------------------------------
-PROJECT_ID=$(curl -s -X POST "$API_URL/v1/projects" \
+PROJ_RESP=$(curl -s -X POST "$API_URL/v1/projects" \
     -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-    -d '{"name":"smoke-test-project"}' | jq -r '.id // .project.id // empty')
-[ -n "$PROJECT_ID" ] && ok "Project created: $PROJECT_ID" || { bad "Project creation failed"; exit 1; }
+    -d "{\"name\":\"smoke-project-$STAMP\"}")
+PROJECT_ID=$(echo "$PROJ_RESP" | jq -r '.id // .project.id // empty')
+[ -n "$PROJECT_ID" ] && ok "Project created: $PROJECT_ID" || { bad "Project creation failed: $PROJ_RESP"; exit 1; }
 
-API_KEY=$(curl -s -X POST "$API_URL/v1/projects/$PROJECT_ID/api-keys" \
+KEY_RESP=$(curl -s -X POST "$API_URL/v1/projects/$PROJECT_ID/api-keys" \
     -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-    -d '{"name":"smoke-test-key"}' | jq -r '.api_key // .key // empty')
-[ -n "$API_KEY" ] && ok "API key issued" || { bad "API key creation failed"; exit 1; }
+    -d '{"name":"smoke-test-key"}')
+API_KEY=$(echo "$KEY_RESP" | jq -r '.api_key // .key // empty')
+[ -n "$API_KEY" ] && ok "API key issued" || { bad "API key creation failed: $KEY_RESP"; exit 1; }
 
 AUTH=(-H "Authorization: Bearer $API_KEY")
 
