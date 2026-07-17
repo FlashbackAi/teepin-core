@@ -21,20 +21,26 @@ echo ""
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
 
-# Function to create and seal a secret
+# Function to create and seal a secret with ALL of its keys in one file.
+# Usage: create_sealed_secret <name> <description> key1=value1 [key2=value2 ...]
+# (One call per secret — separate calls would overwrite each other's keys.)
 create_sealed_secret() {
     local name=$1
-    local key=$2
-    local value=$3
-    local description=$4
+    local description=$2
+    shift 2
 
-    echo "🔐 Creating sealed secret: $name"
+    local literals=()
+    for kv in "$@"; do
+        literals+=(--from-literal="$kv")
+    done
 
-    # Create regular secret (dry-run)
+    echo "🔐 Creating sealed secret: $name ($# keys)"
+
+    # Create regular secret (dry-run) with every key, then seal it
     kubectl create secret generic "$name" \
         --dry-run=client \
         --namespace="$NAMESPACE" \
-        --from-literal="$key"="$value" \
+        "${literals[@]}" \
         -o yaml | \
     kubeseal \
         --controller-namespace=kube-system \
@@ -59,14 +65,19 @@ echo ""
 read -p "Enter PostgreSQL database name [default: teepin]: " PG_DATABASE
 PG_DATABASE=${PG_DATABASE:-teepin}
 
-# Create PostgreSQL connection string
+# Individual DB_* keys (what the API reads) plus a connection string
+# for tools that prefer one.
 PG_URL="postgresql://${PG_USER}:${PG_PASSWORD}@${PG_HOST}:5432/${PG_DATABASE}?sslmode=require"
 
 create_sealed_secret \
     "postgresql-credentials" \
-    "connection-string" \
-    "$PG_URL" \
-    "PostgreSQL connection string for AWS RDS"
+    "PostgreSQL / AWS RDS credentials" \
+    "host=$PG_HOST" \
+    "port=5432" \
+    "username=$PG_USER" \
+    "password=$PG_PASSWORD" \
+    "database=$PG_DATABASE" \
+    "connection-string=$PG_URL"
 
 # Redis credentials
 echo ""
@@ -80,15 +91,9 @@ REDIS_URL="redis://${REDIS_HOST}:6379"
 
 create_sealed_secret \
     "redis-credentials" \
-    "url" \
-    "$REDIS_URL" \
-    "Redis connection URL"
-
-create_sealed_secret \
-    "redis-credentials" \
-    "password" \
-    "$REDIS_PASSWORD" \
-    "Redis authentication password"
+    "Redis connection URL and password" \
+    "url=$REDIS_URL" \
+    "password=$REDIS_PASSWORD"
 
 # Harbor credentials
 echo ""
@@ -102,21 +107,10 @@ echo ""
 
 create_sealed_secret \
     "harbor-credentials" \
-    "url" \
-    "$HARBOR_URL" \
-    "Harbor container registry URL"
-
-create_sealed_secret \
-    "harbor-credentials" \
-    "username" \
-    "$HARBOR_USER" \
-    "Harbor admin username"
-
-create_sealed_secret \
-    "harbor-credentials" \
-    "password" \
-    "$HARBOR_PASSWORD" \
-    "Harbor admin password"
+    "Harbor container registry credentials" \
+    "url=$HARBOR_URL" \
+    "username=$HARBOR_USER" \
+    "password=$HARBOR_PASSWORD"
 
 # JWT Secret for API authentication
 echo ""
@@ -130,9 +124,8 @@ fi
 
 create_sealed_secret \
     "jwt-secret" \
-    "secret" \
-    "$JWT_SECRET" \
-    "JWT signing secret for API authentication"
+    "JWT signing secret for API authentication" \
+    "secret=$JWT_SECRET"
 
 # Encryption key for billing data
 echo ""
@@ -146,9 +139,8 @@ fi
 
 create_sealed_secret \
     "encryption-key" \
-    "key" \
-    "$ENCRYPT_KEY" \
-    "AES-256 encryption key for sensitive data"
+    "AES-256 encryption key for sensitive data" \
+    "key=$ENCRYPT_KEY"
 
 # Cloudflare API token (for ExternalDNS)
 echo ""
@@ -158,15 +150,9 @@ read -p "Enter Cloudflare Zone ID: " CF_ZONE_ID
 
 create_sealed_secret \
     "cloudflare-credentials" \
-    "api-token" \
-    "$CF_TOKEN" \
-    "Cloudflare API token for ExternalDNS"
-
-create_sealed_secret \
-    "cloudflare-credentials" \
-    "zone-id" \
-    "$CF_ZONE_ID" \
-    "Cloudflare Zone ID"
+    "Cloudflare API token and zone for ExternalDNS" \
+    "api-token=$CF_TOKEN" \
+    "zone-id=$CF_ZONE_ID"
 
 echo ""
 echo "✅ All sealed secrets created in: $OUTPUT_DIR/"

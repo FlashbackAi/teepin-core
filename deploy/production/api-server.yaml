@@ -64,14 +64,43 @@ spec:
               containerPort: 8080
               protocol: TCP
 
-          # Environment variables
+          # Environment variables — names must match what the API code
+          # reads (cmd/api-server/main.go): DB_*, REDIS_*, HARBOR_ADMIN_*.
           env:
             # Database connection (from sealed secret)
-            - name: DATABASE_URL
+            - name: DB_HOST
               valueFrom:
                 secretKeyRef:
                   name: postgresql-credentials
-                  key: connection-string
+                  key: host
+
+            - name: DB_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql-credentials
+                  key: port
+
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql-credentials
+                  key: username
+
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql-credentials
+                  key: password
+
+            - name: DB_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql-credentials
+                  key: database
+
+            # RDS/Aurora enforces TLS
+            - name: DB_SSLMODE
+              value: "require"
 
             # Redis connection (from sealed secret)
             - name: REDIS_URL
@@ -93,13 +122,13 @@ spec:
                   name: harbor-credentials
                   key: url
 
-            - name: HARBOR_USERNAME
+            - name: HARBOR_ADMIN_USERNAME
               valueFrom:
                 secretKeyRef:
                   name: harbor-credentials
                   key: username
 
-            - name: HARBOR_PASSWORD
+            - name: HARBOR_ADMIN_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: harbor-credentials
