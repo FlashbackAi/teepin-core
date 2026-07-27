@@ -97,13 +97,15 @@ CODE=$(curl -s -o /dev/null -w "%{http_code}" "$API_URL/v1/compute/instances")
 
 # --- 4. Instance types reflect real hardware ---------------------------
 info "Discovering instance types"
-TYPES=$(curl -s "${AUTH[@]}" "$API_URL/v1/compute/instance-types")
-COUNT=$(echo "$TYPES" | jq '.instance_types | length')
-if [ "$COUNT" -gt 0 ]; then
+TYPES=$(curl -s "${AUTH[@]}" "$API_URL/v1/compute/instance-types" || echo "")
+# Tolerate non-JSON responses (rollouts, proxies): never crash, always
+# show what the API actually said.
+COUNT=$(echo "$TYPES" | jq '.instance_types | length' 2>/dev/null || echo 0)
+if [ "${COUNT:-0}" -gt 0 ] 2>/dev/null; then
     ok "Discovered $COUNT instance types from hardware"
     echo "$TYPES" | jq -r '.instance_types[] | "     \(.name)  \(.gpu_vram)  $\(.price_per_hour)/hr"'
 else
-    bad "No instance types discovered — is the GPU Operator publishing labels?"
+    bad "No instance types discovered — response was: ${TYPES:-<empty>}"
 fi
 
 if [ "$SKIP_GPU" = "true" ]; then
