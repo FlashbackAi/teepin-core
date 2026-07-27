@@ -86,7 +86,10 @@ PROJECT_ID=$(echo "$PROJ_RESP" | jq -r '.id // .project.id // empty')
 KEY_RESP=$(curl -s -X POST "$API_URL/v1/projects/$PROJECT_ID/api-keys" \
     -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
     -d '{"name":"smoke-test-key"}')
-API_KEY=$(echo "$KEY_RESP" | jq -r '.api_key // .key // empty')
+# The secret is the "key" field (returned once); "api_key" is a metadata
+# object — selecting it would inject a multi-line value into the auth
+# header, which the HTTP server rejects with a plain-text 400.
+API_KEY=$(echo "$KEY_RESP" | jq -r '[.key, .api_key] | map(select(type=="string")) | first // empty')
 [ -n "$API_KEY" ] && ok "API key issued" || { bad "API key creation failed: $KEY_RESP"; exit 1; }
 
 AUTH=(-H "Authorization: Bearer $API_KEY")
@@ -116,7 +119,7 @@ else
     R20=$(curl -s -X POST "${AUTH[@]}" -H "Content-Type: application/json" \
         "$API_URL/v1/compute/instances" \
         -d '{"name":"smoke-mig20","image":"nvidia/cuda:12.3.1-base-ubuntu22.04","gpu_vram":"20GB","cpu_units":2,"memory":"8GB","env":{"SLEEP":"1"}}')
-    ID20=$(echo "$R20" | jq -r '.id // empty')
+    ID20=$(echo "$R20" | jq -r '.id // empty' 2>/dev/null || true)
     if [ -n "$ID20" ]; then
         CREATED_IDS+=("$ID20")
         ok "20GB instance created: $ID20 (type: $(echo "$R20" | jq -r .instance_type), \$$(echo "$R20" | jq -r .price_per_hour)/hr)"
@@ -132,7 +135,7 @@ else
     R25=$(curl -s -X POST "${AUTH[@]}" -H "Content-Type: application/json" \
         "$API_URL/v1/compute/instances" \
         -d '{"name":"smoke-roundup25","image":"nvidia/cuda:12.3.1-base-ubuntu22.04","gpu_vram":"25GB","cpu_units":2,"memory":"8GB"}')
-    ID25=$(echo "$R25" | jq -r '.id // empty')
+    ID25=$(echo "$R25" | jq -r '.id // empty' 2>/dev/null || true)
     if [ -n "$ID25" ]; then
         CREATED_IDS+=("$ID25")
         ALLOC=$(echo "$R25" | jq -r .allocated_vram)
@@ -147,7 +150,7 @@ else
     # --- 7. Wait for scheduling, then verify status --------------------
     info "Waiting up to 120s for instances to run..."
     for i in $(seq 1 24); do
-        STATUS=$(curl -s "${AUTH[@]}" "$API_URL/v1/compute/instances/$ID20" | jq -r '.status // empty')
+        STATUS=$(curl -s "${AUTH[@]}" "$API_URL/v1/compute/instances/$ID20" | jq -r '.status // empty' 2>/dev/null || true)
         [ "$STATUS" = "Running" ] && break
         sleep 5
     done
@@ -159,7 +162,7 @@ else
     echo "$LOGS" | jq -e 'has("logs")' > /dev/null && ok "Log retrieval works" || bad "Log retrieval failed: $LOGS"
 
     # --- 9. List scoped to project --------------------------------------
-    LIST_COUNT=$(curl -s "${AUTH[@]}" "$API_URL/v1/compute/instances" | jq '.count')
+    LIST_COUNT=$(curl -s "${AUTH[@]}" "$API_URL/v1/compute/instances" | jq '.count' 2>/dev/null || echo 0)
     [ "$LIST_COUNT" -ge 2 ] && ok "List shows this project's instances ($LIST_COUNT)" || bad "List count unexpected: $LIST_COUNT"
 
     # --- 10. Delete + verify -------------------------------------------
