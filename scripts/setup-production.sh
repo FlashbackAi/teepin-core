@@ -144,6 +144,31 @@ done
 
 kubectl wait --for=condition=Ready nodes --all --timeout=300s
 
+# ----------------------------------------------------------------------
+# In-cluster DNS sanity. CoreDNS forwards to the node's resolv.conf,
+# and on some GPU providers that upstream is flaky or a loopback stub —
+# external lookups (e.g. the RDS endpoint) then fail with SERVFAIL
+# ("server misbehaving") or hang. Pin CoreDNS to public resolvers when
+# external resolution fails from inside the cluster.
+# ----------------------------------------------------------------------
+log_info "Checking in-cluster DNS resolution..."
+DNS_OK=false
+for i in 1 2; do
+    if kubectl run dnscheck-$i --rm -i --restart=Never --image=busybox:1.36 \
+        --pod-running-timeout=90s -- nslookup amazonaws.com > /dev/null 2>&1; then
+        DNS_OK=true
+        break
+    fi
+done
+if [ "$DNS_OK" != "true" ]; then
+    log_warn "In-cluster DNS cannot resolve external names — pinning CoreDNS upstream to 8.8.8.8/1.1.1.1"
+    kubectl -n kube-system get configmap rke2-coredns-rke2-coredns -o yaml \
+        | sed 's|forward[[:space:]]*\.[[:space:]]*/etc/resolv.conf|forward . 8.8.8.8 1.1.1.1|' \
+        | kubectl apply -f -
+    kubectl -n kube-system rollout restart deployment rke2-coredns-rke2-coredns
+    kubectl -n kube-system rollout status deployment rke2-coredns-rke2-coredns --timeout=120s
+fi
+
 log_info "RKE2 Kubernetes installed and ready"
 
 # ============================================================================
