@@ -414,15 +414,45 @@ log_info "Deploying from: $REPO_DIR"
 # Create production namespace
 kubectl apply -f deploy/production/namespace.yaml
 
-# Sealed secrets: create them interactively right here if they don't
-# exist yet (the controller and kubeseal were installed in Step 7).
-if [ ! -d "deploy/production/secrets" ] || [ -z "$(ls -A deploy/production/secrets 2>/dev/null)" ]; then
+# Sealed secrets: create them interactively right here if no secret
+# manifests exist (the controller and kubeseal were installed in Step 7).
+if ! ls deploy/production/secrets/*.yaml > /dev/null 2>&1; then
     log_info "No sealed secrets found — creating them now (interactive)"
     bash "$SCRIPT_DIR/create-sealed-secrets.sh"
 fi
 
 kubectl apply -f deploy/production/secrets/
-log_info "Sealed secrets applied"
+
+# Sealed secrets are encrypted against THIS cluster's controller key.
+# Files carried over from a previous cluster apply cleanly but never
+# unseal — verify the plain Secrets actually materialize before
+# deploying an API server that would crash-loop without them.
+log_info "Verifying sealed secrets unseal on this cluster..."
+secrets_unsealed() {
+    kubectl -n teepin-prod get secret postgresql-credentials > /dev/null 2>&1
+}
+UNSEALED=false
+for i in $(seq 1 12); do
+    if secrets_unsealed; then UNSEALED=true; break; fi
+    sleep 5
+done
+
+if [ "$UNSEALED" != "true" ]; then
+    log_warn "Sealed secrets did not unseal — they were likely created for a DIFFERENT cluster"
+    log_info "Re-creating sealed secrets for this cluster..."
+    rm -f deploy/production/secrets/*.yaml
+    bash "$SCRIPT_DIR/create-sealed-secrets.sh"
+    kubectl apply -f deploy/production/secrets/
+    for i in $(seq 1 12); do
+        if secrets_unsealed; then UNSEALED=true; break; fi
+        sleep 5
+    done
+    if [ "$UNSEALED" != "true" ]; then
+        log_error "Secrets still not unsealing — check: kubectl logs -n kube-system -l name=sealed-secrets-controller"
+        exit 1
+    fi
+fi
+log_info "Sealed secrets applied and unsealed"
 
 # Deploy Redis for rate limiting
 kubectl apply -f deploy/local/redis.yaml
