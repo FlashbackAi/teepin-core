@@ -414,10 +414,13 @@ log_info "Deploying from: $REPO_DIR"
 # Create production namespace
 kubectl apply -f deploy/production/namespace.yaml
 
-# Sealed secrets: create them interactively right here if no secret
-# manifests exist (the controller and kubeseal were installed in Step 7).
-if ! ls deploy/production/secrets/*.yaml > /dev/null 2>&1; then
-    log_info "No sealed secrets found — creating them now (interactive)"
+# Sealed secrets: (re)create them interactively when no VALID manifests
+# exist. Content check, not just filenames — a failed earlier run can
+# leave empty or comment-only .yaml files behind, which `kubectl apply`
+# rejects with "no objects passed to apply".
+if ! grep -q "kind: SealedSecret" deploy/production/secrets/*.yaml 2>/dev/null; then
+    log_info "No valid sealed-secret manifests found — creating them now (interactive)"
+    rm -f deploy/production/secrets/*.yaml 2>/dev/null || true
     bash "$SCRIPT_DIR/create-sealed-secrets.sh"
 fi
 
