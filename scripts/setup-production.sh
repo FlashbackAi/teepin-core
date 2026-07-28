@@ -151,6 +151,25 @@ kubectl wait --for=condition=Ready nodes --all --timeout=300s
 # ("server misbehaving") or hang. Pin CoreDNS to public resolvers when
 # external resolution fails from inside the cluster.
 # ----------------------------------------------------------------------
+# Pod egress first: a pod that cannot reach the outside world at all
+# means the CNI datapath is broken (or the provider drops tenant pod
+# traffic). Nothing downstream can work, and no amount of DNS or
+# secrets config fixes it — fail here, at minute two, not at the smoke
+# test an hour later.
+log_info "Checking pod network egress..."
+if ! kubectl run netcheck --rm -i --restart=Never --image=busybox:1.36 \
+    --pod-running-timeout=90s -- ping -c 2 -W 5 8.8.8.8 2>/dev/null | grep -q "bytes from"; then
+    log_error "A new pod has NO network egress — the CNI datapath is broken."
+    log_error "Diagnose with:"
+    log_error "  iptables -S FORWARD | head -3                                  # Docker sets DROP; must be ACCEPT"
+    log_error "  kubectl -n kube-system exec ds/cilium -- cilium status --verbose | grep -i masquerad"
+    log_error "  kubectl run vipcheck --rm -i --restart=Never --image=busybox:1.36 -- nc -zv -w 5 10.43.0.1 443"
+    log_error "If the host has egress but pods do not, and Cilium reports healthy,"
+    log_error "the provider is dropping tenant pod traffic — use a different server."
+    exit 1
+fi
+log_info "Pod network egress OK"
+
 log_info "Checking in-cluster DNS resolution..."
 DNS_OK=false
 for i in 1 2; do
@@ -506,6 +525,31 @@ if ! command -v docker > /dev/null; then
     log_info "Installing Docker (build tooling)..."
     apt-get install -y docker.io
     systemctl enable --now docker
+fi
+
+# Docker sets the iptables FORWARD policy to DROP on every start
+# (including at boot), which silently kills CNI pod traffic. Restore
+# ACCEPT now and persist it across reboots.
+iptables -P FORWARD ACCEPT
+cat > /etc/systemd/system/teepin-forward-accept.service <<'EOF'
+[Unit]
+Description=Restore iptables FORWARD ACCEPT (Docker sets DROP, breaking CNI pod traffic)
+After=docker.service network-online.target
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/iptables -P FORWARD ACCEPT
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable teepin-forward-accept.service > /dev/null 2>&1 || true
+
+# Re-verify pod egress: the Docker install above is the single most
+# common way a working cluster loses pod networking mid-setup.
+if ! kubectl run netcheck2 --rm -i --restart=Never --image=busybox:1.36 \
+    --pod-running-timeout=90s -- ping -c 2 -W 5 8.8.8.8 2>/dev/null | grep -q "bytes from"; then
+    log_error "Pod egress broke after installing Docker — check: iptables -S FORWARD | head -3"
+    exit 1
 fi
 
 docker build -t teepin/api-server:latest -f cmd/api-server/Dockerfile .
