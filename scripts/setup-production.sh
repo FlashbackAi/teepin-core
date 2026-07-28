@@ -37,7 +37,22 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-echo "🚀 TEEPIN Production Setup"
+# The repo this script lives in is the deployment source — no separate
+# /opt/teepin clone, no wrong-cwd surprises for the sealed-secrets step.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Make kubectl/helm/RKE2 tooling available in THIS shell and every
+# future login shell (profile.d, idempotent — unlike .bashrc appends).
+# Done first so a re-run after a reboot has a working kubectl at once.
+export KUBECONFIG=/etc/rancher/rke2/rke2.yaml
+export PATH=$PATH:/var/lib/rancher/rke2/bin
+cat > /etc/profile.d/teepin-k8s.sh <<'PROFILE'
+export KUBECONFIG=/etc/rancher/rke2/rke2.yaml
+export PATH=$PATH:/var/lib/rancher/rke2/bin
+PROFILE
+
+echo "TEEPIN Production Setup"
 echo "=========================="
 echo ""
 log_info "This will install TEEPIN platform on this server"
@@ -78,7 +93,7 @@ if ! command -v helm > /dev/null; then
     curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 fi
 
-log_info "✅ Prerequisites installed"
+log_info "Prerequisites installed"
 
 # ============================================================================
 # Step 2: Install RKE2 (Production Kubernetes)
@@ -108,16 +123,11 @@ systemctl enable rke2-server.service
 systemctl start rke2-server.service
 
 # Wait for RKE2 to be ready
-log_info "⏳ Waiting for RKE2 to be ready (this may take 2-3 minutes)..."
+log_info "Waiting for RKE2 to be ready (this may take 2-3 minutes)..."
 sleep 60
 
-# Set up kubectl
-export KUBECONFIG=/etc/rancher/rke2/rke2.yaml
-export PATH=$PATH:/var/lib/rancher/rke2/bin
-
-# Add to bashrc for persistence
-echo "export KUBECONFIG=/etc/rancher/rke2/rke2.yaml" >> /root/.bashrc
-echo "export PATH=\$PATH:/var/lib/rancher/rke2/bin" >> /root/.bashrc
+# kubectl env was exported at script start (and persisted via
+# /etc/profile.d/teepin-k8s.sh).
 
 # Wait for nodes to be ready
 until kubectl get nodes 2>/dev/null; do
@@ -127,7 +137,7 @@ done
 
 kubectl wait --for=condition=Ready nodes --all --timeout=300s
 
-log_info "✅ RKE2 Kubernetes installed and ready"
+log_info "RKE2 Kubernetes installed and ready"
 
 # ============================================================================
 # Step 3: Install NVIDIA Drivers
@@ -141,15 +151,20 @@ if ! lspci | grep -i nvidia > /dev/null; then
 else
     GPU_PRESENT=true
 
-    # Install NVIDIA drivers
-    ubuntu-drivers autoinstall
-
-    # Verify installation
-    if nvidia-smi; then
-        log_info "✅ NVIDIA drivers installed successfully"
+    # GPU cloud providers usually preinstall the driver; running
+    # ubuntu-drivers on top of a vendor CUDA repo only produces apt
+    # dependency conflicts. Install only when no working driver exists.
+    if command -v nvidia-smi > /dev/null && nvidia-smi > /dev/null 2>&1; then
+        log_info "NVIDIA driver already working ($(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)) — skipping driver install"
     else
-        log_error "NVIDIA driver installation failed"
-        exit 1
+        ubuntu-drivers autoinstall
+
+        if nvidia-smi; then
+            log_info "NVIDIA drivers installed successfully"
+        else
+            log_error "NVIDIA driver installation failed"
+            exit 1
+        fi
     fi
 fi
 
@@ -176,7 +191,7 @@ if [ "$GPU_PRESENT" = true ]; then
     # Check GPU
     kubectl get nodes -o json | jq '.items[].status.capacity | select(.["nvidia.com/gpu"] != null)'
 
-    log_info "✅ NVIDIA GPU Operator installed"
+    log_info "NVIDIA GPU Operator installed"
 
     # ------------------------------------------------------------------
     # MIG partitioning: mig.strategy=mixed alone creates ZERO MIG
@@ -186,32 +201,118 @@ if [ "$GPU_PRESENT" = true ]; then
     # exercises every TEEPIN allocation path. Non-MIG GPUs (L40S, A40)
     # skip this and serve whole-GPU allocations.
     # ------------------------------------------------------------------
-    log_info "Configuring MIG partitioning (layout: ${MIG_CONFIG:-all-balanced})..."
+    MIG_LAYOUT="${MIG_CONFIG:-all-balanced}"
+    log_info "Configuring MIG partitioning (layout: $MIG_LAYOUT)..."
+
+    # Wait for MIG extended resources to appear on any node.
+    # $1 = timeout in seconds. Returns 0 when devices exist, 2 when the
+    # mig-manager reports 'failed' (fail fast), 1 on timeout.
+    wait_for_mig_devices() {
+        local deadline=$(( $(date +%s) + $1 ))
+        local state
+        while [ "$(date +%s)" -lt "$deadline" ]; do
+            if kubectl get nodes -o json | jq -e \
+                '[.items[].status.allocatable | keys[] | select(startswith("nvidia.com/mig-"))] | length > 0' > /dev/null; then
+                return 0
+            fi
+            state=$(kubectl get nodes -l nvidia.com/mig.capable=true \
+                -o jsonpath='{.items[0].metadata.labels.nvidia\.com/mig\.config\.state}' 2>/dev/null || true)
+            if [ "$state" = "failed" ]; then
+                return 2
+            fi
+            sleep 10
+        done
+        return 1
+    }
+
+    apply_mig_label() {
+        kubectl label nodes -l nvidia.com/mig.capable=true \
+            nvidia.com/mig.config="$MIG_LAYOUT" --overwrite
+    }
+
+    # The mig-manager only reacts to label CHANGES — after a 'failed'
+    # state or a reboot, the label must be toggled to force a retry.
+    retrigger_mig_manager() {
+        log_info "Retriggering the mig-manager (label toggle)..."
+        kubectl label nodes -l nvidia.com/mig.capable=true nvidia.com/mig.config- --overwrite
+        sleep 5
+        apply_mig_label
+    }
+
+    show_mig_devices() {
+        log_info "MIG devices available:"
+        kubectl get nodes -o json | jq '.items[].status.allocatable | with_entries(select(.key | startswith("nvidia.com/")))'
+    }
+
+    prompt_reboot_for_mig() {
+        log_warn "MIG mode change is PENDING and requires a reboot to apply"
+        log_warn "(the GPU reset fails on VMs: the device is held by a host process the mig-manager cannot stop)"
+        log_warn "After the reboot, re-run this script — completed steps skip through in seconds."
+        if [ "${AUTO_REBOOT:-}" = "true" ]; then
+            log_info "AUTO_REBOOT=true — rebooting now"
+            reboot
+            exit 0
+        fi
+        read -p "Reboot now? (yes/no): " DO_REBOOT
+        if [ "$DO_REBOOT" = "yes" ]; then
+            log_info "Rebooting — re-run this script when the server is back (SSH drops for ~2-3 minutes)"
+            reboot
+            exit 0
+        fi
+        log_error "Cannot continue without MIG devices — reboot and re-run this script"
+        exit 1
+    }
 
     MIG_NODES=$(kubectl get nodes -l nvidia.com/mig.capable=true -o name)
     if [ -z "$MIG_NODES" ]; then
         log_warn "No MIG-capable GPU detected — whole-GPU allocations only"
     else
-        kubectl label nodes -l nvidia.com/mig.capable=true \
-            nvidia.com/mig.config="${MIG_CONFIG:-all-balanced}" --overwrite
+        apply_mig_label
 
         log_info "Waiting for MIG devices to appear (mig-manager reconfigures the GPU)..."
-        MIG_READY=false
-        for i in $(seq 1 60); do
-            if kubectl get nodes -o json | jq -e \
-                '[.items[].status.allocatable | keys[] | select(startswith("nvidia.com/mig-"))] | length > 0' > /dev/null; then
-                MIG_READY=true
-                break
-            fi
-            sleep 10
-        done
+        set +e; wait_for_mig_devices 600; MIG_WAIT=$?; set -e
 
-        if [ "$MIG_READY" = true ]; then
-            log_info "✅ MIG devices available:"
-            kubectl get nodes -o json | jq '.items[].status.allocatable | with_entries(select(.key | startswith("nvidia.com/")))'
+        if [ "$MIG_WAIT" = "0" ]; then
+            show_mig_devices
         else
-            log_error "MIG devices did not appear within 10 minutes — check: kubectl logs -n gpu-operator -l app=nvidia-mig-manager"
-            exit 1
+            log_warn "MIG devices not up yet — diagnosing..."
+            echo "---- nvidia-mig-manager logs (last 15 lines) ----"
+            kubectl logs -n gpu-operator -l app=nvidia-mig-manager --tail=15 2>/dev/null || true
+            echo "-------------------------------------------------"
+
+            MIG_CURRENT=$(nvidia-smi -i 0 --query-gpu=mig.mode.current --format=csv,noheader 2>/dev/null || echo unknown)
+            log_info "MIG mode currently: $MIG_CURRENT"
+
+            if [ "$MIG_CURRENT" = "Disabled" ]; then
+                # Known VM failure: enabling MIG needs a GPU reset but a
+                # host process holds the device. Try the graceful path
+                # first — stop GPU host services, retry the enable — and
+                # only fall back to a reboot when that doesn't stick.
+                log_info "Trying to enable MIG mode without a reboot (stopping GPU host services)..."
+                systemctl stop nvidia-persistenced nvidia-fabricmanager nvidia-dcgm 2>/dev/null || true
+                nvidia-smi -i 0 -mig 1 > /dev/null 2>&1 || true
+                MIG_CURRENT=$(nvidia-smi -i 0 --query-gpu=mig.mode.current --format=csv,noheader 2>/dev/null || echo unknown)
+                systemctl start nvidia-persistenced nvidia-fabricmanager 2>/dev/null || true
+            fi
+
+            if [ "$MIG_CURRENT" = "Enabled" ]; then
+                # Mode is on (live-enabled just now, or since a reboot) —
+                # the layout simply needs a fresh trigger.
+                retrigger_mig_manager
+                set +e; wait_for_mig_devices 600; MIG_WAIT=$?; set -e
+                if [ "$MIG_WAIT" = "0" ]; then
+                    show_mig_devices
+                else
+                    log_error "MIG devices still not available after retrigger:"
+                    kubectl logs -n gpu-operator -l app=nvidia-mig-manager --tail=30 2>/dev/null || true
+                    exit 1
+                fi
+            elif [ "$MIG_CURRENT" = "Disabled" ]; then
+                prompt_reboot_for_mig
+            else
+                log_error "Could not determine MIG mode (nvidia-smi said: $MIG_CURRENT)"
+                exit 1
+            fi
         fi
     fi
 else
@@ -226,7 +327,7 @@ log_info "Step 5/10: Installing cert-manager..."
 kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml
 kubectl wait --for=condition=available --timeout=300s deployment/cert-manager -n cert-manager
 
-log_info "✅ cert-manager installed"
+log_info "cert-manager installed"
 
 # ============================================================================
 # Step 6: Install Ingress NGINX
@@ -255,7 +356,7 @@ helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
 
 kubectl wait --for=condition=available --timeout=300s deployment/ingress-nginx-controller -n ingress-nginx
 
-log_info "✅ Ingress NGINX installed"
+log_info "Ingress NGINX installed"
 
 # ============================================================================
 # Step 7: Install Sealed Secrets
@@ -265,7 +366,17 @@ log_info "Step 7/10: Installing Sealed Secrets..."
 kubectl apply -f https://github.com/bitnami-labs/sealed-secrets/releases/download/v0.24.0/controller.yaml
 kubectl wait --for=condition=available --timeout=120s deployment/sealed-secrets-controller -n kube-system
 
-log_info "✅ Sealed Secrets installed"
+# kubeseal CLI (needed to create sealed secrets in Step 9)
+if ! command -v kubeseal > /dev/null; then
+    log_info "Installing kubeseal CLI..."
+    KUBESEAL_VERSION="0.24.0"
+    wget -q "https://github.com/bitnami-labs/sealed-secrets/releases/download/v${KUBESEAL_VERSION}/kubeseal-${KUBESEAL_VERSION}-linux-amd64.tar.gz" -O /tmp/kubeseal.tar.gz
+    tar -xzf /tmp/kubeseal.tar.gz -C /tmp kubeseal
+    install -m 755 /tmp/kubeseal /usr/local/bin/kubeseal
+    rm -f /tmp/kubeseal.tar.gz /tmp/kubeseal
+fi
+
+log_info "Sealed Secrets installed (controller + kubeseal CLI)"
 
 # ============================================================================
 # Step 8: Install Monitoring Stack (Prometheus + Grafana)
@@ -288,32 +399,30 @@ helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
 
 log_info "Grafana admin password: $GRAFANA_PASSWORD — SAVE THIS to your password manager"
 
-log_info "✅ Monitoring stack installed"
+log_info "Monitoring stack installed"
 
 # ============================================================================
 # Step 9: Clone TEEPIN Repository and Deploy Platform
 # ============================================================================
 log_info "Step 9/10: Deploying TEEPIN platform..."
 
-# Clone repo (if not already present)
-if [ ! -d "/opt/teepin" ]; then
-    cd /opt
-    git clone https://github.com/FlashbackAi/teepin-core.git teepin
-fi
-
-cd /opt/teepin
+# Deploy from the repo this script lives in — no separate /opt/teepin
+# clone that can drift from the working checkout.
+cd "$REPO_DIR"
+log_info "Deploying from: $REPO_DIR"
 
 # Create production namespace
 kubectl apply -f deploy/production/namespace.yaml
 
-# Deploy sealed secrets (must be created first - see scripts/create-sealed-secrets.sh)
-if [ -d "deploy/production/secrets" ]; then
-    kubectl apply -f deploy/production/secrets/
-    log_info "✅ Sealed secrets applied"
-else
-    log_warn "No sealed secrets found - you must run scripts/create-sealed-secrets.sh first!"
-    log_warn "Setup will continue, but API server will fail without secrets"
+# Sealed secrets: create them interactively right here if they don't
+# exist yet (the controller and kubeseal were installed in Step 7).
+if [ ! -d "deploy/production/secrets" ] || [ -z "$(ls -A deploy/production/secrets 2>/dev/null)" ]; then
+    log_info "No sealed secrets found — creating them now (interactive)"
+    bash "$SCRIPT_DIR/create-sealed-secrets.sh"
 fi
+
+kubectl apply -f deploy/production/secrets/
+log_info "Sealed secrets applied"
 
 # Deploy Redis for rate limiting
 kubectl apply -f deploy/local/redis.yaml
@@ -343,18 +452,21 @@ docker save teepin/api-server:latest -o /tmp/teepin-api-server.tar
     -n k8s.io images import /tmp/teepin-api-server.tar
 rm -f /tmp/teepin-api-server.tar
 
-log_info "✅ API server image built and imported"
+log_info "API server image built and imported"
 
-# Deploy API server
+# Deploy API server. The image tag never changes (latest + IfNotPresent),
+# so on re-runs `apply` alone would keep old pods running the old image —
+# always restart the rollout after importing a fresh build.
 kubectl apply -f deploy/production/api-server.yaml
+kubectl -n teepin-prod rollout restart deployment/api-server
 
 # Wait for API server
-kubectl wait --for=condition=available --timeout=300s deployment/api-server -n teepin-prod
+kubectl -n teepin-prod rollout status deployment/api-server --timeout=300s
 
 # Apply network policies
 kubectl apply -f deploy/production/network-policies.yaml
 
-log_info "✅ TEEPIN platform deployed"
+log_info "TEEPIN platform deployed"
 
 # ============================================================================
 # Step 10: Post-Install Configuration
@@ -382,9 +494,9 @@ fi
 # Installation Complete
 # ============================================================================
 echo ""
-echo "✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅"
-echo "🎉 TEEPIN Production Setup Complete!"
-echo "✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅"
+echo "=================================================="
+echo " TEEPIN Production Setup Complete"
+echo "=================================================="
 echo ""
 log_info "Platform Status:"
 echo "  Kubernetes:   $(kubectl version --short | grep Server | awk '{print $3}')"
@@ -393,10 +505,10 @@ echo "  Grafana:      http://$EXTERNAL_IP:3000 (admin/admin)"
 echo "  GPU:          $([ "$GPU_PRESENT" = true ] && echo "Available" || echo "Not detected")"
 echo ""
 log_info "Next Steps:"
-echo "  1. Configure DNS: Point api.teepin.io to $EXTERNAL_IP"
-echo "  2. Create sealed secrets: ./scripts/create-sealed-secrets.sh"
+echo "  1. Run the smoke test:  bash $SCRIPT_DIR/production-smoke-test.sh"
+echo "  2. Configure DNS: Point api.teepin.io to $EXTERNAL_IP"
 echo "  3. Verify health: curl http://$EXTERNAL_IP/health"
-echo "  4. Run security audit: ./scripts/run-security-audit.sh"
+echo "  4. Run security audit: bash $SCRIPT_DIR/run-security-audit.sh"
 echo "  5. Create first customer project"
 echo ""
 log_info "Useful Commands:"

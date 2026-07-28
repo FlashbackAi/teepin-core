@@ -25,6 +25,27 @@ set -euo pipefail
 
 API_URL="${1:-http://localhost:8080}"
 SKIP_GPU="${SKIP_GPU:-false}"
+
+# RKE2 kubectl env (for the automatic port-forward below).
+if ! command -v kubectl > /dev/null 2>&1; then
+    export KUBECONFIG=/etc/rancher/rke2/rke2.yaml
+    export PATH=$PATH:/var/lib/rancher/rke2/bin
+fi
+
+# When targeting the default localhost URL with nothing listening,
+# start the port-forward automatically (and clean it up on exit) —
+# no separate manual `kubectl port-forward` step.
+PF_PID=""
+cleanup_pf() { [ -n "$PF_PID" ] && kill "$PF_PID" 2>/dev/null || true; }
+trap cleanup_pf EXIT
+if [ "$API_URL" = "http://localhost:8080" ] && \
+   ! curl -s -m 2 "$API_URL/health" > /dev/null 2>&1 && \
+   command -v kubectl > /dev/null 2>&1; then
+    echo "Starting kubectl port-forward to svc/api-server (teepin-prod)..."
+    kubectl -n teepin-prod port-forward svc/api-server 8080:80 > /dev/null 2>&1 &
+    PF_PID=$!
+    sleep 3
+fi
 STAMP=$(date +%s)
 EMAIL="smoke-${STAMP}@test.teepin.io"
 PASSWORD="Sm0ke-Test-$STAMP!"

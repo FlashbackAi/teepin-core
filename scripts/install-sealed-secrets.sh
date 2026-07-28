@@ -9,22 +9,30 @@ fi
 
 # Install Sealed Secrets for encrypting Kubernetes secrets
 # Usage: ./scripts/install-sealed-secrets.sh
+# NOTE: setup-production.sh Step 7 does all of this already — this
+# standalone script exists for clusters set up by other means.
 
 set -e
 
-echo "🔒 Installing Sealed Secrets..."
+# RKE2 kubectl env (harmless if kubectl is already on PATH).
+if ! command -v kubectl > /dev/null 2>&1; then
+    export KUBECONFIG=/etc/rancher/rke2/rke2.yaml
+    export PATH=$PATH:/var/lib/rancher/rke2/bin
+fi
+
+echo "Installing Sealed Secrets..."
 
 # Install Sealed Secrets controller
 kubectl apply -f https://github.com/bitnami-labs/sealed-secrets/releases/download/v0.24.0/controller.yaml
 
 # Wait for controller to be ready
-echo "⏳ Waiting for Sealed Secrets controller to be ready..."
+echo "Waiting for Sealed Secrets controller to be ready..."
 kubectl wait --for=condition=available --timeout=120s \
   deployment/sealed-secrets-controller -n kube-system
 
 # Install kubeseal CLI (if not already installed)
 if ! command -v kubeseal &> /dev/null; then
-    echo "📦 Installing kubeseal CLI..."
+    echo "Installing kubeseal CLI..."
 
     # Detect OS
     OS=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -45,20 +53,20 @@ if ! command -v kubeseal &> /dev/null; then
     sudo install -m 755 /tmp/kubeseal /usr/local/bin/kubeseal
     rm /tmp/kubeseal.tar.gz /tmp/kubeseal
 
-    echo "✅ kubeseal CLI installed"
+    echo "kubeseal CLI installed"
 else
-    echo "✅ kubeseal CLI already installed"
+    echo "kubeseal CLI already installed"
 fi
 
 # Verify installation
 echo ""
-echo "🔍 Verifying installation..."
+echo "Verifying installation..."
 kubectl get pods -n kube-system -l name=sealed-secrets-controller
 echo ""
 kubeseal --version
 
 echo ""
-echo "✅ Sealed Secrets installed successfully!"
+echo "Sealed Secrets installed successfully!"
 echo ""
 echo "Usage:"
 echo "  # Create a sealed secret from a regular secret:"

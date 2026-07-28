@@ -187,6 +187,15 @@ spec:
                   name: encryption-key
                   key: key
 
+            # Admin API token (pricing management). Optional: without
+            # the secret the admin API stays disabled, API still runs.
+            - name: ADMIN_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: admin-api-token
+                  key: token
+                  optional: true
+
             # Application config
             - name: PORT
               value: "8080"
