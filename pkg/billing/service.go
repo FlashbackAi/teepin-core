@@ -10,8 +10,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-
-	"github.com/FlashbackAi/teepin-core/pkg/gpu"
 )
 
 // Service handles billing and usage tracking
@@ -132,16 +130,18 @@ func (s *Service) GetUsageSummary(ctx context.Context, projectID uuid.UUID, star
 }
 
 // CalculateVRAMCost calculates GPU cost from allocated VRAM using the
-// platform's linear pricing ($0.10 per GB-hour). This is model-agnostic
-// and covers every instance type, including custom sizes
-// (gpu.h100.custom-25gb) that a static rate table cannot enumerate.
-func (s *Service) CalculateVRAMCost(vramGB int, hours float64) float64 {
-	return float64(vramGB) * gpu.PricePerGBHour * hours
+// platform's linear pricing at the current admin-configured rate. This
+// is model-agnostic and covers every instance type, including custom
+// sizes (gpu.h100.custom-25gb) that a static rate table cannot
+// enumerate.
+func (s *Service) CalculateVRAMCost(ctx context.Context, vramGB int, hours float64) float64 {
+	return float64(vramGB) * s.VRAMPricePerGBHour(ctx) * hours
 }
 
-// VRAMUnitPrice returns the hourly rate for a VRAM allocation.
-func (s *Service) VRAMUnitPrice(vramGB int) float64 {
-	return float64(vramGB) * gpu.PricePerGBHour
+// VRAMUnitPrice returns the hourly rate for a VRAM allocation at the
+// current admin-configured rate.
+func (s *Service) VRAMUnitPrice(ctx context.Context, vramGB int) float64 {
+	return float64(vramGB) * s.VRAMPricePerGBHour(ctx)
 }
 
 // CreateInvoice generates an invoice for a billing period

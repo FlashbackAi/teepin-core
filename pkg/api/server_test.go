@@ -85,7 +85,7 @@ func newTenantServer(t *testing.T, objects ...runtime.Object) *Server {
 		return true, filtered, nil
 	})
 
-	return NewServer(client, nil, nil, compute.NewStore(db))
+	return NewServer(client, nil, nil, compute.NewStore(db), nil)
 }
 
 // doRequest performs a request against the handler with the caller's
@@ -181,7 +181,7 @@ func TestPodToInstance_EnrichesFromAnnotations(t *testing.T) {
 	pod := tenantPod("inst-aaaa1111", uuid.New(), "25")
 	pod.Spec.Containers = []corev1.Container{{Image: "nginx:latest"}}
 
-	inst := podToInstance(pod)
+	inst := podToInstance(pod, gpu.DefaultPricePerGBHour)
 
 	if inst.GPUVRAM != "25GB" || inst.AllocatedVRAM != "25GB" {
 		t.Errorf("VRAM = %q/%q, want 25GB/25GB", inst.GPUVRAM, inst.AllocatedVRAM)
@@ -215,7 +215,7 @@ func TestParseMemoryGB(t *testing.T) {
 func TestRequireProjectScope_StandaloneModeAllowsAll(t *testing.T) {
 	// Without a store (no database) there is no tenancy: requests
 	// proceed unscoped, preserving the zero-dependency local dev flow.
-	server := NewServer(fake.NewSimpleClientset(), nil, nil, nil)
+	server := NewServer(fake.NewSimpleClientset(), nil, nil, nil, nil)
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)

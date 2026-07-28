@@ -11,10 +11,12 @@ import (
 	"strconv"
 )
 
-// PricePerGBHour is the platform-wide GPU price: linear, exact-allocation
-// pricing at $0.10 per GB of VRAM per hour. This is the single source of
-// truth for GPU pricing.
-const PricePerGBHour = 0.10
+// DefaultPricePerGBHour is the compiled-in fallback GPU rate: linear,
+// exact-allocation pricing at $0.10 per GB of VRAM per hour. The live
+// rate is admin-configurable in billing.pricing and read on every
+// allocation; this constant applies only when the platform runs without
+// a database (local standalone mode) or the pricing read fails.
+const DefaultPricePerGBHour = 0.10
 
 // Allocation types.
 const (
@@ -174,14 +176,15 @@ type InstanceTypeInfo struct {
 	GPUModel     string  // "h100"
 	MemoryGB     int     // VRAM
 	Isolation    string  // "mig" or "shared"
-	PricePerHour float64 // linear: MemoryGB * PricePerGBHour
+	PricePerHour float64 // linear: MemoryGB * the rate passed by the caller
 }
 
 // AvailableInstanceTypes derives the offerable instance types from the
 // cluster's current GPU inventory: every MIG profile exposed by a node,
 // plus a full-GPU type per model. Custom sizes are always available via
-// gpu_vram and are not enumerated.
-func (a *Allocator) AvailableInstanceTypes(ctx context.Context) ([]InstanceTypeInfo, error) {
+// gpu_vram and are not enumerated. pricePerGBHour is the live platform
+// rate the prices are quoted at.
+func (a *Allocator) AvailableInstanceTypes(ctx context.Context, pricePerGBHour float64) ([]InstanceTypeInfo, error) {
 	nodes, err := a.inventory.Snapshot(ctx)
 	if err != nil {
 		return nil, err
@@ -202,7 +205,7 @@ func (a *Allocator) AvailableInstanceTypes(ctx context.Context) ([]InstanceTypeI
 				GPUModel:     node.Model,
 				MemoryGB:     mig.MemoryGB,
 				Isolation:    AllocationMIG,
-				PricePerHour: GetPriceForVRAM(mig.MemoryGB),
+				PricePerHour: PriceForVRAM(mig.MemoryGB, pricePerGBHour),
 			})
 		}
 
@@ -215,7 +218,7 @@ func (a *Allocator) AvailableInstanceTypes(ctx context.Context) ([]InstanceTypeI
 					GPUModel:     node.Model,
 					MemoryGB:     node.MemoryGBPerGPU,
 					Isolation:    AllocationShared,
-					PricePerHour: GetPriceForVRAM(node.MemoryGBPerGPU),
+					PricePerHour: PriceForVRAM(node.MemoryGBPerGPU, pricePerGBHour),
 				})
 			}
 		}
@@ -231,10 +234,17 @@ func (a *Allocator) AvailableInstanceTypes(ctx context.Context) ([]InstanceTypeI
 	return types, nil
 }
 
-// GetPriceForVRAM returns the hourly price for a VRAM allocation.
-// Pricing is linear and exact: $0.10 per GB-hour.
+// PriceForVRAM returns the hourly price for a VRAM allocation at the
+// given per-GB-hour rate. Pricing is linear and exact.
+func PriceForVRAM(vramGB int, perGBHour float64) float64 {
+	return float64(vramGB) * perGBHour
+}
+
+// GetPriceForVRAM returns the hourly price for a VRAM allocation at the
+// compiled-in default rate. Callers with database access must prefer
+// the live rate (billing.Service.VRAMPricePerGBHour) via PriceForVRAM.
 func GetPriceForVRAM(vramGB int) float64 {
-	return float64(vramGB) * PricePerGBHour
+	return PriceForVRAM(vramGB, DefaultPricePerGBHour)
 }
 
 // vramRe matches VRAM strings such as "25GB", "25 GB", or "40000MB".

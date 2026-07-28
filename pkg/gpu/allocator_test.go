@@ -281,7 +281,7 @@ func TestAvailableInstanceTypes(t *testing.T) {
 		"nvidia.com/mig-2g.20gb": "3",
 	}))
 
-	types, err := alloc.AvailableInstanceTypes(context.Background())
+	types, err := alloc.AvailableInstanceTypes(context.Background(), DefaultPricePerGBHour)
 	if err != nil {
 		t.Fatalf("AvailableInstanceTypes failed: %v", err)
 	}
@@ -309,5 +309,12 @@ func TestGetPriceForVRAM(t *testing.T) {
 		if got := GetPriceForVRAM(vram); got != want {
 			t.Errorf("GetPriceForVRAM(%d) = %.2f, want %.2f", vram, got, want)
 		}
+	}
+}
+
+func TestPriceForVRAM_CustomRate(t *testing.T) {
+	// Admin-configured rates flow through linearly.
+	if got := PriceForVRAM(20, 0.25); got != 5.00 {
+		t.Errorf("PriceForVRAM(20, 0.25) = %.2f, want 5.00", got)
 	}
 }

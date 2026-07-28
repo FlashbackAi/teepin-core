@@ -33,27 +33,27 @@ func NewUsageCollector(db *sql.DB, billingService *Service) *UsageCollector {
 
 // Start begins periodic usage collection
 func (c *UsageCollector) Start(ctx context.Context) {
-	log.Println("📊 Starting usage collector...")
+	log.Println("Starting usage collector...")
 
 	ticker := time.NewTicker(c.collectionInterval)
 	defer ticker.Stop()
 
 	// Run immediately on start
 	if err := c.collectUsage(ctx); err != nil {
-		log.Printf("⚠️  Usage collection error: %v", err)
+		log.Printf("WARN: usage collection error: %v", err)
 	}
 
 	for {
 		select {
 		case <-ticker.C:
 			if err := c.collectUsage(ctx); err != nil {
-				log.Printf("⚠️  Usage collection error: %v", err)
+				log.Printf("WARN: usage collection error: %v", err)
 			}
 		case <-c.stopChan:
-			log.Println("📊 Stopping usage collector...")
+			log.Println("Stopping usage collector...")
 			return
 		case <-ctx.Done():
-			log.Println("📊 Usage collector stopped (context cancelled)")
+			log.Println("Usage collector stopped (context cancelled)")
 			return
 		}
 	}
@@ -64,23 +64,32 @@ func (c *UsageCollector) Stop() {
 	close(c.stopChan)
 }
 
-// collectUsage collects usage for all running instances
+// collectUsage collects usage for all billable instances: running ones,
+// plus terminated ones whose final partial interval has not been billed
+// yet. Without the terminated pass, everything between the last hourly
+// tick and termination — including the entire life of instances shorter
+// than one interval — would silently ride free.
 func (c *UsageCollector) collectUsage(ctx context.Context) error {
-	log.Println("📊 Collecting usage metrics...")
+	log.Println("Collecting usage metrics...")
 
-	// Get all running instances
-	instances, err := c.getRunningInstances(ctx)
+	instances, err := c.getBillableInstances(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to get running instances: %w", err)
+		return fmt.Errorf("failed to get billable instances: %w", err)
 	}
 
 	if len(instances) == 0 {
-		log.Println("📊 No running instances to collect")
+		log.Println("No billable instances to collect")
 		return nil
 	}
 
-	endTime := time.Now()
+	now := time.Now()
 	var recordedCount int
+
+	// The rate is read once per collection run so every record in the
+	// run is metered consistently, but never cached across runs — admin
+	// price changes apply from the next tick.
+	vramRate := 0.0
+	rateFetched := false
 
 	for _, inst := range instances {
 		// Only GPU usage is metered for now; CPU-only instances get
@@ -93,13 +102,20 @@ func (c *UsageCollector) collectUsage(ctx context.Context) error {
 		// Get last collection time for this instance
 		lastCollectionTime, err := c.getLastCollectionTime(ctx, inst.ID)
 		if err != nil {
-			log.Printf("⚠️  Failed to get last collection time for %s: %v", inst.ID, err)
+			log.Printf("WARN: failed to get last collection time for %s: %v", inst.ID, err)
 			continue
 		}
 
 		// If no previous collection, use instance creation time
 		if lastCollectionTime.IsZero() {
 			lastCollectionTime = inst.CreatedAt
+		}
+
+		// Bill up to now for running instances; terminated instances
+		// are billed exactly to their termination timestamp.
+		endTime := now
+		if inst.TerminatedAt != nil && inst.TerminatedAt.Before(endTime) {
+			endTime = *inst.TerminatedAt
 		}
 
 		// Calculate hours since last collection
@@ -111,10 +127,16 @@ func (c *UsageCollector) collectUsage(ctx context.Context) error {
 			continue
 		}
 
-		// GPU cost is linear on allocated VRAM ($0.10/GB-hour) —
-		// model-agnostic and correct for custom sizes too.
-		cost := c.billingService.CalculateVRAMCost(inst.GPUVRAMGB, hours)
-		unitPrice := c.billingService.VRAMUnitPrice(inst.GPUVRAMGB)
+		if !rateFetched {
+			vramRate = c.billingService.VRAMPricePerGBHour(ctx)
+			rateFetched = true
+		}
+
+		// GPU cost is linear on allocated VRAM at the current
+		// admin-configured rate — model-agnostic and correct for
+		// custom sizes too.
+		unitPrice := float64(inst.GPUVRAMGB) * vramRate
+		cost := unitPrice * hours
 
 		// Record usage
 		record := &UsageRecord{
@@ -130,33 +152,47 @@ func (c *UsageCollector) collectUsage(ctx context.Context) error {
 		}
 
 		if err := c.billingService.RecordUsage(ctx, record); err != nil {
-			log.Printf("⚠️  Failed to record usage for %s: %v", inst.ID, err)
+			log.Printf("WARN: failed to record usage for %s: %v", inst.ID, err)
 			continue
 		}
 
 		recordedCount++
 	}
 
-	log.Printf("✅ Collected usage for %d instances (total: %d running)", recordedCount, len(instances))
+	log.Printf("Collected usage for %d instances (total: %d billable)", recordedCount, len(instances))
 	return nil
 }
 
-// runningInstance represents a running instance with billing info
-type runningInstance struct {
+// billableInstance represents an instance with billing info. A nil
+// TerminatedAt means the instance is still running.
+type billableInstance struct {
 	ID           string
 	ProjectID    uuid.UUID
 	InstanceType string
 	GPUVRAMGB    int
 	CreatedAt    time.Time
+	TerminatedAt *time.Time
 }
 
-// getRunningInstances gets all currently running instances
-func (c *UsageCollector) getRunningInstances(ctx context.Context) ([]runningInstance, error) {
+// getBillableInstances returns instances with unbilled GPU time:
+// running instances, and terminated instances whose terminated_at lies
+// beyond their last billed end_time (the unbilled tail).
+func (c *UsageCollector) getBillableInstances(ctx context.Context) ([]billableInstance, error) {
 	query := `
-		SELECT id, project_id, COALESCE(instance_type_id, ''),
-		       COALESCE(gpu_vram_gb, 0), created_at
-		FROM compute.instances
-		WHERE status = 'running' AND terminated_at IS NULL
+		SELECT i.id, i.project_id, COALESCE(i.instance_type_id, ''),
+		       COALESCE(i.gpu_vram_gb, 0), i.created_at, i.terminated_at
+		FROM compute.instances i
+		LEFT JOIN LATERAL (
+			SELECT MAX(end_time) AS last_end
+			FROM billing.usage_records ur
+			WHERE ur.instance_id = i.id
+		) b ON true
+		WHERE COALESCE(i.gpu_vram_gb, 0) > 0
+		  AND (
+			(i.status = 'running' AND i.terminated_at IS NULL)
+			OR (i.terminated_at IS NOT NULL
+			    AND i.terminated_at > COALESCE(b.last_end, i.created_at) + interval '1 minute')
+		  )
 	`
 
 	rows, err := c.db.QueryContext(ctx, query)
@@ -165,10 +201,10 @@ func (c *UsageCollector) getRunningInstances(ctx context.Context) ([]runningInst
 	}
 	defer rows.Close()
 
-	var instances []runningInstance
+	var instances []billableInstance
 	for rows.Next() {
-		var inst runningInstance
-		if err := rows.Scan(&inst.ID, &inst.ProjectID, &inst.InstanceType, &inst.GPUVRAMGB, &inst.CreatedAt); err != nil {
+		var inst billableInstance
+		if err := rows.Scan(&inst.ID, &inst.ProjectID, &inst.InstanceType, &inst.GPUVRAMGB, &inst.CreatedAt, &inst.TerminatedAt); err != nil {
 			return nil, fmt.Errorf("scan failed: %w", err)
 		}
 		instances = append(instances, inst)

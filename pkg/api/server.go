@@ -27,30 +27,51 @@ import (
 )
 
 // Server represents the API server
+// PricingProvider supplies the live platform GPU rate. Implemented by
+// billing.Service; nil means no database and the compiled-in default
+// rate applies.
+type PricingProvider interface {
+	VRAMPricePerGBHour(ctx context.Context) float64
+}
+
 type Server struct {
 	k8sClient         kubernetes.Interface
 	gpuAllocator      *gpu.Allocator
 	networkingService *networking.Service
-	store             *compute.Store // nil in standalone mode (no database)
+	store             *compute.Store  // nil in standalone mode (no database)
+	pricing           PricingProvider // nil in standalone mode (no database)
 }
 
-// NewServer creates a new API server. store may be nil when the
-// platform runs without a database (local standalone mode); in that
-// case instances are not persisted and not billed.
-func NewServer(k8sClient kubernetes.Interface, gpuAllocator *gpu.Allocator, networkingService *networking.Service, store *compute.Store) *Server {
+// NewServer creates a new API server. store and pricing may be nil when
+// the platform runs without a database (local standalone mode); in that
+// case instances are not persisted, not billed, and priced at the
+// compiled-in default rate.
+func NewServer(k8sClient kubernetes.Interface, gpuAllocator *gpu.Allocator, networkingService *networking.Service, store *compute.Store, pricing PricingProvider) *Server {
 	return &Server{
 		k8sClient:         k8sClient,
 		gpuAllocator:      gpuAllocator,
 		networkingService: networkingService,
 		store:             store,
+		pricing:           pricing,
 	}
+}
+
+// vramRate returns the current platform GPU rate ($/GB-hour). Read on
+// every call — price changes made through the admin API must apply to
+// the very next allocation, never a cached quote.
+func (s *Server) vramRate(ctx context.Context) float64 {
+	if s.pricing == nil {
+		return gpu.DefaultPricePerGBHour
+	}
+	return s.pricing.VRAMPricePerGBHour(ctx)
 }
 
 // ListInstanceTypes returns available instance types derived from the
 // cluster's live GPU inventory. Custom VRAM sizes are always available
 // via the gpu_vram request field and are not enumerated here.
 func (s *Server) ListInstanceTypes(c *gin.Context) {
-	types, err := s.gpuAllocator.AvailableInstanceTypes(c.Request.Context())
+	rate := s.vramRate(c.Request.Context())
+	types, err := s.gpuAllocator.AvailableInstanceTypes(c.Request.Context(), rate)
 	if err != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": fmt.Sprintf("GPU discovery failed: %v", err)})
 		return
@@ -75,7 +96,7 @@ func (s *Server) ListInstanceTypes(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"instance_types": instanceTypes,
-		"pricing":        fmt.Sprintf("$%.2f per GB-hour, exact allocation (custom sizes supported via gpu_vram)", gpu.PricePerGBHour),
+		"pricing":        fmt.Sprintf("$%.2f per GB-hour, exact allocation (custom sizes supported via gpu_vram)", rate),
 	})
 }
 
@@ -193,7 +214,7 @@ func (s *Server) CreateInstance(c *gin.Context) {
 		instance.GPUVRAM = fmt.Sprintf("%dGB", allocation.RequestedVRAM)
 		instance.AllocatedVRAM = fmt.Sprintf("%dGB", allocation.AllocatedVRAM)
 		instance.InstanceType = allocation.InstanceType
-		instance.PricePerHour = gpu.GetPriceForVRAM(allocation.AllocatedVRAM)
+		instance.PricePerHour = gpu.PriceForVRAM(allocation.AllocatedVRAM, s.vramRate(c.Request.Context()))
 		if allocation.AllocatedVRAM > allocation.RequestedVRAM {
 			instance.AllocationNote = fmt.Sprintf(
 				"requested %dGB; allocated %dGB — the smallest isolation unit that fits (billed for %dGB at $%.2f/hr). Exact custom sizes arrive with software VRAM partitioning.",
@@ -235,9 +256,10 @@ func (s *Server) ListInstances(c *gin.Context) {
 		return
 	}
 
+	rate := s.vramRate(c.Request.Context())
 	instances := make([]models.Instance, 0, len(pods.Items))
 	for _, pod := range pods.Items {
-		instance := podToInstance(&pod)
+		instance := podToInstance(&pod, rate)
 		instances = append(instances, instance)
 	}
 
@@ -270,7 +292,7 @@ func (s *Server) GetInstance(c *gin.Context) {
 		return
 	}
 
-	instance := podToInstance(&pods.Items[0])
+	instance := podToInstance(&pods.Items[0], s.vramRate(c.Request.Context()))
 	c.JSON(http.StatusOK, instance)
 }
 
@@ -559,7 +581,7 @@ func (s *Server) createPod(ctx context.Context, instanceID string, instanceUUID,
 	return createdPod, nil
 }
 
-func podToInstance(pod *corev1.Pod) models.Instance {
+func podToInstance(pod *corev1.Pod, vramRate float64) models.Instance {
 	instance := models.Instance{
 		ID:         pod.Labels["app.teepin.cloud/instance-id"],
 		Name:       pod.Labels["app.teepin.cloud/name"],
@@ -577,7 +599,7 @@ func podToInstance(pod *corev1.Pod) models.Instance {
 	if v, err := strconv.Atoi(pod.Annotations[gpu.AnnotationVRAMGB]); err == nil && v > 0 {
 		instance.GPUVRAM = fmt.Sprintf("%dGB", v)
 		instance.AllocatedVRAM = instance.GPUVRAM
-		instance.PricePerHour = gpu.GetPriceForVRAM(v)
+		instance.PricePerHour = gpu.PriceForVRAM(v, vramRate)
 	}
 	if t := pod.Annotations[annotationInstanceType]; t != "" {
 		instance.InstanceType = t

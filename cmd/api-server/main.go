@@ -208,11 +208,25 @@ func main() {
 		log.Println("✅ Instance reconciler started")
 	}
 
-	// Initialize API server with networking integration
-	apiServer := api.NewServer(k8sClient, gpuAllocator, networkingService, instanceStore)
+	// Initialize API server with networking integration. billingService
+	// doubles as the live pricing provider: rates come from the
+	// billing.pricing table and are re-read before every allocation.
+	apiServer := api.NewServer(k8sClient, gpuAllocator, networkingService, instanceStore, billingService)
+
+	// Admin API (pricing management): only enabled with an explicit
+	// operator token — never on by default.
+	var adminHandler *api.AdminHandler
+	if billingService != nil {
+		if adminToken := os.Getenv("ADMIN_API_TOKEN"); adminToken != "" {
+			adminHandler = api.NewAdminHandler(billingService, adminToken)
+			log.Println("Admin API enabled (/v1/admin)")
+		} else {
+			log.Println("WARN: ADMIN_API_TOKEN not set — admin API (pricing management) disabled")
+		}
+	}
 
 	// Setup router
-	router := setupRouter(apiServer, authHandler, authMiddleware, billingHandler, registryHandler, rateLimitMiddleware)
+	router := setupRouter(apiServer, authHandler, authMiddleware, billingHandler, registryHandler, adminHandler, rateLimitMiddleware)
 
 	// Create HTTP server
 	port := getEnv("PORT", "8080")
@@ -345,7 +359,7 @@ func initRateLimiting() *ratelimit.Config {
 	return config
 }
 
-func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler, registryHandler *api.RegistryHandler, rateLimitMiddleware *ratelimit.Middleware) *gin.Engine {
+func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler, registryHandler *api.RegistryHandler, adminHandler *api.AdminHandler, rateLimitMiddleware *ratelimit.Middleware) *gin.Engine {
 	// Set Gin to release mode in production
 	if os.Getenv("GIN_MODE") == "" {
 		gin.SetMode(gin.ReleaseMode)
@@ -428,6 +442,16 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, authMiddle
 			compute.DELETE("/instances/:id", apiServer.DeleteInstance)
 			compute.GET("/instances/:id/logs", apiServer.GetInstanceLogs)
 			compute.GET("/instances/:id/metrics", apiServer.GetInstanceMetrics)
+		}
+
+		// Admin endpoints (operator token, separate from customer auth)
+		if adminHandler != nil {
+			admin := v1.Group("/admin")
+			admin.Use(adminHandler.RequireAdminToken())
+			{
+				admin.GET("/pricing", adminHandler.GetPricing)
+				admin.PUT("/pricing", adminHandler.UpdatePricing)
+			}
 		}
 
 		// SDL deployment endpoint
