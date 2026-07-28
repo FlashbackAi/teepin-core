@@ -100,7 +100,10 @@ while true; do
 
     if ! command -v psql > /dev/null 2>&1; then
         echo "Installing postgresql-client (for connectivity verification)..."
-        apt-get install -y -qq postgresql-client > /dev/null
+        # Non-interactive: needrestart's post-install hook otherwise
+        # pops a service-restart dialog and appears to hang.
+        DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
+            apt-get install -y -qq postgresql-client
     fi
 
     echo "Verifying database connectivity..."

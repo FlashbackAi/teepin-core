@@ -37,6 +37,13 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+# Non-interactive apt: without this, needrestart's "Restarting
+# services..." hook can pop an interactive dialog (or hang) after any
+# package install and stall the whole setup.
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+export NEEDRESTART_SUSPEND=1
+
 # The repo this script lives in is the deployment source — no separate
 # /opt/teepin clone, no wrong-cwd surprises for the sealed-secrets step.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

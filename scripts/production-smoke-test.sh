@@ -44,7 +44,11 @@ if [ "$API_URL" = "http://localhost:8080" ] && \
     echo "Starting kubectl port-forward to svc/api-server (teepin-prod)..."
     kubectl -n teepin-prod port-forward svc/api-server 8080:80 > /dev/null 2>&1 &
     PF_PID=$!
-    sleep 3
+    # Wait for the forward (and the API behind it) to answer, up to 20s.
+    for i in $(seq 1 10); do
+        curl -s -m 2 "$API_URL/health" > /dev/null 2>&1 && break
+        sleep 2
+    done
 fi
 STAMP=$(date +%s)
 EMAIL="smoke-${STAMP}@test.teepin.io"
