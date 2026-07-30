@@ -58,6 +58,10 @@ cat > /etc/profile.d/teepin-k8s.sh <<'PROFILE'
 export KUBECONFIG=/etc/rancher/rke2/rke2.yaml
 export PATH=$PATH:/var/lib/rancher/rke2/bin
 PROFILE
+# profile.d only covers login shells; plain `sudo su` skips it. Hook
+# .bashrc too so kubectl works in every interactive root shell.
+grep -q "teepin-k8s" /root/.bashrc 2>/dev/null || \
+    echo '[ -f /etc/profile.d/teepin-k8s.sh ] && . /etc/profile.d/teepin-k8s.sh' >> /root/.bashrc
 
 echo "TEEPIN Production Setup"
 echo "=========================="
@@ -236,8 +240,11 @@ if [ "$GPU_PRESENT" = true ]; then
         --set mig.strategy=mixed \
         --wait
 
-    # Verify GPU is visible to Kubernetes
-    kubectl wait --for=condition=ready pod -l app=nvidia-device-plugin-daemonset -n gpu-operator --timeout=300s
+    # Verify GPU is visible to Kubernetes. On a fresh cluster this can
+    # take a while: the operator pulls images, validates the driver, and
+    # installs the container toolkit (with a containerd restart) before
+    # the device plugin can become Ready.
+    kubectl wait --for=condition=ready pod -l app=nvidia-device-plugin-daemonset -n gpu-operator --timeout=900s
 
     # Check GPU
     kubectl get nodes -o json | jq '.items[].status.capacity | select(.["nvidia.com/gpu"] != null)'
