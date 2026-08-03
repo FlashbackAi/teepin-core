@@ -609,6 +609,30 @@ if kubectl get crd ciliumnetworkpolicies.cilium.io > /dev/null 2>&1; then
     log_info "Network policies applied (CiliumNetworkPolicy)"
 else
     kubectl apply -f deploy/production/network-policies-standard.yaml
+
+    # Node IPs are cluster-specific and cannot be hardcoded. On bare
+    # metal they are frequently PUBLIC addresses, and kube-proxy DNATs
+    # the apiserver VIP to them — so a customer pod can otherwise reach
+    # the Kubernetes API through the node address.
+    #
+    # NetworkPolicy rules are ADDITIVE: a second policy cannot subtract
+    # from the first. The node IPs must therefore be merged into the
+    # SAME `except` list, patching the policy in place.
+    NODE_IPS=$(kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{.status.addresses[?(@.type=="ExternalIP")].address}{"\n"}{end}' | grep -v '^$' | sort -u)
+    if [ -n "$NODE_IPS" ]; then
+        EXCEPT_JSON=$(
+            {
+                printf '"10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","169.254.0.0/16","100.64.0.0/10"'
+                for ip in $NODE_IPS; do printf ',"%s/32"' "$ip"; done
+            }
+        )
+        # Egress rule 0 is DNS, rule 1 is the internet rule being patched.
+        kubectl -n default patch networkpolicy customer-instance-isolation --type=json \
+            -p "[{\"op\":\"replace\",\"path\":\"/spec/egress/1/to/0/ipBlock/except\",\"value\":[$EXCEPT_JSON]}]" \
+            > /dev/null
+        log_info "Node IPs excluded from customer egress: $(echo "$NODE_IPS" | tr '\n' ' ')"
+    fi
+
     log_info "Network policies applied (standard NetworkPolicy, CNI=$CNI)"
 fi
 

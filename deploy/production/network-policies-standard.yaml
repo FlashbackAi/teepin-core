@@ -86,6 +86,14 @@ spec:
     # excluding RFC1918 and the cluster's own CIDRs prevents customer
     # workloads from reaching pods, services, the Kubernetes API, node
     # IPs, or cloud metadata endpoints.
+    #
+    # IMPORTANT — bare-metal nodes with PUBLIC IPs: kube-proxy DNATs the
+    # apiserver service VIP (10.43.0.1:443) to the node's real address.
+    # On a cloud VM that address is private and already excluded here,
+    # but on bare metal it is often a PUBLIC IP, which this rule would
+    # otherwise allow — letting customer pods reach the Kubernetes API.
+    # `teepin-node-ips` below closes that path; keep it in sync when
+    # nodes change (setup-production.sh regenerates it).
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0
@@ -94,6 +102,7 @@ spec:
               - 172.16.0.0/12     # private (docker0, provider networks)
               - 192.168.0.0/16    # private
               - 169.254.0.0/16    # link-local INCLUDING cloud metadata (169.254.169.254)
+              - 100.64.0.0/10     # carrier-grade NAT (some providers' node networks)
 
 ---
 # Policy 2: API server ingress
