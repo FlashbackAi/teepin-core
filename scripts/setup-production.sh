@@ -600,15 +600,16 @@ kubectl -n teepin-prod rollout restart deployment/api-server
 kubectl -n teepin-prod rollout status deployment/api-server --timeout=300s
 
 # Apply network policies
-# Network policies are CiliumNetworkPolicy resources — only applicable
-# when running the Cilium CNI. Under canal they are skipped (the CRDs do
-# not exist); equivalent standard NetworkPolicy resources are a separate
-# task tracked in ROADMAP.md.
+# Network policies: apply the set matching the active CNI. Cilium gets
+# the richer CiliumNetworkPolicy (FQDN + L7 rules); every other CNI gets
+# the portable standard NetworkPolicy equivalent. Tenant isolation is
+# enforced either way.
 if kubectl get crd ciliumnetworkpolicies.cilium.io > /dev/null 2>&1; then
     kubectl apply -f deploy/production/network-policies.yaml
+    log_info "Network policies applied (CiliumNetworkPolicy)"
 else
-    log_warn "Cilium CRDs absent (CNI=$CNI) — skipping CiliumNetworkPolicy manifests"
-    log_warn "Pod-to-pod isolation policies are NOT active; see ROADMAP.md"
+    kubectl apply -f deploy/production/network-policies-standard.yaml
+    log_info "Network policies applied (standard NetworkPolicy, CNI=$CNI)"
 fi
 
 log_info "TEEPIN platform deployed"

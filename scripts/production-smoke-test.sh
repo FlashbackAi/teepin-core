@@ -209,6 +209,40 @@ else
     LIST_COUNT=$(curl -s "${AUTH[@]}" "$API_URL/v1/compute/instances" | jq '.count' 2>/dev/null || echo 0)
     [ "$LIST_COUNT" -ge "$EXPECT_COUNT" ] && ok "List shows this project's instances ($LIST_COUNT)" || bad "List count unexpected: $LIST_COUNT"
 
+    # --- 9b. Tenant network isolation -----------------------------------
+    # Verify the NetworkPolicy actually enforces: a customer pod must NOT
+    # reach the Kubernetes API, Redis, or cloud metadata — but MUST still
+    # reach the internet. Runs a probe pod carrying the managed label, so
+    # the same policy that governs real customer workloads applies to it.
+    if command -v kubectl > /dev/null 2>&1 && kubectl get networkpolicy -n default customer-instance-isolation > /dev/null 2>&1; then
+        info "Verifying tenant network isolation (NetworkPolicy enforcement)"
+
+        # $1 = description, $2 = expect ("blocked"|"allowed"), $3.. = nc args
+        probe_isolation() {
+            local desc="$1" expect="$2"; shift 2
+            local out
+            out=$(kubectl run isoprobe-$RANDOM --rm -i --restart=Never \
+                --image=busybox:1.36 --labels="app.teepin.cloud/managed=true" \
+                --pod-running-timeout=90s -- sh -c "$*" 2>/dev/null || true)
+            if echo "$out" | grep -q "REACHED"; then
+                [ "$expect" = "allowed" ] && ok "$desc" || bad "$desc — traffic was NOT blocked"
+            else
+                [ "$expect" = "blocked" ] && ok "$desc" || bad "$desc — traffic was blocked but should be allowed"
+            fi
+        }
+
+        probe_isolation "Customer pod BLOCKED from Kubernetes API" blocked \
+            "nc -z -w 4 10.43.0.1 443 && echo REACHED"
+        probe_isolation "Customer pod BLOCKED from Redis" blocked \
+            "nc -z -w 4 redis.rate-limit.svc.cluster.local 6379 && echo REACHED"
+        probe_isolation "Customer pod BLOCKED from cloud metadata" blocked \
+            "nc -z -w 4 169.254.169.254 80 && echo REACHED"
+        probe_isolation "Customer pod ALLOWED to reach the internet" allowed \
+            "nc -z -w 6 1.1.1.1 443 && echo REACHED"
+    else
+        info "No customer-instance-isolation NetworkPolicy found — skipping isolation checks"
+    fi
+
     # --- 10. Billing dwell ----------------------------------------------
     # The collector skips usage below a 1-minute floor (no sub-cent
     # charges), so instances deleted seconds after creation legitimately
