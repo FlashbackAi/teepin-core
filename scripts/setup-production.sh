@@ -126,10 +126,18 @@ curl -sfL https://get.rke2.io | INSTALL_RKE2_VERSION=v1.28.5+rke2r1 sh -
 mkdir -p /etc/rancher/rke2
 
 # Create RKE2 configuration
+# CNI choice. Default is canal (RKE2's own default: Flannel + Calico) —
+# Cilium's eBPF datapath proved fragile across several rented GPU hosts
+# (CoreDNS unable to reach the API VIP, pods losing egress), and none of
+# TEEPIN's networking needs Cilium-specific features. Override with
+# CNI=cilium if you specifically want CiliumNetworkPolicy support.
+CNI="${CNI:-canal}"
+log_info "CNI: $CNI"
+
 cat <<EOF > /etc/rancher/rke2/config.yaml
 # RKE2 Production Configuration
 write-kubeconfig-mode: "0644"
-cni: cilium
+cni: $CNI
 disable:
   - rke2-ingress-nginx  # We'll install our own
 tls-san:
@@ -592,7 +600,16 @@ kubectl -n teepin-prod rollout restart deployment/api-server
 kubectl -n teepin-prod rollout status deployment/api-server --timeout=300s
 
 # Apply network policies
-kubectl apply -f deploy/production/network-policies.yaml
+# Network policies are CiliumNetworkPolicy resources — only applicable
+# when running the Cilium CNI. Under canal they are skipped (the CRDs do
+# not exist); equivalent standard NetworkPolicy resources are a separate
+# task tracked in ROADMAP.md.
+if kubectl get crd ciliumnetworkpolicies.cilium.io > /dev/null 2>&1; then
+    kubectl apply -f deploy/production/network-policies.yaml
+else
+    log_warn "Cilium CRDs absent (CNI=$CNI) — skipping CiliumNetworkPolicy manifests"
+    log_warn "Pod-to-pod isolation policies are NOT active; see ROADMAP.md"
+fi
 
 log_info "TEEPIN platform deployed"
 
