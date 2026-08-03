@@ -63,6 +63,14 @@ PROFILE
 grep -q "teepin-k8s" /root/.bashrc 2>/dev/null || \
     echo '[ -f /etc/profile.d/teepin-k8s.sh ] && . /etc/profile.d/teepin-k8s.sh' >> /root/.bashrc
 
+# Belt and braces: symlink kubectl into a directory that is on every
+# shell's default PATH, so an already-open (stale) shell still works
+# and nobody is tempted to `snap install kubectl` — a snap kubectl has
+# no kubeconfig and fails against localhost:8080.
+if [ -x /var/lib/rancher/rke2/bin/kubectl ] && [ ! -e /usr/local/bin/kubectl ]; then
+    ln -sf /var/lib/rancher/rke2/bin/kubectl /usr/local/bin/kubectl
+fi
+
 echo "TEEPIN Production Setup"
 echo "=========================="
 echo ""

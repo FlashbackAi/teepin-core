@@ -139,37 +139,54 @@ fi
 if [ "$SKIP_GPU" = "true" ]; then
     info "SKIP_GPU=true — skipping GPU instance tests"
 else
-    # --- 5. Exact-MIG path: 20GB --------------------------------------
-    info "Creating 20GB instance (exact MIG profile path)"
+    # Derive test sizes from the DISCOVERED hardware so the test works
+    # on any GPU: A100 MIG profiles are 10/20/40GB, H100 10/20/40/80,
+    # H200 18/35/71/141 — hardcoded sizes would falsely "round up".
+    EXACT_GB=$(echo "$TYPES" | jq '[.instance_types[] | select(.description | contains("MIG")) | .gpu_memory_gb] | min // 0' 2>/dev/null || echo 0)
+    if [ "${EXACT_GB:-0}" -gt 0 ] 2>/dev/null; then
+        HAS_MIG=true
+        ROUNDUP_GB=$((EXACT_GB + 5))
+        info "Hardware-derived sizes: exact=${EXACT_GB}GB (smallest MIG profile), round-up=${ROUNDUP_GB}GB"
+    else
+        HAS_MIG=false
+        EXACT_GB=$(echo "$TYPES" | jq '[.instance_types[].gpu_memory_gb] | min // 0' 2>/dev/null || echo 0)
+        info "No MIG profiles exposed — whole-GPU mode: exact=${EXACT_GB}GB, round-up test skipped (one GPU, one instance)"
+    fi
+
+    # --- 5. Exact allocation path ---------------------------------------
+    info "Creating ${EXACT_GB}GB instance (exact allocation path)"
     R20=$(curl -s -X POST "${AUTH[@]}" -H "Content-Type: application/json" \
         "$API_URL/v1/compute/instances" \
-        -d '{"name":"smoke-mig20","image":"nvidia/cuda:12.3.1-base-ubuntu22.04","gpu_vram":"20GB","cpu_units":2,"memory":"8GB","env":{"SLEEP":"1"}}')
+        -d "{\"name\":\"smoke-exact\",\"image\":\"nvidia/cuda:12.3.1-base-ubuntu22.04\",\"gpu_vram\":\"${EXACT_GB}GB\",\"cpu_units\":2,\"memory\":\"8GB\",\"env\":{\"SLEEP\":\"1\"}}")
     ID20=$(echo "$R20" | jq -r '.id // empty' 2>/dev/null || true)
     if [ -n "$ID20" ]; then
         CREATED_IDS+=("$ID20")
-        ok "20GB instance created: $ID20 (type: $(echo "$R20" | jq -r .instance_type), \$$(echo "$R20" | jq -r .price_per_hour)/hr)"
-        [ "$(echo "$R20" | jq -r .allocated_vram)" = "20GB" ] \
-            && ok "20GB allocated exactly (MIG)" \
-            || bad "Expected 20GB allocation, got $(echo "$R20" | jq -r .allocated_vram)"
+        ok "${EXACT_GB}GB instance created: $ID20 (type: $(echo "$R20" | jq -r .instance_type), \$$(echo "$R20" | jq -r .price_per_hour)/hr)"
+        [ "$(echo "$R20" | jq -r .allocated_vram)" = "${EXACT_GB}GB" ] \
+            && ok "${EXACT_GB}GB allocated exactly" \
+            || bad "Expected ${EXACT_GB}GB allocation, got $(echo "$R20" | jq -r .allocated_vram)"
     else
-        bad "20GB instance creation failed: $R20"
+        bad "${EXACT_GB}GB instance creation failed: $R20"
     fi
 
-    # --- 6. Round-up path: 25GB ----------------------------------------
-    info "Creating 25GB instance (round-up path)"
-    R25=$(curl -s -X POST "${AUTH[@]}" -H "Content-Type: application/json" \
-        "$API_URL/v1/compute/instances" \
-        -d '{"name":"smoke-roundup25","image":"nvidia/cuda:12.3.1-base-ubuntu22.04","gpu_vram":"25GB","cpu_units":2,"memory":"8GB"}')
-    ID25=$(echo "$R25" | jq -r '.id // empty' 2>/dev/null || true)
-    if [ -n "$ID25" ]; then
-        CREATED_IDS+=("$ID25")
-        ALLOC=$(echo "$R25" | jq -r .allocated_vram)
-        NOTE=$(echo "$R25" | jq -r '.allocation_note // empty')
-        ok "25GB request allocated as $ALLOC: $ID25"
-        [ -n "$NOTE" ] && ok "Transparent allocation note present: \"$NOTE\"" \
-                       || bad "Missing allocation_note for rounded-up request"
-    else
-        bad "25GB instance creation failed: $R25"
+    # --- 6. Round-up path (MIG hardware only) ---------------------------
+    ID25=""
+    if [ "$HAS_MIG" = "true" ]; then
+        info "Creating ${ROUNDUP_GB}GB instance (round-up path)"
+        R25=$(curl -s -X POST "${AUTH[@]}" -H "Content-Type: application/json" \
+            "$API_URL/v1/compute/instances" \
+            -d "{\"name\":\"smoke-roundup\",\"image\":\"nvidia/cuda:12.3.1-base-ubuntu22.04\",\"gpu_vram\":\"${ROUNDUP_GB}GB\",\"cpu_units\":2,\"memory\":\"8GB\"}")
+        ID25=$(echo "$R25" | jq -r '.id // empty' 2>/dev/null || true)
+        if [ -n "$ID25" ]; then
+            CREATED_IDS+=("$ID25")
+            ALLOC=$(echo "$R25" | jq -r .allocated_vram)
+            NOTE=$(echo "$R25" | jq -r '.allocation_note // empty')
+            ok "${ROUNDUP_GB}GB request allocated as $ALLOC: $ID25"
+            [ -n "$NOTE" ] && ok "Transparent allocation note present: \"$NOTE\"" \
+                           || bad "Missing allocation_note for rounded-up request"
+        else
+            bad "${ROUNDUP_GB}GB instance creation failed: $R25"
+        fi
     fi
 
     # --- 7. Wait for scheduling, then verify status --------------------
@@ -179,16 +196,18 @@ else
         [ "$STATUS" = "Running" ] && break
         sleep 5
     done
-    [ "$STATUS" = "Running" ] && ok "20GB instance is Running on real GPU" \
-                              || bad "20GB instance status after 120s: $STATUS (check: kubectl describe pod)"
+    [ "$STATUS" = "Running" ] && ok "${EXACT_GB}GB instance is Running on real GPU" \
+                              || bad "${EXACT_GB}GB instance status after 120s: $STATUS (check: kubectl describe pod)"
 
     # --- 8. Logs --------------------------------------------------------
     LOGS=$(curl -s "${AUTH[@]}" "$API_URL/v1/compute/instances/$ID20/logs?tail=10")
     echo "$LOGS" | jq -e 'has("logs")' > /dev/null && ok "Log retrieval works" || bad "Log retrieval failed: $LOGS"
 
     # --- 9. List scoped to project --------------------------------------
+    EXPECT_COUNT=1
+    [ "$HAS_MIG" = "true" ] && EXPECT_COUNT=2
     LIST_COUNT=$(curl -s "${AUTH[@]}" "$API_URL/v1/compute/instances" | jq '.count' 2>/dev/null || echo 0)
-    [ "$LIST_COUNT" -ge 2 ] && ok "List shows this project's instances ($LIST_COUNT)" || bad "List count unexpected: $LIST_COUNT"
+    [ "$LIST_COUNT" -ge "$EXPECT_COUNT" ] && ok "List shows this project's instances ($LIST_COUNT)" || bad "List count unexpected: $LIST_COUNT"
 
     # --- 10. Delete + verify -------------------------------------------
     info "Deleting instances"
