@@ -209,7 +209,19 @@ else
     LIST_COUNT=$(curl -s "${AUTH[@]}" "$API_URL/v1/compute/instances" | jq '.count' 2>/dev/null || echo 0)
     [ "$LIST_COUNT" -ge "$EXPECT_COUNT" ] && ok "List shows this project's instances ($LIST_COUNT)" || bad "List count unexpected: $LIST_COUNT"
 
-    # --- 10. Delete + verify -------------------------------------------
+    # --- 10. Billing dwell ----------------------------------------------
+    # The collector skips usage below a 1-minute floor (no sub-cent
+    # charges), so instances deleted seconds after creation legitimately
+    # bill nothing — and the billing path is never exercised. Hold the
+    # instances past the floor so deletion produces a real usage record.
+    # Set BILLING_DWELL=0 to skip (faster run, no billing coverage).
+    DWELL="${BILLING_DWELL:-75}"
+    if [ "$DWELL" -gt 0 ] 2>/dev/null; then
+        info "Holding instances ${DWELL}s to clear the 1-minute billing floor..."
+        sleep "$DWELL"
+    fi
+
+    # --- 11. Delete + verify -------------------------------------------
     info "Deleting instances"
     for id in "$ID20" "$ID25"; do
         [ -z "$id" ] && continue
@@ -222,7 +234,53 @@ else
     [ "$CODE" = "404" ] && ok "Deleting nonexistent instance returns 404" || bad "Expected 404, got $CODE"
 fi
 
-# --- 11. Billing verification (optional, needs cluster access) ---------
+# --- 12. Billing tail verification (RDS/Aurora, via the sealed secret) --
+# Proves terminated instances are billed: the collector must write a
+# usage record ending at terminated_at, for instances that ran past the
+# 1-minute floor. Uses the same credentials the API uses, read from the
+# cluster — no passwords on the command line.
+if [ "$SKIP_GPU" != "true" ] && [ "${DWELL:-0}" -gt 0 ] && command -v kubectl > /dev/null 2>&1; then
+    info "Verifying billing records for terminated instances"
+
+    PGHOST=$(kubectl -n teepin-prod get secret postgresql-credentials -o jsonpath='{.data.host}' 2>/dev/null | base64 -d || true)
+    PGUSER=$(kubectl -n teepin-prod get secret postgresql-credentials -o jsonpath='{.data.username}' 2>/dev/null | base64 -d || true)
+    PGDB=$(kubectl -n teepin-prod get secret postgresql-credentials -o jsonpath='{.data.database}' 2>/dev/null | base64 -d || true)
+    PGPW=$(kubectl -n teepin-prod get secret postgresql-credentials -o jsonpath='{.data.password}' 2>/dev/null | base64 -d || true)
+
+    if [ -z "$PGHOST" ] || ! command -v psql > /dev/null 2>&1; then
+        info "Skipping billing verification (no DB credentials or psql on this host)"
+    else
+        # The collector runs hourly; restart the API to force a tick now.
+        kubectl -n teepin-prod rollout restart deployment/api-server > /dev/null 2>&1 || true
+        kubectl -n teepin-prod rollout status deployment/api-server --timeout=180s > /dev/null 2>&1 || true
+
+        BILLED=0
+        for i in $(seq 1 10); do
+            BILLED=$(PGPASSWORD="$PGPW" psql "host=$PGHOST user=$PGUSER dbname=$PGDB sslmode=require connect_timeout=10" \
+                -tAc "SELECT count(*) FROM billing.usage_records WHERE project_id = '$PROJECT_ID'" 2>/dev/null || echo 0)
+            [ "${BILLED:-0}" -gt 0 ] 2>/dev/null && break
+            sleep 6
+        done
+
+        if [ "${BILLED:-0}" -gt 0 ] 2>/dev/null; then
+            ok "Terminated instances billed ($BILLED usage records)"
+            PGPASSWORD="$PGPW" psql "host=$PGHOST user=$PGUSER dbname=$PGDB sslmode=require" \
+                -c "SELECT instance_id, round(quantity::numeric,4) AS hours, unit_price, round(total_cost::numeric,4) AS cost
+                    FROM billing.usage_records WHERE project_id = '$PROJECT_ID' ORDER BY created_at DESC" 2>/dev/null || true
+
+            # Every record must end at termination, never later.
+            LATE=$(PGPASSWORD="$PGPW" psql "host=$PGHOST user=$PGUSER dbname=$PGDB sslmode=require" -tAc \
+                "SELECT count(*) FROM billing.usage_records u JOIN compute.instances i ON i.id = u.instance_id
+                 WHERE u.project_id = '$PROJECT_ID' AND i.terminated_at IS NOT NULL AND u.end_time > i.terminated_at + interval '1 second'" 2>/dev/null || echo 0)
+            [ "${LATE:-0}" = "0" ] && ok "Usage records end at termination (no overbilling)" \
+                                   || bad "$LATE record(s) billed past terminated_at"
+        else
+            bad "No usage records written for terminated instances — billing tail regression"
+        fi
+    fi
+fi
+
+# --- 13. Instance persistence verification (optional, in-cluster DB) ----
 if [ -n "${PSQL_POD:-}" ]; then
     info "Verifying instance rows in PostgreSQL ($PSQL_POD)"
     ROWS=$(kubectl exec "$PSQL_POD" -- psql -U teepin -d teepin_db -tAc \
