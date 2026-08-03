@@ -182,12 +182,16 @@ if ! kubectl run netcheck --rm -i --restart=Never --image=busybox:1.36 \
 fi
 log_info "Pod network egress OK"
 
+# Three consecutive lookups must succeed: providers with a flaky
+# resolver often pass a single probe and then SERVFAIL under real load
+# ("server misbehaving"), which surfaces much later as database
+# connection failures inside the API.
 log_info "Checking in-cluster DNS resolution..."
-DNS_OK=false
-for i in 1 2; do
-    if kubectl run dnscheck-$i --rm -i --restart=Never --image=busybox:1.36 \
+DNS_OK=true
+for i in 1 2 3; do
+    if ! kubectl run dnscheck-$i --rm -i --restart=Never --image=busybox:1.36 \
         --pod-running-timeout=90s -- nslookup amazonaws.com > /dev/null 2>&1; then
-        DNS_OK=true
+        DNS_OK=false
         break
     fi
 done
