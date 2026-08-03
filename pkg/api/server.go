@@ -502,6 +502,13 @@ func (s *Server) createPod(ctx context.Context, instanceID string, instanceUUID,
 			Labels:    labels,
 		},
 		Spec: corev1.PodSpec{
+			// Tenant isolation: customer workloads must never carry
+			// credentials for the Kubernetes API. Network policy alone
+			// cannot guarantee the API is unreachable (kube-proxy DNATs
+			// the service VIP to node addresses, and IPv4 ipBlock rules
+			// do not cover IPv6 nodes) — without a token, reaching it
+			// gains nothing.
+			AutomountServiceAccountToken: boolPtr(false),
 			Containers: []corev1.Container{
 				{
 					Name:  "app",
@@ -610,6 +617,10 @@ func podToInstance(pod *corev1.Pod, vramRate float64) models.Instance {
 
 // parseMemoryGB parses memory strings like "32GB" or "512MB" to whole
 // GB (rounded up) for persistence. Unparseable input yields 0.
+// boolPtr returns a pointer to b, for Kubernetes API fields that
+// distinguish "false" from "unset".
+func boolPtr(b bool) *bool { return &b }
+
 func parseMemoryGB(memory string) int {
 	m := memoryRe.FindStringSubmatch(memory)
 	if m == nil {

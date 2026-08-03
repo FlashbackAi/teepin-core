@@ -618,7 +618,10 @@ else
     # NetworkPolicy rules are ADDITIVE: a second policy cannot subtract
     # from the first. The node IPs must therefore be merged into the
     # SAME `except` list, patching the policy in place.
-    NODE_IPS=$(kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{.status.addresses[?(@.type=="ExternalIP")].address}{"\n"}{end}' | grep -v '^$' | sort -u)
+    # IPv4 only: an IPv4 ipBlock's `except` entries must be subsets of
+    # its CIDR, so IPv6 node addresses cannot appear here (they would be
+    # rejected outright). IPv6 egress is unaffected by this policy.
+    NODE_IPS=$(kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{.status.addresses[?(@.type=="ExternalIP")].address}{"\n"}{end}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | sort -u)
     if [ -n "$NODE_IPS" ]; then
         EXCEPT_JSON=$(
             {

@@ -231,14 +231,30 @@ else
             fi
         }
 
-        probe_isolation "Customer pod BLOCKED from Kubernetes API" blocked \
-            "nc -z -w 4 10.43.0.1 443 && echo REACHED"
         probe_isolation "Customer pod BLOCKED from Redis" blocked \
             "nc -z -w 4 redis.rate-limit.svc.cluster.local 6379 && echo REACHED"
         probe_isolation "Customer pod BLOCKED from cloud metadata" blocked \
             "nc -z -w 4 169.254.169.254 80 && echo REACHED"
         probe_isolation "Customer pod ALLOWED to reach the internet" allowed \
             "nc -z -w 6 1.1.1.1 443 && echo REACHED"
+
+        # The Kubernetes API cannot be reliably blocked by IP (kube-proxy
+        # DNATs the service VIP to node addresses, and an IPv4 ipBlock
+        # cannot cover IPv6-only nodes). What matters is that customer
+        # pods carry NO credentials — check the real instance pods.
+        POD=$(kubectl -n default get pods -l app.teepin.cloud/managed=true \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+        if [ -n "$POD" ]; then
+            MOUNTED=$(kubectl -n default get pod "$POD" \
+                -o jsonpath='{.spec.automountServiceAccountToken}' 2>/dev/null || true)
+            HASVOL=$(kubectl -n default get pod "$POD" \
+                -o jsonpath='{.spec.volumes[*].name}' 2>/dev/null | grep -c "kube-api-access" || true)
+            if [ "$MOUNTED" = "false" ] && [ "${HASVOL:-0}" = "0" ]; then
+                ok "Customer pod carries NO Kubernetes API credentials"
+            else
+                bad "Customer pod has a ServiceAccount token mounted (automount=$MOUNTED, token volumes=$HASVOL)"
+            fi
+        fi
     else
         info "No customer-instance-isolation NetworkPolicy found — skipping isolation checks"
     fi
