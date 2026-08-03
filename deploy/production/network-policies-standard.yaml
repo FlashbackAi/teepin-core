@@ -1,0 +1,181 @@
+# Copyright 2026 TEEPIN Project
+# Licensed under the Apache License, Version 2.0
+
+# Standard Kubernetes NetworkPolicy for production.
+#
+# CNI-portable equivalent of network-policies.yaml (CiliumNetworkPolicy),
+# for clusters running canal/Calico/Flannel. Apply THIS file under canal;
+# apply network-policies.yaml only when running the Cilium CNI.
+#
+# The security goal is tenant isolation: a customer's GPU container must
+# not reach another customer's container, the Kubernetes API, Redis, the
+# database, or any other cluster-internal service — while still reaching
+# the public internet (models, package registries, their own APIs).
+#
+# Differences forced by the standard API (no FQDN or L7 rules):
+#   - "RDS by hostname" becomes "any external IP on 5432" (the private
+#     cluster ranges are excluded, so this cannot reach in-cluster pods).
+#   - "deny the Kubernetes API" becomes an explicit `except` on the
+#     service CIDR and the node IPs, since standard policy cannot match
+#     the apiserver as an entity.
+#
+# NOTE: policies select pods by namespace label. The namespaces below
+# must carry `kubernetes.io/metadata.name` (set automatically by
+# Kubernetes >= 1.21) — no manual labelling required.
+
+---
+# Policy 1: Customer instance isolation (THE tenant-isolation policy)
+#
+# Applies to every TEEPIN-managed customer pod in the `default`
+# namespace. Selecting the pods at all switches them to deny-by-default
+# for both directions; the rules below re-open only what is required.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: customer-instance-isolation
+  namespace: default
+  labels:
+    app.teepin.io/managed-by: teepin
+spec:
+  podSelector:
+    matchLabels:
+      app.teepin.cloud/managed: "true"
+  policyTypes:
+    - Ingress
+    - Egress
+
+  ingress:
+    # The API server (health checks, log retrieval, exec).
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: teepin-prod
+          podSelector:
+            matchLabels:
+              app: api-server
+
+    # The ingress controller, for customer-exposed endpoints.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+
+    # Prometheus scraping (metrics endpoints on customer pods).
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+
+    # NOTE: deliberately NO rule allowing other customer instances —
+    # that omission is the tenant isolation.
+
+  egress:
+    # DNS resolution (CoreDNS in kube-system).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+
+    # The public internet: everything EXCEPT private ranges. This is how
+    # standard NetworkPolicy expresses Cilium's `toEntities: world` —
+    # excluding RFC1918 and the cluster's own CIDRs prevents customer
+    # workloads from reaching pods, services, the Kubernetes API, node
+    # IPs, or cloud metadata endpoints.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8        # pod CIDR (10.42.x), service CIDR (10.43.x), private nets
+              - 172.16.0.0/12     # private (docker0, provider networks)
+              - 192.168.0.0/16    # private
+              - 169.254.0.0/16    # link-local INCLUDING cloud metadata (169.254.169.254)
+
+---
+# Policy 2: API server ingress
+#
+# Only the ingress controller and Prometheus may reach the API server.
+# Egress is intentionally unrestricted: the API server must reach RDS
+# (external), Redis, Harbor, the Kubernetes API, and customer pods —
+# and it is a trusted platform component, not tenant workload.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-server-ingress
+  namespace: teepin-prod
+  labels:
+    app.teepin.io/managed-by: teepin
+spec:
+  podSelector:
+    matchLabels:
+      app: api-server
+  policyTypes:
+    - Ingress
+
+  ingress:
+    # Ingress controller → API (customer-facing traffic).
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - port: 8080
+          protocol: TCP
+
+    # Prometheus → API (metrics).
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 8080
+          protocol: TCP
+
+    # Health probes and port-forward arrive from the node itself, not
+    # from a pod; kubelet traffic is not subject to NetworkPolicy, but
+    # `kubectl port-forward` is proxied by the API server via kubelet
+    # and likewise unaffected. No rule needed.
+
+---
+# Policy 3: Redis isolation
+#
+# Redis backs rate limiting and must be reachable ONLY by the API
+# server — never by customer workloads.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-isolation
+  namespace: rate-limit
+  labels:
+    app.teepin.io/managed-by: teepin
+spec:
+  podSelector:
+    matchLabels:
+      app: redis
+  policyTypes:
+    - Ingress
+
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: teepin-prod
+          podSelector:
+            matchLabels:
+              app: api-server
+      ports:
+        - port: 6379
+          protocol: TCP
+
+    # Prometheus scrapes the redis-metrics exporter.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 9121
+          protocol: TCP
