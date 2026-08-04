@@ -264,11 +264,29 @@ if [ "$GPU_PRESENT" = true ]; then
     helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
     helm repo update
 
-    # Install GPU Operator
+    # Install GPU Operator.
+    #
+    # CRITICAL — MIG tenant isolation: by default the container toolkit
+    # honours NVIDIA_VISIBLE_DEVICES from the container environment,
+    # which the base CUDA images set to "all". A customer allocated one
+    # 10GB MIG slice then sees EVERY slice on the card, including other
+    # tenants'. The two ACCEPT_* settings below stop that: the runtime
+    # ignores the env var and uses only the device the plugin assigned
+    # via volume mounts. Verified 2026-08-04 on an H100: without them a
+    # 10GB customer container listed all 4 MIG devices; with them it
+    # lists exactly one.
     helm upgrade --install gpu-operator nvidia/gpu-operator \
         --namespace gpu-operator \
         --create-namespace \
         --set mig.strategy=mixed \
+        --set devicePlugin.env[0].name=DEVICE_LIST_STRATEGY \
+        --set-string devicePlugin.env[0].value=envvar \
+        --set devicePlugin.env[1].name=MIG_STRATEGY \
+        --set-string devicePlugin.env[1].value=mixed \
+        --set toolkit.env[0].name=ACCEPT_NVIDIA_VISIBLE_DEVICES_ENVVAR_WHEN_UNPRIVILEGED \
+        --set-string toolkit.env[0].value=false \
+        --set toolkit.env[1].name=ACCEPT_NVIDIA_VISIBLE_DEVICES_AS_VOLUME_MOUNTS \
+        --set-string toolkit.env[1].value=true \
         --wait
 
     # Verify GPU is visible to Kubernetes. On a fresh cluster this can

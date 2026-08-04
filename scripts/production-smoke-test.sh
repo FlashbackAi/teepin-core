@@ -166,7 +166,7 @@ else
     info "Creating ${EXACT_GB}GB instance (exact allocation path)"
     R20=$(curl -s -X POST "${AUTH[@]}" -H "Content-Type: application/json" \
         "$API_URL/v1/compute/instances" \
-        -d "{\"name\":\"smoke-exact\",\"image\":\"nvidia/cuda:12.3.1-base-ubuntu22.04\",\"gpu_vram\":\"${EXACT_GB}GB\",\"cpu_units\":2,\"memory\":\"8GB\",\"env\":{\"SLEEP\":\"1\"}}")
+        -d "{\"name\":\"smoke-exact\",\"image\":\"nvidia/cuda:12.3.1-base-ubuntu22.04\",\"gpu_vram\":\"${EXACT_GB}GB\",\"cpu_units\":2,\"memory\":\"8GB\",\"command\":[\"sleep\"],\"args\":[\"600\"]}")
     ID20=$(echo "$R20" | jq -r '.id // empty' 2>/dev/null || true)
     if [ -n "$ID20" ]; then
         CREATED_IDS+=("$ID20")
@@ -184,7 +184,7 @@ else
         info "Creating ${ROUNDUP_GB}GB instance (round-up path)"
         R25=$(curl -s -X POST "${AUTH[@]}" -H "Content-Type: application/json" \
             "$API_URL/v1/compute/instances" \
-            -d "{\"name\":\"smoke-roundup\",\"image\":\"nvidia/cuda:12.3.1-base-ubuntu22.04\",\"gpu_vram\":\"${ROUNDUP_GB}GB\",\"cpu_units\":2,\"memory\":\"8GB\"}")
+            -d "{\"name\":\"smoke-roundup\",\"image\":\"nvidia/cuda:12.3.1-base-ubuntu22.04\",\"gpu_vram\":\"${ROUNDUP_GB}GB\",\"cpu_units\":2,\"memory\":\"8GB\",\"command\":[\"sleep\"],\"args\":[\"600\"]}")
         ID25=$(echo "$R25" | jq -r '.id // empty' 2>/dev/null || true)
         if [ -n "$ID25" ]; then
             CREATED_IDS+=("$ID25")
@@ -228,23 +228,37 @@ else
                 bad "nvidia-smi failed inside the container — the GPU is NOT usable by customers"
             fi
 
-            # 2. MIG isolation: the container must see its slice's memory,
-            #    not the full card. A 10GB slice on an 80GB H100 that
-            #    reports 80GB would mean isolation is not working.
+            # 2. MIG tenant isolation: the container must see EXACTLY
+            #    ONE MIG device — its own. Seeing more means a customer
+            #    can reach other tenants' slices. This regressed silently
+            #    once already (toolkit honouring NVIDIA_VISIBLE_DEVICES=all
+            #    from the image), so assert the device COUNT, not just
+            #    the reported memory size.
+            if [ "$HAS_MIG" = "true" ]; then
+                MIG_COUNT=$(kubectl -n default exec "$POD" -- \
+                    nvidia-smi -L 2>/dev/null | grep -c "MIG" || echo 0)
+                if [ "${MIG_COUNT:-0}" = "1" ]; then
+                    ok "MIG isolation enforced: container sees exactly 1 MIG device (its own)"
+                elif [ "${MIG_COUNT:-0}" = "0" ]; then
+                    info "No MIG devices listed inside the container (nvidia-smi -L returned none)"
+                else
+                    bad "MIG ISOLATION BROKEN: container sees $MIG_COUNT MIG devices — other tenants' slices are visible"
+                fi
+            fi
+
+            # Visible VRAM should also match the allocated slice.
             VISIBLE_MIB=$(kubectl -n default exec "$POD" -- \
                 nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' \r' || true)
             if [ -n "$VISIBLE_MIB" ] 2>/dev/null && [ "${VISIBLE_MIB:-0}" -gt 0 ] 2>/dev/null; then
                 VISIBLE_GB=$((VISIBLE_MIB / 1024))
-                # Allow generous slack: MIG slices report slightly under
-                # their nominal size (e.g. a 10GB slice reports ~9.5GB).
                 CEILING=$((EXACT_GB + 5))
                 if [ "$VISIBLE_GB" -le "$CEILING" ]; then
                     ok "Container sees ~${VISIBLE_GB}GB VRAM (its ${EXACT_GB}GB slice, not the whole GPU)"
                 else
-                    bad "Container sees ${VISIBLE_GB}GB but was allocated ${EXACT_GB}GB — MIG isolation NOT enforced"
+                    bad "Container sees ${VISIBLE_GB}GB but was allocated ${EXACT_GB}GB — isolation NOT enforced"
                 fi
             else
-                info "Could not read visible VRAM from the container (skipping isolation assertion)"
+                info "Could not read visible VRAM from the container (skipping size assertion)"
             fi
 
             # 3. Actual computation: allocate device memory and run a
