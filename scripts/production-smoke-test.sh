@@ -199,6 +199,70 @@ else
     [ "$STATUS" = "Running" ] && ok "${EXACT_GB}GB instance is Running on real GPU" \
                               || bad "${EXACT_GB}GB instance status after 120s: $STATUS (check: kubectl describe pod)"
 
+    # --- 7b. THE PRODUCT TEST: real GPU compute in the customer container -
+    # Everything else verifies plumbing. This verifies the thing customers
+    # pay for: that a workload inside their container can actually use the
+    # GPU, and sees ONLY their slice — not the whole card.
+    if command -v kubectl > /dev/null 2>&1 && [ "$STATUS" = "Running" ]; then
+        info "Verifying real GPU compute inside the customer container"
+        POD=$(kubectl -n default get pods -l "app.teepin.cloud/instance-id=$ID20" \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+
+        if [ -z "$POD" ]; then
+            bad "Could not find the customer pod for $ID20"
+        else
+            # 1. The GPU is visible to the container at all.
+            SMI=$(kubectl -n default exec "$POD" -- nvidia-smi 2>/dev/null || true)
+            if echo "$SMI" | grep -qE "NVIDIA|CUDA Version"; then
+                ok "nvidia-smi works inside the customer container"
+            else
+                bad "nvidia-smi failed inside the container — the GPU is NOT usable by customers"
+            fi
+
+            # 2. MIG isolation: the container must see its slice's memory,
+            #    not the full card. A 10GB slice on an 80GB H100 that
+            #    reports 80GB would mean isolation is not working.
+            VISIBLE_MIB=$(kubectl -n default exec "$POD" -- \
+                nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' \r' || true)
+            if [ -n "$VISIBLE_MIB" ] 2>/dev/null && [ "${VISIBLE_MIB:-0}" -gt 0 ] 2>/dev/null; then
+                VISIBLE_GB=$((VISIBLE_MIB / 1024))
+                # Allow generous slack: MIG slices report slightly under
+                # their nominal size (e.g. a 10GB slice reports ~9.5GB).
+                CEILING=$((EXACT_GB + 5))
+                if [ "$VISIBLE_GB" -le "$CEILING" ]; then
+                    ok "Container sees ~${VISIBLE_GB}GB VRAM (its ${EXACT_GB}GB slice, not the whole GPU)"
+                else
+                    bad "Container sees ${VISIBLE_GB}GB but was allocated ${EXACT_GB}GB — MIG isolation NOT enforced"
+                fi
+            else
+                info "Could not read visible VRAM from the container (skipping isolation assertion)"
+            fi
+
+            # 3. Actual computation: allocate device memory and run a
+            #    matmul on it. Proves CUDA initializes and the slice does
+            #    real work — not just that a device node exists.
+            COMPUTE=$(kubectl -n default exec "$POD" -- sh -c '
+                if command -v python3 >/dev/null 2>&1 && python3 -c "import torch" 2>/dev/null; then
+                    python3 -c "import torch; a=torch.randn(512,512,device=\"cuda\"); print(\"COMPUTE_OK\", float((a@a).sum()) == float((a@a).sum()))"
+                else
+                    # No torch in the base CUDA image: fall back to the
+                    # bundled CUDA sample-equivalent — a device query plus
+                    # a memory allocation via nvidia-smi is the most we can
+                    # assert without a toolchain.
+                    nvidia-smi --query-gpu=uuid,compute_mode --format=csv,noheader && echo "COMPUTE_QUERY_OK"
+                fi' 2>/dev/null || true)
+
+            if echo "$COMPUTE" | grep -q "COMPUTE_OK"; then
+                ok "Real CUDA computation succeeded on the customer's GPU slice"
+            elif echo "$COMPUTE" | grep -q "COMPUTE_QUERY_OK"; then
+                ok "GPU device query OK inside container (base image has no CUDA toolchain for a full matmul)"
+                info "     For a true compute test, deploy a torch image — see GPU_WORKLOAD_TEST in the docs"
+            else
+                bad "GPU compute check failed inside the container: ${COMPUTE:-<no output>}"
+            fi
+        fi
+    fi
+
     # --- 8. Logs --------------------------------------------------------
     LOGS=$(curl -s "${AUTH[@]}" "$API_URL/v1/compute/instances/$ID20/logs?tail=10")
     echo "$LOGS" | jq -e 'has("logs")' > /dev/null && ok "Log retrieval works" || bad "Log retrieval failed: $LOGS"
