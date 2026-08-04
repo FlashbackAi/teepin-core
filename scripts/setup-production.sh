@@ -433,6 +433,7 @@ log_info "Step 5/10: Installing cert-manager..."
 
 kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml
 kubectl wait --for=condition=available --timeout=300s deployment/cert-manager -n cert-manager
+kubectl wait --for=condition=available --timeout=300s deployment/cert-manager-webhook -n cert-manager
 
 log_info "cert-manager installed"
 
@@ -451,6 +452,13 @@ helm repo update
 INGRESS_SERVICE_TYPE="${INGRESS_SERVICE_TYPE:-NodePort}"
 log_info "Ingress service type: $INGRESS_SERVICE_TYPE"
 
+# Customer endpoints need the ingress on the REAL ports 80/443:
+#   - customers expect https://inst-xxx.teepin.io, not :30443
+#   - Let's Encrypt HTTP-01 validation only ever connects to port 80
+# hostPort binds the controller directly to the node's ports, which
+# works on bare metal without MetalLB or any cloud load balancer.
+INGRESS_HOST_PORTS="${INGRESS_HOST_PORTS:-true}"
+
 # helm upgrade --install makes re-runs idempotent (a previously failed
 # release would otherwise abort with 'cannot re-use a name').
 helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
@@ -459,6 +467,9 @@ helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
     --set controller.service.type="$INGRESS_SERVICE_TYPE" \
     --set controller.service.nodePorts.http=30080 \
     --set controller.service.nodePorts.https=30443 \
+    --set controller.hostPort.enabled="$INGRESS_HOST_PORTS" \
+    --set controller.hostPort.ports.http=80 \
+    --set controller.hostPort.ports.https=443 \
     --wait --timeout 10m
 
 kubectl wait --for=condition=available --timeout=300s deployment/ingress-nginx-controller -n ingress-nginx
@@ -618,6 +629,19 @@ docker save teepin/api-server:latest -o /tmp/teepin-api-server.tar
 rm -f /tmp/teepin-api-server.tar
 
 log_info "API server image built and imported"
+
+# ClusterIssuers for customer endpoint certificates. Applied after
+# ingress-nginx exists, since the HTTP-01 solver routes through it.
+# The webhook needs a moment after cert-manager becomes available, so
+# retry rather than failing the whole run.
+for i in 1 2 3 4 5; do
+    if kubectl apply -f deploy/production/cluster-issuer.yaml > /dev/null 2>&1; then
+        log_info "cert-manager ClusterIssuers applied (letsencrypt-staging, letsencrypt-prod)"
+        break
+    fi
+    [ "$i" = "5" ] && log_warn "ClusterIssuers not applied — customer endpoints will have no TLS"
+    sleep 10
+done
 
 # Deploy API server. The image tag never changes (latest + IfNotPresent),
 # so on re-runs `apply` alone would keep old pods running the old image —

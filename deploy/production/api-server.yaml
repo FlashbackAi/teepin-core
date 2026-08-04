@@ -206,14 +206,25 @@ spec:
             - name: TEEPIN_DOMAIN
               value: "teepin.io"
 
+            # Namespace customer INSTANCES run in — their Service and
+            # Ingress must be created alongside them. This is "default"
+            # (see createPod); pointing it at teepin-prod puts the
+            # routing objects in a namespace with no instance pods, so
+            # nothing ever resolves.
             - name: TEEPIN_NAMESPACE
-              value: "teepin-prod"
+              value: "default"
 
             - name: ENABLE_TLS
               value: "true"
 
+            # Start on the STAGING issuer: Let's Encrypt production
+            # allows only 50 certs per domain per week, and a
+            # misconfiguration burns that quota fast. Certificates are
+            # untrusted by browsers until this is switched to
+            # letsencrypt-prod, which should happen once an end-to-end
+            # issuance has been observed working.
             - name: TLS_ISSUER
-              value: "letsencrypt-prod"
+              value: "letsencrypt-staging"
 
             - name: RATE_LIMIT_ENABLED
               value: "true"

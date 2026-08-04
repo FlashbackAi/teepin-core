@@ -1,0 +1,58 @@
+# Copyright 2026 TEEPIN Project
+# Licensed under the Apache License, Version 2.0
+
+# cert-manager ClusterIssuers for customer instance endpoints.
+#
+# HTTP-01 solver: cert-manager proves domain ownership by serving a
+# token over HTTP through the shared ingress-nginx controller. This
+# needs the instance hostname to resolve to this cluster's public
+# address — satisfied by the WILDCARD DNS record (*.teepin.io -> node
+# IP), so no DNS provider API credentials are required.
+#
+# Note: HTTP-01 requires port 80 to be reachable from the internet. On
+# a NodePort ingress (bare-metal default, ports 30080/30443) that means
+# either fronting it with something on :80, or running ingress-nginx
+# with hostNetwork/hostPort — see scripts/setup-production.sh.
+#
+# For a WILDCARD certificate (*.teepin.io, one cert for every instance)
+# a DNS-01 solver is required instead, which DOES need provider
+# credentials. Per-instance HTTP-01 certs avoid that at the cost of one
+# ACME order per instance (Let's Encrypt allows 50 certs/domain/week —
+# revisit before high instance churn).
+
+---
+# Staging issuer: use while testing. Let's Encrypt staging has vastly
+# higher rate limits and issues untrusted certs, so a misconfiguration
+# cannot burn the production quota.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    email: admin@teepin.io
+    privateKeySecretRef:
+      name: letsencrypt-staging-account-key
+    solvers:
+      - http01:
+          ingress:
+            class: nginx
+
+---
+# Production issuer: browser-trusted certificates.
+# Rate limit: 50 certificates per registered domain per week.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: admin@teepin.io
+    privateKeySecretRef:
+      name: letsencrypt-prod-account-key
+    solvers:
+      - http01:
+          ingress:
+            class: nginx

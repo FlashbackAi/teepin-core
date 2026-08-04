@@ -150,13 +150,15 @@ func (s *Server) CreateInstance(c *gin.Context) {
 		return
 	}
 
-	// Provision networking endpoint (LoadBalancer + Ingress + TLS)
+	// Provision the public endpoint (ClusterIP Service + Ingress + TLS).
+	// instanceID is passed through: it is both the pod's
+	// app.teepin.cloud/instance-id label (what the Service selects on)
+	// and the customer-facing hostname under the wildcard domain.
 	var endpointInfo *networking.EndpointInfo
 	if s.networkingService != nil && len(req.Ports) > 0 {
-		// Use first exposed port for LoadBalancer
 		exposedPort := int32(req.Ports[0].Container)
 
-		endpointInfo, err = s.networkingService.ProvisionEndpoint(c.Request.Context(), instanceUUID, exposedPort)
+		endpointInfo, err = s.networkingService.ProvisionEndpoint(c.Request.Context(), instanceUUID, instanceID, exposedPort)
 		if err != nil {
 			// Cleanup: delete pod if networking provisioning fails
 			_ = s.k8sClient.CoreV1().Pods("default").Delete(c.Request.Context(), pod.Name, metav1.DeleteOptions{})
