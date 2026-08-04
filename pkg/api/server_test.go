@@ -4,6 +4,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -23,6 +24,7 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/auth"
 	"github.com/FlashbackAi/teepin-core/pkg/compute"
 	"github.com/FlashbackAi/teepin-core/pkg/gpu"
+	"github.com/FlashbackAi/teepin-core/pkg/models"
 )
 
 func init() {
@@ -227,5 +229,59 @@ func TestRequireProjectScope_StandaloneModeAllowsAll(t *testing.T) {
 	}
 	if strings.Contains(w.Body.String(), "error") {
 		t.Errorf("no error should be written in standalone mode")
+	}
+}
+
+// TestCreatePod_GPUPodsGetRuntimeClass guards a defect found in
+// production: without the NVIDIA RuntimeClass, containerd starts GPU
+// pods under plain runc. Kubernetes still accounts for (and TEEPIN
+// still bills) the GPU, but no device nodes or driver libraries are
+// injected — the customer receives a container with no usable GPU.
+func TestCreatePod_GPUPodsGetRuntimeClass(t *testing.T) {
+	server := NewServer(fake.NewSimpleClientset(), nil, nil, nil, nil)
+	req := &models.CreateInstanceRequest{
+		Name: "gpu-instance", Image: "nvidia/cuda:12.3.1-base-ubuntu22.04",
+		CPUUnits: 2, Memory: "8GB",
+	}
+	alloc := &gpu.Allocation{
+		AllocatedVRAM: 10, RequestedVRAM: 10,
+		ResourceName: "nvidia.com/mig-1g.10gb", Quantity: 1,
+		InstanceType: "gpu.h100.1g.10gb",
+	}
+
+	pod, err := server.createPod(context.Background(), "inst-test0001",
+		uuid.New(), uuid.New(), req, alloc)
+	if err != nil {
+		t.Fatalf("createPod failed: %v", err)
+	}
+
+	if pod.Spec.RuntimeClassName == nil {
+		t.Fatal("GPU pod has no RuntimeClassName — the container will get NO usable GPU")
+	}
+	if *pod.Spec.RuntimeClassName != "nvidia" {
+		t.Errorf("RuntimeClassName = %q, want \"nvidia\"", *pod.Spec.RuntimeClassName)
+	}
+
+	// Customer pods must never carry Kubernetes API credentials.
+	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken {
+		t.Error("customer pod must set AutomountServiceAccountToken=false")
+	}
+}
+
+// TestCreatePod_CPUOnlyHasNoRuntimeClass: the NVIDIA runtime is only
+// for GPU workloads; CPU instances must not require it.
+func TestCreatePod_CPUOnlyHasNoRuntimeClass(t *testing.T) {
+	server := NewServer(fake.NewSimpleClientset(), nil, nil, nil, nil)
+	req := &models.CreateInstanceRequest{
+		Name: "cpu-instance", Image: "nginx:latest", CPUUnits: 2, Memory: "4GB",
+	}
+
+	pod, err := server.createPod(context.Background(), "inst-cpu00001",
+		uuid.New(), uuid.New(), req, nil)
+	if err != nil {
+		t.Fatalf("createPod failed: %v", err)
+	}
+	if pod.Spec.RuntimeClassName != nil {
+		t.Errorf("CPU-only pod should not set RuntimeClassName, got %q", *pod.Spec.RuntimeClassName)
 	}
 }

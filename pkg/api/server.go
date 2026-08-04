@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -528,6 +529,20 @@ func (s *Server) createPod(ctx context.Context, instanceID string, instanceUUID,
 		},
 	}
 
+	// GPU pods MUST run under the NVIDIA container runtime. Without it
+	// containerd starts the container with plain runc: Kubernetes still
+	// accounts for the GPU resource, the device nodes and driver
+	// libraries are never injected, and the customer gets a container
+	// with no usable GPU — billed, but unusable. Configurable because
+	// the RuntimeClass name varies (nvidia, nvidia-cdi, ...); set
+	// TEEPIN_GPU_RUNTIME_CLASS="" to disable for clusters where nvidia
+	// is already containerd's default runtime.
+	if allocation != nil {
+		if rc := getEnv("TEEPIN_GPU_RUNTIME_CLASS", "nvidia"); rc != "" {
+			pod.Spec.RuntimeClassName = &rc
+		}
+	}
+
 	// Add GPU resources if allocated
 	if allocation != nil {
 		// VRAM annotations drive capacity accounting (inventory) and
@@ -620,6 +635,17 @@ func podToInstance(pod *corev1.Pod, vramRate float64) models.Instance {
 // boolPtr returns a pointer to b, for Kubernetes API fields that
 // distinguish "false" from "unset".
 func boolPtr(b bool) *bool { return &b }
+
+// getEnv returns the environment variable or a default. Unlike a bare
+// os.Getenv this distinguishes "unset" from "explicitly empty": an
+// explicitly empty value is returned as empty, which callers use to
+// disable optional behaviour.
+func getEnv(key, defaultValue string) string {
+	if v, ok := os.LookupEnv(key); ok {
+		return v
+	}
+	return defaultValue
+}
 
 func parseMemoryGB(memory string) int {
 	m := memoryRe.FindStringSubmatch(memory)
