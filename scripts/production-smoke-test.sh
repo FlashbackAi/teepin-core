@@ -26,10 +26,19 @@ set -euo pipefail
 API_URL="${1:-http://localhost:8080}"
 SKIP_GPU="${SKIP_GPU:-false}"
 
-# RKE2 kubectl env (for the automatic port-forward below).
-if ! command -v kubectl > /dev/null 2>&1; then
+# RKE2 kubectl env. Also covers the case where a snap kubectl (no
+# kubeconfig, talks to localhost:8080) shadows the real one — otherwise
+# the port-forward below fails silently and this reports a misleading
+# "API health check failed".
+if ! command -v kubectl > /dev/null 2>&1 || ! kubectl get nodes > /dev/null 2>&1; then
     export KUBECONFIG=/etc/rancher/rke2/rke2.yaml
-    export PATH=$PATH:/var/lib/rancher/rke2/bin
+    export PATH=/var/lib/rancher/rke2/bin:$PATH
+    if ! kubectl get nodes > /dev/null 2>&1; then
+        echo "ERROR: kubectl cannot reach the cluster."
+        echo "       Tried KUBECONFIG=/etc/rancher/rke2/rke2.yaml with RKE2's kubectl."
+        echo "       Is RKE2 running?  systemctl status rke2-server"
+        exit 1
+    fi
 fi
 
 # When targeting the default localhost URL with nothing listening,

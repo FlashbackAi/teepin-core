@@ -285,3 +285,42 @@ func TestCreatePod_CPUOnlyHasNoRuntimeClass(t *testing.T) {
 		t.Errorf("CPU-only pod should not set RuntimeClassName, got %q", *pod.Spec.RuntimeClassName)
 	}
 }
+
+// TestCreatePod_CommandOverride: without command/args support, images
+// whose default command exits (most base images) crash-loop forever and
+// the customer has no way to keep them alive.
+func TestCreatePod_CommandOverride(t *testing.T) {
+	server := NewServer(fake.NewSimpleClientset(), nil, nil, nil, nil)
+	req := &models.CreateInstanceRequest{
+		Name: "cmd-instance", Image: "nvidia/cuda:12.3.1-base-ubuntu22.04",
+		CPUUnits: 2, Memory: "8GB",
+		Command: []string{"sleep"}, Args: []string{"600"},
+	}
+
+	pod, err := server.createPod(context.Background(), "inst-cmd00001",
+		uuid.New(), uuid.New(), req, nil)
+	if err != nil {
+		t.Fatalf("createPod failed: %v", err)
+	}
+
+	c := pod.Spec.Containers[0]
+	if len(c.Command) != 1 || c.Command[0] != "sleep" {
+		t.Errorf("Command = %v, want [sleep]", c.Command)
+	}
+	if len(c.Args) != 1 || c.Args[0] != "600" {
+		t.Errorf("Args = %v, want [600]", c.Args)
+	}
+
+	// Omitting them must leave the image defaults untouched.
+	req2 := &models.CreateInstanceRequest{
+		Name: "default-cmd", Image: "nginx:latest", CPUUnits: 1, Memory: "1GB",
+	}
+	pod2, err := server.createPod(context.Background(), "inst-cmd00002",
+		uuid.New(), uuid.New(), req2, nil)
+	if err != nil {
+		t.Fatalf("createPod failed: %v", err)
+	}
+	if pod2.Spec.Containers[0].Command != nil {
+		t.Errorf("Command should be nil when unset, got %v", pod2.Spec.Containers[0].Command)
+	}
+}

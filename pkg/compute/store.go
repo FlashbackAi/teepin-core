@@ -86,10 +86,14 @@ func (s *Store) Create(ctx context.Context, rec *InstanceRecord) error {
 // UpdateStatus sets the instance status. When the status becomes
 // running for the first time, started_at is stamped.
 func (s *Store) UpdateStatus(ctx context.Context, id, status string) error {
+	// $1 is cast explicitly: using the same placeholder for both the
+	// assignment and the comparison makes PostgreSQL fail with
+	// "inconsistent types deduced for parameter $1", so every status
+	// update errored and started_at was never stamped.
 	query := `
 		UPDATE compute.instances
-		SET status = $1,
-		    started_at = CASE WHEN $1 = 'running' AND started_at IS NULL
+		SET status = $1::varchar,
+		    started_at = CASE WHEN $1::varchar = 'running' AND started_at IS NULL
 		                      THEN NOW() ELSE started_at END
 		WHERE id = $2 AND terminated_at IS NULL
 	`

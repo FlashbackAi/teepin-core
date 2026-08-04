@@ -512,8 +512,12 @@ func (s *Server) createPod(ctx context.Context, instanceID string, instanceUUID,
 			AutomountServiceAccountToken: boolPtr(false),
 			Containers: []corev1.Container{
 				{
-					Name:  "app",
-					Image: req.Image,
+					Name: "app",
+					// Optional overrides for the image's ENTRYPOINT/CMD.
+					// nil leaves the image defaults in place.
+					Command: req.Command,
+					Args:    req.Args,
+					Image:   req.Image,
 					Resources: corev1.ResourceRequirements{
 						Requests: corev1.ResourceList{
 							corev1.ResourceCPU:    resource.MustParse(fmt.Sprintf("%d", req.CPUUnits)),

@@ -63,12 +63,23 @@ PROFILE
 grep -q "teepin-k8s" /root/.bashrc 2>/dev/null || \
     echo '[ -f /etc/profile.d/teepin-k8s.sh ] && . /etc/profile.d/teepin-k8s.sh' >> /root/.bashrc
 
-# Belt and braces: symlink kubectl into a directory that is on every
-# shell's default PATH, so an already-open (stale) shell still works
-# and nobody is tempted to `snap install kubectl` — a snap kubectl has
-# no kubeconfig and fails against localhost:8080.
-if [ -x /var/lib/rancher/rke2/bin/kubectl ] && [ ! -e /usr/local/bin/kubectl ]; then
-    ln -sf /var/lib/rancher/rke2/bin/kubectl /usr/local/bin/kubectl
+# A script cannot export into the shell that invoked it, so profile.d
+# and .bashrc only help NEW shells. This wrapper needs no environment
+# at all: it hardcodes the kubeconfig, so kubectl works in any shell —
+# already-open, non-login, cron, whatever.
+#
+# Installed at /usr/bin (not /usr/local/bin) because Ubuntu puts
+# /snap/bin ahead of /usr/local/bin: a stray `snap install kubectl`
+# would otherwise shadow it and fail against localhost:8080.
+# Overwritten every run so a snap install never wins.
+if [ -x /var/lib/rancher/rke2/bin/kubectl ]; then
+    cat > /usr/bin/kubectl <<'KWRAP'
+#!/bin/sh
+# TEEPIN: kubectl wrapper with the RKE2 kubeconfig baked in.
+export KUBECONFIG="${KUBECONFIG:-/etc/rancher/rke2/rke2.yaml}"
+exec /var/lib/rancher/rke2/bin/kubectl "$@"
+KWRAP
+    chmod +x /usr/bin/kubectl
 fi
 
 echo "TEEPIN Production Setup"

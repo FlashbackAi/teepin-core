@@ -37,7 +37,13 @@ type CreateInstanceRequest struct {
 	InstanceType string            `json:"instance_type,omitempty"` // Legacy: "gpu.h100.mig-2g"
 	CPUUnits     int               `json:"cpu_units" binding:"required,min=1"`
 	Memory       string            `json:"memory" binding:"required"` // e.g., "32GB"
-	Ports        []PortMapping     `json:"ports,omitempty"`
+	// Command and Args override the image's ENTRYPOINT and CMD. Without
+	// them an image whose default command exits (most base images,
+	// including nvidia/cuda:*-base) crash-loops forever with no way for
+	// the customer to keep it alive.
+	Command []string      `json:"command,omitempty"`
+	Args    []string      `json:"args,omitempty"`
+	Ports   []PortMapping `json:"ports,omitempty"`
 	Env          map[string]string `json:"env,omitempty"`
 	Labels       map[string]string `json:"labels,omitempty"`
 }
