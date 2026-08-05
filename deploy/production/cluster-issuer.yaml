@@ -6,7 +6,7 @@
 # HTTP-01 solver: cert-manager proves domain ownership by serving a
 # token over HTTP through the shared ingress-nginx controller. This
 # needs the instance hostname to resolve to this cluster's public
-# address — satisfied by the WILDCARD DNS record (*.teepin.io -> node
+# address — satisfied by the WILDCARD DNS record (*.teepin.com -> node
 # IP), so no DNS provider API credentials are required.
 #
 # Note: HTTP-01 requires port 80 to be reachable from the internet. On
@@ -14,7 +14,7 @@
 # either fronting it with something on :80, or running ingress-nginx
 # with hostNetwork/hostPort — see scripts/setup-production.sh.
 #
-# For a WILDCARD certificate (*.teepin.io, one cert for every instance)
+# For a WILDCARD certificate (*.teepin.com, one cert for every instance)
 # a DNS-01 solver is required instead, which DOES need provider
 # credentials. Per-instance HTTP-01 certs avoid that at the cost of one
 # ACME order per instance (Let's Encrypt allows 50 certs/domain/week —
@@ -31,7 +31,7 @@ metadata:
 spec:
   acme:
     server: https://acme-staging-v02.api.letsencrypt.org/directory
-    email: admin@teepin.io
+    email: admin@teepin.com
     privateKeySecretRef:
       name: letsencrypt-staging-account-key
     solvers:
@@ -49,7 +49,7 @@ metadata:
 spec:
   acme:
     server: https://acme-v02.api.letsencrypt.org/directory
-    email: admin@teepin.io
+    email: admin@teepin.com
     privateKeySecretRef:
       name: letsencrypt-prod-account-key
     solvers:

@@ -204,7 +204,7 @@ spec:
               value: "release"
 
             - name: TEEPIN_DOMAIN
-              value: "teepin.io"
+              value: "teepin.com"
 
             # Namespace customer INSTANCES run in — their Service and
             # Ingress must be created alongside them. This is "default"
@@ -217,14 +217,15 @@ spec:
             - name: ENABLE_TLS
               value: "true"
 
-            # Start on the STAGING issuer: Let's Encrypt production
-            # allows only 50 certs per domain per week, and a
-            # misconfiguration burns that quota fast. Certificates are
-            # untrusted by browsers until this is switched to
-            # letsencrypt-prod, which should happen once an end-to-end
-            # issuance has been observed working.
+            # Production issuer: browser-trusted certificates.
+            # Staging (letsencrypt-staging) issues from an UNTRUSTED CA
+            # — browsers show "Not secure" — so it is only for shaking
+            # out the HTTP-01 pipeline. Verified working end to end on
+            # 2026-08-04, hence production here.
+            # Rate limit: 50 certificates per registered domain per
+            # week; switch back to staging for any high-churn testing.
             - name: TLS_ISSUER
-              value: "letsencrypt-staging"
+              value: "letsencrypt-prod"
 
             - name: RATE_LIMIT_ENABLED
               value: "true"
