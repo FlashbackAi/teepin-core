@@ -178,8 +178,11 @@ CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PATCH "$API_URL/v1/accounts/cur
 # first account's project, even holding a valid token and the real
 # project UUID. Must be 404 — a 403 would confirm the project exists.
 OTHER_EMAIL="other-${STAMP}@test.teepin.io"
-curl -s -X POST "$API_URL/v1/accounts" -H "Content-Type: application/json" \
-    -d "{\"type\":\"personal\",\"display_name\":\"Other Tenant\",\"email\":\"$OTHER_EMAIL\",\"password\":\"$PASSWORD\"}" > /dev/null
+# The alias must be explicit and unique: a personal account derives its
+# alias from the display name, so a fixed name collides on the second
+# run (aliases are globally unique).
+OTHER_RESP=$(curl -s -X POST "$API_URL/v1/accounts" -H "Content-Type: application/json" \
+    -d "{\"type\":\"personal\",\"display_name\":\"Other Tenant\",\"alias\":\"other-${STAMP}\",\"email\":\"$OTHER_EMAIL\",\"password\":\"$PASSWORD\"}")
 OTHER_TOKEN=$(curl -s -X POST "$API_URL/v1/auth/login" -H "Content-Type: application/json" \
     -d "{\"email\":\"$OTHER_EMAIL\",\"password\":\"$PASSWORD\"}" | jq -r '.access_token // empty')
 
@@ -198,7 +201,7 @@ if [ -n "$OTHER_TOKEN" ]; then
     [ "${OTHER_COUNT:-0}" = "0" ] && ok "Another account's project list is empty" \
                                   || bad "Another account sees $OTHER_COUNT projects — tenancy is broken"
 else
-    bad "Could not create the second account for the isolation check"
+    bad "Could not create the second account for the isolation check: $OTHER_RESP"
 fi
 
 # --- 3. Tenancy: unauthenticated access must be rejected ---------------
