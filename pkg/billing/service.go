@@ -30,13 +30,15 @@ func NewService(db *sql.DB) *Service {
 func (s *Service) RecordUsage(ctx context.Context, record *UsageRecord) error {
 	query := `
 		INSERT INTO billing.usage_records
-		(project_id, instance_id, resource_type, quantity, unit, unit_price, total_cost, start_time, end_time)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		(account_id, project_id, instance_id, resource_type, quantity, unit,
+		 unit_price, total_cost, start_time, end_time)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		RETURNING id, created_at
 	`
 
 	err := s.db.QueryRowContext(
 		ctx, query,
+		record.AccountID,
 		record.ProjectID,
 		record.InstanceID,
 		record.ResourceType,

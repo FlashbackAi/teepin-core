@@ -24,7 +24,7 @@ func newMockCollector(t *testing.T) (*UsageCollector, sqlmock.Sqlmock) {
 
 func billableInstanceRows() *sqlmock.Rows {
 	return sqlmock.NewRows([]string{
-		"id", "project_id", "instance_type_id", "gpu_vram_gb", "created_at", "terminated_at",
+		"id", "account_id", "project_id", "instance_type_id", "gpu_vram_gb", "created_at", "terminated_at",
 	})
 }
 
@@ -35,14 +35,14 @@ func expectPricingRead(mock sqlmock.Sqlmock, rate float64) {
 
 func TestCollectUsage_BillsCustomSizeLinearly(t *testing.T) {
 	collector, mock := newMockCollector(t)
-	projectID := uuid.New()
+	accountID, projectID := uuid.New(), uuid.New()
 	createdAt := time.Now().Add(-2 * time.Hour)
 
 	// A 25GB custom instance running for ~2 hours. The old rate-table
 	// logic priced unknown types at $0 — this must now bill $0.10/GB-hr.
 	mock.ExpectQuery(`SELECT .+ FROM compute\.instances`).
 		WillReturnRows(billableInstanceRows().
-			AddRow("inst-25gb0001", projectID, "gpu.h100.custom-25gb", 25, createdAt, nil))
+			AddRow("inst-25gb0001", accountID, projectID, "gpu.h100.custom-25gb", 25, createdAt, nil))
 
 	// No previous collection.
 	mock.ExpectQuery(`SELECT MAX\(end_time\)`).
@@ -54,7 +54,7 @@ func TestCollectUsage_BillsCustomSizeLinearly(t *testing.T) {
 
 	// Usage record: unit price must be exactly 25 * $0.10 = $2.50/hr.
 	mock.ExpectQuery(`INSERT INTO billing\.usage_records`).
-		WithArgs(projectID, "inst-25gb0001", "gpu.h100.custom-25gb",
+		WithArgs(accountID, projectID, "inst-25gb0001", "gpu.h100.custom-25gb",
 			sqlmock.AnyArg(), // hours (wall-clock dependent)
 			"hours",
 			2.50,             // unit price — the regression this test guards
@@ -73,12 +73,12 @@ func TestCollectUsage_BillsCustomSizeLinearly(t *testing.T) {
 
 func TestCollectUsage_UsesAdminConfiguredRate(t *testing.T) {
 	collector, mock := newMockCollector(t)
-	projectID := uuid.New()
+	accountID, projectID := uuid.New(), uuid.New()
 	createdAt := time.Now().Add(-1 * time.Hour)
 
 	mock.ExpectQuery(`SELECT .+ FROM compute\.instances`).
 		WillReturnRows(billableInstanceRows().
-			AddRow("inst-20gb0001", projectID, "gpu.a100.2g.20gb", 20, createdAt, nil))
+			AddRow("inst-20gb0001", accountID, projectID, "gpu.a100.2g.20gb", 20, createdAt, nil))
 
 	mock.ExpectQuery(`SELECT MAX\(end_time\)`).
 		WithArgs("inst-20gb0001").
@@ -88,7 +88,7 @@ func TestCollectUsage_UsesAdminConfiguredRate(t *testing.T) {
 	expectPricingRead(mock, 0.20)
 
 	mock.ExpectQuery(`INSERT INTO billing\.usage_records`).
-		WithArgs(projectID, "inst-20gb0001", "gpu.a100.2g.20gb",
+		WithArgs(accountID, projectID, "inst-20gb0001", "gpu.a100.2g.20gb",
 			sqlmock.AnyArg(), "hours",
 			4.00, // 20GB at the admin-configured $0.20/GB-hr
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
@@ -105,7 +105,7 @@ func TestCollectUsage_UsesAdminConfiguredRate(t *testing.T) {
 
 func TestCollectUsage_BillsTerminatedTail(t *testing.T) {
 	collector, mock := newMockCollector(t)
-	projectID := uuid.New()
+	accountID, projectID := uuid.New(), uuid.New()
 	createdAt := time.Now().Add(-50 * time.Minute)
 	terminatedAt := time.Now().Add(-10 * time.Minute)
 
@@ -114,7 +114,7 @@ func TestCollectUsage_BillsTerminatedTail(t *testing.T) {
 	// so this workload was never billed at all.
 	mock.ExpectQuery(`SELECT .+ FROM compute\.instances`).
 		WillReturnRows(billableInstanceRows().
-			AddRow("inst-short001", projectID, "gpu.a100.2g.20gb", 20, createdAt, terminatedAt))
+			AddRow("inst-short001", accountID, projectID, "gpu.a100.2g.20gb", 20, createdAt, terminatedAt))
 
 	mock.ExpectQuery(`SELECT MAX\(end_time\)`).
 		WithArgs("inst-short001").
@@ -124,7 +124,7 @@ func TestCollectUsage_BillsTerminatedTail(t *testing.T) {
 
 	// The record must end exactly at terminated_at — not at "now".
 	mock.ExpectQuery(`INSERT INTO billing\.usage_records`).
-		WithArgs(projectID, "inst-short001", "gpu.a100.2g.20gb",
+		WithArgs(accountID, projectID, "inst-short001", "gpu.a100.2g.20gb",
 			sqlmock.AnyArg(), "hours",
 			2.00,             // 20GB * $0.10
 			sqlmock.AnyArg(), // total cost
@@ -147,7 +147,7 @@ func TestCollectUsage_SkipsCPUOnlyInstances(t *testing.T) {
 	// CPU-only instance (no VRAM): no usage record must be written.
 	mock.ExpectQuery(`SELECT .+ FROM compute\.instances`).
 		WillReturnRows(billableInstanceRows().
-			AddRow("inst-cpu00001", uuid.New(), "cpu.small", 0, time.Now().Add(-3*time.Hour), nil))
+			AddRow("inst-cpu00001", uuid.New(), uuid.New(), "cpu.small", 0, time.Now().Add(-3*time.Hour), nil))
 
 	if err := collector.collectUsage(context.Background()); err != nil {
 		t.Fatalf("collectUsage failed: %v", err)
@@ -162,7 +162,7 @@ func TestCollectUsage_SkipsRecentlyCollected(t *testing.T) {
 
 	mock.ExpectQuery(`SELECT .+ FROM compute\.instances`).
 		WillReturnRows(billableInstanceRows().
-			AddRow("inst-20gb0001", uuid.New(), "gpu.h100.2g.20gb", 20, time.Now().Add(-5*time.Hour), nil))
+			AddRow("inst-20gb0001", uuid.New(), uuid.New(), "gpu.h100.2g.20gb", 20, time.Now().Add(-5*time.Hour), nil))
 
 	// Last collection was 30 seconds ago → below the 1-minute floor,
 	// no new record (and no pricing read either).

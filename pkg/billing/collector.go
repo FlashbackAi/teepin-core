@@ -140,6 +140,7 @@ func (c *UsageCollector) collectUsage(ctx context.Context) error {
 
 		// Record usage
 		record := &UsageRecord{
+			AccountID:    inst.AccountID,
 			ProjectID:    inst.ProjectID,
 			InstanceID:   inst.ID,
 			ResourceType: inst.InstanceType,
@@ -167,6 +168,7 @@ func (c *UsageCollector) collectUsage(ctx context.Context) error {
 // TerminatedAt means the instance is still running.
 type billableInstance struct {
 	ID           string
+	AccountID    uuid.UUID
 	ProjectID    uuid.UUID
 	InstanceType string
 	GPUVRAMGB    int
@@ -179,7 +181,7 @@ type billableInstance struct {
 // beyond their last billed end_time (the unbilled tail).
 func (c *UsageCollector) getBillableInstances(ctx context.Context) ([]billableInstance, error) {
 	query := `
-		SELECT i.id, i.project_id, COALESCE(i.instance_type_id, ''),
+		SELECT i.id, i.account_id, i.project_id, COALESCE(i.instance_type_id, ''),
 		       COALESCE(i.gpu_vram_gb, 0), i.created_at, i.terminated_at
 		FROM compute.instances i
 		LEFT JOIN LATERAL (
@@ -204,7 +206,7 @@ func (c *UsageCollector) getBillableInstances(ctx context.Context) ([]billableIn
 	var instances []billableInstance
 	for rows.Next() {
 		var inst billableInstance
-		if err := rows.Scan(&inst.ID, &inst.ProjectID, &inst.InstanceType, &inst.GPUVRAMGB, &inst.CreatedAt, &inst.TerminatedAt); err != nil {
+		if err := rows.Scan(&inst.ID, &inst.AccountID, &inst.ProjectID, &inst.InstanceType, &inst.GPUVRAMGB, &inst.CreatedAt, &inst.TerminatedAt); err != nil {
 			return nil, fmt.Errorf("scan failed: %w", err)
 		}
 		instances = append(instances, inst)

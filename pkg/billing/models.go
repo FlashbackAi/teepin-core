@@ -11,7 +11,11 @@ import (
 
 // UsageRecord represents a metered usage record
 type UsageRecord struct {
-	ID           uuid.UUID `json:"id"`
+	ID uuid.UUID `json:"id"`
+	// AccountID is the billed tenant. NOT NULL in the schema: a usage
+	// record with no account cannot be invoiced, so the insert must
+	// always carry it.
+	AccountID    uuid.UUID `json:"account_id"`
 	ProjectID    uuid.UUID `json:"project_id"`
 	InstanceID   string    `json:"instance_id"`
 	ResourceType string    `json:"resource_type"`
