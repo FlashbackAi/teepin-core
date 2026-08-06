@@ -7,8 +7,15 @@ import (
 )
 
 type User struct {
-	ID            uuid.UUID  `json:"id"`
-	Email         string     `json:"email"`
+	ID        uuid.UUID `json:"id"`
+	AccountID uuid.UUID `json:"account_id"`
+	Email     string    `json:"email"`
+	// Username is set for sub-users, who sign in with
+	// alias + username + password. Account owners sign in with their
+	// globally-unique email and leave this empty.
+	Username      string     `json:"username,omitempty"`
+	Role          string     `json:"role"` // owner | admin | member | viewer
+	Status        string     `json:"status,omitempty"`
 	PasswordHash  string     `json:"-"` // Never expose
 	FullName      string     `json:"full_name,omitempty"`
 	EmailVerified bool       `json:"email_verified"`
@@ -17,8 +24,31 @@ type User struct {
 	DeletedAt     *time.Time `json:"deleted_at,omitempty"`
 }
 
+// CanManageUsers reports whether the role may invite, edit or remove
+// sub-users.
+func (u *User) CanManageUsers() bool {
+	return u.Role == RoleOwner || u.Role == RoleAdmin
+}
+
+// CanManageBilling reports whether the role may change payment details.
+// Deliberately owner-only: admins run infrastructure, they do not hold
+// spending authority.
+func (u *User) CanManageBilling() bool {
+	return u.Role == RoleOwner
+}
+
+// CanWrite reports whether the role may create or delete resources.
+func (u *User) CanWrite() bool {
+	return u.Role == RoleOwner || u.Role == RoleAdmin || u.Role == RoleMember
+}
+
 type Project struct {
-	ID          uuid.UUID  `json:"id"`
+	ID uuid.UUID `json:"id"`
+	// AccountID is the tenant that owns this project. Every query
+	// touching a project must filter on it.
+	AccountID uuid.UUID `json:"account_id"`
+	// OwnerID records which user created the project; it confers no
+	// exclusive rights, since the ACCOUNT owns the project.
 	OwnerID     uuid.UUID  `json:"owner_id"`
 	Name        string     `json:"name"`
 	Slug        string     `json:"slug"`
@@ -29,7 +59,11 @@ type Project struct {
 }
 
 type APIKey struct {
-	ID         uuid.UUID  `json:"id"`
+	ID uuid.UUID `json:"id"`
+	// AccountID is resolved from the key's project at validation time,
+	// not stored on the key — one source of truth for which tenant a
+	// key belongs to.
+	AccountID  uuid.UUID  `json:"account_id"`
 	ProjectID  uuid.UUID  `json:"project_id"`
 	UserID     uuid.UUID  `json:"user_id"`
 	Name       string     `json:"name"`

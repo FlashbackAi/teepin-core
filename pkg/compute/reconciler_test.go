@@ -32,7 +32,7 @@ func managedPod(instanceID string, phase corev1.PodPhase) *corev1.Pod {
 func expectListActive(mock sqlmock.Sqlmock, id, status string) {
 	mock.ExpectQuery(`SELECT .+ FROM compute\.instances WHERE terminated_at IS NULL`).
 		WillReturnRows(instanceRows().AddRow(
-			id, uuid.New(), uuid.New(), "app", "nginx:latest",
+			id, uuid.New(), uuid.New(), uuid.New(), "app", "nginx:latest",
 			"gpu.h100.2g.20gb", status, 20, 8, 32, "",
 			id+"-pod", "default", time.Now(), time.Now(), nil, nil,
 		))

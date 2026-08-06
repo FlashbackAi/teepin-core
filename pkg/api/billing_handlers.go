@@ -44,33 +44,31 @@ func (h *BillingHandler) resolveProjectID(c *gin.Context) (uuid.UUID, error) {
 			return uuid.Nil, fmt.Errorf("invalid project_id format")
 		}
 
-		// Verify user has access to this project
-		userID, exists := auth.GetUserID(c)
+		// Tenancy: the project must belong to the caller's account.
+		// Without this an attacker could read another customer's
+		// billing simply by passing their project_id.
+		accountID, exists := auth.GetAccountID(c)
 		if !exists {
 			return uuid.Nil, fmt.Errorf("authentication required")
 		}
 
-		project, err := h.authService.GetProject(c.Request.Context(), projectID)
-		if err != nil {
+		if _, err := h.authService.GetProject(c.Request.Context(), accountID, projectID); err != nil {
+			// Deliberately indistinguishable from a nonexistent project.
 			return uuid.Nil, fmt.Errorf("project not found")
-		}
-
-		if project.OwnerID != userID {
-			return uuid.Nil, fmt.Errorf("access denied to project")
 		}
 
 		return projectID, nil
 	}
 
-	// Fall back to user's first project
-	userID, exists := auth.GetUserID(c)
+	// Fall back to the account's first project.
+	accountID, exists := auth.GetAccountID(c)
 	if !exists {
 		return uuid.Nil, fmt.Errorf("project_id required (provide in query param or use API key)")
 	}
 
-	projects, err := h.authService.ListProjects(c.Request.Context(), userID)
+	projects, err := h.authService.ListProjects(c.Request.Context(), accountID)
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("failed to get user projects: %w", err)
+		return uuid.Nil, fmt.Errorf("failed to list projects: %w", err)
 	}
 
 	if len(projects) == 0 {
@@ -300,4 +298,46 @@ func (h *BillingHandler) GetCurrentMonthUsage(c *gin.Context) {
 // daysInMonth returns the number of days in a given month
 func daysInMonth(t time.Time) int {
 	return time.Date(t.Year(), t.Month()+1, 0, 0, 0, 0, 0, time.UTC).Day()
+}
+
+// GetAccountSummary returns the account bill for a period, broken down
+// project → service. Defaults to month-to-date, which is what the
+// console dashboard shows.
+// GET /v1/billing/summary?start=&end=
+func (h *BillingHandler) GetAccountSummary(c *gin.Context) {
+	accountID, exists := auth.GetAccountID(c)
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
+		return
+	}
+
+	start, end := billing.CurrentMonthRange(time.Now())
+	if v := c.Query("start"); v != "" {
+		parsed, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid start (expected RFC3339)"})
+			return
+		}
+		start = parsed
+	}
+	if v := c.Query("end"); v != "" {
+		parsed, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid end (expected RFC3339)"})
+			return
+		}
+		end = parsed
+	}
+	if end.Before(start) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "end must be after start"})
+		return
+	}
+
+	summary, err := h.billingService.GetAccountSummary(c.Request.Context(), accountID, start, end)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, summary)
 }

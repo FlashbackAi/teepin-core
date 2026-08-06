@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -64,11 +65,13 @@ func main() {
 	}
 	var authService *auth.Service
 	var authHandler *api.AuthHandler
+	var accountHandler *api.AccountHandler
 	var authMiddleware *auth.Middleware
 
 	if dbClient != nil {
 		authService = auth.NewService(dbClient.DB(), jwtSecret)
 		authHandler = api.NewAuthHandler(authService)
+		accountHandler = api.NewAccountHandler(authService)
 		authMiddleware = auth.NewMiddleware(authService, jwtSecret)
 		log.Println("✅ Authentication system initialized")
 	}
@@ -226,7 +229,7 @@ func main() {
 	}
 
 	// Setup router
-	router := setupRouter(apiServer, authHandler, authMiddleware, billingHandler, registryHandler, adminHandler, rateLimitMiddleware)
+	router := setupRouter(apiServer, authHandler, accountHandler, authMiddleware, billingHandler, registryHandler, adminHandler, rateLimitMiddleware)
 
 	// Create HTTP server
 	port := getEnv("PORT", "8080")
@@ -359,7 +362,7 @@ func initRateLimiting() *ratelimit.Config {
 	return config
 }
 
-func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler, registryHandler *api.RegistryHandler, adminHandler *api.AdminHandler, rateLimitMiddleware *ratelimit.Middleware) *gin.Engine {
+func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHandler *api.AccountHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler, registryHandler *api.RegistryHandler, adminHandler *api.AdminHandler, rateLimitMiddleware *ratelimit.Middleware) *gin.Engine {
 	// Set Gin to release mode in production
 	if os.Getenv("GIN_MODE") == "" {
 		gin.SetMode(gin.ReleaseMode)
@@ -389,9 +392,33 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, authMiddle
 		if authHandler != nil {
 			authRoutes := v1.Group("/auth")
 			{
-				authRoutes.POST("/register", authHandler.Register)
+				// Account owners sign in by email; sub-users by
+				// account alias + username, since the same email may
+				// exist in several accounts.
 				authRoutes.POST("/login", authHandler.Login)
 				authRoutes.GET("/me", authMiddleware.RequireAuth(), authHandler.GetCurrentUser)
+				if accountHandler != nil {
+					authRoutes.POST("/login/sub-user", accountHandler.LoginSubUser)
+				}
+			}
+
+			// Account endpoints. Registration creates an account plus
+			// its owner user — every user belongs to an account,
+			// because the account is what gets billed.
+			if accountHandler != nil {
+				v1.POST("/accounts", accountHandler.Register)
+
+				accounts := v1.Group("/accounts/current")
+				accounts.Use(authMiddleware.RequireAuth())
+				{
+					accounts.GET("", accountHandler.GetCurrent)
+					accounts.PATCH("", accountHandler.UpdateCurrent)
+					accounts.POST("/convert-to-organization", accountHandler.ConvertToOrganization)
+					accounts.GET("/users", accountHandler.ListUsers)
+					accounts.POST("/users", accountHandler.CreateUser)
+					accounts.PATCH("/users/:user_id", accountHandler.UpdateUser)
+					accounts.DELETE("/users/:user_id", accountHandler.DeleteUser)
+				}
 			}
 
 			// Project endpoints (require auth)
@@ -420,6 +447,7 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, authMiddle
 			billing := v1.Group("/billing")
 			billing.Use(authMiddleware.RequireAuth())
 			{
+				billing.GET("/summary", billingHandler.GetAccountSummary)
 				billing.GET("/usage", billingHandler.GetUsageSummary)
 				billing.GET("/usage/records", billingHandler.GetUsageRecords)
 				billing.GET("/current-month", billingHandler.GetCurrentMonthUsage)
@@ -481,15 +509,49 @@ func versionHandler(c *gin.Context) {
 	})
 }
 
+// corsMiddleware allows browser clients (the console) to call the API
+// cross-origin.
+//
+// Origins are an explicit allowlist, never "*": a wildcard origin
+// combined with Allow-Credentials is rejected outright by every
+// browser, so the previous "*" + credentials:true combination meant no
+// authenticated cross-origin request could ever succeed. The allowlist
+// also stops arbitrary sites driving the API with a user's cookies.
+//
+// Configure with TEEPIN_CORS_ORIGINS (comma-separated). Defaults cover
+// the production console and local development.
 func corsMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
-		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
-		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With")
-		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT, DELETE, PATCH")
+	raw := getEnv("TEEPIN_CORS_ORIGINS",
+		"https://console.teepin.com,http://localhost:3000")
 
-		if c.Request.Method == "OPTIONS" {
-			c.AbortWithStatus(204)
+	allowed := map[string]bool{}
+	for _, o := range strings.Split(raw, ",") {
+		if o = strings.TrimSpace(o); o != "" {
+			allowed[o] = true
+		}
+	}
+	log.Printf("CORS allowed origins: %s", raw)
+
+	return func(c *gin.Context) {
+		origin := c.GetHeader("Origin")
+
+		if origin != "" && allowed[origin] {
+			c.Writer.Header().Set("Access-Control-Allow-Origin", origin)
+			c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
+			// Responses vary by Origin — without this, a shared cache
+			// could serve one origin's headers to another.
+			c.Writer.Header().Add("Vary", "Origin")
+			c.Writer.Header().Set("Access-Control-Allow-Headers",
+				"Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, Accept, Origin, Cache-Control, X-Requested-With")
+			c.Writer.Header().Set("Access-Control-Allow-Methods",
+				"GET, POST, PUT, PATCH, DELETE, OPTIONS")
+			c.Writer.Header().Set("Access-Control-Max-Age", "86400")
+		}
+
+		// Preflight: answer here regardless — a disallowed origin simply
+		// receives no CORS headers and the browser blocks it.
+		if c.Request.Method == http.MethodOptions {
+			c.AbortWithStatus(http.StatusNoContent)
 			return
 		}
 

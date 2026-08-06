@@ -87,11 +87,14 @@ func (h *AuthHandler) GetCurrentUser(c *gin.Context) {
 // CreateProject creates a new project
 // POST /v1/projects
 func (h *AuthHandler) CreateProject(c *gin.Context) {
-	userID, exists := auth.GetUserID(c)
-	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "not authenticated"})
+	accountID, ok := requireAccount(c)
+	if !ok {
 		return
 	}
+	if !requireWriteRole(c) {
+		return
+	}
+	userID, _ := auth.GetUserID(c)
 
 	var req struct {
 		Name        string `json:"name" binding:"required"`
@@ -103,7 +106,8 @@ func (h *AuthHandler) CreateProject(c *gin.Context) {
 		return
 	}
 
-	project, err := h.authService.CreateProject(c.Request.Context(), userID, req.Name, req.Description)
+	// The account owns the project; userID only records who created it.
+	project, err := h.authService.CreateProject(c.Request.Context(), accountID, userID, req.Name, req.Description)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -115,41 +119,42 @@ func (h *AuthHandler) CreateProject(c *gin.Context) {
 // ListProjects lists all projects for the authenticated user
 // GET /v1/projects
 func (h *AuthHandler) ListProjects(c *gin.Context) {
-	userID, exists := auth.GetUserID(c)
-	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "not authenticated"})
+	accountID, ok := requireAccount(c)
+	if !ok {
 		return
 	}
 
-	projects, err := h.authService.ListProjects(c.Request.Context(), userID)
+	// Every member of the account sees its projects — scoping by user
+	// would hide a colleague's projects from their own teammates.
+	projects, err := h.authService.ListProjects(c.Request.Context(), accountID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"projects": projects})
+	c.JSON(http.StatusOK, gin.H{"projects": projects, "count": len(projects)})
 }
 
 // GetProject retrieves a specific project
 // GET /v1/projects/:id
 func (h *AuthHandler) GetProject(c *gin.Context) {
-	projectIDStr := c.Param("id")
-	projectID, err := uuid.Parse(projectIDStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid project ID"})
+	projectID, ok := parseProjectID(c)
+	if !ok {
+		return
+	}
+	accountID, ok := requireAccount(c)
+	if !ok {
 		return
 	}
 
-	project, err := h.authService.GetProject(c.Request.Context(), projectID)
+	// Tenancy is enforced in the query itself: a project in another
+	// account simply does not match, so it is reported as not found.
+	// The previous owner_id comparison both leaked existence (403 tells
+	// you it exists) and denied colleagues access to their own account's
+	// projects.
+	project, err := h.authService.GetProject(c.Request.Context(), accountID, projectID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "project not found"})
-		return
-	}
-
-	// TODO: Check if user has access to this project
-	userID, _ := auth.GetUserID(c)
-	if project.OwnerID != userID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
 		return
 	}
 
@@ -165,21 +170,18 @@ func (h *AuthHandler) CreateAPIKey(c *gin.Context) {
 		return
 	}
 
-	projectIDStr := c.Param("id")
-	projectID, err := uuid.Parse(projectIDStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid project ID"})
+	projectID, ok := parseProjectID(c)
+	if !ok {
+		return
+	}
+	if !requireWriteRole(c) {
 		return
 	}
 
-	// Verify user owns the project
-	project, err := h.authService.GetProject(c.Request.Context(), projectID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "project not found"})
-		return
-	}
-	if project.OwnerID != userID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
+	// Tenancy: the project must belong to the caller's account.
+	// Reported as 404 rather than 403 so the response never confirms
+	// that another account's project exists.
+	if _, ok := h.requireAccountProject(c, projectID); !ok {
 		return
 	}
 
@@ -212,27 +214,15 @@ func (h *AuthHandler) CreateAPIKey(c *gin.Context) {
 // ListAPIKeys lists all API keys for a project
 // GET /v1/projects/:id/api-keys
 func (h *AuthHandler) ListAPIKeys(c *gin.Context) {
-	userID, exists := auth.GetUserID(c)
-	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "not authenticated"})
+	projectID, ok := parseProjectID(c)
+	if !ok {
 		return
 	}
 
-	projectIDStr := c.Param("id")
-	projectID, err := uuid.Parse(projectIDStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid project ID"})
-		return
-	}
-
-	// Verify user owns the project
-	project, err := h.authService.GetProject(c.Request.Context(), projectID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "project not found"})
-		return
-	}
-	if project.OwnerID != userID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
+	// Tenancy: the project must belong to the caller's account.
+	// Reported as 404 rather than 403 so the response never confirms
+	// that another account's project exists.
+	if _, ok := h.requireAccountProject(c, projectID); !ok {
 		return
 	}
 
@@ -248,16 +238,11 @@ func (h *AuthHandler) ListAPIKeys(c *gin.Context) {
 // RevokeAPIKey revokes an API key
 // DELETE /v1/projects/:project_id/api-keys/:key_id
 func (h *AuthHandler) RevokeAPIKey(c *gin.Context) {
-	userID, exists := auth.GetUserID(c)
-	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "not authenticated"})
+	projectID, ok := parseProjectID(c)
+	if !ok {
 		return
 	}
-
-	projectIDStr := c.Param("id")
-	projectID, err := uuid.Parse(projectIDStr)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid project ID"})
+	if !requireWriteRole(c) {
 		return
 	}
 
@@ -268,14 +253,10 @@ func (h *AuthHandler) RevokeAPIKey(c *gin.Context) {
 		return
 	}
 
-	// Verify user owns the project
-	project, err := h.authService.GetProject(c.Request.Context(), projectID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "project not found"})
-		return
-	}
-	if project.OwnerID != userID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
+	// Tenancy: the project must belong to the caller's account.
+	// Reported as 404 rather than 403 so the response never confirms
+	// that another account's project exists.
+	if _, ok := h.requireAccountProject(c, projectID); !ok {
 		return
 	}
 

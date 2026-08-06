@@ -230,6 +230,12 @@ spec:
             - name: RATE_LIMIT_ENABLED
               value: "true"
 
+            # Browser origins permitted to call the API. Explicit
+            # allowlist — "*" is invalid alongside Allow-Credentials and
+            # would break every authenticated cross-origin request.
+            - name: TEEPIN_CORS_ORIGINS
+              value: "https://console.teepin.com,http://localhost:3000"
+
           # Resource limits
           resources:
             requests:

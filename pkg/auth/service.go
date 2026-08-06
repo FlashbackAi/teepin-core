@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -56,18 +57,22 @@ func (s *Service) RegisterUser(ctx context.Context, email, password, fullName st
 }
 
 // Login authenticates a user and returns JWT tokens
+// Login authenticates an ACCOUNT OWNER by email. Sub-users sign in with
+// alias + username + password via LoginSubUser — their email is not a
+// globally unique identifier.
 func (s *Service) Login(ctx context.Context, email, password string) (accessToken, refreshToken string, err error) {
-	// Get user
 	var user User
 	query := `
-		SELECT id, email, password_hash, full_name, email_verified, created_at, updated_at
+		SELECT id, account_id, email, COALESCE(username,''), role, status,
+		       password_hash, COALESCE(full_name,''), email_verified, created_at, updated_at
 		FROM auth.users
-		WHERE email = $1 AND deleted_at IS NULL
+		WHERE email = $1 AND username IS NULL AND deleted_at IS NULL
 	`
 
 	err = s.db.QueryRowContext(ctx, query, email).Scan(
-		&user.ID, &user.Email, &user.PasswordHash, &user.FullName,
-		&user.EmailVerified, &user.CreatedAt, &user.UpdatedAt,
+		&user.ID, &user.AccountID, &user.Email, &user.Username, &user.Role, &user.Status,
+		&user.PasswordHash, &user.FullName, &user.EmailVerified,
+		&user.CreatedAt, &user.UpdatedAt,
 	)
 
 	if err == sql.ErrNoRows {
@@ -77,17 +82,32 @@ func (s *Service) Login(ctx context.Context, email, password string) (accessToke
 		return "", "", fmt.Errorf("failed to get user: %w", err)
 	}
 
-	// Verify password
 	if !VerifyPassword(user.PasswordHash, password) {
 		return "", "", fmt.Errorf("invalid credentials")
 	}
+	if user.Status == "disabled" {
+		return "", "", fmt.Errorf("this login has been disabled")
+	}
 
-	// Generate JWT tokens
-	accessToken, refreshToken, err = GenerateJWT(user.ID, user.Email, s.jwtSecret)
+	return s.issueTokens(ctx, &user)
+}
+
+// issueTokens mints access and refresh tokens carrying the user's
+// account context. Shared by owner and sub-user login so both paths
+// produce identical claims.
+func (s *Service) issueTokens(ctx context.Context, user *User) (accessToken, refreshToken string, err error) {
+	var alias string
+	// A missing alias must not block sign-in — the account ID in the
+	// claims is what authorisation actually depends on.
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT alias FROM auth.accounts WHERE id = $1`, user.AccountID).Scan(&alias); err != nil {
+		alias = ""
+	}
+
+	accessToken, refreshToken, err = GenerateJWT(user, alias, s.jwtSecret)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to generate tokens: %w", err)
 	}
-
 	return accessToken, refreshToken, nil
 }
 
@@ -120,13 +140,22 @@ func (s *Service) GetUserByID(ctx context.Context, userID uuid.UUID) (*User, err
 // the clean slug; later projects with the same name (from any owner)
 // get a short random suffix — customers must never be blocked because
 // someone else already named a project "production".
-func (s *Service) CreateProject(ctx context.Context, ownerID uuid.UUID, name, description string) (*Project, error) {
-	slug := strings.ToLower(strings.ReplaceAll(name, " ", "-"))
+// CreateProject adds a project to an account. ownerID records who
+// created it; the account owns it.
+//
+// Slugs are unique per account (migration 007), so two customers may
+// each have a "production" project. A collision within one account
+// falls back to a suffixed slug rather than failing the request.
+func (s *Service) CreateProject(ctx context.Context, accountID, ownerID uuid.UUID, name, description string) (*Project, error) {
+	slug := slugify(name)
+	if slug == "" {
+		return nil, fmt.Errorf("project name must contain at least one letter or number")
+	}
 
-	project, err := s.insertProject(ctx, ownerID, name, slug, description)
+	project, err := s.insertProject(ctx, accountID, ownerID, name, slug, description)
 	if isUniqueViolation(err) {
 		suffixed := fmt.Sprintf("%s-%s", slug, uuid.New().String()[:6])
-		project, err = s.insertProject(ctx, ownerID, name, suffixed, description)
+		project, err = s.insertProject(ctx, accountID, ownerID, name, suffixed, description)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to create project: %w", err)
@@ -135,23 +164,30 @@ func (s *Service) CreateProject(ctx context.Context, ownerID uuid.UUID, name, de
 	return project, nil
 }
 
-func (s *Service) insertProject(ctx context.Context, ownerID uuid.UUID, name, slug, description string) (*Project, error) {
-	var project Project
-	query := `
-		INSERT INTO auth.projects (owner_id, name, slug, description)
-		VALUES ($1, $2, $3, $4)
-		RETURNING id, owner_id, name, slug, description, created_at, updated_at
-	`
-
-	err := s.db.QueryRowContext(ctx, query, ownerID, name, slug, description).Scan(
-		&project.ID, &project.OwnerID, &project.Name, &project.Slug,
-		&project.Description, &project.CreatedAt, &project.UpdatedAt,
-	)
-	if err != nil {
-		return nil, err
+// slugify converts a project name into a URL-safe slug.
+// Replacing only spaces (as this previously did) let names like
+// "ACME/prod v2" produce slugs containing slashes and other characters
+// that break URLs.
+func slugify(name string) string {
+	s := strings.ToLower(strings.TrimSpace(name))
+	s = nonSlugChars.ReplaceAllString(s, "-")
+	s = strings.Trim(s, "-")
+	if len(s) > 63 {
+		s = strings.Trim(s[:63], "-")
 	}
+	return s
+}
 
-	return &project, nil
+var nonSlugChars = regexp.MustCompile(`[^a-z0-9]+`)
+
+func (s *Service) insertProject(ctx context.Context, accountID, ownerID uuid.UUID, name, slug, description string) (*Project, error) {
+	row := s.db.QueryRowContext(ctx, `
+		INSERT INTO auth.projects (account_id, owner_id, name, slug, description)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING `+projectColumns+`
+	`, accountID, ownerID, name, slug, description)
+
+	return scanProject(row)
 }
 
 // isUniqueViolation reports whether err is a PostgreSQL unique
@@ -162,58 +198,79 @@ func isUniqueViolation(err error) bool {
 }
 
 // ListProjects lists all projects for a user
-func (s *Service) ListProjects(ctx context.Context, ownerID uuid.UUID) ([]Project, error) {
-	query := `
-		SELECT id, owner_id, name, slug, description, created_at, updated_at
-		FROM auth.projects
-		WHERE owner_id = $1 AND deleted_at IS NULL
-		ORDER BY created_at DESC
-	`
+// projectColumns is the shared select list, so every project query
+// returns the same shape and scanning cannot drift between them.
+const projectColumns = `id, account_id, owner_id, name, slug,
+	COALESCE(description,''), created_at, updated_at`
 
-	rows, err := s.db.QueryContext(ctx, query, ownerID)
+func scanProject(row interface{ Scan(...any) error }) (*Project, error) {
+	var p Project
+	if err := row.Scan(&p.ID, &p.AccountID, &p.OwnerID, &p.Name, &p.Slug,
+		&p.Description, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+// ErrProjectNotFound is returned when a project does not exist or
+// belongs to another account. Handlers map it to 404.
+var ErrProjectNotFound = errors.New("project not found")
+
+// ListProjects returns every project in an account.
+//
+// Scoped by ACCOUNT, not by owner: projects belong to the account, so
+// every member of it sees them. Filtering by owner_id would hide a
+// colleague's projects from their own teammates.
+func (s *Service) ListProjects(ctx context.Context, accountID uuid.UUID) ([]Project, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+projectColumns+`
+		FROM auth.projects
+		WHERE account_id = $1 AND deleted_at IS NULL
+		ORDER BY created_at DESC
+	`, accountID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list projects: %w", err)
 	}
 	defer rows.Close()
 
-	var projects []Project
+	projects := []Project{}
 	for rows.Next() {
-		var project Project
-		err := rows.Scan(
-			&project.ID, &project.OwnerID, &project.Name, &project.Slug,
-			&project.Description, &project.CreatedAt, &project.UpdatedAt,
-		)
+		p, err := scanProject(rows)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan project: %w", err)
 		}
-		projects = append(projects, project)
+		projects = append(projects, *p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read projects: %w", err)
 	}
 
 	return projects, nil
 }
 
 // GetProject retrieves a project by ID
-func (s *Service) GetProject(ctx context.Context, projectID uuid.UUID) (*Project, error) {
-	var project Project
-	query := `
-		SELECT id, owner_id, name, slug, description, created_at, updated_at
+// GetProject returns one project belonging to the given account.
+//
+// The account_id predicate is the tenancy check and is NOT optional:
+// without it any authenticated caller who learned a project UUID could
+// read another customer's project. A project in a different account is
+// reported as not found — never as forbidden, which would confirm that
+// it exists.
+func (s *Service) GetProject(ctx context.Context, accountID, projectID uuid.UUID) (*Project, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT `+projectColumns+`
 		FROM auth.projects
-		WHERE id = $1 AND deleted_at IS NULL
-	`
+		WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL
+	`, projectID, accountID)
 
-	err := s.db.QueryRowContext(ctx, query, projectID).Scan(
-		&project.ID, &project.OwnerID, &project.Name, &project.Slug,
-		&project.Description, &project.CreatedAt, &project.UpdatedAt,
-	)
-
+	p, err := scanProject(row)
 	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("project not found")
+		return nil, ErrProjectNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get project: %w", err)
 	}
-
-	return &project, nil
+	return p, nil
 }
 
 // CreateAPIKey creates a new API key for a project
@@ -253,11 +310,18 @@ func (s *Service) ValidateAPIKey(ctx context.Context, key string) (*APIKey, erro
 
 	prefix := key[:12]
 
-	// Get all keys with this prefix
-	query := `
-		SELECT id, project_id, user_id, name, key_hash, key_prefix, scopes, last_used_at, created_at
-		FROM auth.api_keys
-		WHERE key_prefix = $1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > NOW())
+	// The account is joined from the key's project rather than stored on
+	// the key: one source of truth, so a key can never outlive or
+	// disagree with the project it belongs to. Soft-deleted projects
+	// yield no row, which revokes their keys implicitly.
+	const query = `
+		SELECT k.id, k.project_id, k.user_id, k.name, k.key_hash, k.key_prefix,
+		       k.scopes, k.last_used_at, k.created_at, p.account_id
+		FROM auth.api_keys k
+		JOIN auth.projects p ON p.id = k.project_id AND p.deleted_at IS NULL
+		WHERE k.key_prefix = $1
+		  AND k.revoked_at IS NULL
+		  AND (k.expires_at IS NULL OR k.expires_at > NOW())
 	`
 
 	rows, err := s.db.QueryContext(ctx, query, prefix)
@@ -268,20 +332,26 @@ func (s *Service) ValidateAPIKey(ctx context.Context, key string) (*APIKey, erro
 
 	for rows.Next() {
 		var apiKey APIKey
-		err := rows.Scan(
+		if err := rows.Scan(
 			&apiKey.ID, &apiKey.ProjectID, &apiKey.UserID, &apiKey.Name, &apiKey.KeyHash,
 			&apiKey.KeyPrefix, pq.Array(&apiKey.Scopes), &apiKey.LastUsedAt, &apiKey.CreatedAt,
-		)
-		if err != nil {
+			&apiKey.AccountID,
+		); err != nil {
+			// A malformed row must not mask a valid key sharing the
+			// prefix; skip it and keep checking.
 			continue
 		}
 
-		// Verify the key
+		// Compare against every candidate with this prefix: the hash
+		// comparison is constant-time, so this does not leak which
+		// prefix matched.
 		if VerifyAPIKey(key, apiKey.KeyHash) {
-			// Update last used timestamp
 			go s.updateAPIKeyLastUsed(apiKey.ID)
 			return &apiKey, nil
 		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read API keys: %w", err)
 	}
 
 	return nil, fmt.Errorf("invalid API key")

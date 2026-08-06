@@ -37,23 +37,18 @@ func (h *RegistryHandler) ProvisionRegistry(c *gin.Context) {
 		return
 	}
 
-	// Verify user has access to this project
-	userID, exists := auth.GetUserID(c)
+	// Tenancy: the project must belong to the caller's account.
+	// Reported as 404 rather than 403 so the response never confirms
+	// that another account's project exists.
+	accountID, exists := auth.GetAccountID(c)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
 		return
 	}
 
-	// Get project details
-	project, err := h.authService.GetProject(c.Request.Context(), projectID)
+	project, err := h.authService.GetProject(c.Request.Context(), accountID, projectID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "project not found"})
-		return
-	}
-
-	// Verify ownership
-	if project.OwnerID != userID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
 		return
 	}
 
@@ -82,23 +77,17 @@ func (h *RegistryHandler) GetRegistryCredentials(c *gin.Context) {
 		return
 	}
 
-	// Verify user has access to this project
-	userID, exists := auth.GetUserID(c)
+	// Tenancy: the project must belong to the caller's account.
+	// Reported as 404 rather than 403 so the response never confirms
+	// that another account's project exists.
+	accountID, exists := auth.GetAccountID(c)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
 		return
 	}
 
-	// Get project details
-	project, err := h.authService.GetProject(c.Request.Context(), projectID)
-	if err != nil {
+	if _, err := h.authService.GetProject(c.Request.Context(), accountID, projectID); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "project not found"})
-		return
-	}
-
-	// Verify ownership
-	if project.OwnerID != userID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
 		return
 	}
 
@@ -123,23 +112,17 @@ func (h *RegistryHandler) RevokeRegistry(c *gin.Context) {
 		return
 	}
 
-	// Verify user has access to this project
-	userID, exists := auth.GetUserID(c)
+	// Tenancy: the project must belong to the caller's account.
+	// Reported as 404 rather than 403 so the response never confirms
+	// that another account's project exists.
+	accountID, exists := auth.GetAccountID(c)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
 		return
 	}
 
-	// Get project details
-	project, err := h.authService.GetProject(c.Request.Context(), projectID)
-	if err != nil {
+	if _, err := h.authService.GetProject(c.Request.Context(), accountID, projectID); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "project not found"})
-		return
-	}
-
-	// Verify ownership
-	if project.OwnerID != userID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
 		return
 	}
 
@@ -166,23 +149,17 @@ func (h *RegistryHandler) GetDockerLoginCommand(c *gin.Context) {
 		return
 	}
 
-	// Verify user has access to this project
-	userID, exists := auth.GetUserID(c)
+	// Tenancy: the project must belong to the caller's account.
+	// Reported as 404 rather than 403 so the response never confirms
+	// that another account's project exists.
+	accountID, exists := auth.GetAccountID(c)
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
 		return
 	}
 
-	// Get project details
-	project, err := h.authService.GetProject(c.Request.Context(), projectID)
-	if err != nil {
+	if _, err := h.authService.GetProject(c.Request.Context(), accountID, projectID); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "project not found"})
-		return
-	}
-
-	// Verify ownership
-	if project.OwnerID != userID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
 		return
 	}
 

@@ -31,21 +31,21 @@ type Instance struct {
 
 // CreateInstanceRequest represents a request to create an instance
 type CreateInstanceRequest struct {
-	Name         string            `json:"name" binding:"required"`
-	Image        string            `json:"image" binding:"required"`
-	GPUVRAM      string            `json:"gpu_vram,omitempty"`      // e.g., "25GB"
-	InstanceType string            `json:"instance_type,omitempty"` // Legacy: "gpu.h100.mig-2g"
-	CPUUnits     int               `json:"cpu_units" binding:"required,min=1"`
-	Memory       string            `json:"memory" binding:"required"` // e.g., "32GB"
+	Name         string `json:"name" binding:"required"`
+	Image        string `json:"image" binding:"required"`
+	GPUVRAM      string `json:"gpu_vram,omitempty"`      // e.g., "25GB"
+	InstanceType string `json:"instance_type,omitempty"` // Legacy: "gpu.h100.mig-2g"
+	CPUUnits     int    `json:"cpu_units" binding:"required,min=1"`
+	Memory       string `json:"memory" binding:"required"` // e.g., "32GB"
 	// Command and Args override the image's ENTRYPOINT and CMD. Without
 	// them an image whose default command exits (most base images,
 	// including nvidia/cuda:*-base) crash-loops forever with no way for
 	// the customer to keep it alive.
-	Command []string      `json:"command,omitempty"`
-	Args    []string      `json:"args,omitempty"`
-	Ports   []PortMapping `json:"ports,omitempty"`
-	Env          map[string]string `json:"env,omitempty"`
-	Labels       map[string]string `json:"labels,omitempty"`
+	Command []string          `json:"command,omitempty"`
+	Args    []string          `json:"args,omitempty"`
+	Ports   []PortMapping     `json:"ports,omitempty"`
+	Env     map[string]string `json:"env,omitempty"`
+	Labels  map[string]string `json:"labels,omitempty"`
 }
 
 // PortMapping defines port exposure

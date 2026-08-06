@@ -643,6 +643,11 @@ for i in 1 2 3 4 5; do
     sleep 10
 done
 
+# Public API endpoint (https://api.teepin.com). Applied after the
+# ClusterIssuers so cert-manager can issue its certificate immediately.
+kubectl apply -f deploy/production/api-ingress.yaml
+log_info "API ingress applied — https://api.teepin.com (certificate issues within ~60s)"
+
 # Deploy API server. The image tag never changes (latest + IfNotPresent),
 # so on re-runs `apply` alone would keep old pods running the old image —
 # always restart the rollout after importing a fresh build.

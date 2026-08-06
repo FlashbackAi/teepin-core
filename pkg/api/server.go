@@ -112,7 +112,7 @@ func (s *Server) CreateInstance(c *gin.Context) {
 	// Billing integrity: when persistence is enabled, every instance
 	// must belong to a project so its usage can be metered. Refuse to
 	// run unbilled workloads.
-	projectID, ok := s.requireProjectScope(c)
+	projectID, accountID, ok := s.requireScope(c)
 	if !ok {
 		return
 	}
@@ -172,6 +172,7 @@ func (s *Server) CreateInstance(c *gin.Context) {
 	if s.store != nil {
 		record := &compute.InstanceRecord{
 			ID:           instanceID,
+			AccountID:    accountID,
 			ProjectID:    projectID,
 			UserID:       userID,
 			Name:         req.Name,
@@ -460,17 +461,39 @@ const annotationInstanceType = "teepin.io/instance-type"
 // In standalone mode (no database) there is no tenancy and uuid.Nil is
 // returned with ok=true.
 func (s *Server) requireProjectScope(c *gin.Context) (uuid.UUID, bool) {
+	projectID, _, ok := s.requireScope(c)
+	return projectID, ok
+}
+
+// requireScope resolves the project AND the owning account for a
+// request.
+//
+// Pod queries filter on the project label, which already isolates
+// tenants; the account is carried alongside so persisted rows and
+// billing records record their tenant directly, and so future queries
+// can authorise without a join.
+//
+// Returns (Nil, Nil, true) in standalone mode (no database), where
+// there is no tenancy to enforce.
+func (s *Server) requireScope(c *gin.Context) (projectID, accountID uuid.UUID, ok bool) {
 	if s.store == nil {
-		return uuid.Nil, true
+		return uuid.Nil, uuid.Nil, true
 	}
-	projectID, ok := auth.GetProjectID(c)
-	if !ok {
+
+	projectID, hasProject := auth.GetProjectID(c)
+	if !hasProject {
 		c.JSON(http.StatusUnauthorized, gin.H{
 			"error": "authentication with a project is required (use an API key: Authorization: Bearer tpk_...)",
 		})
-		return uuid.Nil, false
+		return uuid.Nil, uuid.Nil, false
 	}
-	return projectID, true
+
+	// Tokens issued before accounts existed carry no account claim;
+	// the project label still scopes them correctly, so accept them
+	// rather than locking out in-flight sessions.
+	accountID, _ = auth.GetAccountID(c)
+
+	return projectID, accountID, true
 }
 
 // instanceSelector builds the label selector for one instance,

@@ -27,7 +27,11 @@ const (
 
 // InstanceRecord is a row of compute.instances.
 type InstanceRecord struct {
-	ID           string
+	ID string
+	// AccountID is the tenant that owns this instance. Denormalised
+	// from the project so every tenancy check and billing aggregation
+	// filters on it directly, without a join.
+	AccountID    uuid.UUID
 	ProjectID    uuid.UUID
 	UserID       uuid.UUID
 	Name         string
@@ -60,9 +64,9 @@ func NewStore(db *sql.DB) *Store {
 func (s *Store) Create(ctx context.Context, rec *InstanceRecord) error {
 	query := `
 		INSERT INTO compute.instances
-		(id, project_id, user_id, name, image, instance_type_id, status,
+		(id, account_id, project_id, user_id, name, image, instance_type_id, status,
 		 gpu_vram_gb, cpu_units, memory_gb, endpoint, k8s_pod_name, k8s_namespace)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		RETURNING created_at, updated_at
 	`
 
@@ -72,7 +76,7 @@ func (s *Store) Create(ctx context.Context, rec *InstanceRecord) error {
 	}
 
 	err := s.db.QueryRowContext(ctx, query,
-		rec.ID, rec.ProjectID, rec.UserID, rec.Name, rec.Image,
+		rec.ID, rec.AccountID, rec.ProjectID, rec.UserID, rec.Name, rec.Image,
 		rec.InstanceType, rec.Status, vram, rec.CPUUnits, rec.MemoryGB,
 		nullIfEmpty(rec.Endpoint), nullIfEmpty(rec.K8sPodName), rec.K8sNamespace,
 	).Scan(&rec.CreatedAt, &rec.UpdatedAt)
@@ -145,12 +149,17 @@ func (s *Store) ListActive(ctx context.Context) ([]InstanceRecord, error) {
 }
 
 // ListByProject returns the project's non-terminated instances.
-func (s *Store) ListByProject(ctx context.Context, projectID uuid.UUID) ([]InstanceRecord, error) {
-	return s.query(ctx, "WHERE project_id = $1 AND terminated_at IS NULL ORDER BY created_at DESC", projectID)
+// ListByProject returns an account's live instances in one project.
+// Both predicates are required: project_id alone would let a caller
+// read another account's instances by guessing a project UUID.
+func (s *Store) ListByProject(ctx context.Context, accountID, projectID uuid.UUID) ([]InstanceRecord, error) {
+	return s.query(ctx,
+		"WHERE account_id = $1 AND project_id = $2 AND terminated_at IS NULL ORDER BY created_at DESC",
+		accountID, projectID)
 }
 
 const selectColumns = `
-	SELECT id, project_id, user_id, name, image,
+	SELECT id, account_id, project_id, user_id, name, image,
 	       COALESCE(instance_type_id, ''), status, COALESCE(gpu_vram_gb, 0),
 	       cpu_units, memory_gb, COALESCE(endpoint, ''),
 	       COALESCE(k8s_pod_name, ''), COALESCE(k8s_namespace, ''),
@@ -169,7 +178,7 @@ func (s *Store) query(ctx context.Context, where string, args ...interface{}) ([
 	for rows.Next() {
 		var rec InstanceRecord
 		if err := rows.Scan(
-			&rec.ID, &rec.ProjectID, &rec.UserID, &rec.Name, &rec.Image,
+			&rec.ID, &rec.AccountID, &rec.ProjectID, &rec.UserID, &rec.Name, &rec.Image,
 			&rec.InstanceType, &rec.Status, &rec.GPUVRAMGB,
 			&rec.CPUUnits, &rec.MemoryGB, &rec.Endpoint,
 			&rec.K8sPodName, &rec.K8sNamespace,

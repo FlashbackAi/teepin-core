@@ -1,0 +1,60 @@
+# Copyright 2026 TEEPIN Project
+# Licensed under the Apache License, Version 2.0
+
+# Public API endpoint: https://api.teepin.com
+#
+# Until this exists the API is reachable only via `kubectl port-forward`,
+# which no browser, CLI, or SDK can use — so this is the prerequisite for
+# the console, the CLI, and every customer integration.
+#
+# Routing works the same way as customer instance endpoints: the shared
+# ingress-nginx controller (hostPort 80/443) terminates TLS and routes by
+# hostname, and the wildcard DNS record *.teepin.com already resolves
+# api.teepin.com to this node. No extra DNS entry is required.
+#
+# cert-manager issues the certificate via HTTP-01 against the same
+# ingress — see cluster-issuer.yaml.
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-server
+  namespace: teepin-prod
+  labels:
+    app: api-server
+    app.teepin.io/component: api
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+
+    # Force HTTPS: API keys and JWTs must never traverse plaintext.
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+
+    # CORS is handled by the Go API (an explicit origin allowlist —
+    # see corsMiddleware in cmd/api-server/main.go). Letting nginx add
+    # its own CORS headers as well would produce duplicates, which
+    # browsers reject.
+
+    # Instance logs stream; do not cut them off at the default 60s.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+
+    # SDL deployment payloads can be sizeable.
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - api.teepin.com
+      secretName: api-teepin-com-tls
+  rules:
+    - host: api.teepin.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api-server
+                port:
+                  number: 80

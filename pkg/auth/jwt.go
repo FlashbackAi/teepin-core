@@ -9,44 +9,45 @@ import (
 )
 
 type Claims struct {
-	UserID    uuid.UUID `json:"user_id"`
-	Email     string    `json:"email"`
-	ProjectID uuid.UUID `json:"project_id,omitempty"`
+	UserID uuid.UUID `json:"user_id"`
+	Email  string    `json:"email"`
+	// AccountID is the tenant boundary. Every authorisation check reads
+	// it from the token, so a request can never reach another account's
+	// resources even if it guesses a valid project or instance ID.
+	AccountID    uuid.UUID `json:"account_id,omitempty"`
+	AccountAlias string    `json:"account_alias,omitempty"`
+	Role         string    `json:"role,omitempty"`
+	ProjectID    uuid.UUID `json:"project_id,omitempty"`
 	jwt.RegisteredClaims
 }
 
-// GenerateJWT creates an access token (15 minutes) and refresh token (7 days)
-func GenerateJWT(userID uuid.UUID, email string, secret string) (accessToken, refreshToken string, err error) {
-	// Access token (15 minutes)
-	accessClaims := Claims{
-		UserID: userID,
-		Email:  email,
-		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(15 * time.Minute)),
-			IssuedAt:  jwt.NewNumericDate(time.Now()),
-			Issuer:    "teepin-api",
-		},
+// GenerateJWT creates an access token (15 minutes) and refresh token
+// (7 days) for a user, carrying their account and role.
+func GenerateJWT(user *User, accountAlias, secret string) (accessToken, refreshToken string, err error) {
+	newClaims := func(ttl time.Duration) Claims {
+		return Claims{
+			UserID:       user.ID,
+			Email:        user.Email,
+			AccountID:    user.AccountID,
+			AccountAlias: accountAlias,
+			Role:         user.Role,
+			RegisteredClaims: jwt.RegisteredClaims{
+				ExpiresAt: jwt.NewNumericDate(time.Now().Add(ttl)),
+				IssuedAt:  jwt.NewNumericDate(time.Now()),
+				Issuer:    "teepin-api",
+				Subject:   user.ID.String(),
+			},
+		}
 	}
 
-	accessTokenObj := jwt.NewWithClaims(jwt.SigningMethodHS256, accessClaims)
-	accessToken, err = accessTokenObj.SignedString([]byte(secret))
+	accessToken, err = jwt.NewWithClaims(jwt.SigningMethodHS256, newClaims(15*time.Minute)).
+		SignedString([]byte(secret))
 	if err != nil {
 		return "", "", err
 	}
 
-	// Refresh token (7 days)
-	refreshClaims := Claims{
-		UserID: userID,
-		Email:  email,
-		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(7 * 24 * time.Hour)),
-			IssuedAt:  jwt.NewNumericDate(time.Now()),
-			Issuer:    "teepin-api",
-		},
-	}
-
-	refreshTokenObj := jwt.NewWithClaims(jwt.SigningMethodHS256, refreshClaims)
-	refreshToken, err = refreshTokenObj.SignedString([]byte(secret))
+	refreshToken, err = jwt.NewWithClaims(jwt.SigningMethodHS256, newClaims(7*24*time.Hour)).
+		SignedString([]byte(secret))
 	if err != nil {
 		return "", "", err
 	}
