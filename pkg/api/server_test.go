@@ -6,58 +6,152 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/kubernetes/fake"
-	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/FlashbackAi/teepin-core/pkg/auth"
+	"github.com/FlashbackAi/teepin-core/pkg/cluster"
 	"github.com/FlashbackAi/teepin-core/pkg/compute"
 	"github.com/FlashbackAi/teepin-core/pkg/gpu"
-	"github.com/FlashbackAi/teepin-core/pkg/models"
 )
 
 func init() {
 	gin.SetMode(gin.TestMode)
 }
 
-// tenantPod builds a TEEPIN-managed pod owned by a project.
-func tenantPod(instanceID string, projectID uuid.UUID, vramGB string) *corev1.Pod {
-	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      instanceID + "-pod",
-			Namespace: "default",
-			Labels: map[string]string{
-				"app.teepin.cloud/managed":     "true",
-				"app.teepin.cloud/instance-id": instanceID,
-				"app.teepin.cloud/name":        "app-" + instanceID,
-				"teepin.io/instance-uuid":      uuid.New().String(),
-				LabelProjectID:                 projectID.String(),
-			},
-			Annotations: map[string]string{
-				gpu.AnnotationVRAMGB:   vramGB,
-				annotationInstanceType: "gpu.h100.custom-" + vramGB + "gb",
-			},
-		},
-		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+// fakeCluster is an in-memory cluster.Client.
+//
+// It enforces the Scope predicate exactly as DirectClient does against
+// real label selectors, because that is the behaviour these handler
+// tests depend on: a handler that forgets to pass a scope must fail
+// here, not silently pass because the fake ignores tenancy.
+type fakeCluster struct {
+	instances map[string]fakeInstance
+
+	// failWith, when set, is returned by every operation. Used to test
+	// how handlers degrade when GPU capacity is unreachable.
+	failWith error
+}
+
+type fakeInstance struct {
+	projectID string
+	status    string
+	message   string
+	logs      string
+}
+
+func newFakeCluster() *fakeCluster {
+	return &fakeCluster{instances: map[string]fakeInstance{}}
+}
+
+func (f *fakeCluster) add(instanceID, projectID, status string) {
+	f.instances[instanceID] = fakeInstance{
+		projectID: projectID,
+		status:    status,
+		logs:      "log line one\nlog line two\n",
 	}
 }
 
+// visible applies the tenancy predicate. Mirrors the label-selector
+// filtering DirectClient delegates to Kubernetes.
+func (f *fakeCluster) visible(scope cluster.Scope, id string) (fakeInstance, bool) {
+	inst, ok := f.instances[id]
+	if !ok {
+		return fakeInstance{}, false
+	}
+	if scope.ProjectID != "" && inst.projectID != scope.ProjectID {
+		return fakeInstance{}, false
+	}
+	return inst, true
+}
+
+func (f *fakeCluster) CreateInstance(_ context.Context, spec cluster.InstanceSpec) (*cluster.InstanceResult, error) {
+	if f.failWith != nil {
+		return nil, f.failWith
+	}
+	f.instances[spec.InstanceID] = fakeInstance{
+		projectID: spec.ProjectID,
+		status:    compute.StatusPending,
+	}
+	return &cluster.InstanceResult{PodName: spec.InstanceID + "-pod"}, nil
+}
+
+func (f *fakeCluster) DeleteInstance(_ context.Context, scope cluster.Scope, id string) error {
+	if f.failWith != nil {
+		return f.failWith
+	}
+	if _, ok := f.visible(scope, id); ok {
+		delete(f.instances, id)
+	}
+	// Idempotent: deleting what is not there (or not yours) is not an
+	// error at this layer.
+	return nil
+}
+
+func (f *fakeCluster) GetInstanceStatus(_ context.Context, scope cluster.Scope, id string) (*cluster.InstanceStatus, error) {
+	if f.failWith != nil {
+		return nil, f.failWith
+	}
+	inst, ok := f.visible(scope, id)
+	if !ok {
+		return nil, cluster.ErrNotFound
+	}
+	return &cluster.InstanceStatus{
+		InstanceID: id,
+		Status:     inst.status,
+		Message:    inst.message,
+		ObservedAt: time.Now().UTC(),
+	}, nil
+}
+
+func (f *fakeCluster) ListInstanceStatuses(_ context.Context, scope cluster.Scope) ([]cluster.InstanceStatus, error) {
+	if f.failWith != nil {
+		return nil, f.failWith
+	}
+	var out []cluster.InstanceStatus
+	for id, inst := range f.instances {
+		if scope.ProjectID != "" && inst.projectID != scope.ProjectID {
+			continue
+		}
+		out = append(out, cluster.InstanceStatus{
+			InstanceID: id,
+			Status:     inst.status,
+			Message:    inst.message,
+			ObservedAt: time.Now().UTC(),
+		})
+	}
+	return out, nil
+}
+
+func (f *fakeCluster) StreamLogs(_ context.Context, scope cluster.Scope, id string, _ cluster.LogOptions, w io.Writer) error {
+	if f.failWith != nil {
+		return f.failWith
+	}
+	inst, ok := f.visible(scope, id)
+	if !ok {
+		return cluster.ErrNotFound
+	}
+	_, err := io.WriteString(w, inst.logs)
+	return err
+}
+
+func (f *fakeCluster) Inventory(context.Context) ([]cluster.NodeInventory, error) {
+	return nil, f.failWith
+}
+
+func (f *fakeCluster) Healthy(context.Context) bool { return f.failWith == nil }
+
 // newTenantServer builds a Server with tenancy active (store present)
-// over a fake cluster. The fake clientset does not filter List calls
-// by label selector, so a reactor applies the selector the way the
-// real API server would.
-func newTenantServer(t *testing.T, objects ...runtime.Object) *Server {
+// over a fake cluster.
+func newTenantServer(t *testing.T, fc *fakeCluster) *Server {
 	t.Helper()
 
 	db, _, err := sqlmock.New()
@@ -66,28 +160,7 @@ func newTenantServer(t *testing.T, objects ...runtime.Object) *Server {
 	}
 	t.Cleanup(func() { db.Close() })
 
-	client := fake.NewSimpleClientset(objects...)
-	client.PrependReactor("list", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
-		listAction := action.(k8stesting.ListAction)
-		restriction := listAction.GetListRestrictions().Labels
-
-		pods, err := client.Tracker().List(
-			corev1.SchemeGroupVersion.WithResource("pods"),
-			corev1.SchemeGroupVersion.WithKind("Pod"), "default")
-		if err != nil {
-			return true, nil, err
-		}
-
-		filtered := &corev1.PodList{}
-		for _, item := range pods.(*corev1.PodList).Items {
-			if restriction == nil || restriction.Matches(labels.Set(item.Labels)) {
-				filtered.Items = append(filtered.Items, item)
-			}
-		}
-		return true, filtered, nil
-	})
-
-	return NewServer(client, nil, nil, compute.NewStore(db), nil)
+	return NewServer(fc, nil, nil, compute.NewStore(db), nil)
 }
 
 // doRequest performs a request against the handler with the caller's
@@ -104,12 +177,19 @@ func doRequest(handler gin.HandlerFunc, method, path string, params gin.Params, 
 	return w
 }
 
+// The tenancy tests below are the reason this package has tests at all.
+// An earlier version let any authenticated caller read another
+// customer's instance by ID; these pin that boundary at the handler
+// layer, where the scope is chosen.
+
 func TestListInstances_ScopedToCallerProject(t *testing.T) {
 	tenantA, tenantB := uuid.New(), uuid.New()
-	server := newTenantServer(t,
-		tenantPod("inst-aaaa1111", tenantA, "20"),
-		tenantPod("inst-bbbb2222", tenantB, "25"),
-	)
+
+	fc := newFakeCluster()
+	fc.add("inst-aaaa1111", tenantA.String(), compute.StatusRunning)
+	fc.add("inst-bbbb2222", tenantB.String(), compute.StatusRunning)
+
+	server := newTenantServer(t, fc)
 
 	w := doRequest(server.ListInstances, http.MethodGet, "/v1/compute/instances", nil, tenantA)
 
@@ -132,7 +212,7 @@ func TestListInstances_ScopedToCallerProject(t *testing.T) {
 }
 
 func TestListInstances_RequiresAuthWhenTenancyActive(t *testing.T) {
-	server := newTenantServer(t)
+	server := newTenantServer(t, newFakeCluster())
 
 	w := doRequest(server.ListInstances, http.MethodGet, "/v1/compute/instances", nil, uuid.Nil)
 
@@ -143,7 +223,10 @@ func TestListInstances_RequiresAuthWhenTenancyActive(t *testing.T) {
 
 func TestGetInstance_CrossTenantIs404(t *testing.T) {
 	tenantA, tenantB := uuid.New(), uuid.New()
-	server := newTenantServer(t, tenantPod("inst-aaaa1111", tenantA, "20"))
+
+	fc := newFakeCluster()
+	fc.add("inst-aaaa1111", tenantA.String(), compute.StatusRunning)
+	server := newTenantServer(t, fc)
 
 	params := gin.Params{{Key: "id", Value: "inst-aaaa1111"}}
 
@@ -152,26 +235,34 @@ func TestGetInstance_CrossTenantIs404(t *testing.T) {
 		t.Errorf("owner GET status = %d, want 200", w.Code)
 	}
 
-	// Another tenant gets 404 — indistinguishable from nonexistent.
+	// Another tenant gets 404 — indistinguishable from nonexistent, so
+	// existence does not leak.
 	if w := doRequest(server.GetInstance, http.MethodGet, "/", params, tenantB); w.Code != http.StatusNotFound {
 		t.Errorf("cross-tenant GET status = %d, want 404", w.Code)
 	}
 }
 
-func TestDeleteInstance_CrossTenantIs404(t *testing.T) {
+func TestDeleteInstance_CrossTenantIs404AndDoesNotDelete(t *testing.T) {
 	tenantA, tenantB := uuid.New(), uuid.New()
-	server := newTenantServer(t, tenantPod("inst-aaaa1111", tenantA, "20"))
+
+	fc := newFakeCluster()
+	fc.add("inst-aaaa1111", tenantA.String(), compute.StatusRunning)
+	server := newTenantServer(t, fc)
 
 	params := gin.Params{{Key: "id", Value: "inst-aaaa1111"}}
 
-	// Another tenant cannot delete it.
 	if w := doRequest(server.DeleteInstance, http.MethodDelete, "/", params, tenantB); w.Code != http.StatusNotFound {
 		t.Errorf("cross-tenant DELETE status = %d, want 404", w.Code)
+	}
+
+	// The 404 must not be cosmetic: the instance has to survive.
+	if _, ok := fc.instances["inst-aaaa1111"]; !ok {
+		t.Error("another tenant's instance was deleted despite the 404")
 	}
 }
 
 func TestDeleteInstance_NonexistentIs404(t *testing.T) {
-	server := newTenantServer(t)
+	server := newTenantServer(t, newFakeCluster())
 
 	params := gin.Params{{Key: "id", Value: "inst-nope0000"}}
 	if w := doRequest(server.DeleteInstance, http.MethodDelete, "/", params, uuid.New()); w.Code != http.StatusNotFound {
@@ -179,12 +270,87 @@ func TestDeleteInstance_NonexistentIs404(t *testing.T) {
 	}
 }
 
-func TestPodToInstance_EnrichesFromAnnotations(t *testing.T) {
-	pod := tenantPod("inst-aaaa1111", uuid.New(), "25")
-	pod.Spec.Containers = []corev1.Container{{Image: "nginx:latest"}}
+func TestGetInstanceLogs_CrossTenantIs404(t *testing.T) {
+	tenantA, tenantB := uuid.New(), uuid.New()
 
-	inst := podToInstance(pod, gpu.DefaultPricePerGBHour)
+	fc := newFakeCluster()
+	fc.add("inst-aaaa1111", tenantA.String(), compute.StatusRunning)
+	server := newTenantServer(t, fc)
 
+	params := gin.Params{{Key: "id", Value: "inst-aaaa1111"}}
+
+	// Logs routinely carry credentials, prompts and customer data.
+	w := doRequest(server.GetInstanceLogs, http.MethodGet, "/", params, tenantB)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("cross-tenant logs status = %d, want 404", w.Code)
+	}
+	if strings.Contains(w.Body.String(), "log line") {
+		t.Error("another tenant's log content leaked into the response")
+	}
+}
+
+func TestGetInstanceLogs_OwnerGetsContent(t *testing.T) {
+	tenant := uuid.New()
+
+	fc := newFakeCluster()
+	fc.add("inst-aaaa1111", tenant.String(), compute.StatusRunning)
+	server := newTenantServer(t, fc)
+
+	params := gin.Params{{Key: "id", Value: "inst-aaaa1111"}}
+	w := doRequest(server.GetInstanceLogs, http.MethodGet, "/", params, tenant)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("owner logs status = %d, want 200", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "log line one") {
+		t.Errorf("owner should receive log content, got %s", w.Body.String())
+	}
+}
+
+// TestClusterUnavailable_IsNot500 pins the behaviour the whole
+// control-plane split exists for: when GPU capacity is unreachable, the
+// API says so in a way clients retry, rather than reporting a generic
+// server error that reads like data loss.
+func TestClusterUnavailable_IsNot500(t *testing.T) {
+	fc := newFakeCluster()
+	fc.failWith = cluster.ErrClusterUnavailable
+	server := newTenantServer(t, fc)
+
+	w := doRequest(server.ListInstances, http.MethodGet, "/", nil, uuid.New())
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 when the cluster is unreachable", w.Code)
+	}
+	// The customer must not be led to believe their instances are gone.
+	if strings.Contains(strings.ToLower(w.Body.String()), "not found") {
+		t.Errorf("unreachable cluster must not be reported as missing instances: %s", w.Body.String())
+	}
+}
+
+func TestStatusToInstance_UsesRecordForCommercialFields(t *testing.T) {
+	st := cluster.InstanceStatus{
+		InstanceID: "inst-aaaa1111",
+		Status:     compute.StatusRunning,
+		ObservedAt: time.Now().UTC(),
+	}
+	record := &compute.InstanceRecord{
+		ID:           "inst-aaaa1111",
+		Name:         "trainer",
+		Image:        "nginx:latest",
+		InstanceType: "gpu.h100.custom-25gb",
+		GPUVRAMGB:    25,
+		CPUUnits:     8,
+		MemoryGB:     32,
+	}
+
+	inst := statusToInstance(st, record, gpu.DefaultPricePerGBHour)
+
+	// Status comes from the cluster (it observes reality)...
+	if inst.Status != compute.StatusRunning {
+		t.Errorf("Status = %q, want running", inst.Status)
+	}
+	// ...while the commercial facts come from the record, so a
+	// rescheduled pod cannot change what the customer agreed to pay.
 	if inst.GPUVRAM != "25GB" || inst.AllocatedVRAM != "25GB" {
 		t.Errorf("VRAM = %q/%q, want 25GB/25GB", inst.GPUVRAM, inst.AllocatedVRAM)
 	}
@@ -196,6 +362,35 @@ func TestPodToInstance_EnrichesFromAnnotations(t *testing.T) {
 	}
 	if inst.Image != "nginx:latest" {
 		t.Errorf("Image = %q, want nginx:latest", inst.Image)
+	}
+}
+
+func TestStatusToInstance_SurfacesFailureReason(t *testing.T) {
+	st := cluster.InstanceStatus{
+		InstanceID: "inst-badimage",
+		Status:     compute.StatusFailed,
+		Message:    "manifest unknown",
+		ObservedAt: time.Now().UTC(),
+	}
+
+	inst := statusToInstance(st, nil, gpu.DefaultPricePerGBHour)
+
+	// "failed" with no reason sends the customer to support to learn
+	// something the cluster already knew.
+	if inst.StatusMessage != "manifest unknown" {
+		t.Errorf("StatusMessage = %q, want the cluster's explanation", inst.StatusMessage)
+	}
+}
+
+func TestStatusToInstance_NoRecordIsNotAPanic(t *testing.T) {
+	// Standalone mode (no database): the cluster view alone must still
+	// produce a usable response rather than nil-dereferencing.
+	st := cluster.InstanceStatus{InstanceID: "inst-solo0001", Status: compute.StatusRunning}
+
+	inst := statusToInstance(st, nil, gpu.DefaultPricePerGBHour)
+
+	if inst.ID != "inst-solo0001" || inst.Status != compute.StatusRunning {
+		t.Errorf("standalone conversion lost data: %+v", inst)
 	}
 }
 
@@ -217,7 +412,7 @@ func TestParseMemoryGB(t *testing.T) {
 func TestRequireProjectScope_StandaloneModeAllowsAll(t *testing.T) {
 	// Without a store (no database) there is no tenancy: requests
 	// proceed unscoped, preserving the zero-dependency local dev flow.
-	server := NewServer(fake.NewSimpleClientset(), nil, nil, nil, nil)
+	server := NewServer(newFakeCluster(), nil, nil, nil, nil)
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -232,95 +427,14 @@ func TestRequireProjectScope_StandaloneModeAllowsAll(t *testing.T) {
 	}
 }
 
-// TestCreatePod_GPUPodsGetRuntimeClass guards a defect found in
-// production: without the NVIDIA RuntimeClass, containerd starts GPU
-// pods under plain runc. Kubernetes still accounts for (and TEEPIN
-// still bills) the GPU, but no device nodes or driver libraries are
-// injected — the customer receives a container with no usable GPU.
-func TestCreatePod_GPUPodsGetRuntimeClass(t *testing.T) {
-	server := NewServer(fake.NewSimpleClientset(), nil, nil, nil, nil)
-	req := &models.CreateInstanceRequest{
-		Name: "gpu-instance", Image: "nvidia/cuda:12.3.1-base-ubuntu22.04",
-		CPUUnits: 2, Memory: "8GB",
+func TestScopeFor_StandaloneIsUnrestricted(t *testing.T) {
+	// uuid.Nil means standalone mode, where there is no tenancy to
+	// enforce. Any other value must produce a restricted scope — a bug
+	// here would silently disable tenant isolation everywhere.
+	if scopeFor(uuid.Nil).IsRestricted() {
+		t.Error("standalone scope must be unrestricted")
 	}
-	alloc := &gpu.Allocation{
-		AllocatedVRAM: 10, RequestedVRAM: 10,
-		ResourceName: "nvidia.com/mig-1g.10gb", Quantity: 1,
-		InstanceType: "gpu.h100.1g.10gb",
-	}
-
-	pod, err := server.createPod(context.Background(), "inst-test0001",
-		uuid.New(), uuid.New(), req, alloc)
-	if err != nil {
-		t.Fatalf("createPod failed: %v", err)
-	}
-
-	if pod.Spec.RuntimeClassName == nil {
-		t.Fatal("GPU pod has no RuntimeClassName — the container will get NO usable GPU")
-	}
-	if *pod.Spec.RuntimeClassName != "nvidia" {
-		t.Errorf("RuntimeClassName = %q, want \"nvidia\"", *pod.Spec.RuntimeClassName)
-	}
-
-	// Customer pods must never carry Kubernetes API credentials.
-	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken {
-		t.Error("customer pod must set AutomountServiceAccountToken=false")
-	}
-}
-
-// TestCreatePod_CPUOnlyHasNoRuntimeClass: the NVIDIA runtime is only
-// for GPU workloads; CPU instances must not require it.
-func TestCreatePod_CPUOnlyHasNoRuntimeClass(t *testing.T) {
-	server := NewServer(fake.NewSimpleClientset(), nil, nil, nil, nil)
-	req := &models.CreateInstanceRequest{
-		Name: "cpu-instance", Image: "nginx:latest", CPUUnits: 2, Memory: "4GB",
-	}
-
-	pod, err := server.createPod(context.Background(), "inst-cpu00001",
-		uuid.New(), uuid.New(), req, nil)
-	if err != nil {
-		t.Fatalf("createPod failed: %v", err)
-	}
-	if pod.Spec.RuntimeClassName != nil {
-		t.Errorf("CPU-only pod should not set RuntimeClassName, got %q", *pod.Spec.RuntimeClassName)
-	}
-}
-
-// TestCreatePod_CommandOverride: without command/args support, images
-// whose default command exits (most base images) crash-loop forever and
-// the customer has no way to keep them alive.
-func TestCreatePod_CommandOverride(t *testing.T) {
-	server := NewServer(fake.NewSimpleClientset(), nil, nil, nil, nil)
-	req := &models.CreateInstanceRequest{
-		Name: "cmd-instance", Image: "nvidia/cuda:12.3.1-base-ubuntu22.04",
-		CPUUnits: 2, Memory: "8GB",
-		Command: []string{"sleep"}, Args: []string{"600"},
-	}
-
-	pod, err := server.createPod(context.Background(), "inst-cmd00001",
-		uuid.New(), uuid.New(), req, nil)
-	if err != nil {
-		t.Fatalf("createPod failed: %v", err)
-	}
-
-	c := pod.Spec.Containers[0]
-	if len(c.Command) != 1 || c.Command[0] != "sleep" {
-		t.Errorf("Command = %v, want [sleep]", c.Command)
-	}
-	if len(c.Args) != 1 || c.Args[0] != "600" {
-		t.Errorf("Args = %v, want [600]", c.Args)
-	}
-
-	// Omitting them must leave the image defaults untouched.
-	req2 := &models.CreateInstanceRequest{
-		Name: "default-cmd", Image: "nginx:latest", CPUUnits: 1, Memory: "1GB",
-	}
-	pod2, err := server.createPod(context.Background(), "inst-cmd00002",
-		uuid.New(), uuid.New(), req2, nil)
-	if err != nil {
-		t.Fatalf("createPod failed: %v", err)
-	}
-	if pod2.Spec.Containers[0].Command != nil {
-		t.Errorf("Command should be nil when unset, got %v", pod2.Spec.Containers[0].Command)
+	if !scopeFor(uuid.New()).IsRestricted() {
+		t.Error("a project scope must be restricted")
 	}
 }

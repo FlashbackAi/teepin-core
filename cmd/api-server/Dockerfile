@@ -1,5 +1,9 @@
 # Build stage
-FROM golang:1.21-alpine AS builder
+#
+# Must be >= the `go` directive in go.mod (1.25), which grpc 1.83 pushed
+# up. An older toolchain fails the build outright rather than degrading,
+# so this pin and go.mod have to move together.
+FROM golang:1.25-alpine AS builder
 
 WORKDIR /app
 

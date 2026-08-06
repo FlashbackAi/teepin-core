@@ -1,0 +1,151 @@
+# Copyright 2026 TEEPIN Project
+# Licensed under the Apache License, Version 2.0
+#
+# The TEEPIN cluster agent, deployed on the GPU node.
+#
+# The agent dials OUT to the control plane. Nothing here exposes a port,
+# and no inbound firewall rule is needed: the Kubernetes API stays
+# private to the cluster, and the control plane on AWS never connects
+# inward.
+#
+# Before applying, create the token secret (it is NOT in this file, and
+# must match teepin/agent-token in AWS Secrets Manager):
+#
+#   kubectl create secret generic teepin-agent-token \
+#     --namespace teepin-system \
+#     --from-literal=token="$(aws secretsmanager get-secret-value \
+#         --secret-id teepin/agent-token --query SecretString --output text)"
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: teepin-system
+
+---
+# The agent creates and deletes customer workloads, so it needs real
+# permissions in the workload namespace. It is deliberately NOT
+# cluster-admin: it never touches RBAC, secrets outside its own
+# namespace, or the control plane's own resources.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: teepin-agent
+  namespace: teepin-system
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: teepin-agent
+rules:
+  # Customer workloads.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "delete", "deletecollection"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get", "list"]
+  # Endpoint provisioning.
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  # GPU inventory: node labels and allocatable resources.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  # Image pull secrets for private registry images.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "create", "delete"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: teepin-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: teepin-agent
+subjects:
+  - kind: ServiceAccount
+    name: teepin-agent
+    namespace: teepin-system
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: teepin-agent
+  namespace: teepin-system
+  labels:
+    app.kubernetes.io/name: teepin-agent
+    app.kubernetes.io/part-of: teepin
+spec:
+  # Exactly one. Two agents for the same provider would both execute
+  # every command: the control plane addresses a provider, not a
+  # replica, and a second agent registering replaces the first.
+  replicas: 1
+  strategy:
+    # Recreate rather than RollingUpdate: during a rolling update both
+    # agents are briefly connected, and the new one evicts the old
+    # mid-command.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: teepin-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: teepin-agent
+    spec:
+      serviceAccountName: teepin-agent
+      containers:
+        - name: agent
+          image: registry.teepin.com/teepin/agent:latest
+          imagePullPolicy: Always
+          env:
+            - name: TEEPIN_CONTROL_PLANE
+              value: "api.teepin.com:443"
+            - name: TEEPIN_PROVIDER_ID
+              value: "primary"
+            - name: TEEPIN_REGION
+              value: "us-east"
+            - name: TEEPIN_DOMAIN
+              value: "teepin.com"
+            - name: TEEPIN_TLS_ISSUER
+              value: "letsencrypt-prod"
+            - name: TEEPIN_INSTANCE_NAMESPACE
+              value: "default"
+            # Must match the RuntimeClass installed by the GPU Operator.
+            # Without it GPU pods run under plain runc and the customer
+            # gets a billed but unusable GPU.
+            - name: TEEPIN_GPU_RUNTIME_CLASS
+              value: "nvidia"
+            - name: TEEPIN_AGENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: teepin-agent-token
+                  key: token
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65534
+            capabilities:
+              drop: ["ALL"]
+      # Tolerate GPU node taints: the agent must run where the GPUs are.
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule

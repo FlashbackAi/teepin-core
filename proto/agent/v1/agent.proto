@@ -1,0 +1,239 @@
+// Copyright 2026 TEEPIN Project
+// Licensed under the Apache License, Version 2.0
+
+// Package agent.v1 defines the contract between the TEEPIN control
+// plane (AWS) and the cluster agents running beside GPU capacity.
+//
+// Direction matters: the AGENT dials OUT to the control plane and holds
+// the stream open. Nothing inbound is exposed on the GPU node, so the
+// Kubernetes API server stays firewalled. This is the pattern used by
+// io.net workers, GitHub Actions runners and Tailscale.
+//
+// The control plane holds NO Kubernetes credentials. It decides what
+// should exist (placement, billing, tenancy); the agent decides how to
+// make it so (pods, services, ingresses) and reports what is actually
+// running. Where the two disagree, the agent's report wins — it observes
+// reality.
+syntax = "proto3";
+
+package teepin.agent.v1;
+
+option go_package = "github.com/FlashbackAi/teepin-core/pkg/agentpb;agentpb";
+
+import "google/protobuf/timestamp.proto";
+
+// ClusterAgent is the sole interface between the control plane and a
+// GPU provider.
+service ClusterAgent {
+  // Connect establishes the long-lived control channel. The agent opens
+  // it and sends Register as the first message; the control plane then
+  // pushes Commands and the agent replies with Events on the same
+  // stream. One connection multiplexes commands, status reports,
+  // inventory and log streams (HTTP/2).
+  //
+  // On disconnect the agent reconnects with exponential backoff and
+  // jitter, then re-registers and resends full inventory — the control
+  // plane treats every reconnect as a fresh source of truth.
+  rpc Connect(stream AgentMessage) returns (stream ControlMessage);
+}
+
+// ---------------------------------------------------------------------
+// Control plane -> agent
+// ---------------------------------------------------------------------
+
+message ControlMessage {
+  // Correlates a command with the CommandResult or LogChunk stream that
+  // answers it. Commands are idempotent by this id: a command redelivered
+  // after a reconnect must not create a second instance.
+  string request_id = 1;
+
+  oneof payload {
+    CreateInstanceCommand create_instance = 2;
+    DeleteInstanceCommand delete_instance = 3;
+    FetchLogsCommand      fetch_logs      = 4;
+    ExecCommand           exec            = 5;
+    Ping                  ping            = 6;
+  }
+}
+
+// CreateInstanceCommand carries a fully-resolved placement decision.
+//
+// The control plane has already chosen the GPU resource and node from
+// inventory the agent reported: allocation policy and billing stay
+// central. The agent does not re-decide placement — it executes, and
+// fails loudly if the resource is no longer available (which the control
+// plane handles by reallocating).
+message CreateInstanceCommand {
+  string instance_id   = 1;   // "inst-6fea56ce" — also the pod label and hostname
+  string account_id    = 2;   // tenancy: stamped on the pod for auditing
+  string project_id    = 3;
+  string image         = 4;
+
+  repeated string command = 5;  // overrides ENTRYPOINT; empty leaves image default
+  repeated string args    = 6;  // overrides CMD
+
+  int32  cpu_units     = 7;
+  int32  memory_gb     = 8;
+
+  // GPU placement, resolved by the control-plane allocator.
+  // Empty gpu_resource means a CPU-only instance.
+  string gpu_resource  = 9;   // "nvidia.com/mig-1g.10gb" or "nvidia.com/gpu"
+  int32  gpu_quantity  = 10;
+  int32  gpu_vram_gb   = 11;  // billed VRAM — annotated for capacity accounting
+  string node_name     = 12;  // pin to the node whose capacity was accounted
+
+  map<string, string> env    = 13;
+  map<string, string> labels = 14;
+
+  // Public endpoint. When ports is non-empty the agent creates a
+  // ClusterIP Service and an Ingress for <instance_id>.<domain>.
+  repeated PortMapping ports = 15;
+  string endpoint_domain     = 16;  // "teepin.com"
+  bool   enable_tls          = 17;
+  string tls_issuer          = 18;  // cert-manager ClusterIssuer
+
+  // Registry credentials for private images, if the project has them.
+  string image_pull_secret = 19;
+}
+
+message PortMapping {
+  int32  container = 1;
+  string protocol  = 2;  // "tcp" | "udp"
+}
+
+message DeleteInstanceCommand {
+  string instance_id = 1;
+  // Deleting an already-absent instance is success, not an error: the
+  // control plane may retry after a reconnect.
+}
+
+message FetchLogsCommand {
+  string instance_id = 1;
+  int32  tail_lines  = 2;
+  bool   follow      = 3;  // stream until the client disconnects
+}
+
+// ExecCommand runs a command inside a customer container. Used by
+// diagnostics (e.g. verifying GPU visibility); NOT exposed to customers.
+message ExecCommand {
+  string instance_id      = 1;
+  repeated string command = 2;
+  int32  timeout_seconds  = 3;
+}
+
+message Ping { google.protobuf.Timestamp sent_at = 1; }
+
+// ---------------------------------------------------------------------
+// Agent -> control plane
+// ---------------------------------------------------------------------
+
+message AgentMessage {
+  string request_id = 1;  // echoes the command being answered; empty for unsolicited events
+
+  oneof payload {
+    RegisterRequest register       = 2;
+    GPUInventory    inventory      = 3;
+    InstanceStatus  instance_status = 4;
+    LogChunk        log_chunk      = 5;
+    CommandResult   result         = 6;
+    Pong            pong           = 7;
+  }
+}
+
+// RegisterRequest is the first message on every connection.
+message RegisterRequest {
+  string provider_id     = 1;  // stable identity of this GPU provider
+  string agent_version   = 2;  // for compatibility checks and rollout tracking
+  string cluster_version = 3;  // Kubernetes version, for diagnostics
+  string region          = 4;  // "us-east", used in TRNs and placement
+}
+
+// GPUInventory is the agent's view of capacity. Sent on registration,
+// every 30s thereafter, and immediately after any allocation change.
+//
+// This is what the control-plane allocator reasons over. It is a
+// point-in-time report, not a reservation: the control plane may still
+// lose a race, which surfaces as a failed CreateInstanceCommand and is
+// retried against fresh inventory.
+message GPUInventory {
+  repeated GPUNode nodes = 1;
+  google.protobuf.Timestamp observed_at = 2;
+}
+
+message GPUNode {
+  string node_name        = 1;
+  string gpu_product      = 2;  // "NVIDIA-H100-PCIe"
+  string gpu_model        = 3;  // normalised: "h100"
+  int32  memory_gb_per_gpu = 4;
+  int32  gpu_count        = 5;
+  bool   mig_capable      = 6;
+  int32  shared_capacity  = 7;  // allocatable "nvidia.com/gpu"
+  int32  shared_used      = 8;
+  int32  used_vram_gb     = 9;  // consumed by existing pods
+  repeated MIGResource mig_resources = 10;
+  bool   ready            = 11;  // node Ready condition
+}
+
+message MIGResource {
+  string resource_name = 1;  // "nvidia.com/mig-1g.10gb"
+  string profile       = 2;  // "1g.10gb"
+  int32  slices        = 3;
+  int32  memory_gb     = 4;
+  int32  capacity      = 5;
+  int32  used          = 6;
+}
+
+// InstanceStatus reports a pod phase transition. The reconciler moves
+// the database towards this — never the reverse.
+message InstanceStatus {
+  string instance_id = 1;
+  string status      = 2;  // pending | running | failed | terminated
+  string pod_name    = 3;
+  string node_name   = 4;
+  string message     = 5;  // human-readable reason on failure
+  google.protobuf.Timestamp observed_at = 6;
+
+  // Tenancy, echoed back from the pod labels the agent set at creation.
+  //
+  // The control plane caches these statuses and serves customer reads
+  // from that cache, so it must be able to tell whose instance each one
+  // is. Without them a scoped read has nothing to filter on and the
+  // cache would either leak across tenants or be useless.
+  string account_id = 7;
+  string project_id = 8;
+}
+
+message LogChunk {
+  string instance_id = 1;
+  bytes  data        = 2;
+  bool   eof         = 3;  // final chunk for this request_id
+}
+
+// CommandResult answers a command. Failure carries a machine-readable
+// code so the control plane can react (reallocate, surface to the
+// customer, or retry) rather than parsing strings.
+message CommandResult {
+  bool   success = 1;
+  string error_message = 2;
+  ErrorCode error_code = 3;
+
+  // Populated for a successful CreateInstanceCommand.
+  string pod_name = 4;
+  string endpoint_url = 5;
+  string public_ip = 6;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED      = 0;
+  ERROR_CODE_RESOURCE_EXHAUSTED = 1;  // GPU resource gone since inventory — reallocate
+  ERROR_CODE_NOT_FOUND        = 2;  // instance/pod absent
+  ERROR_CODE_INVALID_ARGUMENT = 3;  // malformed command; retrying will not help
+  ERROR_CODE_CLUSTER_ERROR    = 4;  // Kubernetes API failure; retryable
+  ERROR_CODE_IMAGE_PULL       = 5;  // bad image or missing credentials — customer-visible
+  ERROR_CODE_TIMEOUT          = 6;
+}
+
+message Pong {
+  google.protobuf.Timestamp sent_at = 1;
+  google.protobuf.Timestamp received_at = 2;
+}

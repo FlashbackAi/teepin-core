@@ -78,3 +78,6 @@ __debug_bin
 # Local testing
 teepin-local
 
+
+# Pinned build tools fetched by scripts/generate-proto.sh
+.tools/

@@ -4,8 +4,11 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"regexp"
@@ -15,12 +18,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
 
 	"github.com/FlashbackAi/teepin-core/pkg/auth"
+	"github.com/FlashbackAi/teepin-core/pkg/cluster"
 	"github.com/FlashbackAi/teepin-core/pkg/compute"
 	"github.com/FlashbackAi/teepin-core/pkg/gpu"
 	"github.com/FlashbackAi/teepin-core/pkg/models"
@@ -36,7 +36,12 @@ type PricingProvider interface {
 }
 
 type Server struct {
-	k8sClient         kubernetes.Interface
+	// cluster is the only route to GPU capacity. The API server holds no
+	// Kubernetes client of its own: that is what lets the control plane
+	// run on AWS while the GPUs sit in a datacenter elsewhere. See
+	// pkg/cluster for the two implementations.
+	cluster cluster.Client
+
 	gpuAllocator      *gpu.Allocator
 	networkingService *networking.Service
 	store             *compute.Store  // nil in standalone mode (no database)
@@ -47,14 +52,27 @@ type Server struct {
 // the platform runs without a database (local standalone mode); in that
 // case instances are not persisted, not billed, and priced at the
 // compiled-in default rate.
-func NewServer(k8sClient kubernetes.Interface, gpuAllocator *gpu.Allocator, networkingService *networking.Service, store *compute.Store, pricing PricingProvider) *Server {
+func NewServer(clusterClient cluster.Client, gpuAllocator *gpu.Allocator, networkingService *networking.Service, store *compute.Store, pricing PricingProvider) *Server {
 	return &Server{
-		k8sClient:         k8sClient,
+		cluster:           clusterClient,
 		gpuAllocator:      gpuAllocator,
 		networkingService: networkingService,
 		store:             store,
 		pricing:           pricing,
 	}
+}
+
+// scopeFor builds the cluster tenancy predicate for a request.
+//
+// Every compute read and write passes through here. In standalone mode
+// (no database) there is no tenancy and the scope is unrestricted;
+// otherwise it is pinned to the caller's project, which requireScope has
+// already established is present.
+func scopeFor(projectID uuid.UUID) cluster.Scope {
+	if projectID == uuid.Nil {
+		return cluster.AllTenants()
+	}
+	return cluster.ProjectScope(projectID.String())
 }
 
 // vramRate returns the current platform GPU rate ($/GB-hour). Read on
@@ -143,27 +161,45 @@ func (s *Server) CreateInstance(c *gin.Context) {
 		}
 	}
 
-	// Create Kubernetes pod
-	pod, err := s.createPod(c.Request.Context(), instanceID, instanceUUID, projectID, &req, allocation)
+	// Hand the resolved placement to the cluster layer. Everything above
+	// this point is a decision; everything below it is execution.
+	spec := s.instanceSpec(instanceID, instanceUUID, projectID, accountID, &req, allocation)
+
+	scope := scopeFor(projectID)
+
+	result, err := s.cluster.CreateInstance(c.Request.Context(), spec)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to create pod: %v", err)})
+		// A GPU that vanished between allocation and execution is a lost
+		// race, not the customer's fault: say so in terms they can act on,
+		// and use 503 so clients retry rather than treating it as a bad
+		// request.
+		if errors.Is(err, cluster.ErrResourceExhausted) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": "the allocated GPU was taken by another request; retry to be placed on fresh capacity",
+			})
+			return
+		}
+		if errors.Is(err, cluster.ErrClusterUnavailable) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": "no GPU capacity is reachable right now; existing instances are unaffected",
+			})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to create instance: %v", err)})
 		return
 	}
 
-	// Provision the public endpoint (ClusterIP Service + Ingress + TLS).
-	// instanceID is passed through: it is both the pod's
-	// app.teepin.cloud/instance-id label (what the Service selects on)
-	// and the customer-facing hostname under the wildcard domain.
+	// The endpoint is provisioned by the cluster layer alongside the pod:
+	// it must happen next to the cluster, not from the control plane,
+	// which has no Kubernetes access once the agent split completes.
 	var endpointInfo *networking.EndpointInfo
 	if s.networkingService != nil && len(req.Ports) > 0 {
-		exposedPort := int32(req.Ports[0].Container)
-
-		endpointInfo, err = s.networkingService.ProvisionEndpoint(c.Request.Context(), instanceUUID, instanceID, exposedPort)
-		if err != nil {
-			// Cleanup: delete pod if networking provisioning fails
-			_ = s.k8sClient.CoreV1().Pods("default").Delete(c.Request.Context(), pod.Name, metav1.DeleteOptions{})
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to provision endpoint: %v", err)})
-			return
+		// Read back what the cluster layer provisioned so the response
+		// carries DNS and TLS state. Best-effort: a missing endpoint
+		// record must not fail an instance that is already running.
+		if info, epErr := s.networkingService.GetEndpointInfo(
+			c.Request.Context(), instanceUUID, instanceID); epErr == nil {
+			endpointInfo = info
 		}
 	}
 
@@ -180,8 +216,8 @@ func (s *Server) CreateInstance(c *gin.Context) {
 			Status:       compute.StatusPending,
 			CPUUnits:     req.CPUUnits,
 			MemoryGB:     parseMemoryGB(req.Memory),
-			K8sPodName:   pod.Name,
-			K8sNamespace: pod.Namespace,
+			K8sPodName:   result.PodName,
+			K8sNamespace: "default",
 		}
 		if allocation != nil {
 			record.InstanceType = allocation.InstanceType
@@ -192,10 +228,16 @@ func (s *Server) CreateInstance(c *gin.Context) {
 		}
 
 		if err := s.store.Create(c.Request.Context(), record); err != nil {
-			if s.networkingService != nil && endpointInfo != nil {
-				_ = s.networkingService.RevokeEndpoint(c.Request.Context(), instanceUUID)
+			// Roll back rather than leave a workload running that billing
+			// has no record of. DeleteInstance tears down the endpoint
+			// too, so the networking cleanup is covered.
+			if delErr := s.cluster.DeleteInstance(c.Request.Context(), scope, instanceID); delErr != nil {
+				// Both failed: the instance is running and unbilled. Say so
+				// loudly — this needs a human, and silence here is revenue
+				// walking out of the door.
+				log.Printf("ORPHANED INSTANCE %s: persistence failed (%v) and rollback failed (%v) - running unbilled, manual cleanup required",
+					instanceID, err, delErr)
 			}
-			_ = s.k8sClient.CoreV1().Pods(pod.Namespace).Delete(c.Request.Context(), pod.Name, metav1.DeleteOptions{})
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to persist instance: %v", err)})
 			return
 		}
@@ -203,10 +245,15 @@ func (s *Server) CreateInstance(c *gin.Context) {
 
 	// Build response
 	instance := models.Instance{
-		ID:        instanceID,
-		Name:      req.Name,
-		Image:     req.Image,
-		Status:    string(pod.Status.Phase),
+		ID:    instanceID,
+		Name:  req.Name,
+		Image: req.Image,
+		// A freshly created instance is always pending: the pod has been
+		// accepted but no container has started. Previously this reported
+		// the raw pod phase, which is "Pending" at this point anyway —
+		// the difference is that it is now TEEPIN's vocabulary rather
+		// than Kubernetes', consistently with every later read.
+		Status:    compute.StatusPending,
 		CPUUnits:  req.CPUUnits,
 		Memory:    req.Memory,
 		CreatedAt: time.Now().UTC(),
@@ -242,29 +289,32 @@ func (s *Server) CreateInstance(c *gin.Context) {
 // ListInstances lists the caller's instances. With tenancy active the
 // result is scoped to the caller's project — never other tenants'.
 func (s *Server) ListInstances(c *gin.Context) {
-	projectID, ok := s.requireProjectScope(c)
+	projectID, accountID, ok := s.requireScope(c)
 	if !ok {
 		return
 	}
 
-	selector := "app.teepin.cloud/managed=true"
-	if projectID != uuid.Nil {
-		selector += fmt.Sprintf(",%s=%s", LabelProjectID, projectID)
-	}
-
-	pods, err := s.k8sClient.CoreV1().Pods("default").List(c.Request.Context(), metav1.ListOptions{
-		LabelSelector: selector,
-	})
+	statuses, err := s.cluster.ListInstanceStatuses(c.Request.Context(), scopeFor(projectID))
 	if err != nil {
+		if errors.Is(err, cluster.ErrClusterUnavailable) {
+			// The control plane is up; GPU capacity is not reachable. Say
+			// which, so a customer does not read this as their instances
+			// having been destroyed.
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": "GPU capacity is temporarily unreachable; instance state cannot be read right now",
+			})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
+	records := s.recordsByID(c.Request.Context(), accountID, projectID)
+
 	rate := s.vramRate(c.Request.Context())
-	instances := make([]models.Instance, 0, len(pods.Items))
-	for _, pod := range pods.Items {
-		instance := podToInstance(&pod, rate)
-		instances = append(instances, instance)
+	instances := make([]models.Instance, 0, len(statuses))
+	for _, st := range statuses {
+		instances = append(instances, statusToInstance(st, records[st.InstanceID], rate))
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -273,31 +323,68 @@ func (s *Server) ListInstances(c *gin.Context) {
 	})
 }
 
+// recordsByID fetches the caller's stored instance records, keyed by
+// instance ID.
+//
+// One query for the whole page, not one per instance: a customer with
+// fifty instances would otherwise issue fifty round trips to Aurora on
+// every list, which across the Atlantic is the difference between a fast
+// page and a slow one.
+//
+// Returns an empty map in standalone mode or on error: the cluster view
+// alone answers "what is running", and degrading to fewer fields beats
+// failing the request outright.
+func (s *Server) recordsByID(ctx context.Context, accountID, projectID uuid.UUID) map[string]*compute.InstanceRecord {
+	out := map[string]*compute.InstanceRecord{}
+	if s.store == nil || projectID == uuid.Nil {
+		return out
+	}
+
+	records, err := s.store.ListByProject(ctx, accountID, projectID)
+	if err != nil {
+		return out
+	}
+
+	for i := range records {
+		out[records[i].ID] = &records[i]
+	}
+	return out
+}
+
 // GetInstance gets details of a specific instance. Another tenant's
 // instance is indistinguishable from a nonexistent one (404).
 func (s *Server) GetInstance(c *gin.Context) {
 	instanceID := c.Param("id")
 
-	projectID, ok := s.requireProjectScope(c)
+	projectID, _, ok := s.requireScope(c)
 	if !ok {
 		return
 	}
 
-	pods, err := s.k8sClient.CoreV1().Pods("default").List(c.Request.Context(), metav1.ListOptions{
-		LabelSelector: instanceSelector(instanceID, projectID),
-	})
+	st, err := s.cluster.GetInstanceStatus(c.Request.Context(), scopeFor(projectID), instanceID)
 	if err != nil {
+		// Another tenant's instance and a nonexistent one are the same
+		// answer: existence must not leak.
+		if errors.Is(err, cluster.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "instance not found"})
+			return
+		}
+		if errors.Is(err, cluster.ErrClusterUnavailable) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": "GPU capacity is temporarily unreachable; instance state cannot be read right now",
+			})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	if len(pods.Items) == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "instance not found"})
-		return
+	var record *compute.InstanceRecord
+	if s.store != nil {
+		record, _ = s.store.Get(c.Request.Context(), instanceID)
 	}
 
-	instance := podToInstance(&pods.Items[0], s.vramRate(c.Request.Context()))
-	c.JSON(http.StatusOK, instance)
+	c.JSON(http.StatusOK, statusToInstance(*st, record, s.vramRate(c.Request.Context())))
 }
 
 // DeleteInstance deletes an instance. Scoped to the caller's project:
@@ -306,42 +393,35 @@ func (s *Server) GetInstance(c *gin.Context) {
 func (s *Server) DeleteInstance(c *gin.Context) {
 	instanceID := c.Param("id")
 
-	projectID, ok := s.requireProjectScope(c)
+	projectID, _, ok := s.requireScope(c)
 	if !ok {
 		return
 	}
-	selector := instanceSelector(instanceID, projectID)
+	scope := scopeFor(projectID)
 
-	pods, err := s.k8sClient.CoreV1().Pods("default").List(c.Request.Context(), metav1.ListOptions{
-		LabelSelector: selector,
-	})
-	if err != nil {
+	// Existence check before deleting, so that deleting something that
+	// was never there is a 404 rather than a misleading success. The
+	// cluster's own delete is idempotent (commands may be redelivered),
+	// but a customer calling DELETE on a typo deserves to be told.
+	if _, err := s.cluster.GetInstanceStatus(c.Request.Context(), scope, instanceID); err != nil {
+		if errors.Is(err, cluster.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "instance not found"})
+			return
+		}
+		if errors.Is(err, cluster.ErrClusterUnavailable) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": "GPU capacity is temporarily unreachable; the instance cannot be deleted right now",
+			})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	if len(pods.Items) == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "instance not found"})
-		return
-	}
 
-	// Revoke networking endpoint (LoadBalancer + Ingress) using the
-	// full instance UUID carried on the pod.
-	if s.networkingService != nil {
-		if fullUUID, exists := pods.Items[0].Labels["teepin.io/instance-uuid"]; exists {
-			if instanceUUID, err := uuid.Parse(fullUUID); err == nil {
-				if err := s.networkingService.RevokeEndpoint(c.Request.Context(), instanceUUID); err != nil {
-					// Log error but continue with pod deletion
-					c.Header("X-Warning", fmt.Sprintf("Failed to cleanup networking: %v", err))
-				}
-			}
-		}
-	}
-
-	// Delete pod(s)
-	err = s.k8sClient.CoreV1().Pods("default").DeleteCollection(c.Request.Context(), metav1.DeleteOptions{}, metav1.ListOptions{
-		LabelSelector: selector,
-	})
-	if err != nil {
+	// Tears down the pod and its endpoint together — the endpoint
+	// teardown lives next to the cluster because that is where the
+	// Service and Ingress are.
+	if err := s.cluster.DeleteInstance(c.Request.Context(), scope, instanceID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -364,38 +444,37 @@ func (s *Server) DeleteInstance(c *gin.Context) {
 func (s *Server) GetInstanceLogs(c *gin.Context) {
 	instanceID := c.Param("id")
 
-	projectID, ok := s.requireProjectScope(c)
+	projectID, _, ok := s.requireScope(c)
 	if !ok {
 		return
 	}
 
-	pods, err := s.k8sClient.CoreV1().Pods("default").List(c.Request.Context(), metav1.ListOptions{
-		LabelSelector: instanceSelector(instanceID, projectID),
-	})
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	if len(pods.Items) == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "instance not found"})
-		return
-	}
-	pod := &pods.Items[0]
-
 	// Tail size: ?tail=N (default 100, capped to keep responses sane).
-	tail := int64(100)
-	if t, err := strconv.ParseInt(c.Query("tail"), 10, 64); err == nil && t > 0 && t <= 10000 {
+	tail := 100
+	if t, err := strconv.Atoi(c.Query("tail")); err == nil && t > 0 && t <= 10000 {
 		tail = t
 	}
 
-	opts := &corev1.PodLogOptions{
-		TailLines:  &tail,
-		Timestamps: c.Query("timestamps") == "true",
-	}
-	raw, err := s.k8sClient.CoreV1().Pods(pod.Namespace).
-		GetLogs(pod.Name, opts).Do(c.Request.Context()).Raw()
+	// Buffered rather than streamed: this endpoint returns JSON, and the
+	// cap above bounds the size. Live following belongs on a separate
+	// streaming endpoint, which arrives with the agent work.
+	var buf bytes.Buffer
+	err := s.cluster.StreamLogs(c.Request.Context(), scopeFor(projectID), instanceID,
+		cluster.LogOptions{
+			TailLines:  tail,
+			Timestamps: c.Query("timestamps") == "true",
+		}, &buf)
 	if err != nil {
+		if errors.Is(err, cluster.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "instance not found"})
+			return
+		}
+		if errors.Is(err, cluster.ErrClusterUnavailable) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": "GPU capacity is temporarily unreachable; logs cannot be fetched right now",
+			})
+			return
+		}
 		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("failed to fetch logs: %v", err)})
 		return
 	}
@@ -403,7 +482,7 @@ func (s *Server) GetInstanceLogs(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"instance_id": instanceID,
 		"tail":        tail,
-		"logs":        string(raw),
+		"logs":        buf.String(),
 	})
 }
 
@@ -414,20 +493,21 @@ func (s *Server) GetInstanceLogs(c *gin.Context) {
 func (s *Server) GetInstanceMetrics(c *gin.Context) {
 	instanceID := c.Param("id")
 
-	projectID, ok := s.requireProjectScope(c)
+	projectID, _, ok := s.requireScope(c)
 	if !ok {
 		return
 	}
 
-	pods, err := s.k8sClient.CoreV1().Pods("default").List(c.Request.Context(), metav1.ListOptions{
-		LabelSelector: instanceSelector(instanceID, projectID),
-	})
-	if err != nil {
+	// Confirm the instance exists and belongs to the caller before
+	// admitting the feature is missing: a 501 for an instance the caller
+	// does not own would still confirm it exists.
+	if _, err := s.cluster.GetInstanceStatus(
+		c.Request.Context(), scopeFor(projectID), instanceID); err != nil {
+		if errors.Is(err, cluster.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "instance not found"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	if len(pods.Items) == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "instance not found"})
 		return
 	}
 
@@ -496,164 +576,104 @@ func (s *Server) requireScope(c *gin.Context) (projectID, accountID uuid.UUID, o
 	return projectID, accountID, true
 }
 
-// instanceSelector builds the label selector for one instance,
-// restricted to the caller's project when tenancy is active.
-func instanceSelector(instanceID string, projectID uuid.UUID) string {
-	selector := fmt.Sprintf("app.teepin.cloud/instance-id=%s", instanceID)
-	if projectID != uuid.Nil {
-		selector += fmt.Sprintf(",%s=%s", LabelProjectID, projectID)
-	}
-	return selector
-}
-
-func (s *Server) createPod(ctx context.Context, instanceID string, instanceUUID, projectID uuid.UUID, req *models.CreateInstanceRequest, allocation *gpu.Allocation) (*corev1.Pod, error) {
-	// Generate pod selector for networking
-	podSelector := fmt.Sprintf("inst-%s", instanceID[5:]) // Remove "inst-" prefix
-
+// instanceSpec translates a validated request plus a resolved GPU
+// allocation into a cluster placement decision.
+//
+// This is the boundary: everything the control plane decides — tenancy,
+// pricing, which GPU — is baked in here, and the cluster layer executes
+// it without re-deciding anything. Nothing below this point knows what a
+// customer or an invoice is.
+func (s *Server) instanceSpec(instanceID string, instanceUUID, projectID, accountID uuid.UUID, req *models.CreateInstanceRequest, allocation *gpu.Allocation) cluster.InstanceSpec {
 	labels := map[string]string{
-		"app.teepin.cloud/managed":     "true",
-		"app.teepin.cloud/instance-id": instanceID,
-		"app.teepin.cloud/name":        req.Name,
-		"teepin.io/instance":           podSelector,           // For LoadBalancer selector
-		"teepin.io/instance-uuid":      instanceUUID.String(), // For cleanup
+		"app.teepin.cloud/name": req.Name,
+		// The full UUID is how endpoint teardown finds the Service and
+		// Ingress belonging to this instance; the short instance ID is
+		// what the Service selector matches.
+		"teepin.io/instance-uuid": instanceUUID.String(),
 	}
+
+	spec := cluster.InstanceSpec{
+		InstanceID: instanceID,
+		Image:      req.Image,
+		Command:    req.Command,
+		Args:       req.Args,
+		Env:        req.Env,
+		Labels:     labels,
+		CPUUnits:   req.CPUUnits,
+		MemoryGB:   parseMemoryGB(req.Memory),
+	}
+
 	if projectID != uuid.Nil {
-		labels[LabelProjectID] = projectID.String()
+		spec.ProjectID = projectID.String()
+	}
+	if accountID != uuid.Nil {
+		spec.AccountID = accountID.String()
 	}
 
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-%s", req.Name, uuid.New().String()[:5]),
-			Namespace: "default",
-			Labels:    labels,
-		},
-		Spec: corev1.PodSpec{
-			// Tenant isolation: customer workloads must never carry
-			// credentials for the Kubernetes API. Network policy alone
-			// cannot guarantee the API is unreachable (kube-proxy DNATs
-			// the service VIP to node addresses, and IPv4 ipBlock rules
-			// do not cover IPv6 nodes) — without a token, reaching it
-			// gains nothing.
-			AutomountServiceAccountToken: boolPtr(false),
-			Containers: []corev1.Container{
-				{
-					Name: "app",
-					// Optional overrides for the image's ENTRYPOINT/CMD.
-					// nil leaves the image defaults in place.
-					Command: req.Command,
-					Args:    req.Args,
-					Image:   req.Image,
-					Resources: corev1.ResourceRequirements{
-						Requests: corev1.ResourceList{
-							corev1.ResourceCPU:    resource.MustParse(fmt.Sprintf("%d", req.CPUUnits)),
-							corev1.ResourceMemory: resource.MustParse(convertMemoryToK8sFormat(req.Memory)),
-						},
-						Limits: corev1.ResourceList{
-							corev1.ResourceCPU:    resource.MustParse(fmt.Sprintf("%d", req.CPUUnits)),
-							corev1.ResourceMemory: resource.MustParse(convertMemoryToK8sFormat(req.Memory)),
-						},
-					},
-				},
-			},
-		},
-	}
-
-	// GPU pods MUST run under the NVIDIA container runtime. Without it
-	// containerd starts the container with plain runc: Kubernetes still
-	// accounts for the GPU resource, the device nodes and driver
-	// libraries are never injected, and the customer gets a container
-	// with no usable GPU — billed, but unusable. Configurable because
-	// the RuntimeClass name varies (nvidia, nvidia-cdi, ...); set
-	// TEEPIN_GPU_RUNTIME_CLASS="" to disable for clusters where nvidia
-	// is already containerd's default runtime.
 	if allocation != nil {
-		if rc := getEnv("TEEPIN_GPU_RUNTIME_CLASS", "nvidia"); rc != "" {
-			pod.Spec.RuntimeClassName = &rc
-		}
-	}
-
-	// Add GPU resources if allocated
-	if allocation != nil {
-		// VRAM annotations drive capacity accounting (inventory) and
-		// billing reconciliation.
-		pod.ObjectMeta.Annotations = map[string]string{
-			gpu.AnnotationVRAMGB:      strconv.Itoa(allocation.AllocatedVRAM),
-			gpu.AnnotationGPUResource: allocation.ResourceName,
-			annotationInstanceType:    allocation.InstanceType,
-		}
-
-		// Pin to the node whose capacity the allocator accounted against.
-		if allocation.NodeName != "" {
-			pod.Spec.NodeSelector = map[string]string{
-				"kubernetes.io/hostname": allocation.NodeName,
-			}
-		}
-
-		// Request the allocated device: a MIG slice (e.g.
-		// nvidia.com/mig-2g.20gb) or a shared GPU (nvidia.com/gpu).
-		// Simulated allocations skip this — local Kind nodes expose no
-		// GPU extended resources and the pod would be unschedulable.
+		// Simulated allocations (local development on nodes with no real
+		// GPU) must not request an extended resource: no device plugin
+		// advertises it, and the pod would sit unschedulable forever.
 		if !allocation.Simulated {
-			pod.Spec.Containers[0].Resources.Limits[corev1.ResourceName(allocation.ResourceName)] =
-				resource.MustParse(strconv.Itoa(allocation.Quantity))
+			spec.GPUResource = allocation.ResourceName
+			spec.GPUQuantity = allocation.Quantity
 		}
+		spec.GPUVRAMGB = allocation.AllocatedVRAM
+		spec.NodeName = allocation.NodeName
+		spec.InstanceType = allocation.InstanceType
 	}
 
-	// Add environment variables
-	if len(req.Env) > 0 {
-		envVars := make([]corev1.EnvVar, 0, len(req.Env))
-		for key, value := range req.Env {
-			envVars = append(envVars, corev1.EnvVar{
-				Name:  key,
-				Value: value,
-			})
-		}
-		pod.Spec.Containers[0].Env = envVars
+	for _, port := range req.Ports {
+		spec.Ports = append(spec.Ports, cluster.PortMapping{
+			Container: port.Container,
+			Protocol:  "tcp",
+		})
 	}
 
-	// Add ports
-	if len(req.Ports) > 0 {
-		ports := make([]corev1.ContainerPort, 0, len(req.Ports))
-		for _, port := range req.Ports {
-			ports = append(ports, corev1.ContainerPort{
-				ContainerPort: int32(port.Container),
-				Protocol:      corev1.ProtocolTCP,
-			})
-		}
-		pod.Spec.Containers[0].Ports = ports
-	}
-
-	// Create pod
-	createdPod, err := s.k8sClient.CoreV1().Pods("default").Create(ctx, pod, metav1.CreateOptions{})
-	if err != nil {
-		return nil, err
-	}
-
-	return createdPod, nil
+	return spec
 }
 
-func podToInstance(pod *corev1.Pod, vramRate float64) models.Instance {
+// statusToInstance builds the customer-facing view of an instance from
+// the cluster's live status and, where available, the stored record.
+//
+// The two sources answer different questions and neither is sufficient
+// alone. The cluster is authoritative about what is *running* — it
+// observes reality, so a pod that died is visible here before any
+// database row changes. The database is authoritative about what was
+// *agreed*: image, GPU allocation and price are commercial facts that
+// must not change because a pod was rescheduled.
+//
+// record may be nil in standalone mode (no database), in which case the
+// commercial fields are simply absent rather than guessed.
+func statusToInstance(st cluster.InstanceStatus, record *compute.InstanceRecord, vramRate float64) models.Instance {
 	instance := models.Instance{
-		ID:         pod.Labels["app.teepin.cloud/instance-id"],
-		Name:       pod.Labels["app.teepin.cloud/name"],
-		Status:     string(pod.Status.Phase),
-		CreatedAt:  pod.CreationTimestamp.Time,
-		UpdatedAt:  pod.CreationTimestamp.Time,
-		InternalIP: pod.Status.PodIP,
+		ID:     st.InstanceID,
+		Status: st.Status,
+		// The status message carries why a pod is failing (ImagePullBackOff
+		// and friends). Customers cannot fix what they cannot see.
+		StatusMessage: st.Message,
+		UpdatedAt:     st.ObservedAt,
 	}
 
-	if len(pod.Spec.Containers) > 0 {
-		instance.Image = pod.Spec.Containers[0].Image
+	if record == nil {
+		return instance
 	}
 
-	// GPU details from the allocation annotations.
-	if v, err := strconv.Atoi(pod.Annotations[gpu.AnnotationVRAMGB]); err == nil && v > 0 {
-		instance.GPUVRAM = fmt.Sprintf("%dGB", v)
+	instance.Name = record.Name
+	instance.Image = record.Image
+	instance.CreatedAt = record.CreatedAt
+	instance.CPUUnits = record.CPUUnits
+	instance.Memory = fmt.Sprintf("%dGB", record.MemoryGB)
+	instance.InstanceType = record.InstanceType
+	instance.Endpoint = record.Endpoint
+
+	if record.GPUVRAMGB > 0 {
+		instance.GPUVRAM = fmt.Sprintf("%dGB", record.GPUVRAMGB)
 		instance.AllocatedVRAM = instance.GPUVRAM
-		instance.PricePerHour = gpu.PriceForVRAM(v, vramRate)
-	}
-	if t := pod.Annotations[annotationInstanceType]; t != "" {
-		instance.InstanceType = t
+		// Priced from the live rate rather than a stored one: an admin
+		// price change must apply to the next quote, and this field is a
+		// current quote, not an invoice line.
+		instance.PricePerHour = gpu.PriceForVRAM(record.GPUVRAMGB, vramRate)
 	}
 
 	return instance

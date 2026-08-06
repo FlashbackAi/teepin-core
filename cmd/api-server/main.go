@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -16,13 +17,20 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/reflection"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
+	agentpb "github.com/FlashbackAi/teepin-core/pkg/agentpb"
 	"github.com/FlashbackAi/teepin-core/pkg/api"
 	"github.com/FlashbackAi/teepin-core/pkg/auth"
 	"github.com/FlashbackAi/teepin-core/pkg/billing"
+	"github.com/FlashbackAi/teepin-core/pkg/cluster"
 	"github.com/FlashbackAi/teepin-core/pkg/compute"
 	"github.com/FlashbackAi/teepin-core/pkg/database"
 	"github.com/FlashbackAi/teepin-core/pkg/gpu"
@@ -204,17 +212,81 @@ func main() {
 
 	// Reconciler keeps DB state in sync with the cluster: pod phase
 	// changes update status, vanished pods stop billing.
-	if instanceStore != nil && k8sClient != nil {
-		reconciler := compute.NewReconciler(instanceStore, k8sClient,
-			getEnv("TEEPIN_INSTANCE_NAMESPACE", "default"))
+	// Started below, once the cluster client exists — the reconciler
+	// reads cluster state through the same seam as the API.
+	startReconciler := instanceStore != nil
+
+	// Cluster client: the API server's only route to GPU capacity.
+	//
+	// TEEPIN_CLUSTER_MODE selects how capacity is reached:
+	//
+	//   direct — an in-cluster Kubernetes client. The control plane runs
+	//            beside the GPUs. This is the single-node deployment and
+	//            local development.
+	//   agent  — capacity is reached over gRPC via an agent dialling in
+	//            from the GPU datacenter, and this process holds no
+	//            Kubernetes credentials at all. Required when the control
+	//            plane runs on AWS.
+	//
+	// Defaults to direct: an operator who has not thought about this is
+	// running beside their GPUs, and silently starting with no route to
+	// capacity would be worse than the explicit failure below.
+	clusterMode := getEnv("TEEPIN_CLUSTER_MODE", "direct")
+
+	var (
+		clusterClient cluster.Client
+		agentServer   *cluster.AgentServer // non-nil only in agent mode
+		agentRegistry *cluster.Registry
+	)
+	switch clusterMode {
+	case "direct":
+		if k8sClient == nil {
+			log.Println("WARN: TEEPIN_CLUSTER_MODE=direct but no Kubernetes client is available - compute endpoints will report no capacity")
+			clusterClient = cluster.NewUnavailable("no kubernetes client")
+		} else {
+			clusterClient = cluster.NewDirectClient(
+				k8sClient,
+				networkingService,
+				gpuInventory,
+				getEnv("TEEPIN_GPU_RUNTIME_CLASS", "nvidia"),
+			)
+			log.Println("Cluster mode: direct (in-cluster Kubernetes client)")
+		}
+
+	case "agent":
+		agentToken := os.Getenv("TEEPIN_AGENT_TOKEN")
+		if agentToken == "" {
+			// Refuse rather than run an open agent channel: anyone able to
+			// reach the port could otherwise place workloads on customer
+			// GPUs and read customer logs.
+			log.Fatal("TEEPIN_AGENT_TOKEN is required in agent mode")
+		}
+
+		agentRegistry = cluster.NewRegistry()
+		agentClient := cluster.NewAgentClient(agentRegistry)
+		agentServer = cluster.NewAgentServer(agentRegistry, agentClient, agentToken)
+		clusterClient = agentClient
+
+		log.Println("Cluster mode: agent (gRPC control channel, no Kubernetes credentials held)")
+
+	default:
+		log.Fatalf("Invalid TEEPIN_CLUSTER_MODE %q (want \"direct\" or \"agent\")", clusterMode)
+	}
+
+	// Reconciler keeps DB state in sync with the cluster: status changes
+	// update the record, vanished instances stop billing. It runs
+	// wherever the control plane runs, reading through the same cluster
+	// seam as the API.
+	if startReconciler {
+		reconciler := compute.NewReconciler(instanceStore, clusterClient)
 		go reconciler.Start(context.Background())
-		log.Println("✅ Instance reconciler started")
+		log.Println("Instance reconciler started")
 	}
 
 	// Initialize API server with networking integration. billingService
 	// doubles as the live pricing provider: rates come from the
 	// billing.pricing table and are re-read before every allocation.
-	apiServer := api.NewServer(k8sClient, gpuAllocator, networkingService, instanceStore, billingService)
+	apiServer := api.NewServer(clusterClient, gpuAllocator, networkingService, instanceStore, billingService)
 
 	// Admin API (pricing management): only enabled with an explicit
 	// operator token — never on by default.
@@ -240,11 +312,58 @@ func main() {
 
 	// Start server in goroutine
 	go func() {
-		log.Printf("🚀 API server listening on %s\n", srv.Addr)
+		log.Printf("API server listening on %s", srv.Addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Failed to start server: %v", err)
 		}
 	}()
+
+	// gRPC control channel for agents, on its own port so the load
+	// balancer can route HTTP and gRPC separately.
+	var grpcServer *grpc.Server
+	if agentServer != nil {
+		grpcPort := getEnv("GRPC_PORT", "9090")
+
+		listener, err := net.Listen("tcp", ":"+grpcPort)
+		if err != nil {
+			log.Fatalf("Failed to listen on gRPC port %s: %v", grpcPort, err)
+		}
+
+		grpcServer = grpc.NewServer(
+			// Agents hold streams open indefinitely. Without an enforcement
+			// policy gRPC rejects their keepalives as too aggressive and
+			// tears down connections that are perfectly healthy.
+			grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+				MinTime:             10 * time.Second,
+				PermitWithoutStream: true,
+			}),
+			grpc.KeepaliveParams(keepalive.ServerParameters{
+				Time:    30 * time.Second,
+				Timeout: 10 * time.Second,
+			}),
+		)
+
+		agentpb.RegisterClusterAgentServer(grpcServer, agentServer)
+
+		// The standard gRPC health service, which the ALB target group
+		// checks. A gRPC port with no health service marks every task
+		// unhealthy and ECS destroys them - that failure cost a
+		// deployment before this existed.
+		healthServer := health.NewServer()
+		healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
+		healthpb.RegisterHealthServer(grpcServer, healthServer)
+
+		// Reflection lets grpcurl introspect the service when debugging a
+		// connection problem from outside the cluster.
+		reflection.Register(grpcServer)
+
+		go func() {
+			log.Printf("Agent gRPC channel listening on :%s", grpcPort)
+			if err := grpcServer.Serve(listener); err != nil {
+				log.Printf("gRPC server stopped: %v", err)
+			}
+		}()
+	}
 
 	// Wait for interrupt signal
 	quit := make(chan os.Signal, 1)
@@ -259,6 +378,14 @@ func main() {
 
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Fatalf("Server forced to shutdown: %v", err)
+	}
+
+	// GracefulStop lets agents observe a clean disconnect and reconnect
+	// promptly, rather than waiting for a keepalive to expire against a
+	// socket that is already gone.
+	if grpcServer != nil {
+		grpcServer.GracefulStop()
+		log.Println("Agent gRPC channel stopped")
 	}
 
 	// Close database connection

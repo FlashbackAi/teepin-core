@@ -7,10 +7,16 @@ import "time"
 
 // Instance represents a compute instance
 type Instance struct {
-	ID             string            `json:"id"`
-	Name           string            `json:"name"`
-	Image          string            `json:"image"`
-	Status         string            `json:"status"`
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Image  string `json:"image"`
+	Status string `json:"status"`
+	// StatusMessage explains a non-running status in terms the customer
+	// can act on — "manifest unknown" for a bad image tag, the crash
+	// reason for a container that will not start. Without it a failed
+	// instance is just the word "failed", and the customer opens a
+	// support ticket to learn what the cluster already knew.
+	StatusMessage  string            `json:"status_message,omitempty"`
 	InstanceType   string            `json:"instance_type,omitempty"` // derived from hardware, e.g. "gpu.h100.2g.20gb"
 	PricePerHour   float64           `json:"price_per_hour,omitempty"`
 	GPUVRAM        string            `json:"gpu_vram,omitempty"`        // what was requested
