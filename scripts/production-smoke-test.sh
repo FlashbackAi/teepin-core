@@ -96,19 +96,38 @@ else
     bad "API health check failed — aborting"; exit 1
 fi
 
-# --- 1. Register + login ----------------------------------------------
-info "Registering test user $EMAIL"
-REG=$(curl -s -X POST "$API_URL/v1/auth/register" -H "Content-Type: application/json" \
-    -d "{\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\",\"name\":\"Smoke Test\"}")
-if echo "$REG" | jq -e '.user.id // .id' > /dev/null 2>&1; then
-    ok "User registered"
+# --- 1. Account signup + login -----------------------------------------
+# Signup creates an ACCOUNT plus its owner user: every user belongs to
+# an account, because the account is what gets billed.
+ALIAS="smoke-${STAMP}"
+info "Creating test account $ALIAS ($EMAIL)"
+REG=$(curl -s -X POST "$API_URL/v1/accounts" -H "Content-Type: application/json" \
+    -d "{\"type\":\"organization\",\"display_name\":\"Smoke Test Co\",\"alias\":\"$ALIAS\",\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\",\"full_name\":\"Smoke Test\"}")
+
+ACCOUNT_ID=$(echo "$REG" | jq -r '.account.id // empty' 2>/dev/null || true)
+ACCOUNT_NUMBER=$(echo "$REG" | jq -r '.account.account_number_formatted // empty' 2>/dev/null || true)
+if [ -n "$ACCOUNT_ID" ]; then
+    ok "Account created: $ACCOUNT_NUMBER ($ALIAS)"
 else
-    bad "Registration failed: $REG"; exit 1
+    bad "Account creation failed: $REG"; exit 1
 fi
+
+# The signup identity must be the account owner: sole billing authority.
+OWNER_ROLE=$(echo "$REG" | jq -r '.user.role // empty')
+[ "$OWNER_ROLE" = "owner" ] && ok "Signup user has the owner role" \
+                            || bad "Signup user role = '$OWNER_ROLE', want 'owner'"
 
 TOKEN=$(curl -s -X POST "$API_URL/v1/auth/login" -H "Content-Type: application/json" \
     -d "{\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\"}" | jq -r '.access_token // empty')
 [ -n "$TOKEN" ] && ok "Login returned JWT" || { bad "Login failed"; exit 1; }
+
+# --- 1b. Account details ------------------------------------------------
+ACCT=$(curl -s "$API_URL/v1/accounts/current" -H "Authorization: Bearer $TOKEN")
+if echo "$ACCT" | jq -e '.account_number' > /dev/null 2>&1; then
+    ok "Account details retrievable ($(echo "$ACCT" | jq -r .type))"
+else
+    bad "GET /v1/accounts/current failed: $ACCT"
+fi
 
 # --- 2. Project + API key ----------------------------------------------
 PROJ_RESP=$(curl -s -X POST "$API_URL/v1/projects" \
@@ -127,6 +146,60 @@ API_KEY=$(echo "$KEY_RESP" | jq -r '[.key, .api_key] | map(select(type=="string"
 [ -n "$API_KEY" ] && ok "API key issued" || { bad "API key creation failed: $KEY_RESP"; exit 1; }
 
 AUTH=(-H "Authorization: Bearer $API_KEY")
+
+# --- 2b. Sub-users ------------------------------------------------------
+# A colleague gets their own login inside the account, signing in with
+# alias + username (NOT email — the same email may exist in several
+# accounts).
+SUB=$(curl -s -X POST "$API_URL/v1/accounts/current/users" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d "{\"username\":\"alice\",\"email\":\"alice-${STAMP}@test.teepin.io\",\"password\":\"Alice-$STAMP!\",\"role\":\"member\"}")
+if echo "$SUB" | jq -e '.id' > /dev/null 2>&1; then
+    ok "Sub-user created (role: $(echo "$SUB" | jq -r .role))"
+else
+    bad "Sub-user creation failed: $SUB"
+fi
+
+SUB_TOKEN=$(curl -s -X POST "$API_URL/v1/auth/login/sub-user" -H "Content-Type: application/json" \
+    -d "{\"alias\":\"$ALIAS\",\"username\":\"alice\",\"password\":\"Alice-$STAMP!\"}" \
+    | jq -r '.access_token // empty')
+[ -n "$SUB_TOKEN" ] && ok "Sub-user signed in with alias + username" \
+                    || bad "Sub-user login failed"
+
+# Owner-only operations must be refused for a member.
+CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PATCH "$API_URL/v1/accounts/current" \
+    -H "Authorization: Bearer $SUB_TOKEN" -H "Content-Type: application/json" \
+    -d '{"display_name":"Hijacked"}')
+[ "$CODE" = "403" ] && ok "Member cannot edit account details (403)" \
+                    || bad "Member editing account returned $CODE, want 403"
+
+# --- 2c. Cross-account isolation ---------------------------------------
+# THE tenancy test: a second account must not be able to read the
+# first account's project, even holding a valid token and the real
+# project UUID. Must be 404 — a 403 would confirm the project exists.
+OTHER_EMAIL="other-${STAMP}@test.teepin.io"
+curl -s -X POST "$API_URL/v1/accounts" -H "Content-Type: application/json" \
+    -d "{\"type\":\"personal\",\"display_name\":\"Other Tenant\",\"email\":\"$OTHER_EMAIL\",\"password\":\"$PASSWORD\"}" > /dev/null
+OTHER_TOKEN=$(curl -s -X POST "$API_URL/v1/auth/login" -H "Content-Type: application/json" \
+    -d "{\"email\":\"$OTHER_EMAIL\",\"password\":\"$PASSWORD\"}" | jq -r '.access_token // empty')
+
+if [ -n "$OTHER_TOKEN" ]; then
+    CODE=$(curl -s -o /dev/null -w "%{http_code}" "$API_URL/v1/projects/$PROJECT_ID" \
+        -H "Authorization: Bearer $OTHER_TOKEN")
+    case "$CODE" in
+        404) ok "Cross-account project read blocked (404, existence not leaked)" ;;
+        200) bad "CROSS-TENANT LEAK: another account read this project" ;;
+        *)   bad "Cross-account read returned $CODE, want 404 (403 leaks existence)" ;;
+    esac
+
+    # The other account must also see none of this account's projects.
+    OTHER_COUNT=$(curl -s "$API_URL/v1/projects" -H "Authorization: Bearer $OTHER_TOKEN" \
+        | jq '.count // 0' 2>/dev/null || echo 0)
+    [ "${OTHER_COUNT:-0}" = "0" ] && ok "Another account's project list is empty" \
+                                  || bad "Another account sees $OTHER_COUNT projects — tenancy is broken"
+else
+    bad "Could not create the second account for the isolation check"
+fi
 
 # --- 3. Tenancy: unauthenticated access must be rejected ---------------
 CODE=$(curl -s -o /dev/null -w "%{http_code}" "$API_URL/v1/compute/instances")
@@ -415,6 +488,18 @@ if [ "$SKIP_GPU" != "true" ] && [ "${DWELL:-0}" -gt 0 ] && command -v kubectl > 
             bad "No usage records written for terminated instances — billing tail regression"
         fi
     fi
+fi
+
+# --- 12b. Account billing summary ---------------------------------------
+# What the console dashboard renders: one account total, attributed
+# down to project and service.
+info "Checking the account billing summary"
+SUMMARY=$(curl -s "$API_URL/v1/billing/summary" -H "Authorization: Bearer $TOKEN")
+if echo "$SUMMARY" | jq -e 'has("total_cost") and has("projects")' > /dev/null 2>&1; then
+    ok "Billing summary: \$$(echo "$SUMMARY" | jq -r '.total_cost') across $(echo "$SUMMARY" | jq -r '.projects | length') project(s)"
+    echo "$SUMMARY" | jq -r '.projects[]? | "     \(.project_name)  $\(.cost)"'
+else
+    bad "Billing summary failed: $SUMMARY"
 fi
 
 # --- 13. Instance persistence verification (optional, in-cluster DB) ----
