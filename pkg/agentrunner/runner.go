@@ -40,6 +40,29 @@ const inventoryInterval = 30 * time.Second
 // is well inside the billing granularity that consumes it.
 const statusInterval = 15 * time.Second
 
+// sendTimeout bounds a single write to the control plane.
+//
+// This is the liveness check that matters. gRPC's transport keepalive
+// does NOT reliably detect a half-open connection here: grpc.NewClient
+// manages the channel lazily, and once a stream is established the
+// client will happily block in Recv() forever against a peer that has
+// gone away. A Fargate task draining during a deploy produces exactly
+// that — the control plane calls GracefulStop, the ALB drops the
+// connection, and the agent notices nothing.
+//
+// Observed in production 2026-08-07: an agent held a dead connection for
+// ten minutes with no reconnect attempt, while the control plane logged
+// "cluster unreachable" every 30 seconds. Because writes happen at least
+// every statusInterval, a blocked or failed write is the fastest honest
+// signal that the connection is gone.
+const sendTimeout = 20 * time.Second
+
+// heartbeatInterval is how often the agent writes purely to prove the
+// connection is alive. Combined with sendTimeout this bounds detection
+// of a dead control plane at roughly 30 seconds, against the ten minutes
+// observed before it existed.
+const heartbeatInterval = 10 * time.Second
+
 // Config configures a Runner.
 type Config struct {
 	ProviderID string
@@ -63,6 +86,11 @@ type Runner struct {
 	// concurrent SendMsg.
 	sendMu sync.Mutex
 
+	// fail reports a dead connection to Run, which returns so the caller
+	// reconnects. Buffered and sent non-blockingly: many goroutines may
+	// notice the same failure, and only the first needs to be recorded.
+	fail chan error
+
 	// lastReported deduplicates status pushes: without it, every sweep
 	// would resend the unchanged state of every instance, which at any
 	// scale is a lot of traffic saying nothing.
@@ -74,6 +102,7 @@ func New(cfg Config) *Runner {
 	return &Runner{
 		cfg:          cfg,
 		lastReported: make(map[string]string),
+		fail:         make(chan error, 1),
 	}
 }
 
@@ -98,8 +127,12 @@ func (r *Runner) Run(ctx context.Context, s stream) error {
 		return fmt.Errorf("register: %w", err)
 	}
 
+	// cancel MUST run before wg.Wait below, or the deferred wait blocks
+	// forever: the loop goroutines only exit on ctx.Done, so returning
+	// from Run for any other reason (EOF, send failure) would hang here
+	// and leak every goroutine from every past connection. Defers run in
+	// reverse order, so this is declared AFTER the WaitGroup defer.
 	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
 
 	// Inventory immediately on connect: the control plane treats every
 	// reconnect as a fresh source of truth and has no capacity data
@@ -108,23 +141,60 @@ func (r *Runner) Run(ctx context.Context, s stream) error {
 	r.reportStatuses(ctx, s)
 
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(3)
 	go func() { defer wg.Done(); r.inventoryLoop(ctx, s) }()
 	go func() { defer wg.Done(); r.statusLoop(ctx, s) }()
+	go func() { defer wg.Done(); r.heartbeatLoop(ctx, s) }()
+
+	// Reverse defer order: wait runs last, cancel first. Both are needed
+	// — cancel alone would let goroutines outlive the connection and
+	// write to a dead stream; wait alone would deadlock.
 	defer wg.Wait()
+	defer cancel()
+
+	// Recv runs in its own goroutine so the loop below can also wake on a
+	// send failure. Blocking directly on Recv is what let a dead
+	// connection go unnoticed for ten minutes: the control plane had gone
+	// away, but nothing was arriving to error on.
+	received := make(chan *agentpb.ControlMessage)
+	recvErr := make(chan error, 1)
+	go func() {
+		for {
+			msg, err := s.Recv()
+			if err != nil {
+				recvErr <- err
+				return
+			}
+			select {
+			case received <- msg:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
 	for {
-		msg, err := s.Recv()
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
+		select {
+		case msg := <-received:
+			// Each command runs in its own goroutine: a slow image pull
+			// must not stall the delete or log request behind it.
+			go r.handleCommand(ctx, s, msg)
 
-		// Each command runs in its own goroutine: a slow image pull must
-		// not stall the delete or log request behind it.
-		go r.handleCommand(ctx, s, msg)
+		case err := <-recvErr:
+			if err == io.EOF {
+				return nil
+			}
+			return err
+
+		case err := <-r.fail:
+			// A write failed or hung: the connection is dead even though
+			// Recv has not noticed. Returning triggers the caller's
+			// reconnect with backoff.
+			return fmt.Errorf("connection failed: %w", err)
+
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 }
 
@@ -304,6 +374,38 @@ func (w *chunkWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// heartbeatLoop writes to the control plane on a fixed interval.
+//
+// The other loops are not sufficient as a liveness signal: status sweeps
+// only send on a CHANGE, so a steady-state agent with nothing happening
+// can go minutes without writing anything. Inventory does write every
+// 30s, but tying connection detection to it means a change in inventory
+// cadence silently changes failure detection. An explicit heartbeat
+// keeps the two concerns separate.
+//
+// The Pong message type is reused rather than adding a new one: the
+// control plane already ignores unsolicited Pongs, so this needs no
+// server-side change and no proto version bump.
+func (r *Runner) heartbeatLoop(ctx context.Context, s stream) {
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// A failure here reports through send() and ends the
+			// connection, which is the entire point of the heartbeat.
+			_ = r.send(s, &agentpb.AgentMessage{
+				Payload: &agentpb.AgentMessage_Pong{Pong: &agentpb.Pong{
+					SentAt: timestamppb.Now(),
+				}},
+			})
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 func (r *Runner) inventoryLoop(ctx context.Context, s stream) {
 	ticker := time.NewTicker(inventoryInterval)
 	defer ticker.Stop()
@@ -436,10 +538,46 @@ func (r *Runner) reportStatuses(ctx context.Context, s stream) {
 	}
 }
 
+// send writes to the control plane, treating a failure or a hang as a
+// dead connection.
+//
+// The timeout is the important part. gRPC's SendMsg can block
+// indefinitely when the peer has gone away without closing (a drained
+// Fargate task behind an ALB), and the agent would otherwise sit there
+// believing it is connected while the control plane reports no capacity.
 func (r *Runner) send(s stream, msg *agentpb.AgentMessage) error {
 	r.sendMu.Lock()
 	defer r.sendMu.Unlock()
-	return s.Send(msg)
+
+	done := make(chan error, 1)
+	go func() { done <- s.Send(msg) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			r.reportFailure(err)
+		}
+		return err
+
+	case <-time.After(sendTimeout):
+		// The goroutine above is left running: it holds sendMu's caller
+		// contract only for this call, and it will exit when the stream
+		// is finally torn down. Leaking it briefly is preferable to
+		// blocking the agent forever.
+		err := fmt.Errorf("send timed out after %s: connection presumed dead", sendTimeout)
+		r.reportFailure(err)
+		return err
+	}
+}
+
+// reportFailure records the first error that indicates a dead
+// connection, waking Run so the caller reconnects.
+func (r *Runner) reportFailure(err error) {
+	select {
+	case r.fail <- err:
+	default:
+		// Already reporting a failure; the first one is the useful one.
+	}
 }
 
 func (r *Runner) replyError(s stream, requestID string, code agentpb.ErrorCode, message string) {
