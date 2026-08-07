@@ -505,9 +505,18 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 		gin.SetMode(gin.ReleaseMode)
 	}
 
-	router := gin.Default()
+	// gin.New() rather than gin.Default(): Default installs a Logger that
+	// records every request including health checks. Behind an ALB with
+	// two target groups that is ~12 lines every 15 seconds saying
+	// nothing, which buries real events (a startup line becomes
+	// unfindable within minutes) and is billed by CloudWatch per ingested
+	// byte.
+	router := gin.New()
 
 	// Middleware (order matters!)
+	router.Use(gin.LoggerWithConfig(gin.LoggerConfig{
+		SkipPaths: []string{"/health", "/ready"},
+	}))
 	router.Use(gin.Recovery())
 	router.Use(corsMiddleware())
 	router.Use(requestIDMiddleware())
