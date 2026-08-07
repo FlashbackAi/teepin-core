@@ -25,13 +25,25 @@ const (
 	AllocationSimulated = "simulated" // local development without GPUs
 )
 
+// Snapshotter supplies the current GPU inventory.
+//
+// An interface rather than the concrete *Inventory because the control
+// plane may be nowhere near the GPUs: on AWS the capacity report arrives
+// over the agent's gRPC stream, and nothing here can call the Kubernetes
+// API. Both sources produce the same []*NodeGPUInfo, so the allocation
+// policy below is identical either way — placement decisions must not
+// depend on how the platform happens to be deployed.
+type Snapshotter interface {
+	Snapshot(ctx context.Context) ([]*NodeGPUInfo, error)
+}
+
 // Allocator selects GPU capacity for instance requests based on the
 // live cluster inventory. It is hardware-agnostic: MIG slices are used
 // when a node exposes a profile matching the requested size exactly,
 // otherwise the workload is placed on a shared GPU with capacity
 // accounting.
 type Allocator struct {
-	inventory *Inventory
+	inventory Snapshotter
 }
 
 // Allocation is the result of a successful GPU allocation.
@@ -54,8 +66,10 @@ type Allocation struct {
 	Simulated      bool   // true when running against simulated capacity
 }
 
-// NewAllocator creates a GPU allocator backed by the given inventory.
-func NewAllocator(inventory *Inventory) *Allocator {
+// NewAllocator creates a GPU allocator backed by the given inventory
+// source — a local Kubernetes client in direct mode, or the agent's
+// reported capacity when the control plane runs remotely.
+func NewAllocator(inventory Snapshotter) *Allocator {
 	return &Allocator{inventory: inventory}
 }
 

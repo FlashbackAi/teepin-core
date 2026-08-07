@@ -176,7 +176,12 @@ func main() {
 	} else {
 		gpuInventory = gpu.NewInventory(nil, gpuSimulated)
 	}
-	gpuAllocator := gpu.NewAllocator(gpuInventory)
+	// The allocator is constructed below, once the cluster client exists:
+	// its inventory source depends on how capacity is reached. Building
+	// it here against the local Kubernetes client is what made agent mode
+	// fail with "no kubernetes client available for GPU discovery" — the
+	// control plane on AWS has none, and the capacity report arrives over
+	// the agent stream instead.
 	if gpuSimulated {
 		log.Println("✅ GPU allocator initialized (SIMULATION mode — no real GPU hardware)")
 	} else {
@@ -272,6 +277,11 @@ func main() {
 	default:
 		log.Fatalf("Invalid TEEPIN_CLUSTER_MODE %q (want \"direct\" or \"agent\")", clusterMode)
 	}
+
+	// GPU allocator, over whichever inventory source matches the
+	// deployment. Placement policy is identical in both modes; only the
+	// source of the capacity report differs.
+	gpuAllocator := gpu.NewAllocator(cluster.NewSnapshotter(clusterClient))
 
 	// Reconciler keeps DB state in sync with the cluster: status changes
 	// update the record, vanished instances stop billing. It runs
