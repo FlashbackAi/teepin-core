@@ -351,10 +351,98 @@ if [ "$GPU_PRESENT" = true ]; then
         kubectl get nodes -o json | jq '.items[].status.allocatable | with_entries(select(.key | startswith("nvidia.com/")))'
     }
 
+    # Install a one-shot systemd unit that finishes MIG setup after the
+    # reboot.
+    #
+    # Without this the reboot is a cliff: the operator comes back with
+    # MIG mode enabled but no layout applied, the node advertises zero
+    # GPU capacity, and it stays that way until a human remembers to
+    # re-run this script. That happened on three separate VMs before
+    # this existed — and the failure is silent, because every component
+    # reports healthy while capacity is simply absent.
+    install_mig_resume_unit() {
+        log_info "Installing teepin-mig-resume.service to finish after the reboot..."
+
+        cat > /etc/systemd/system/teepin-mig-resume.service <<EOF
+[Unit]
+Description=Finish TEEPIN MIG partitioning after a reboot
+# rke2-server must be up before kubectl will work.
+After=rke2-server.service network-online.target
+Wants=rke2-server.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=KUBECONFIG=/etc/rancher/rke2/rke2.yaml
+Environment=PATH=/var/lib/rancher/rke2/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=MIG_CONFIG=${MIG_LAYOUT}
+ExecStart=/usr/local/bin/teepin-mig-resume.sh
+# Disables itself on success, so this runs exactly once.
+ExecStartPost=/bin/systemctl disable teepin-mig-resume.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+        cat > /usr/local/bin/teepin-mig-resume.sh <<'RESUME'
+#!/bin/bash
+# Applies the MIG layout once the cluster is up after a reboot.
+# Installed by setup-production.sh; disables itself when it succeeds.
+set -uo pipefail
+
+LAYOUT="${MIG_CONFIG:-all-balanced}"
+log() { echo "[teepin-mig-resume] $1"; }
+
+# The API server takes a while to accept connections after boot.
+for _ in $(seq 1 60); do
+    kubectl get nodes > /dev/null 2>&1 && break
+    sleep 10
+done
+
+# And gpu-feature-discovery needs to relabel the node before the
+# mig-manager will act on anything.
+for _ in $(seq 1 30); do
+    [ -n "$(kubectl get nodes -l nvidia.com/mig.capable=true -o name 2>/dev/null)" ] && break
+    sleep 10
+done
+
+if [ -z "$(kubectl get nodes -l nvidia.com/mig.capable=true -o name 2>/dev/null)" ]; then
+    log "No MIG-capable node found; nothing to do."
+    exit 0
+fi
+
+# Toggle the label: the mig-manager only reacts to CHANGES, and the
+# label usually survives the reboot unchanged.
+log "Applying MIG layout $LAYOUT"
+kubectl label nodes -l nvidia.com/mig.capable=true nvidia.com/mig.config- --overwrite > /dev/null 2>&1
+sleep 5
+kubectl label nodes -l nvidia.com/mig.capable=true nvidia.com/mig.config="$LAYOUT" --overwrite
+
+for _ in $(seq 1 60); do
+    if kubectl get nodes -o json | jq -e \
+        '[.items[].status.allocatable | keys[] | select(startswith("nvidia.com/mig-"))] | length > 0' > /dev/null 2>&1; then
+        log "MIG devices are available."
+        exit 0
+    fi
+    sleep 10
+done
+
+log "MIG devices did not appear within 10 minutes; leaving the unit enabled to retry on next boot."
+exit 1
+RESUME
+
+        chmod +x /usr/local/bin/teepin-mig-resume.sh
+        systemctl daemon-reload
+        systemctl enable teepin-mig-resume.service > /dev/null 2>&1
+    }
+
     prompt_reboot_for_mig() {
         log_warn "MIG mode change is PENDING and requires a reboot to apply"
         log_warn "(the GPU reset fails on VMs: the device is held by a host process the mig-manager cannot stop)"
-        log_warn "After the reboot, re-run this script — completed steps skip through in seconds."
+
+        install_mig_resume_unit
+        log_info "MIG partitioning will complete automatically after the reboot."
+
         if [ "${AUTO_REBOOT:-}" = "true" ]; then
             log_info "AUTO_REBOOT=true — rebooting now"
             reboot
@@ -362,13 +450,44 @@ if [ "$GPU_PRESENT" = true ]; then
         fi
         read -p "Reboot now? (yes/no): " DO_REBOOT
         if [ "$DO_REBOOT" = "yes" ]; then
-            log_info "Rebooting — re-run this script when the server is back (SSH drops for ~2-3 minutes)"
+            log_info "Rebooting — SSH drops for ~2-3 minutes. MIG completes on its own."
+            log_info "Verify with: kubectl get nodes -o json | jq '.items[0].status.allocatable'"
             reboot
             exit 0
         fi
-        log_error "Cannot continue without MIG devices — reboot and re-run this script"
+        log_warn "Not rebooting. MIG stays pending until you do — the node has NO GPU capacity until then."
+        log_warn "Reboot when convenient; teepin-mig-resume.service finishes the job."
         exit 1
     }
+
+    # Wait for the GPU operator to label the node before deciding whether
+    # it is MIG-capable.
+    #
+    # gpu-feature-discovery applies nvidia.com/mig.capable a minute or so
+    # after the operator starts, and longer after a reboot. Checking too
+    # early finds no MIG nodes, skips this entire block, and leaves the
+    # node advertising NO GPU capacity at all — which is worse than not
+    # enabling MIG, because whole-GPU allocation is lost too. Observed on
+    # a fresh io.net VM 2026-08-07.
+    wait_for_mig_capable_label() {
+        local deadline=$(( $(date +%s) + $1 ))
+        while [ "$(date +%s)" -lt "$deadline" ]; do
+            if [ -n "$(kubectl get nodes -l nvidia.com/mig.capable=true -o name 2>/dev/null)" ]; then
+                return 0
+            fi
+            # A GPU that is present but not MIG-capable (L40S, A40, RTX)
+            # is a legitimate answer, not something to wait out.
+            if kubectl get nodes -o json 2>/dev/null | jq -e \
+                '[.items[].status.allocatable | keys[] | select(. == "nvidia.com/gpu")] | length > 0' > /dev/null; then
+                return 1
+            fi
+            sleep 10
+        done
+        return 1
+    }
+
+    log_info "Waiting for GPU node labels (gpu-feature-discovery)..."
+    set +e; wait_for_mig_capable_label 180; set -e
 
     MIG_NODES=$(kubectl get nodes -l nvidia.com/mig.capable=true -o name)
     if [ -z "$MIG_NODES" ]; then

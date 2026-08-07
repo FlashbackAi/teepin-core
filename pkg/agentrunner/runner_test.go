@@ -210,6 +210,79 @@ func TestRun_RegistersFirst(t *testing.T) {
 	}
 }
 
+// instanceCluster reports a fixed set of running instances.
+type instanceCluster struct {
+	nullCluster
+	instances []cluster.InstanceStatus
+}
+
+func (c instanceCluster) ListInstanceStatuses(context.Context, cluster.Scope) ([]cluster.InstanceStatus, error) {
+	return c.instances, nil
+}
+
+// TestReconnect_ReportsEveryInstanceAgain is the regression test for a
+// bug that made running, billed instances invisible to their owner.
+//
+// The control plane holds instance statuses in memory, so a restarted
+// task or a fresh connection starts from nothing. The agent's status
+// sweep only sends CHANGES — and `lastReported` was created once at
+// startup and never reset. After a reconnect the agent therefore
+// considered every unchanged instance "already reported" and stayed
+// silent, so the control plane never learned they existed.
+//
+// Observed 2026-08-07: two pods running in the cluster, each visible
+// under only one of two API keys, while both were being billed.
+func TestReconnect_ReportsEveryInstanceAgain(t *testing.T) {
+	live := []cluster.InstanceStatus{
+		{InstanceID: "inst-aaaa1111", Status: "running", ProjectID: "p1"},
+		{InstanceID: "inst-bbbb2222", Status: "running", ProjectID: "p1"},
+	}
+
+	r := New(Config{
+		ProviderID: "test-provider",
+		Cluster:    instanceCluster{instances: live},
+	})
+
+	countStatuses := func(s *stubStream) int {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		n := 0
+		for _, msg := range s.sent {
+			if msg.GetInstanceStatus() != nil {
+				n++
+			}
+		}
+		return n
+	}
+
+	// First connection: both instances reported.
+	first := newStubStream()
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	go func() { _ = r.Run(ctx1, first) }()
+	time.Sleep(700 * time.Millisecond)
+	cancel1()
+
+	if got := countStatuses(first); got < 2 {
+		t.Fatalf("first connection reported %d statuses, want at least 2", got)
+	}
+
+	// Second connection, same Runner, nothing changed in the cluster.
+	// Every instance must be reported again: the control plane on the
+	// other end has no memory of the first connection.
+	second := newStubStream()
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	go func() { _ = r.Run(ctx2, second) }()
+	time.Sleep(700 * time.Millisecond)
+
+	if got := countStatuses(second); got < 2 {
+		t.Errorf(
+			"after reconnect only %d statuses were sent, want 2: unchanged instances "+
+				"stay invisible to the control plane and are billed but unlistable",
+			got)
+	}
+}
+
 func TestRun_ReturnsOnStreamEOF(t *testing.T) {
 	s := newStubStream()
 	r := newTestRunner()

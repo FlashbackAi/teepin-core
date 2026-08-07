@@ -115,6 +115,24 @@ type stream interface {
 
 // Run registers, then serves commands until the stream ends.
 func (r *Runner) Run(ctx context.Context, s stream) error {
+	// Forget what was reported on any previous connection.
+	//
+	// The control plane holds instance statuses in memory, so a restarted
+	// task or a new connection starts from nothing. Meanwhile the status
+	// sweep only sends CHANGES — so without this reset, an instance whose
+	// state has not changed since the last connection is never re-sent,
+	// and the control plane never learns it exists.
+	//
+	// The effect is severe: the instance runs, is billed, and is
+	// completely invisible to its owner. Observed 2026-08-07, where two
+	// running pods each appeared under only one of two API keys.
+	// Re-registration must mean "here is everything", which is what the
+	// proto's comment about treating every reconnect as a fresh source of
+	// truth already promised.
+	r.statusMu.Lock()
+	r.lastReported = make(map[string]string)
+	r.statusMu.Unlock()
+
 	if err := r.send(s, &agentpb.AgentMessage{
 		Payload: &agentpb.AgentMessage_Register{
 			Register: &agentpb.RegisterRequest{
