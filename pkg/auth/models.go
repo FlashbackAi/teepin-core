@@ -49,13 +49,36 @@ type Project struct {
 	AccountID uuid.UUID `json:"account_id"`
 	// OwnerID records which user created the project; it confers no
 	// exclusive rights, since the ACCOUNT owns the project.
-	OwnerID     uuid.UUID  `json:"owner_id"`
-	Name        string     `json:"name"`
-	Slug        string     `json:"slug"`
-	Description string     `json:"description,omitempty"`
+	OwnerID     uuid.UUID `json:"owner_id"`
+	Name        string    `json:"name"`
+	Slug        string    `json:"slug"`
+	Description string    `json:"description,omitempty"`
+	// Environment is "dev", "staging", "prod", or empty when the customer
+	// has not declared one. The console shows it as a badge next to the
+	// project name everywhere, so that a destructive action in production
+	// looks different from the same action in a scratch project.
+	Environment string     `json:"environment,omitempty"`
 	CreatedAt   time.Time  `json:"created_at"`
 	UpdatedAt   time.Time  `json:"updated_at"`
 	DeletedAt   *time.Time `json:"deleted_at,omitempty"`
+}
+
+// ValidEnvironments are the only accepted values, matching the CHECK
+// constraint in migration 008.
+var ValidEnvironments = []string{"dev", "staging", "prod"}
+
+// IsValidEnvironment reports whether e may be stored. Empty is valid and
+// means "not declared".
+func IsValidEnvironment(e string) bool {
+	if e == "" {
+		return true
+	}
+	for _, valid := range ValidEnvironments {
+		if e == valid {
+			return true
+		}
+	}
+	return false
 }
 
 type APIKey struct {

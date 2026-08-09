@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/FlashbackAi/teepin-core/pkg/auth"
@@ -159,6 +160,101 @@ func (h *AuthHandler) GetProject(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, project)
+}
+
+// UpdateProject changes a project's name, description or environment.
+// PATCH /v1/projects/:id
+//
+// Every field is optional; omitting one leaves it unchanged. That is why
+// the request binds to pointers — a missing "description" must mean
+// "leave it alone", not "set it to empty".
+func (h *AuthHandler) UpdateProject(c *gin.Context) {
+	projectID, ok := parseProjectID(c)
+	if !ok {
+		return
+	}
+	accountID, ok := requireAccount(c)
+	if !ok {
+		return
+	}
+	if !requireWriteRole(c) {
+		return
+	}
+
+	var req struct {
+		Name        *string `json:"name"`
+		Description *string `json:"description"`
+		Environment *string `json:"environment"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	project, err := h.authService.UpdateProject(c.Request.Context(), accountID, projectID,
+		auth.ProjectUpdate{
+			Name:        req.Name,
+			Description: req.Description,
+			Environment: req.Environment,
+		})
+	if err != nil {
+		switch {
+		case errors.Is(err, auth.ErrProjectNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "project not found"})
+		case errors.Is(err, auth.ErrProjectNameTaken):
+			// 409, not 400: the request was well-formed, it conflicts
+			// with existing state the customer can resolve.
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		case errors.Is(err, auth.ErrInvalidEnvironment):
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+		return
+	}
+
+	c.JSON(http.StatusOK, project)
+}
+
+// DeleteProject soft-deletes a project.
+// DELETE /v1/projects/:id
+//
+// Refuses while instances are running. Deleting a project is an
+// organisational decision; destroying running GPU workloads is not, and
+// a cascade would let one confirmation end a training run. The response
+// names the blocking instances so the customer can decide what to stop.
+func (h *AuthHandler) DeleteProject(c *gin.Context) {
+	projectID, ok := parseProjectID(c)
+	if !ok {
+		return
+	}
+	accountID, ok := requireAccount(c)
+	if !ok {
+		return
+	}
+	if !requireWriteRole(c) {
+		return
+	}
+
+	if err := h.authService.DeleteProject(c.Request.Context(), accountID, projectID); err != nil {
+		switch {
+		case errors.Is(err, auth.ErrProjectNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "project not found"})
+		case errors.Is(err, auth.ErrProjectHasInstances):
+			c.JSON(http.StatusConflict, gin.H{
+				"error": err.Error(),
+				"hint":  "terminate the project's instances before deleting it",
+			})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "project deleted",
+		"id":      projectID,
+	})
 }
 
 // CreateAPIKey creates a new API key for a project

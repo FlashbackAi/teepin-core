@@ -201,12 +201,12 @@ func isUniqueViolation(err error) bool {
 // projectColumns is the shared select list, so every project query
 // returns the same shape and scanning cannot drift between them.
 const projectColumns = `id, account_id, owner_id, name, slug,
-	COALESCE(description,''), created_at, updated_at`
+	COALESCE(description,''), COALESCE(environment,''), created_at, updated_at`
 
 func scanProject(row interface{ Scan(...any) error }) (*Project, error) {
 	var p Project
 	if err := row.Scan(&p.ID, &p.AccountID, &p.OwnerID, &p.Name, &p.Slug,
-		&p.Description, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		&p.Description, &p.Environment, &p.CreatedAt, &p.UpdatedAt); err != nil {
 		return nil, err
 	}
 	return &p, nil
@@ -271,6 +271,140 @@ func (s *Service) GetProject(ctx context.Context, accountID, projectID uuid.UUID
 		return nil, fmt.Errorf("failed to get project: %w", err)
 	}
 	return p, nil
+}
+
+// ProjectUpdate carries the fields a customer may change. A nil field
+// means "leave unchanged", which is what distinguishes clearing a
+// description from not touching it.
+type ProjectUpdate struct {
+	Name        *string
+	Description *string
+	Environment *string
+}
+
+// ErrProjectNameTaken is returned when a rename collides with another
+// project in the same account. Handlers map it to 409.
+var ErrProjectNameTaken = errors.New("a project with that name already exists")
+
+// ErrInvalidEnvironment is returned for an environment outside the
+// permitted set.
+var ErrInvalidEnvironment = errors.New("environment must be dev, staging or prod")
+
+// UpdateProject changes a project's mutable fields.
+//
+// Scoped by account_id for the same reason every other project query is:
+// without it, learning a UUID would be enough to rename another
+// customer's project.
+//
+// The slug deliberately does NOT follow a rename. It appears in API
+// keys, registry paths and customer scripts, so silently changing it
+// would break things the customer cannot see from this screen — the name
+// is the label, the slug is the identifier.
+func (s *Service) UpdateProject(ctx context.Context, accountID, projectID uuid.UUID, update ProjectUpdate) (*Project, error) {
+	if update.Environment != nil && !IsValidEnvironment(*update.Environment) {
+		return nil, ErrInvalidEnvironment
+	}
+	if update.Name != nil && strings.TrimSpace(*update.Name) == "" {
+		return nil, fmt.Errorf("project name cannot be empty")
+	}
+
+	row := s.db.QueryRowContext(ctx, `
+		UPDATE auth.projects
+		SET name        = COALESCE($3, name),
+		    description = COALESCE($4, description),
+		    environment = COALESCE($5, environment),
+		    updated_at  = NOW()
+		WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL
+		RETURNING `+projectColumns,
+		projectID, accountID, update.Name, update.Description, update.Environment)
+
+	p, err := scanProject(row)
+	if err == sql.ErrNoRows {
+		return nil, ErrProjectNotFound
+	}
+	if err != nil {
+		// The per-account unique index on name is the constraint a rename
+		// can realistically violate; report it as a conflict the customer
+		// can act on rather than a generic failure.
+		if strings.Contains(err.Error(), "idx_projects_account_name") {
+			return nil, ErrProjectNameTaken
+		}
+		return nil, fmt.Errorf("failed to update project: %w", err)
+	}
+	return p, nil
+}
+
+// ErrProjectHasInstances is returned when a project still holds live
+// compute. Handlers map it to 409 and list the blockers.
+var ErrProjectHasInstances = errors.New("project still has running instances")
+
+// Note: DeleteProject wraps this with a count, so the customer-facing
+// message reads "project still has running instances (1 instance)".
+
+// DeleteProject soft-deletes a project.
+//
+// Refuses while instances are running, rather than cascading. Deleting a
+// project is a naming decision; destroying running GPU workloads is not,
+// and conflating them means one mistyped confirmation can end a training
+// run. AWS refuses to delete a VPC with resources in it for the same
+// reason. The caller is expected to surface the blocking instances so
+// the customer can decide what to terminate.
+//
+// Soft delete because billing history references the project: a hard
+// delete would either orphan usage records or destroy the evidence
+// behind an invoice the customer may later query.
+func (s *Service) DeleteProject(ctx context.Context, accountID, projectID uuid.UUID) error {
+	// Confirms the project exists in THIS account before reporting
+	// anything about its contents.
+	if _, err := s.GetProject(ctx, accountID, projectID); err != nil {
+		return err
+	}
+
+	var live int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM compute.instances
+		WHERE project_id = $1 AND terminated_at IS NULL
+	`, projectID).Scan(&live)
+	if err != nil {
+		return fmt.Errorf("failed to check for running instances: %w", err)
+	}
+	if live > 0 {
+		// Phrased for the customer, who sees this verbatim. The sentinel
+		// wraps it for callers that branch on the type.
+		noun := "instances"
+		if live == 1 {
+			noun = "instance"
+		}
+		return fmt.Errorf("%w (%d %s)", ErrProjectHasInstances, live, noun)
+	}
+
+	// API keys are revoked with the project. Leaving them valid would
+	// let a deleted project's credentials keep authenticating.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE auth.api_keys SET revoked_at = NOW()
+		WHERE project_id = $1 AND revoked_at IS NULL
+	`, projectID); err != nil {
+		return fmt.Errorf("failed to revoke project API keys: %w", err)
+	}
+
+	result, err := tx.ExecContext(ctx, `
+		UPDATE auth.projects SET deleted_at = NOW(), updated_at = NOW()
+		WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL
+	`, projectID, accountID)
+	if err != nil {
+		return fmt.Errorf("failed to delete project: %w", err)
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return ErrProjectNotFound
+	}
+
+	return tx.Commit()
 }
 
 // CreateAPIKey creates a new API key for a project

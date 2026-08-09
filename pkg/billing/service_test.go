@@ -7,8 +7,10 @@ import (
 	"context"
 	"math"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/google/uuid"
 )
 
 func TestCalculateVRAMCost(t *testing.T) {
@@ -97,5 +99,88 @@ func TestSetVRAMPricePerGBHour_RejectsNonPositive(t *testing.T) {
 		if err := s.SetVRAMPricePerGBHour(context.Background(), price, "test"); err == nil {
 			t.Errorf("SetVRAMPricePerGBHour(%.2f) accepted, want error", price)
 		}
+	}
+}
+
+// CreateManualInvoice guards below pin the account-level invoicing
+// design (migration 012): an invoice belongs to an ACCOUNT, and each
+// line item may optionally attribute itself to one of that account's
+// projects for the per-project breakdown. Neither guard talks to the
+// database beyond the validation query itself — no transaction is
+// opened when validation fails, which these tests confirm implicitly by
+// only stubbing the validation query.
+
+func TestCreateManualInvoice_RejectsNoLineItems(t *testing.T) {
+	s := NewService(nil)
+
+	_, err := s.CreateManualInvoice(context.Background(), ManualInvoiceRequest{
+		AccountID:   uuid.New(),
+		PeriodStart: time.Now(),
+		PeriodEnd:   time.Now(),
+	})
+	if err != ErrNoLineItems {
+		t.Errorf("empty line items: got %v, want ErrNoLineItems", err)
+	}
+}
+
+func TestCreateManualInvoice_RejectsBlankDescription(t *testing.T) {
+	s := NewService(nil)
+
+	_, err := s.CreateManualInvoice(context.Background(), ManualInvoiceRequest{
+		AccountID:   uuid.New(),
+		PeriodStart: time.Now(),
+		PeriodEnd:   time.Now(),
+		LineItems:   []InvoiceLineItem{{Description: "   ", Amount: 10}},
+	})
+	if err == nil {
+		t.Error("blank description accepted, want a validation error")
+	}
+}
+
+// A line item naming another account's project must be rejected before
+// any row is written. Without this check, an operator issuing an
+// invoice for Account A could attribute a charge to Account B's
+// project — corrupting BOTH accounts' project-level billing breakdowns,
+// on a document customers rely on for tax purposes.
+func TestCreateManualInvoice_RejectsLineItemFromOtherAccount(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	s := NewService(db)
+	accountID := uuid.New()
+	otherAccountsProject := uuid.New()
+
+	// resolveBillToByAccount succeeds — the account itself is real.
+	mock.ExpectQuery(`SELECT a\.id, a\.account_number.*FROM auth\.accounts`).
+		WithArgs(accountID).
+		WillReturnRows(sqlmock.NewRows(
+			[]string{"id", "account_number", "legal_name", "display_name", "billing_email", "billing_address", "tax_id"},
+		).AddRow(accountID, "1234567890", "", "Acme Inc", "", "", ""))
+
+	// verifyProjectsBelongToAccount finds ZERO matching rows: the
+	// referenced project belongs to someone else.
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM auth\.projects`).
+		WithArgs(accountID, sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+
+	_, err = s.CreateManualInvoice(context.Background(), ManualInvoiceRequest{
+		AccountID:   accountID,
+		PeriodStart: time.Now(),
+		PeriodEnd:   time.Now(),
+		LineItems: []InvoiceLineItem{
+			{Description: "GPU compute", Amount: 50, ProjectID: &otherAccountsProject},
+		},
+	})
+	if err == nil {
+		t.Fatal("line item referencing another account's project was accepted")
+	}
+
+	// No transaction should have been opened — BeginTx would show up as
+	// an unmet expectation if the code proceeded past validation.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unexpected additional queries after validation failed: %v", err)
 	}
 }

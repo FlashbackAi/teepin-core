@@ -34,8 +34,8 @@ func TestGetProject_FiltersByAccount(t *testing.T) {
 	mock.ExpectQuery(`SELECT .+ FROM auth\.projects\s+WHERE id = \$1 AND account_id = \$2`).
 		WithArgs(projectID, accountID).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "account_id", "owner_id", "name", "slug", "description", "created_at", "updated_at",
-		}).AddRow(projectID, accountID, uuid.New(), "production", "production", "", nowUTC(), nowUTC()))
+			"id", "account_id", "owner_id", "name", "slug", "description", "environment", "created_at", "updated_at",
+		}).AddRow(projectID, accountID, uuid.New(), "production", "production", "", "", nowUTC(), nowUTC()))
 
 	p, err := svc.GetProject(context.Background(), accountID, projectID)
 	if err != nil {
@@ -79,10 +79,10 @@ func TestListProjects_ScopedByAccountNotOwner(t *testing.T) {
 	mock.ExpectQuery(`SELECT .+ FROM auth\.projects\s+WHERE account_id = \$1`).
 		WithArgs(accountID).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "account_id", "owner_id", "name", "slug", "description", "created_at", "updated_at",
+			"id", "account_id", "owner_id", "name", "slug", "description", "environment", "created_at", "updated_at",
 		}).
-			AddRow(uuid.New(), accountID, ownerA, "production", "production", "", nowUTC(), nowUTC()).
-			AddRow(uuid.New(), accountID, ownerB, "staging", "staging", "", nowUTC(), nowUTC()))
+			AddRow(uuid.New(), accountID, ownerA, "production", "production", "", "", nowUTC(), nowUTC()).
+			AddRow(uuid.New(), accountID, ownerB, "staging", "staging", "", "", nowUTC(), nowUTC()))
 
 	projects, err := svc.ListProjects(context.Background(), accountID)
 	if err != nil {

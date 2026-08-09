@@ -37,6 +37,7 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/harbor"
 	"github.com/FlashbackAi/teepin-core/pkg/networking"
 	"github.com/FlashbackAi/teepin-core/pkg/ratelimit"
+	"github.com/FlashbackAi/teepin-core/pkg/statuspage"
 )
 
 const (
@@ -283,6 +284,18 @@ func main() {
 	// source of the capacity report differs.
 	gpuAllocator := gpu.NewAllocator(cluster.NewSnapshotter(clusterClient))
 
+	// Public status page metric. Silently inert unless all three
+	// STATUSPAGE_* variables are set, so no deployment needs to know
+	// about it.
+	statusReporter := statuspage.New(statuspage.Config{
+		APIKey:   os.Getenv("STATUSPAGE_API_KEY"),
+		PageID:   os.Getenv("STATUSPAGE_PAGE_ID"),
+		MetricID: os.Getenv("STATUSPAGE_GPU_METRIC_ID"),
+	}, clusterClient)
+	if statusReporter.Enabled() {
+		go statusReporter.Start(context.Background())
+	}
+
 	// Reconciler keeps DB state in sync with the cluster: status changes
 	// update the record, vanished instances stop billing. It runs
 	// wherever the control plane runs, reading through the same cluster
@@ -303,7 +316,7 @@ func main() {
 	var adminHandler *api.AdminHandler
 	if billingService != nil {
 		if adminToken := os.Getenv("ADMIN_API_TOKEN"); adminToken != "" {
-			adminHandler = api.NewAdminHandler(billingService, adminToken)
+			adminHandler = api.NewAdminHandler(billingService, authService, adminToken)
 			log.Println("Admin API enabled (/v1/admin)")
 		} else {
 			log.Println("WARN: ADMIN_API_TOKEN not set — admin API (pricing management) disabled")
@@ -574,6 +587,8 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 				projects.POST("", authHandler.CreateProject)
 				projects.GET("", authHandler.ListProjects)
 				projects.GET("/:id", authHandler.GetProject)
+				projects.PATCH("/:id", authHandler.UpdateProject)
+				projects.DELETE("/:id", authHandler.DeleteProject)
 				projects.POST("/:id/api-keys", authHandler.CreateAPIKey)
 				projects.GET("/:id/api-keys", authHandler.ListAPIKeys)
 				projects.DELETE("/:id/api-keys/:key_id", authHandler.RevokeAPIKey)
@@ -625,6 +640,16 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 			{
 				admin.GET("/pricing", adminHandler.GetPricing)
 				admin.PUT("/pricing", adminHandler.UpdatePricing)
+
+				// Manual invoicing for the operator control centre.
+				admin.GET("/accounts", adminHandler.ListAccounts)
+				admin.GET("/accounts/:account_id/projects", adminHandler.ListAccountProjects)
+				admin.POST("/invoices", adminHandler.CreateManualInvoice)
+				admin.GET("/invoices/:id", adminHandler.GetInvoice)
+				admin.POST("/invoices/:id/issue", adminHandler.IssueInvoice)
+				admin.POST("/invoices/:id/void", adminHandler.VoidInvoice)
+				admin.GET("/projects/:project_id/invoices", adminHandler.ListProjectInvoices)
+				admin.GET("/accounts/:account_id/invoices", adminHandler.ListAccountInvoices)
 			}
 		}
 

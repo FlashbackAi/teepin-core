@@ -176,17 +176,25 @@ func (h *BillingHandler) GetUsageRecords(c *gin.Context) {
 	})
 }
 
-// ListInvoices lists all invoices for a project
+// ListInvoices lists every invoice the caller's ACCOUNT owns —
+// project-anchored usage invoices and account-level manual invoices
+// together. Account-scoped rather than project-scoped since migration
+// 012: a manual invoice covering several projects (or none) has no
+// single project to filter by, and a customer thinks in terms of "what
+// do I owe", not "what does this one project owe".
+//
 // GET /v1/billing/invoices
-// Supports project resolution via: API key context, ?project_id=xxx, or user's first project
+// Works with either a JWT or a project API key — both carry an
+// account_id (ValidateAPIKey resolves it from the key's project), so
+// either credential resolves the account this lists invoices for.
 func (h *BillingHandler) ListInvoices(c *gin.Context) {
-	projectID, err := h.resolveProjectID(c)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	accountID, ok := auth.GetAccountID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "account authentication required"})
 		return
 	}
 
-	invoices, err := h.billingService.ListInvoices(c.Request.Context(), projectID)
+	invoices, err := h.billingService.ListAccountInvoices(c.Request.Context(), accountID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -214,10 +222,19 @@ func (h *BillingHandler) GetInvoice(c *gin.Context) {
 		return
 	}
 
-	// Verify user has access to this invoice's project
-	projectID, _ := auth.GetProjectID(c)
-	if invoice.ProjectID != projectID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "access denied"})
+	// Tenancy check is now ACCOUNT-based, not project-based: an invoice
+	// may be account-level (ProjectID nil — a manual invoice, or one
+	// covering several projects) and still belongs to exactly one
+	// account. Checking project_id here would make an account-level
+	// invoice unreachable through this endpoint for every legitimate
+	// caller, while checking account_id covers both cases correctly.
+	//
+	// 404 rather than 403: confirming an invoice ID exists for another
+	// customer's account leaks information a billing endpoint must not
+	// leak.
+	accountID, ok := auth.GetAccountID(c)
+	if !ok || invoice.AccountID != accountID {
+		c.JSON(http.StatusNotFound, gin.H{"error": "invoice not found"})
 		return
 	}
 

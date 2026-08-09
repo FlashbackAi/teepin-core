@@ -255,6 +255,39 @@ func (s *Service) GetAccount(ctx context.Context, accountID uuid.UUID) (*Account
 
 // GetAccountByAlias resolves an alias to an account — the first step of
 // sub-user sign-in (alias + username + password).
+// ListAllAccounts returns every account on the platform.
+//
+// OPERATOR ONLY. This deliberately has NO tenancy predicate, which is
+// precisely why it must never be reachable from a customer-authenticated
+// route — it exists for the admin control centre (choosing who to
+// invoice) and is gated behind the operator token.
+func (s *Service) ListAllAccounts(ctx context.Context) ([]Account, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, account_number, alias, type, display_name,
+		       legal_name, tax_id, billing_email, country,
+		       status, created_at, updated_at
+		FROM auth.accounts
+		WHERE status != 'closed'
+		ORDER BY created_at DESC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list accounts: %w", err)
+	}
+	defer rows.Close()
+
+	accounts := []Account{}
+	for rows.Next() {
+		var a Account
+		if err := rows.Scan(&a.ID, &a.AccountNumber, &a.Alias, &a.Type,
+			&a.DisplayName, &a.LegalName, &a.TaxID, &a.BillingEmail,
+			&a.Country, &a.Status, &a.CreatedAt, &a.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("failed to scan account: %w", err)
+		}
+		accounts = append(accounts, a)
+	}
+	return accounts, rows.Err()
+}
+
 func (s *Service) GetAccountByAlias(ctx context.Context, alias string) (*Account, error) {
 	var a Account
 	err := s.db.QueryRowContext(ctx, `
