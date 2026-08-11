@@ -4,6 +4,7 @@
 package billing
 
 import (
+	"encoding/json"
 	"time"
 
 	"github.com/google/uuid"
@@ -79,6 +80,34 @@ type Invoice struct {
 	// LineItems is populated by GetInvoice, not by list queries — a list
 	// of fifty invoices does not need every line of every one.
 	LineItems []InvoiceLineItem `json:"line_items,omitempty"`
+
+	// PDFS3Key is the object key of the rendered document in the invoices
+	// bucket ({account_id}/{invoice_number}.pdf). Set ONCE at issue time,
+	// never overwritten. Nil until issued, and nil for invoices issued
+	// while S3 storage was not configured. json:"-" — the key is internal
+	// plumbing; the customer never needs it and exposing a bucket path
+	// leaks storage layout. PDFAvailable below is what the client sees.
+	PDFS3Key *string `json:"-"`
+	// PDFGeneratedAt records when the stored document was rendered.
+	PDFGeneratedAt *time.Time `json:"pdf_generated_at,omitempty"`
+}
+
+// PDFAvailable reports whether a downloadable document has been stored
+// for this invoice. Derived, not a column: the client needs to know
+// whether to offer a download, without ever seeing the S3 key.
+func (i *Invoice) PDFAvailable() bool {
+	return i.PDFS3Key != nil && *i.PDFS3Key != ""
+}
+
+// MarshalJSON adds the derived pdf_available flag alongside the invoice's
+// own fields. Hand-rolled rather than a struct tag because it is computed
+// from PDFS3Key (which is itself json:"-"), so there is no field to tag.
+func (i Invoice) MarshalJSON() ([]byte, error) {
+	type alias Invoice // avoid infinite recursion into this method
+	return json.Marshal(struct {
+		alias
+		PDFAvailable bool `json:"pdf_available"`
+	}{alias(i), i.PDFAvailable()})
 }
 
 // InvoiceLineItem is one line on an invoice.
@@ -117,20 +146,53 @@ type InvoiceLineItem struct {
 	ResourceType string `json:"resource_type,omitempty"`
 }
 
-// PaymentMethod represents a stored payment method
+// PaymentMethod is a card stored against an ACCOUNT (not a project — the
+// account is the billing entity). A row existing is not proof the card
+// works: Status must be "verified" (Stripe confirmed a SetupIntent)
+// before it counts toward the provisioning gate.
 type PaymentMethod struct {
-	ID                    uuid.UUID `json:"id"`
-	ProjectID             uuid.UUID `json:"project_id"`
+	ID uuid.UUID `json:"id"`
+	// AccountID is the owner. Payment is account-level: one card added to
+	// an account lets every project under it provision.
+	AccountID             uuid.UUID `json:"account_id"`
 	StripeCustomerID      string    `json:"stripe_customer_id"`
 	StripePaymentMethodID string    `json:"stripe_payment_method_id"`
-	Type                  string    `json:"type"` // card, bank_account
-	Last4                 *string   `json:"last4,omitempty"`
-	Brand                 *string   `json:"brand,omitempty"`
-	ExpMonth              *int      `json:"exp_month,omitempty"`
-	ExpYear               *int      `json:"exp_year,omitempty"`
-	IsDefault             bool      `json:"is_default"`
-	CreatedAt             time.Time `json:"created_at"`
-	UpdatedAt             time.Time `json:"updated_at"`
+	// StripeSetupIntentID ties the card to the validation attempt that
+	// created it — the webhook matches on this to mark it verified.
+	StripeSetupIntentID *string `json:"-"`
+	Type                string  `json:"type"` // card, bank_account
+	Last4               *string `json:"last4,omitempty"`
+	Brand               *string `json:"brand,omitempty"`
+	ExpMonth            *int    `json:"exp_month,omitempty"`
+	ExpYear             *int    `json:"exp_year,omitempty"`
+	// Status: pending (SetupIntent not yet confirmed), verified (spendable
+	// — the only status that opens the gate), failed, removed.
+	Status     string     `json:"status"`
+	VerifiedAt *time.Time `json:"verified_at,omitempty"`
+	IsDefault  bool       `json:"is_default"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
+}
+
+// CreditTransaction is one row of the append-only credit ledger. Grants
+// are positive, consumption/expiry/revocation negative; an account's
+// balance is the SUM of its rows (excluding lapsed grants). Rows are
+// never updated or deleted — the ledger is the audit trail for spendable
+// value an operator can mint.
+type CreditTransaction struct {
+	ID        uuid.UUID `json:"id"`
+	AccountID uuid.UUID `json:"account_id"`
+	// Amount is positive for a grant, negative otherwise.
+	Amount float64 `json:"amount"`
+	Kind   string  `json:"kind"` // grant, consumption, expiry, revocation
+	Reason string  `json:"reason"`
+	// GrantedBy identifies the operator, on grants only.
+	GrantedBy *string `json:"granted_by,omitempty"`
+	// ExpiresAt applies to grants; nil means it never expires.
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	// UsageRecordID links a consumption row to the interval it paid for.
+	UsageRecordID *uuid.UUID `json:"usage_record_id,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
 }
 
 // ResourcePricing defines pricing for different resource types

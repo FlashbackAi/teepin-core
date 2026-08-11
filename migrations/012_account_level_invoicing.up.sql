@@ -61,9 +61,17 @@ BEGIN
     JOIN information_schema.key_column_usage kcu
         ON kcu.constraint_name = tc.constraint_name
        AND kcu.table_schema = tc.table_schema
+    -- constraint_column_usage.table_schema is the schema of the
+    -- REFERENCED table (auth), not the constrained one (billing) — this
+    -- migration originally joined it against tc.table_schema and always
+    -- got zero rows, which made this DO block raise its own "could not
+    -- locate" exception on every attempt. Confirmed live against
+    -- production 2026-08-09: ccu returned table_schema='auth',
+    -- table_name='projects', column_name='id' for this exact
+    -- constraint. No schema predicate on ccu is needed — constraint_name
+    -- already scopes it to one FK.
     JOIN information_schema.constraint_column_usage ccu
         ON ccu.constraint_name = tc.constraint_name
-       AND ccu.table_schema = tc.table_schema
     WHERE tc.constraint_type = 'FOREIGN KEY'
       AND tc.table_schema = 'billing'
       AND tc.table_name = 'invoices'
@@ -97,9 +105,11 @@ BEGIN
     JOIN information_schema.key_column_usage kcu
         ON kcu.constraint_name = tc.constraint_name
        AND kcu.table_schema = tc.table_schema
+    -- Same fix as the invoices block above: ccu.table_schema is the
+    -- REFERENCED schema (auth), never billing, so that predicate always
+    -- excluded the real row.
     JOIN information_schema.constraint_column_usage ccu
         ON ccu.constraint_name = tc.constraint_name
-       AND ccu.table_schema = tc.table_schema
     WHERE tc.constraint_type = 'FOREIGN KEY'
       AND tc.table_schema = 'billing'
       AND tc.table_name = 'usage_records'

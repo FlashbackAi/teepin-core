@@ -150,8 +150,16 @@ func (f *fakeCluster) Inventory(context.Context) ([]cluster.NodeInventory, error
 func (f *fakeCluster) Healthy(context.Context) bool { return f.failWith == nil }
 
 // newTenantServer builds a Server with tenancy active (store present)
-// over a fake cluster.
+// over a fake cluster, with a permissive payment gate so tenancy tests
+// are not blocked by billing.
 func newTenantServer(t *testing.T, fc *fakeCluster) *Server {
+	t.Helper()
+	return newTenantServerWithGate(t, fc, allowGate{})
+}
+
+// newTenantServerWithGate is newTenantServer with an explicit gate, for
+// the tests that assert payment-gate behaviour.
+func newTenantServerWithGate(t *testing.T, fc *fakeCluster, gate ProvisionGate) *Server {
 	t.Helper()
 
 	db, _, err := sqlmock.New()
@@ -160,11 +168,18 @@ func newTenantServer(t *testing.T, fc *fakeCluster) *Server {
 	}
 	t.Cleanup(func() { db.Close() })
 
-	return NewServer(fc, nil, nil, compute.NewStore(db), nil)
+	return NewServer(fc, nil, nil, compute.NewStore(db), nil, gate)
 }
 
+// A fixed account for tenancy tests. requireScope now requires an
+// account claim (an API key always carries one); the specific value does
+// not matter to cluster-tenancy tests, only that it is present.
+var testAccountID = uuid.MustParse("00000000-0000-0000-0000-0000000000aa")
+
 // doRequest performs a request against the handler with the caller's
-// project injected the way auth middleware would.
+// project injected the way auth middleware would. It also injects an
+// account, because every real compute credential carries one and
+// requireScope now requires it.
 func doRequest(handler gin.HandlerFunc, method, path string, params gin.Params, projectID uuid.UUID) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -172,9 +187,32 @@ func doRequest(handler gin.HandlerFunc, method, path string, params gin.Params, 
 	c.Params = params
 	if projectID != uuid.Nil {
 		c.Set(string(auth.ProjectIDKey), projectID)
+		c.Set(string(auth.AccountIDKey), testAccountID)
 	}
 	handler(c)
 	return w
+}
+
+// allowGate is a permissive ProvisionGate for cluster-tenancy tests,
+// which are not about billing — it always allows, so the payment gate
+// never interferes with what those tests actually assert.
+type allowGate struct{}
+
+func (allowGate) AccountCanProvision(context.Context, uuid.UUID) (bool, string, error) {
+	return true, "", nil
+}
+
+// denyGate blocks provisioning, for the tests that assert the gate.
+type denyGate struct {
+	reason string
+	err    error
+}
+
+func (g denyGate) AccountCanProvision(context.Context, uuid.UUID) (bool, string, error) {
+	if g.err != nil {
+		return false, "", g.err
+	}
+	return false, g.reason, nil
 }
 
 // The tenancy tests below are the reason this package has tests at all.
@@ -409,10 +447,50 @@ func TestParseMemoryGB(t *testing.T) {
 	}
 }
 
+// The payment gate: an account with no validated card cannot launch.
+func TestCreateInstance_BlockedWithoutPaymentMethod(t *testing.T) {
+	server := newTenantServerWithGate(t, newFakeCluster(),
+		denyGate{reason: "add a validated payment method before launching resources"})
+
+	w := createInstanceReq(server, uuid.New())
+	if w.Code != http.StatusPaymentRequired {
+		t.Fatalf("status = %d, want 402", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "payment_method_required") {
+		t.Errorf("body missing machine code: %s", w.Body.String())
+	}
+}
+
+// The gate must fail CLOSED: a billing-check error denies with 503, it
+// does not hand out a GPU.
+func TestCreateInstance_GateErrorFailsClosed(t *testing.T) {
+	server := newTenantServerWithGate(t, newFakeCluster(),
+		denyGate{err: context.DeadlineExceeded})
+
+	w := createInstanceReq(server, uuid.New())
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", w.Code)
+	}
+}
+
+// createInstanceReq issues a POST /instances with an account+project in
+// context and a minimal CPU-only body (no GPU, so it needs no allocator).
+func createInstanceReq(server *Server, projectID uuid.UUID) *httptest.ResponseRecorder {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/",
+		strings.NewReader(`{"name":"t","image":"nginx","cpu_units":1,"memory":"1GB"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set(string(auth.ProjectIDKey), projectID)
+	c.Set(string(auth.AccountIDKey), testAccountID)
+	server.CreateInstance(c)
+	return w
+}
+
 func TestRequireProjectScope_StandaloneModeAllowsAll(t *testing.T) {
 	// Without a store (no database) there is no tenancy: requests
 	// proceed unscoped, preserving the zero-dependency local dev flow.
-	server := NewServer(newFakeCluster(), nil, nil, nil, nil)
+	server := NewServer(newFakeCluster(), nil, nil, nil, nil, nil)
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)

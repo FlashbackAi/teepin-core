@@ -194,7 +194,12 @@ func (h *BillingHandler) ListInvoices(c *gin.Context) {
 		return
 	}
 
-	invoices, err := h.billingService.ListAccountInvoices(c.Request.Context(), accountID)
+	// ...ForCustomer, not ListAccountInvoices: a draft is an operator's
+	// in-progress document (see INVOICE-DESIGN.md "Lifecycle" — creation
+	// and issuing are deliberately separate so a mistyped amount is
+	// correctable BEFORE a customer holds a copy). The control centre
+	// uses the unfiltered ListAccountInvoices; this is the customer path.
+	invoices, err := h.billingService.ListAccountInvoicesForCustomer(c.Request.Context(), accountID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -238,7 +243,80 @@ func (h *BillingHandler) GetInvoice(c *gin.Context) {
 		return
 	}
 
+	// Same reasoning as ListInvoices: a draft is not yet a fact the
+	// customer should see, even by direct ID — an operator may have
+	// shared a link, or a customer may have seen the ID in a webhook
+	// payload before the invoice was ready. 404, not 403, for the same
+	// non-leaking reason as the account check above.
+	if invoice.Status == "draft" {
+		c.JSON(http.StatusNotFound, gin.H{"error": "invoice not found"})
+		return
+	}
+
 	c.JSON(http.StatusOK, invoice)
+}
+
+// DownloadInvoicePDF returns a short-lived presigned URL for the
+// invoice's stored PDF document.
+// GET /v1/billing/invoices/:id/pdf  →  {"url": "https://...s3..."}
+//
+// Every failure below returns 404, never 403 — the same non-leaking
+// discipline as GetInvoice. A customer of another account, a draft, and
+// an invoice whose document has not been generated are all
+// indistinguishable from "no such invoice".
+//
+// The endpoint hands back the presigned URL as JSON rather than a 302,
+// and the client NAVIGATES to it (a link click). It deliberately does
+// NOT redirect, because the console fetches this endpoint with the auth
+// token, and a fetch that follows a redirect into S3 is a cross-origin
+// fetch — which S3 blocks with no Access-Control-Allow-Origin. Handing
+// back the URL lets the browser navigate to it instead (navigation is
+// not subject to CORS), which is the intended use of a presigned URL.
+// The API still never proxies the bytes, and the bucket stays private.
+func (h *BillingHandler) DownloadInvoicePDF(c *gin.Context) {
+	invoiceID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid invoice ID"})
+		return
+	}
+
+	invoice, err := h.billingService.GetInvoice(c.Request.Context(), invoiceID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "invoice not found"})
+		return
+	}
+
+	// Account tenancy + draft checks, identical to GetInvoice.
+	accountID, ok := auth.GetAccountID(c)
+	if !ok || invoice.AccountID != accountID {
+		c.JSON(http.StatusNotFound, gin.H{"error": "invoice not found"})
+		return
+	}
+	if invoice.Status == "draft" {
+		c.JSON(http.StatusNotFound, gin.H{"error": "invoice not found"})
+		return
+	}
+
+	// No stored document yet — issued before PDF storage existed, or a
+	// generation that failed and has not been backfilled. Distinct
+	// message so the console can say "not yet available" rather than
+	// implying the invoice itself is missing, but still a 404.
+	if !invoice.PDFAvailable() {
+		c.JSON(http.StatusNotFound, gin.H{"error": "invoice document not yet available"})
+		return
+	}
+
+	// Short TTL: a download is immediate, and a URL that outlives the
+	// click is a URL that can be forwarded.
+	url, err := h.billingService.PresignInvoicePDF(c.Request.Context(), invoice, 5*time.Minute)
+	if err != nil {
+		// Storage unavailable (not configured) or a presign failure —
+		// same 404 to the customer, logged server-side for the operator.
+		c.JSON(http.StatusNotFound, gin.H{"error": "invoice document not yet available"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"url": url})
 }
 
 // CreateInvoice generates a new invoice for a period

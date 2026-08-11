@@ -35,6 +35,14 @@ type PricingProvider interface {
 	VRAMPricePerGBHour(ctx context.Context) float64
 }
 
+// ProvisionGate answers whether an account may create resources right
+// now — the "no validated payment method, no resources" check. Returns
+// (false, customer-facing reason, nil) when blocked. Implemented by
+// billing.Service; nil means no gate (standalone/no-database mode).
+type ProvisionGate interface {
+	AccountCanProvision(ctx context.Context, accountID uuid.UUID) (bool, string, error)
+}
+
 type Server struct {
 	// cluster is the only route to GPU capacity. The API server holds no
 	// Kubernetes client of its own: that is what lets the control plane
@@ -46,19 +54,21 @@ type Server struct {
 	networkingService *networking.Service
 	store             *compute.Store  // nil in standalone mode (no database)
 	pricing           PricingProvider // nil in standalone mode (no database)
+	gate              ProvisionGate   // nil in standalone mode (no billing gate)
 }
 
-// NewServer creates a new API server. store and pricing may be nil when
-// the platform runs without a database (local standalone mode); in that
-// case instances are not persisted, not billed, and priced at the
-// compiled-in default rate.
-func NewServer(clusterClient cluster.Client, gpuAllocator *gpu.Allocator, networkingService *networking.Service, store *compute.Store, pricing PricingProvider) *Server {
+// NewServer creates a new API server. store, pricing and gate may be nil
+// when the platform runs without a database (local standalone mode); in
+// that case instances are not persisted, not billed, priced at the
+// compiled-in default rate, and not gated on payment.
+func NewServer(clusterClient cluster.Client, gpuAllocator *gpu.Allocator, networkingService *networking.Service, store *compute.Store, pricing PricingProvider, gate ProvisionGate) *Server {
 	return &Server{
 		cluster:           clusterClient,
 		gpuAllocator:      gpuAllocator,
 		networkingService: networkingService,
 		store:             store,
 		pricing:           pricing,
+		gate:              gate,
 	}
 }
 
@@ -135,6 +145,30 @@ func (s *Server) CreateInstance(c *gin.Context) {
 		return
 	}
 	userID, _ := auth.GetUserID(c)
+
+	// Payment gate: no validated payment method (or a non-active account),
+	// no resources. Checked here — after identity is resolved, before any
+	// GPU is allocated or any side effect occurs — so a blocked account
+	// consumes nothing. Skipped when no gate is wired (standalone mode).
+	//
+	// Fails CLOSED: a billing check that errors returns 503 and denies,
+	// never hands out GPU capacity on a database blip.
+	if s.gate != nil {
+		allowed, reason, err := s.gate.AccountCanProvision(c.Request.Context(), accountID)
+		if err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": "unable to verify billing status, please retry",
+			})
+			return
+		}
+		if !allowed {
+			c.JSON(http.StatusPaymentRequired, gin.H{
+				"error": reason,
+				"code":  "payment_method_required",
+			})
+			return
+		}
+	}
 
 	// Generate instance UUID
 	instanceUUID := uuid.New()
@@ -568,10 +602,19 @@ func (s *Server) requireScope(c *gin.Context) (projectID, accountID uuid.UUID, o
 		return uuid.Nil, uuid.Nil, false
 	}
 
-	// Tokens issued before accounts existed carry no account claim;
-	// the project label still scopes them correctly, so accept them
-	// rather than locking out in-flight sessions.
-	accountID, _ = auth.GetAccountID(c)
+	// account_id is REQUIRED, not best-effort. A billing gate keyed on the
+	// account is silently defeated by a caller whose accountID resolves to
+	// Nil, so a token with a project but no account claim must be rejected
+	// rather than waved through. Every credential the compute API accepts
+	// (project API keys, current JWTs) carries an account since migration
+	// 007; one that does not is stale and must re-authenticate.
+	accountID, hasAccount := auth.GetAccountID(c)
+	if !hasAccount || accountID == uuid.Nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": "your session predates account-scoped billing; sign in again or issue a new API key",
+		})
+		return uuid.Nil, uuid.Nil, false
+	}
 
 	return projectID, accountID, true
 }

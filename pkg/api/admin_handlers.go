@@ -243,6 +243,50 @@ func (h *AdminHandler) CreateManualInvoice(c *gin.Context) {
 	c.JSON(http.StatusCreated, invoice)
 }
 
+// GenerateAccountUsageInvoice builds a DRAFT usage invoice for an
+// account's metered activity over a period, with one line item per
+// (project, resource). Like a manual invoice it is created as a draft
+// for review; issuing (and its PDF) is a deliberate second step.
+// POST /v1/admin/accounts/:account_id/usage-invoices
+//
+//	{"period_start":"2026-08-01","period_end":"2026-08-31"}
+func (h *AdminHandler) GenerateAccountUsageInvoice(c *gin.Context) {
+	accountID, err := uuid.Parse(c.Param("account_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid account id"})
+		return
+	}
+
+	var req struct {
+		PeriodStart string `json:"period_start" binding:"required"`
+		PeriodEnd   string `json:"period_end" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	periodStart, err := time.Parse("2006-01-02", req.PeriodStart)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "period_start must be YYYY-MM-DD"})
+		return
+	}
+	periodEnd, err := time.Parse("2006-01-02", req.PeriodEnd)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "period_end must be YYYY-MM-DD"})
+		return
+	}
+
+	invoice, err := h.billingService.CreateAccountUsageInvoice(
+		c.Request.Context(), accountID, periodStart, periodEnd)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusCreated, invoice)
+}
+
 // IssueInvoice moves a draft to open, making it payable.
 // POST /v1/admin/invoices/:id/issue
 func (h *AdminHandler) IssueInvoice(c *gin.Context) {
@@ -331,4 +375,77 @@ func (h *AdminHandler) ListAccountInvoices(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"invoices": invoices, "count": len(invoices)})
+}
+
+// GrantCredit records operator-granted credit for an account. The
+// service enforces the guardrails (reason required, amount positive and
+// within the per-grant cap, expiry in the future).
+// POST /v1/admin/accounts/:account_id/credits
+//
+//	{"amount": 500, "reason": "design partner", "expires_at": "2026-12-31"}
+func (h *AdminHandler) GrantCredit(c *gin.Context) {
+	accountID, err := uuid.Parse(c.Param("account_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid account id"})
+		return
+	}
+
+	var req struct {
+		Amount    float64 `json:"amount" binding:"required"`
+		Reason    string  `json:"reason" binding:"required"`
+		ExpiresAt string  `json:"expires_at"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	var expiresAt *time.Time
+	if req.ExpiresAt != "" {
+		parsed, err := time.Parse("2006-01-02", req.ExpiresAt)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "expires_at must be YYYY-MM-DD"})
+			return
+		}
+		expiresAt = &parsed
+	}
+
+	// The operator identity is the admin token holder; record a stable
+	// label rather than the token itself.
+	if err := h.billingService.GrantCredit(c.Request.Context(), billing.GrantRequest{
+		AccountID: accountID,
+		Amount:    req.Amount,
+		Reason:    req.Reason,
+		GrantedBy: "operator",
+		ExpiresAt: expiresAt,
+	}); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	balance, _ := h.billingService.CreditBalance(c.Request.Context(), accountID)
+	c.JSON(http.StatusCreated, gin.H{"balance": balance})
+}
+
+// GetAccountCredits returns an account's current credit balance and full
+// ledger, for the control-centre credit view.
+// GET /v1/admin/accounts/:account_id/credits
+func (h *AdminHandler) GetAccountCredits(c *gin.Context) {
+	accountID, err := uuid.Parse(c.Param("account_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid account id"})
+		return
+	}
+
+	balance, err := h.billingService.CreditBalance(c.Request.Context(), accountID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	txns, err := h.billingService.ListCreditTransactions(c.Request.Context(), accountID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"balance": balance, "transactions": txns})
 }

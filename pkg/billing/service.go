@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -15,10 +16,39 @@ import (
 	"github.com/lib/pq"
 )
 
+// PDFStore is the subset of object storage the billing service needs:
+// write a rendered invoice document at issue time, and mint a short-lived
+// read URL for a customer download. Defined here as an interface (rather
+// than importing the concrete s3 package) so billing has no dependency on
+// AWS — main injects a *storage/s3.Client, tests inject a fake, and
+// neither creates an import cycle.
+type PDFStore interface {
+	PutObject(ctx context.Context, key string, body []byte, contentType string) error
+	PresignGetObject(ctx context.Context, key, filename string, ttl time.Duration) (string, error)
+}
+
+// PDFRenderer turns an issued invoice into PDF bytes. The concrete
+// implementation lives in pkg/billing/pdf; billing takes it as a
+// function value so it does not import that package (pdf imports
+// billing for the Invoice type — importing back would be a cycle).
+type PDFRenderer func(inv *Invoice) ([]byte, error)
+
 // Service handles billing and usage tracking
 type Service struct {
 	db      *sql.DB
 	pricing *ResourcePricing
+
+	// pdfStore and renderInvoicePDF are OPTIONAL. When either is nil,
+	// IssueInvoice still issues the invoice but stores no document — the
+	// path taken in local development, which has no AWS. Both are wired
+	// together at the composition root (main) or left nil.
+	pdfStore         PDFStore
+	renderInvoicePDF PDFRenderer
+
+	// stripe is OPTIONAL. Nil in local dev (no Stripe keys): CreateSetupIntent
+	// errors, and AccountCanProvision still works off the DB (it never
+	// calls Stripe). Wired at the composition root via WithStripe.
+	stripe StripeGateway
 }
 
 // NewService creates a new billing service
@@ -27,6 +57,18 @@ func NewService(db *sql.DB) *Service {
 		db:      db,
 		pricing: DefaultPricing(),
 	}
+}
+
+// WithPDFStorage enables invoice-document generation at issue time. Both
+// a renderer and a store are required for storage to happen; passing a
+// nil either leaves the feature off. Returns the same *Service for
+// chaining at construction. Kept separate from NewService so every
+// existing NewService(db) call site — and all sqlmock tests — compile
+// unchanged.
+func (s *Service) WithPDFStorage(render PDFRenderer, store PDFStore) *Service {
+	s.renderInvoicePDF = render
+	s.pdfStore = store
+	return s
 }
 
 // RecordUsage records a usage event for billing
@@ -132,6 +174,186 @@ func (s *Service) GetUsageSummary(ctx context.Context, projectID uuid.UUID, star
 	}
 
 	return summary, nil
+}
+
+// accountUsageLine is one aggregated (project, resource) charge across a
+// billing period, the raw material for a usage invoice's line items.
+type accountUsageLine struct {
+	ProjectID    uuid.UUID
+	ProjectName  string
+	ResourceType string
+	Unit         string
+	Quantity     float64 // SUM over the period (e.g. total GPU-hours)
+	TotalCost    float64 // SUM over the period — authoritative amount
+}
+
+// accountUsageByProjectResource aggregates an account's metered usage
+// across ALL its projects, grouped by (project, resource_type), for the
+// billing period. One row per project+resource becomes one invoice line.
+//
+// It groups by project AND resource so the invoice reads the way a
+// customer expects — "Project X → GPU 20GB: 120h, CPU: 96h / Project Y →
+// …" — the same shape as an AWS bill breaking services out under one
+// account. unit_price is deliberately NOT summed: it is derived per line
+// as SUM(total_cost)/SUM(quantity) (a blended rate) at build time, so a
+// mid-period rate change does not corrupt the figure; total_cost stays
+// the authoritative amount.
+func (s *Service) accountUsageByProjectResource(ctx context.Context, accountID uuid.UUID, start, end time.Time) ([]accountUsageLine, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT u.project_id, COALESCE(p.name, ''), u.resource_type,
+		       COALESCE(MAX(u.unit), ''),
+		       SUM(u.quantity), SUM(u.total_cost)
+		FROM billing.usage_records u
+		JOIN auth.projects p ON p.id = u.project_id
+		WHERE p.account_id = $1
+		  AND u.start_time >= $2 AND u.end_time <= $3
+		GROUP BY u.project_id, p.name, u.resource_type
+		HAVING SUM(u.total_cost) <> 0
+		ORDER BY p.name, u.resource_type
+	`, accountID, start, end)
+	if err != nil {
+		return nil, fmt.Errorf("failed to aggregate account usage: %w", err)
+	}
+	defer rows.Close()
+
+	var lines []accountUsageLine
+	for rows.Next() {
+		var l accountUsageLine
+		if err := rows.Scan(&l.ProjectID, &l.ProjectName, &l.ResourceType,
+			&l.Unit, &l.Quantity, &l.TotalCost); err != nil {
+			return nil, fmt.Errorf("failed to scan usage line: %w", err)
+		}
+		lines = append(lines, l)
+	}
+	return lines, rows.Err()
+}
+
+// CreateAccountUsageInvoice generates a DRAFT usage invoice covering an
+// entire account's metered activity for a period, with one line item per
+// (project, resource) so the customer sees exactly what each project's
+// resources cost — the account-level equivalent of the manual path, and
+// the same per-project breakdown a customer relies on for tax purposes.
+//
+// Created as a draft on purpose: like a manual invoice, a usage invoice
+// is reviewed and issued as a deliberate second step (which is also when
+// its PDF is rendered), never sent to a customer by the act of
+// generation.
+func (s *Service) CreateAccountUsageInvoice(ctx context.Context, accountID uuid.UUID, periodStart, periodEnd time.Time) (*Invoice, error) {
+	if err := validateInvoicePeriod(periodStart, periodEnd); err != nil {
+		return nil, err
+	}
+
+	// Snapshot the customer identity before opening the transaction — a
+	// bad account id should fail without consuming an invoice number.
+	bill, err := s.resolveBillToByAccount(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+
+	usage, err := s.accountUsageByProjectResource(ctx, accountID, periodStart, periodEnd)
+	if err != nil {
+		return nil, err
+	}
+	if len(usage) == 0 {
+		return nil, fmt.Errorf("no billable usage for this account in the period")
+	}
+
+	// Build line items. Amount is the authoritative summed cost; quantity
+	// and the blended unit price are context.
+	var subtotal float64
+	lineItems := make([]InvoiceLineItem, 0, len(usage))
+	for _, u := range usage {
+		unitPrice := 0.0
+		if u.Quantity != 0 {
+			unitPrice = u.TotalCost / u.Quantity // blended rate over the period
+		}
+		projectID := u.ProjectID
+		lineItems = append(lineItems, InvoiceLineItem{
+			Description:  u.ResourceType,
+			ProjectID:    &projectID,
+			ProjectName:  u.ProjectName,
+			Quantity:     u.Quantity,
+			Unit:         u.Unit,
+			UnitPrice:    unitPrice,
+			Amount:       u.TotalCost,
+			ResourceType: u.ResourceType,
+		})
+		subtotal += u.TotalCost
+	}
+
+	tax := 0.0 // no tax engine yet — see ROADMAP B6
+	total := subtotal + tax
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	invoiceNumber, err := s.nextInvoiceNumber(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+
+	invoice := &Invoice{
+		AccountID:     accountID,
+		InvoiceNumber: invoiceNumber,
+		PeriodStart:   periodStart,
+		PeriodEnd:     periodEnd,
+		Subtotal:      subtotal,
+		Tax:           tax,
+		Total:         total,
+		Status:        "draft",
+		Source:        "usage",
+		Currency:      "USD",
+		BillToName:    bill.Name,
+		BillToEmail:   bill.Email,
+		BillToAddress: bill.Address,
+		BillToTaxID:   bill.TaxID,
+		BillToAccount: bill.AccountNumber,
+	}
+
+	// account-level: project_id on the INVOICE stays null; the breakdown
+	// lives on the line items, exactly like the manual path.
+	err = tx.QueryRowContext(ctx, `
+		INSERT INTO billing.invoices
+		(account_id, invoice_number, period_start, period_end,
+		 subtotal, tax, total, status, source, currency,
+		 bill_to_name, bill_to_email, bill_to_address, bill_to_tax_id,
+		 bill_to_account_number)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,'draft','usage',$8,$9,$10,$11,$12,$13)
+		RETURNING id, created_at, updated_at
+	`,
+		invoice.AccountID, invoice.InvoiceNumber,
+		invoice.PeriodStart, invoice.PeriodEnd,
+		invoice.Subtotal, invoice.Tax, invoice.Total, invoice.Currency,
+		nullIfEmpty(invoice.BillToName), nullIfEmpty(invoice.BillToEmail),
+		nullIfEmpty(invoice.BillToAddress), nullIfEmpty(invoice.BillToTaxID),
+		nullIfEmpty(invoice.BillToAccount),
+	).Scan(&invoice.ID, &invoice.CreatedAt, &invoice.UpdatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create usage invoice: %w", err)
+	}
+
+	for i, item := range lineItems {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO billing.invoice_line_items
+			(invoice_id, project_id, description, quantity, unit, unit_price, amount, position)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		`, invoice.ID, item.ProjectID, item.Description,
+			nullIfZero(item.Quantity), nullIfEmpty(item.Unit),
+			nullIfZero(item.UnitPrice), item.Amount, i,
+		); err != nil {
+			return nil, fmt.Errorf("failed to create usage line item %d: %w", i+1, err)
+		}
+		item.SortOrder = i
+		invoice.LineItems = append(invoice.LineItems, item)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("failed to commit usage invoice: %w", err)
+	}
+	return invoice, nil
 }
 
 // CalculateVRAMCost calculates GPU cost from allocated VRAM using the
@@ -391,6 +613,25 @@ var ErrNoLineItems = errors.New("an invoice needs at least one line item")
 
 // CreateManualInvoice issues an invoice with explicit line items.
 //
+// validateInvoicePeriod rejects a billing period that runs backwards or
+// extends past today. A billing period covers activity that has already
+// happened; an end date in the future would bill for usage that does not
+// exist yet. Compared against the end of the current UTC day so that
+// "period ends today" is always valid regardless of the caller's clock
+// time — invoice periods are dates, not instants.
+func validateInvoicePeriod(start, end time.Time) error {
+	if end.Before(start) {
+		return fmt.Errorf("period end cannot be before period start")
+	}
+	// End of today (UTC): the last instant a period may legitimately end.
+	now := time.Now().UTC()
+	endOfToday := time.Date(now.Year(), now.Month(), now.Day(), 23, 59, 59, 0, time.UTC)
+	if end.After(endOfToday) {
+		return fmt.Errorf("period end cannot be in the future")
+	}
+	return nil
+}
+
 // The total is the SUM of the lines, never a separately supplied
 // figure. Accepting both would allow a total that disagrees with its own
 // breakdown — which is the one thing an invoice must never do, since the
@@ -406,6 +647,15 @@ func (s *Service) CreateManualInvoice(ctx context.Context, req ManualInvoiceRequ
 		if strings.TrimSpace(item.Description) == "" {
 			return nil, fmt.Errorf("line item %d has no description", i+1)
 		}
+	}
+
+	// The billing PERIOD cannot run backwards or into the future: an
+	// invoice bills for activity that has already happened, and a period
+	// ending tomorrow would claim to cover usage that does not exist yet.
+	// The DUE date is deliberately NOT constrained this way — "due in 30
+	// days" is a future date by design.
+	if err := validateInvoicePeriod(req.PeriodStart, req.PeriodEnd); err != nil {
+		return nil, err
 	}
 
 	var subtotal float64
@@ -568,7 +818,87 @@ func (s *Service) IssueInvoice(ctx context.Context, invoiceID uuid.UUID) (*Invoi
 		// already-open invoice must not silently succeed.
 		return nil, fmt.Errorf("invoice is not a draft, or does not exist")
 	}
-	return s.GetInvoice(ctx, invoiceID)
+
+	invoice, err := s.GetInvoice(ctx, invoiceID)
+	if err != nil {
+		return nil, err
+	}
+
+	// The invoice is now issued (status committed as 'open'). Rendering
+	// and storing the PDF is a SEPARATE, best-effort step: the document
+	// is a derived artifact, and a failure to store it must not undo the
+	// issuance — a half-rolled-back re-issue would be worse than a
+	// missing PDF, and the document can be regenerated later. So any
+	// error here is logged and swallowed; the issued invoice is still
+	// returned.
+	s.generateAndStorePDF(ctx, invoice)
+
+	return invoice, nil
+}
+
+// generateAndStorePDF renders the invoice and writes it to object
+// storage, then records the key on the row. Best-effort: see the caller.
+// A no-op when PDF storage is not configured (local dev).
+func (s *Service) generateAndStorePDF(ctx context.Context, invoice *Invoice) {
+	if s.renderInvoicePDF == nil || s.pdfStore == nil {
+		return // storage not wired (e.g. local dev with no AWS)
+	}
+
+	doc, err := s.renderInvoicePDF(invoice)
+	if err != nil {
+		log.Printf("WARN: invoice %s issued but PDF render failed: %v", invoice.InvoiceNumber, err)
+		return
+	}
+
+	// {account_id}/{invoice_number}.pdf — the stable per-invoice key.
+	key := fmt.Sprintf("%s/%s.pdf", invoice.AccountID, invoice.InvoiceNumber)
+	if err := s.pdfStore.PutObject(ctx, key, doc, "application/pdf"); err != nil {
+		log.Printf("WARN: invoice %s issued but PDF upload failed: %v", invoice.InvoiceNumber, err)
+		return
+	}
+
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE billing.invoices
+		SET pdf_s3_key = $1, pdf_generated_at = NOW()
+		WHERE id = $2
+	`, key, invoice.ID); err != nil {
+		// The object is stored but the row does not know its key. The
+		// download endpoint will report "not yet available" until a
+		// re-issue/backfill fixes it; that is recoverable and must not
+		// fail the issuance.
+		log.Printf("WARN: invoice %s PDF stored at %s but recording the key failed: %v",
+			invoice.InvoiceNumber, key, err)
+		return
+	}
+
+	// Reflect the stored document on the returned invoice so the caller
+	// (and its JSON response) reports pdf_available immediately.
+	invoice.PDFS3Key = &key
+	now := time.Now()
+	invoice.PDFGeneratedAt = &now
+}
+
+// ErrPDFUnavailable means no downloadable document exists for an invoice
+// — it was never issued, was issued before PDF storage was configured,
+// or storage is not wired at all. Callers translate this to a 404 so the
+// absence of a document is indistinguishable from a missing invoice.
+var ErrPDFUnavailable = errors.New("invoice document not available")
+
+// PresignInvoicePDF returns a short-lived URL to download the given
+// invoice's stored PDF. Returns ErrPDFUnavailable if PDF storage is not
+// configured or no document was stored. The caller is responsible for
+// the tenancy check (it already holds the invoice); this method only
+// turns a stored key into a downloadable URL, so it never loads or leaks
+// another account's row.
+//
+// The URL is built to force a "save as" under a friendly filename
+// (INV-000005.pdf), not the raw S3 key.
+func (s *Service) PresignInvoicePDF(ctx context.Context, invoice *Invoice, ttl time.Duration) (string, error) {
+	if s.pdfStore == nil || !invoice.PDFAvailable() {
+		return "", ErrPDFUnavailable
+	}
+	filename := invoice.InvoiceNumber + ".pdf"
+	return s.pdfStore.PresignGetObject(ctx, *invoice.PDFS3Key, filename, ttl)
 }
 
 // VoidInvoice cancels an invoice.
@@ -671,6 +1001,8 @@ func (s *Service) GetInvoice(ctx context.Context, invoiceID uuid.UUID) (*Invoice
 		&invoice.BillToAddress,
 		&invoice.BillToTaxID,
 		&invoice.BillToAccount,
+		&invoice.PDFS3Key,
+		&invoice.PDFGeneratedAt,
 	)
 
 	if err == sql.ErrNoRows {
@@ -700,7 +1032,8 @@ const invoiceColumns = `id, project_id, account_id, invoice_number,
 	source, currency, due_date, issued_by, notes,
 	COALESCE(bill_to_name,''), COALESCE(bill_to_email,''),
 	COALESCE(bill_to_address,''), COALESCE(bill_to_tax_id,''),
-	COALESCE(bill_to_account_number,'')`
+	COALESCE(bill_to_account_number,''),
+	pdf_s3_key, pdf_generated_at`
 
 // ListInvoices lists every invoice for a project.
 //
@@ -726,16 +1059,46 @@ func (s *Service) ListInvoices(ctx context.Context, projectID uuid.UUID) ([]Invo
 	return scanInvoices(rows)
 }
 
-// ListAccountInvoices lists every invoice belonging to an account —
-// both project-anchored (usage) and account-level (manual) invoices.
-// This is the list a customer or operator actually wants: "everything
-// this account owes", the same way one AWS account has one bill list
-// regardless of how many services appear on it.
+// ListAccountInvoices lists EVERY invoice belonging to an account,
+// including drafts — both project-anchored (usage) and account-level
+// (manual) invoices. This is the operator's view (control centre): a
+// draft is an in-progress document nobody outside the platform has
+// reviewed yet, and an operator building one needs to see it to edit or
+// discard it.
+//
+// Do not expose this to customers directly — see
+// ListAccountInvoicesForCustomer for the view that excludes drafts.
 func (s *Service) ListAccountInvoices(ctx context.Context, accountID uuid.UUID) ([]Invoice, error) {
 	query := `
 		SELECT ` + invoiceColumns + `
 		FROM billing.invoices
 		WHERE account_id = $1
+		ORDER BY created_at DESC
+	`
+
+	rows, err := s.db.QueryContext(ctx, query, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list invoices: %w", err)
+	}
+	defer rows.Close()
+
+	return scanInvoices(rows)
+}
+
+// ListAccountInvoicesForCustomer lists an account's invoices EXCLUDING
+// drafts.
+//
+// A draft is an operator's in-progress document — see the "Lifecycle"
+// section of INVOICE-DESIGN.md: creation and issuing are deliberately
+// separate precisely so a mistyped amount is correctable BEFORE a
+// customer holds a copy. Showing a draft to the customer it is being
+// prepared for defeats that separation; they would see a number that
+// might still change.
+func (s *Service) ListAccountInvoicesForCustomer(ctx context.Context, accountID uuid.UUID) ([]Invoice, error) {
+	query := `
+		SELECT ` + invoiceColumns + `
+		FROM billing.invoices
+		WHERE account_id = $1 AND status != 'draft'
 		ORDER BY created_at DESC
 	`
 
@@ -778,6 +1141,8 @@ func scanInvoices(rows *sql.Rows) ([]Invoice, error) {
 			&inv.BillToAddress,
 			&inv.BillToTaxID,
 			&inv.BillToAccount,
+			&inv.PDFS3Key,
+			&inv.PDFGeneratedAt,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan invoice: %w", err)

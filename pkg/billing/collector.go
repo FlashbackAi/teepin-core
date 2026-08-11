@@ -157,6 +157,17 @@ func (c *UsageCollector) collectUsage(ctx context.Context) error {
 			continue
 		}
 
+		// Draw this interval's cost from the account's credit balance
+		// first — credits are spent before the card is ever charged. Any
+		// remainder is what will bill to the card later. Best-effort: a
+		// consumption failure must not undo the usage record (that would
+		// lose billable usage), so it is logged and the run continues.
+		// ConsumeCredit is idempotent on the usage record, so a retried
+		// interval never double-draws.
+		if _, err := c.billingService.ConsumeCredit(ctx, record.AccountID, record.ID, record.TotalCost); err != nil {
+			log.Printf("WARN: failed to apply credit for usage %s: %v", record.ID, err)
+		}
+
 		recordedCount++
 	}
 

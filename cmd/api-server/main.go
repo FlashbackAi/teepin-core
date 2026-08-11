@@ -30,14 +30,17 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/api"
 	"github.com/FlashbackAi/teepin-core/pkg/auth"
 	"github.com/FlashbackAi/teepin-core/pkg/billing"
+	billingpdf "github.com/FlashbackAi/teepin-core/pkg/billing/pdf"
 	"github.com/FlashbackAi/teepin-core/pkg/cluster"
 	"github.com/FlashbackAi/teepin-core/pkg/compute"
 	"github.com/FlashbackAi/teepin-core/pkg/database"
 	"github.com/FlashbackAi/teepin-core/pkg/gpu"
 	"github.com/FlashbackAi/teepin-core/pkg/harbor"
 	"github.com/FlashbackAi/teepin-core/pkg/networking"
+	"github.com/FlashbackAi/teepin-core/pkg/payments"
 	"github.com/FlashbackAi/teepin-core/pkg/ratelimit"
 	"github.com/FlashbackAi/teepin-core/pkg/statuspage"
+	s3storage "github.com/FlashbackAi/teepin-core/pkg/storage/s3"
 )
 
 const (
@@ -89,15 +92,55 @@ func main() {
 	var billingService *billing.Service
 	var billingHandler *api.BillingHandler
 	var usageCollector *billing.UsageCollector
+	var stripeClient *payments.Client
 
 	if dbClient != nil && authService != nil {
 		billingService = billing.NewService(dbClient.DB())
+
+		// Enable invoice-PDF generation + storage when a bucket is
+		// configured. Absent (local dev with no AWS), invoices still
+		// issue — just without a stored document. Credentials come from
+		// the AWS default chain (the ECS task role in production); no
+		// static keys are read here.
+		if bucket := os.Getenv("INVOICES_BUCKET"); bucket != "" {
+			s3Client, err := s3storage.NewClient(context.Background(), bucket)
+			if err != nil {
+				// Non-fatal: the platform runs without invoice PDFs
+				// rather than refusing to start. Downloads report "not
+				// yet available" until storage is reachable.
+				log.Printf("WARN: invoice PDF storage disabled: %v", err)
+			} else {
+				billingService.WithPDFStorage(billingpdf.Render, s3Client)
+				log.Printf("Invoice PDF storage enabled (bucket %s)", bucket)
+			}
+		} else {
+			log.Println("Invoice PDF storage not configured (INVOICES_BUCKET unset); invoices will issue without a stored document")
+		}
+
+		// Enable Stripe payment methods when keys are configured. Absent
+		// (local dev), the provisioning gate still works off the DB (no
+		// verified card ⇒ blocked), CreateSetupIntent errors cleanly, and
+		// the webhook endpoint returns 503.
+		if stripeKey := os.Getenv("STRIPE_SECRET_KEY"); stripeKey != "" {
+			stripeClient = payments.NewClient(stripeKey, os.Getenv("STRIPE_WEBHOOK_SECRET"))
+			billingService.WithStripe(newStripeGatewayAdapter(stripeClient))
+			log.Println("Stripe payments enabled")
+		} else {
+			log.Println("Stripe payments not configured (STRIPE_SECRET_KEY unset); provisioning requires a verified card, which cannot be added without Stripe")
+		}
+
 		billingHandler = api.NewBillingHandler(billingService, authService)
 		usageCollector = billing.NewUsageCollector(dbClient.DB(), billingService)
 		log.Println("✅ Billing system initialized")
 
 		// Start usage collector in background
 		go usageCollector.Start(context.Background())
+
+		// Monthly billing cycle: on the 1st, auto-generate + issue a usage
+		// invoice per account for the previous calendar month. Idempotent
+		// and skips accounts with no usage.
+		go billing.NewBillingCycle(dbClient.DB(), billingService).Start(context.Background())
+		log.Println("Monthly billing cycle started")
 	}
 
 	// Initialize Kubernetes client (optional for standalone mode)
@@ -306,10 +349,34 @@ func main() {
 		log.Println("Instance reconciler started")
 	}
 
+	// Suspension sweeper: suspends accounts whose 24h payment grace period
+	// has elapsed and tears down their resources. Inert until something
+	// sets accounts.payment_failed_at (a card removed at Stripe today; a
+	// failed charge later). Needs the DB, and — to actually stop
+	// workloads — the cluster and instance store.
+	if billingService != nil && instanceStore != nil {
+		suspender := newResourceSuspender(clusterClient, instanceStore)
+		sweeper := billing.NewSuspensionSweeper(dbClient.DB(), suspender)
+		go sweeper.Start(context.Background())
+		log.Println("Suspension sweeper started")
+	}
+
 	// Initialize API server with networking integration. billingService
 	// doubles as the live pricing provider: rates come from the
 	// billing.pricing table and are re-read before every allocation.
-	apiServer := api.NewServer(clusterClient, gpuAllocator, networkingService, instanceStore, billingService)
+	// billingService is the pricing provider AND the provisioning gate —
+	// both are methods on the one service. When it is nil (no database),
+	// pass GENUINE nil interfaces, not a typed-nil pointer wrapped in an
+	// interface: the latter is non-nil under `== nil` and would make the
+	// standalone path call methods on a nil *billing.Service. The explicit
+	// branch keeps the standalone (default pricing, no gate) path safe.
+	var pricingProvider api.PricingProvider
+	var provisionGate api.ProvisionGate
+	if billingService != nil {
+		pricingProvider = billingService
+		provisionGate = billingService
+	}
+	apiServer := api.NewServer(clusterClient, gpuAllocator, networkingService, instanceStore, pricingProvider, provisionGate)
 
 	// Admin API (pricing management): only enabled with an explicit
 	// operator token — never on by default.
@@ -323,8 +390,16 @@ func main() {
 		}
 	}
 
+	// Stripe webhook handler — only when Stripe is configured. Registered
+	// as an UNAUTHENTICATED route (Stripe calls it); its authentication is
+	// the mandatory signature check inside the handler.
+	var webhookHandler *api.WebhookHandler
+	if stripeClient != nil && billingService != nil {
+		webhookHandler = api.NewWebhookHandler(newStripeWebhookAdapter(stripeClient), billingService)
+	}
+
 	// Setup router
-	router := setupRouter(apiServer, authHandler, accountHandler, authMiddleware, billingHandler, registryHandler, adminHandler, rateLimitMiddleware)
+	router := setupRouter(apiServer, authHandler, accountHandler, authMiddleware, billingHandler, registryHandler, adminHandler, webhookHandler, rateLimitMiddleware)
 
 	// Create HTTP server
 	port := getEnv("PORT", "8080")
@@ -512,7 +587,7 @@ func initRateLimiting() *ratelimit.Config {
 	return config
 }
 
-func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHandler *api.AccountHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler, registryHandler *api.RegistryHandler, adminHandler *api.AdminHandler, rateLimitMiddleware *ratelimit.Middleware) *gin.Engine {
+func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHandler *api.AccountHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler, registryHandler *api.RegistryHandler, adminHandler *api.AdminHandler, webhookHandler *api.WebhookHandler, rateLimitMiddleware *ratelimit.Middleware) *gin.Engine {
 	// Set Gin to release mode in production
 	if os.Getenv("GIN_MODE") == "" {
 		gin.SetMode(gin.ReleaseMode)
@@ -547,6 +622,13 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 	// API v1
 	v1 := router.Group("/v1")
 	{
+		// Stripe webhooks — UNAUTHENTICATED at the router because Stripe
+		// calls it. Its authentication is the mandatory signature check
+		// inside the handler, so it must sit outside every auth group.
+		if webhookHandler != nil {
+			v1.POST("/webhooks/stripe", webhookHandler.HandleStripe)
+		}
+
 		// Authentication endpoints (public)
 		if authHandler != nil {
 			authRoutes := v1.Group("/auth")
@@ -577,6 +659,16 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 					accounts.POST("/users", accountHandler.CreateUser)
 					accounts.PATCH("/users/:user_id", accountHandler.UpdateUser)
 					accounts.DELETE("/users/:user_id", accountHandler.DeleteUser)
+
+					// Payment methods belong to the account (the billing
+					// entity), so they live under /accounts/current and use
+					// the JWT session — not a project API key.
+					if billingHandler != nil {
+						accounts.POST("/payment-methods/setup-intent", billingHandler.CreateSetupIntent)
+						accounts.GET("/payment-methods", billingHandler.ListPaymentMethods)
+						accounts.DELETE("/payment-methods/:id", billingHandler.RemovePaymentMethod)
+						accounts.POST("/payment-methods/:id/default", billingHandler.SetDefaultPaymentMethod)
+					}
 				}
 			}
 
@@ -614,7 +706,9 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 				billing.GET("/current-month", billingHandler.GetCurrentMonthUsage)
 				billing.GET("/invoices", billingHandler.ListInvoices)
 				billing.GET("/invoices/:id", billingHandler.GetInvoice)
+				billing.GET("/invoices/:id/pdf", billingHandler.DownloadInvoicePDF)
 				billing.POST("/invoices", billingHandler.CreateInvoice)
+				billing.GET("/credits", billingHandler.GetCreditBalance)
 			}
 		}
 
@@ -644,6 +738,9 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 				// Manual invoicing for the operator control centre.
 				admin.GET("/accounts", adminHandler.ListAccounts)
 				admin.GET("/accounts/:account_id/projects", adminHandler.ListAccountProjects)
+				admin.POST("/accounts/:account_id/usage-invoices", adminHandler.GenerateAccountUsageInvoice)
+				admin.POST("/accounts/:account_id/credits", adminHandler.GrantCredit)
+				admin.GET("/accounts/:account_id/credits", adminHandler.GetAccountCredits)
 				admin.POST("/invoices", adminHandler.CreateManualInvoice)
 				admin.GET("/invoices/:id", adminHandler.GetInvoice)
 				admin.POST("/invoices/:id/issue", adminHandler.IssueInvoice)

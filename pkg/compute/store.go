@@ -148,6 +148,15 @@ func (s *Store) ListActive(ctx context.Context) ([]InstanceRecord, error) {
 	return s.query(ctx, "WHERE terminated_at IS NULL")
 }
 
+// ListActiveByAccount returns an account's non-terminated instances
+// across all its projects — used by the suspension sweeper to tear down
+// everything an account is running when its grace period elapses.
+func (s *Store) ListActiveByAccount(ctx context.Context, accountID uuid.UUID) ([]InstanceRecord, error) {
+	return s.query(ctx,
+		"WHERE account_id = $1 AND terminated_at IS NULL ORDER BY created_at DESC",
+		accountID)
+}
+
 // ListByProject returns the project's non-terminated instances.
 // ListByProject returns an account's live instances in one project.
 // Both predicates are required: project_id alone would let a caller
