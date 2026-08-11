@@ -81,3 +81,6 @@ teepin-local
 
 # Pinned build tools fetched by scripts/generate-proto.sh
 .tools/
+
+# Local dev-assistant instructions — not project source
+CLAUDE.md

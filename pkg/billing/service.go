@@ -1179,30 +1179,60 @@ func (s *Service) UpdateInvoiceStatus(ctx context.Context, invoiceID uuid.UUID, 
 	return nil
 }
 
-// MarkInvoicePaid marks an invoice as paid
+// MarkInvoicePaid marks an invoice as paid and settles it: it records the
+// id of the Stripe object that settled it (a pi_… from a card charge, or
+// the sentinel "credit" when credit covered the whole amount), clears any
+// stale charge error, and — if this account has no OTHER unpaid open usage
+// invoice — clears the account's grace clock. A successful collection
+// cancelling the grace clock is symmetric with a good card doing so
+// (MarkPaymentMethodVerified): the account is once again paying, so it
+// should not be suspended.
+//
+// Idempotent-friendly: called from both the optimistic path in ChargeInvoice
+// and the payment_intent.succeeded webhook; the second run simply re-sets
+// the same values.
 func (s *Service) MarkInvoicePaid(ctx context.Context, invoiceID uuid.UUID, stripeInvoiceID string) error {
-	query := `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	var accountID uuid.UUID
+	err = tx.QueryRowContext(ctx, `
 		UPDATE billing.invoices
 		SET status = 'paid',
 		    stripe_invoice_id = $1,
+		    last_charge_error = NULL,
 		    paid_at = NOW(),
 		    updated_at = NOW()
 		WHERE id = $2
-	`
-
-	result, err := s.db.ExecContext(ctx, query, stripeInvoiceID, invoiceID)
+		RETURNING account_id
+	`, stripeInvoiceID, invoiceID).Scan(&accountID)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("invoice not found")
+	}
 	if err != nil {
 		return fmt.Errorf("failed to mark invoice as paid: %w", err)
 	}
 
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("failed to get rows affected: %w", err)
+	// Clear the grace clock only when nothing else is owed: another open
+	// usage invoice still failing must keep the countdown running.
+	var otherUnpaid int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM billing.invoices
+		WHERE account_id = $1 AND source = 'usage' AND status = 'open' AND id != $2
+	`, accountID, invoiceID).Scan(&otherUnpaid); err != nil {
+		return fmt.Errorf("failed to check other unpaid invoices: %w", err)
+	}
+	if otherUnpaid == 0 {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE auth.accounts SET payment_failed_at = NULL, updated_at = NOW()
+			WHERE id = $1 AND payment_failed_at IS NOT NULL
+		`, accountID); err != nil {
+			return fmt.Errorf("failed to clear grace clock: %w", err)
+		}
 	}
 
-	if rows == 0 {
-		return fmt.Errorf("invoice not found")
-	}
-
-	return nil
+	return tx.Commit()
 }

@@ -58,6 +58,10 @@ func (a *stripeGatewayAdapter) DetachPaymentMethod(pmID string) error {
 	return a.c.DetachPaymentMethod(pmID)
 }
 
+func (a *stripeGatewayAdapter) CreatePaymentIntent(customerID, pmID, currency string, amountCents int64, invoiceID, idempotencyKey string) (string, string, error) {
+	return a.c.CreatePaymentIntent(customerID, pmID, currency, amountCents, invoiceID, idempotencyKey)
+}
+
 // stripeWebhookAdapter makes *payments.Client satisfy
 // api.StripeWebhookVerifier, translating the verified event and card
 // details into the api package's own types.
@@ -78,6 +82,9 @@ func (a *stripeWebhookAdapter) VerifyWebhook(payload []byte, sigHeader string) (
 		Type:            e.Type,
 		SetupIntentID:   e.SetupIntentID,
 		PaymentMethodID: e.PaymentMethodID,
+		PaymentIntentID: e.PaymentIntentID,
+		InvoiceID:       e.InvoiceID,
+		FailureReason:   e.FailureReason,
 	}
 	if e.Card != nil {
 		out.Card = &api.CardDetails{

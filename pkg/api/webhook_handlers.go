@@ -22,6 +22,12 @@ type WebhookEvent struct {
 	SetupIntentID   string
 	PaymentMethodID string
 	Card            *CardDetails
+	// PaymentIntentID / InvoiceID / FailureReason are populated for
+	// payment_intent.* events. InvoiceID is for logging only; reconciliation
+	// matches on PaymentIntentID (the id we minted).
+	PaymentIntentID string
+	InvoiceID       string
+	FailureReason   string
 }
 
 // CardDetails mirrors payments.CardDetails for the same decoupling reason.
@@ -130,6 +136,18 @@ func (h *WebhookHandler) dispatch(ctx context.Context, event *WebhookEvent) erro
 				event.Card.Brand, event.Card.Last4, event.Card.ExpMonth, event.Card.ExpYear)
 		}
 		return nil
+
+	case "payment_intent.succeeded":
+		// A card charge settled. Mark the invoice tied to this PaymentIntent
+		// paid — matched by the pi id we minted, never a client-supplied id.
+		// Safe to replay: an already-paid invoice is a no-op.
+		return h.billing.SettleInvoiceByPaymentIntent(ctx, event.PaymentIntentID)
+
+	case "payment_intent.payment_failed":
+		// A card charge failed. Record it against the invoice; once attempts
+		// are exhausted this arms the 24h suspension grace clock.
+		return h.billing.RecordChargeFailureByPaymentIntent(ctx,
+			event.PaymentIntentID, event.FailureReason)
 
 	default:
 		// Acknowledged but not acted on — Stripe sends many event types;

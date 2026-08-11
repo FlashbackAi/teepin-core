@@ -141,6 +141,18 @@ func main() {
 		// and skips accounts with no usage.
 		go billing.NewBillingCycle(dbClient.DB(), billingService).Start(context.Background())
 		log.Println("Monthly billing cycle started")
+
+		// Charge collector: charges issued usage invoices off-session against
+		// the account's verified card, for the net amount after credits.
+		// Only started when Stripe is configured — without a gateway there
+		// is nothing to charge with, and starting it would only record
+		// pointless "not configured" attempts.
+		if stripeClient != nil {
+			go billing.NewChargeCollector(dbClient.DB(), billingService).Start(context.Background())
+			log.Println("Charge collector started")
+		} else {
+			log.Println("Charge collector not started (Stripe not configured); issued invoices will not be charged")
+		}
 	}
 
 	// Initialize Kubernetes client (optional for standalone mode)
@@ -743,7 +755,9 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 				admin.GET("/accounts/:account_id/credits", adminHandler.GetAccountCredits)
 				admin.POST("/invoices", adminHandler.CreateManualInvoice)
 				admin.GET("/invoices/:id", adminHandler.GetInvoice)
+				admin.GET("/invoices/:id/charge-state", adminHandler.GetInvoiceChargeState)
 				admin.POST("/invoices/:id/issue", adminHandler.IssueInvoice)
+				admin.POST("/invoices/:id/charge", adminHandler.ChargeInvoice)
 				admin.POST("/invoices/:id/void", adminHandler.VoidInvoice)
 				admin.GET("/projects/:project_id/invoices", adminHandler.ListProjectInvoices)
 				admin.GET("/accounts/:account_id/invoices", adminHandler.ListAccountInvoices)

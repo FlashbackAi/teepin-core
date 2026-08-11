@@ -123,6 +123,73 @@ func TestWebhook_ReplayIsIdempotent(t *testing.T) {
 	}
 }
 
+// payment_intent.succeeded settles the invoice tied to the pi — matched by
+// the pi id, flipping open→paid.
+func TestWebhook_PaymentIntentSucceededSettles(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	v := &fakeVerifier{event: &WebhookEvent{Type: "payment_intent.succeeded", PaymentIntentID: "pi_1"}}
+	h := NewWebhookHandler(v, billing.NewService(db))
+
+	acct := "00000000-0000-0000-0000-0000000000aa"
+	inv := "00000000-0000-0000-0000-0000000000bb"
+	// Find the open invoice by pi id, then MarkInvoicePaid (tx).
+	mock.ExpectQuery(`SELECT id, status FROM billing\.invoices WHERE stripe_payment_intent_id`).
+		WithArgs("pi_1").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "status"}).AddRow(inv, "open"))
+	mock.ExpectBegin()
+	mock.ExpectQuery(`UPDATE billing\.invoices\s+SET status = 'paid'`).
+		WillReturnRows(sqlmock.NewRows([]string{"account_id"}).AddRow(acct))
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM billing\.invoices`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	mock.ExpectExec(`UPDATE auth\.accounts SET payment_failed_at = NULL`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	if w := postWebhook(h); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// payment_intent.payment_failed records the failure against the invoice.
+func TestWebhook_PaymentIntentFailedRecords(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	v := &fakeVerifier{event: &WebhookEvent{
+		Type: "payment_intent.payment_failed", PaymentIntentID: "pi_1", FailureReason: "card declined",
+	}}
+	h := NewWebhookHandler(v, billing.NewService(db))
+
+	acct := "00000000-0000-0000-0000-0000000000aa"
+	inv := "00000000-0000-0000-0000-0000000000bb"
+	mock.ExpectQuery(`SELECT id, status FROM billing\.invoices WHERE stripe_payment_intent_id`).
+		WithArgs("pi_1").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "status"}).AddRow(inv, "open"))
+	// recordChargeFailure with bump=false; attempts below cap ⇒ no clock arm.
+	mock.ExpectBegin()
+	mock.ExpectQuery(`UPDATE billing\.invoices\s+SET last_charge_error`).
+		WillReturnRows(sqlmock.NewRows([]string{"account_id", "charge_attempts"}).AddRow(acct, 1))
+	mock.ExpectCommit()
+
+	if w := postWebhook(h); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
 // An unknown event type is acknowledged with 200 and touches nothing.
 func TestWebhook_UnknownEventAcknowledged(t *testing.T) {
 	db, mock, _ := sqlmock.New()

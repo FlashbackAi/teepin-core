@@ -32,6 +32,10 @@ type StripeGateway interface {
 	CreateSetupIntent(customerID, currency string) (clientSecret, intentID string, err error)
 	GetPaymentMethod(pmID string) (*CardSummary, error)
 	DetachPaymentMethod(pmID string) error
+	// CreatePaymentIntent charges a stored card off-session for the net
+	// amount of an issued invoice. idempotencyKey (the invoice id) makes a
+	// retried create a no-op at Stripe rather than a double charge.
+	CreatePaymentIntent(customerID, pmID, currency string, amountCents int64, invoiceID, idempotencyKey string) (piID, status string, err error)
 }
 
 // ErrLastVerifiedCard is returned when removing a card would leave the

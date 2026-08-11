@@ -9,10 +9,10 @@
 // vendor's types. That keeps Stripe swappable and, more immediately,
 // keeps the billing package's tests free of Stripe.
 //
-// Nothing here charges money. This phase VALIDATES cards (SetupIntent,
-// off-session) so they can be charged LATER — a SetupIntent moves no
-// funds; a card-issuing bank may place a transient authorization that
-// never settles, but no charge is created.
+// This package both VALIDATES cards (SetupIntent, off-session) and CHARGES
+// them (PaymentIntent, off-session). Validation moves no funds; the charge
+// path (CreatePaymentIntent) is the only place money actually moves, and it
+// is driven by the billing ChargeCollector against already-issued invoices.
 package payments
 
 import (
@@ -131,6 +131,56 @@ func (c *Client) DetachPaymentMethod(pmID string) error {
 	return nil
 }
 
+// CreatePaymentIntent charges a stored card off-session for an issued
+// invoice. This is the FIRST place in the platform that moves money — a
+// SetupIntent validated the card, this actually collects.
+//
+//   - amountCents is the NET amount to collect (invoice total minus any
+//     credit already applied), in the smallest currency unit; the caller
+//     has already handled the credit-covered case and never passes below
+//     Stripe's minimum.
+//   - Confirm+OffSession together mean "charge the saved card now, the
+//     customer is not present" — the whole point of validating off-session
+//     earlier. A card that needs 3DS will decline here rather than prompt,
+//     surfacing as an authentication_required error the caller records.
+//   - idempotencyKey (the invoice id) makes a retried create a no-op at
+//     Stripe: a network failure after Stripe charged the card, followed by
+//     our retry, returns the SAME PaymentIntent rather than double-charging.
+//
+// Returns the PaymentIntent id and its status ("succeeded",
+// "requires_action", "processing", …). A card decline is a normal outcome,
+// returned as an error with a customer-safe message the caller stores.
+func (c *Client) CreatePaymentIntent(customerID, pmID, currency string, amountCents int64, invoiceID, idempotencyKey string) (piID, status string, err error) {
+	params := &stripe.PaymentIntentParams{
+		Amount:        stripe.Int64(amountCents),
+		Currency:      stripe.String(currency),
+		Customer:      stripe.String(customerID),
+		PaymentMethod: stripe.String(pmID),
+		Confirm:       stripe.Bool(true),
+		OffSession:    stripe.Bool(true),
+	}
+	params.AddMetadata("teepin_invoice_id", invoiceID)
+	if idempotencyKey != "" {
+		params.SetIdempotencyKey(idempotencyKey)
+	}
+
+	pi, err := c.sc.PaymentIntents.New(params)
+	if err != nil {
+		// A decline still carries a PaymentIntent id on the error's
+		// underlying object; surface the id when we have it so the caller
+		// can reconcile, but return the error so the charge counts as failed.
+		if serr, ok := err.(*stripe.Error); ok {
+			id := ""
+			if serr.PaymentIntent != nil {
+				id = serr.PaymentIntent.ID
+			}
+			return id, "", fmt.Errorf("stripe: charge declined: %s", serr.Msg)
+		}
+		return "", "", fmt.Errorf("stripe: create payment intent: %w", err)
+	}
+	return pi.ID, string(pi.Status), nil
+}
+
 // WebhookEvent is a vendor-neutral view of the Stripe events this
 // platform acts on, decoded from a verified webhook. Returning this
 // rather than a stripe.Event keeps the api/billing packages free of
@@ -145,6 +195,14 @@ type WebhookEvent struct {
 	PaymentMethodID string
 	// Card is populated for payment_method.* events.
 	Card *CardDetails
+	// PaymentIntentID / InvoiceID are populated for payment_intent.* events.
+	// InvoiceID comes from the metadata we set when creating the intent; it
+	// is for logging only — reconciliation matches on PaymentIntentID, which
+	// we ourselves minted, never on a client-supplied id.
+	PaymentIntentID string
+	InvoiceID       string
+	// FailureReason is the customer-safe decline message on a failed charge.
+	FailureReason string
 }
 
 // VerifyWebhook authenticates a webhook request and decodes it to a
@@ -206,6 +264,25 @@ func (c *Client) VerifyWebhook(payload []byte, sigHeader string) (*WebhookEvent,
 				ExpMonth:        pm.Card.ExpMonth,
 				ExpYear:         pm.Card.ExpYear,
 			}
+		}
+
+	case "payment_intent.succeeded", "payment_intent.payment_failed":
+		var pi struct {
+			ID            string            `json:"id"`
+			Metadata      map[string]string `json:"metadata"`
+			LastPaymentErr *struct {
+				Message string `json:"message"`
+			} `json:"last_payment_error"`
+		}
+		if err := json.Unmarshal(event.Data.Raw, &pi); err != nil {
+			return nil, fmt.Errorf("stripe: decode payment_intent: %w", err)
+		}
+		out.PaymentIntentID = pi.ID
+		if pi.Metadata != nil {
+			out.InvoiceID = pi.Metadata["teepin_invoice_id"]
+		}
+		if pi.LastPaymentErr != nil {
+			out.FailureReason = pi.LastPaymentErr.Message
 		}
 	}
 

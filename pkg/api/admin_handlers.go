@@ -304,6 +304,40 @@ func (h *AdminHandler) IssueInvoice(c *gin.Context) {
 	c.JSON(http.StatusOK, invoice)
 }
 
+// ChargeInvoice charges an open usage invoice now, off-session, against the
+// account's verified card — an operator "collect now" for support or a
+// manual retry after a failed sweep. It runs the same ChargeInvoice unit of
+// work the background collector uses, so behaviour is identical: net of
+// credits, idempotent, and safe to press twice (an already-paid invoice is a
+// no-op). Returns the invoice's resulting state.
+// POST /v1/admin/invoices/:id/charge
+func (h *AdminHandler) ChargeInvoice(c *gin.Context) {
+	invoiceID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid invoice id"})
+		return
+	}
+
+	if err := h.billingService.ChargeInvoice(c.Request.Context(), invoiceID); err != nil {
+		// A charge that could not even be ATTEMPTED (not open, manual,
+		// missing) is a 409 — the request is fine, the invoice's state
+		// forbids it. A card DECLINE is not an error here: ChargeInvoice
+		// records the failed attempt and returns nil, so the operator sees
+		// the updated state below rather than a 500.
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Return the refreshed invoice so the operator sees the outcome
+	// (paid, or still open with an incremented attempt / recorded error).
+	invoice, err := h.billingService.GetInvoice(c.Request.Context(), invoiceID)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"message": "charge attempted", "id": invoiceID})
+		return
+	}
+	c.JSON(http.StatusOK, invoice)
+}
+
 // VoidInvoice cancels a draft or open invoice.
 // POST /v1/admin/invoices/:id/void
 func (h *AdminHandler) VoidInvoice(c *gin.Context) {
@@ -335,6 +369,26 @@ func (h *AdminHandler) GetInvoice(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, invoice)
+}
+
+// GetInvoiceChargeState returns the operator-only charge progress for an
+// invoice (attempts, last error, PaymentIntent id) — kept out of the invoice
+// body so the shared model and the customer-facing path stay untouched, and
+// so the existing GET /invoices/:id response shape does not change.
+// GET /v1/admin/invoices/:id/charge-state
+func (h *AdminHandler) GetInvoiceChargeState(c *gin.Context) {
+	invoiceID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid invoice id"})
+		return
+	}
+
+	st, err := h.billingService.InvoiceChargeState(c.Request.Context(), invoiceID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "invoice not found"})
+		return
+	}
+	c.JSON(http.StatusOK, st)
 }
 
 // ListProjectInvoices returns project-anchored invoices only (the
