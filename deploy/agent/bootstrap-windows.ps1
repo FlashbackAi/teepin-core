@@ -36,7 +36,10 @@ $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
 if (-not $wsl) {
     Info "installing WSL2 with $Distro (a reboot may be required)..."
     wsl --install -d $Distro
-    Info "WSL2 installed. If Windows asks you to reboot, do so and re-run this script."
+    if ($LASTEXITCODE -ne 0) {
+        Fail "WSL2 install did not complete (exit $LASTEXITCODE) — most often a network interruption during download. Check your connection and re-run this script."
+    }
+    Info "WSL2 install started. If Windows asks you to reboot, do so, then re-run this script to continue."
     exit 0
 }
 
@@ -45,6 +48,13 @@ $installed = (wsl --list --quiet) -join "`n"
 if ($installed -notmatch [regex]::Escape($Distro)) {
     Info "installing distro $Distro..."
     wsl --install -d $Distro
+    # wsl.exe does not reliably set a non-zero exit code on a failed download,
+    # so DO NOT trust it — verify the distro actually appeared. A network drop
+    # mid-download otherwise prints a false "installed" and misleads a re-run.
+    $installed = (wsl --list --quiet) -join "`n"
+    if ($installed -notmatch [regex]::Escape($Distro)) {
+        Fail "distro '$Distro' did not install (likely a network interruption during download). Check your connection and re-run this script."
+    }
     Info "distro installed. If prompted to create a UNIX user, do so, then re-run this script."
     exit 0
 }
