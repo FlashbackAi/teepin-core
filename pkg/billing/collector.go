@@ -85,20 +85,15 @@ func (c *UsageCollector) collectUsage(ctx context.Context) error {
 	now := time.Now()
 	var recordedCount int
 
-	// The rate is read once per collection run so every record in the
-	// run is metered consistently, but never cached across runs — admin
-	// price changes apply from the next tick.
+	// Rates are read once per collection run so every record in the run is
+	// metered consistently, but never cached across runs — admin price
+	// changes apply from the next tick.
 	vramRate := 0.0
+	cpuRate := 0.0
+	memRate := 0.0
 	rateFetched := false
 
 	for _, inst := range instances {
-		// Only GPU usage is metered for now; CPU-only instances get
-		// their own meter (CPU/memory rates) in a later milestone.
-		// Skipping avoids writing zero-cost records every hour.
-		if inst.GPUVRAMGB <= 0 {
-			continue
-		}
-
 		// Get last collection time for this instance
 		lastCollectionTime, err := c.getLastCollectionTime(ctx, inst.ID)
 		if err != nil {
@@ -129,13 +124,22 @@ func (c *UsageCollector) collectUsage(ctx context.Context) error {
 
 		if !rateFetched {
 			vramRate = c.billingService.VRAMPricePerGBHour(ctx)
+			cpuRate = c.billingService.CPUCoreRate(ctx)
+			memRate = c.billingService.MemoryGBRate(ctx)
 			rateFetched = true
 		}
 
-		// GPU cost is linear on allocated VRAM at the current
-		// admin-configured rate — model-agnostic and correct for
-		// custom sizes too.
-		unitPrice := float64(inst.GPUVRAMGB) * vramRate
+		// Cost by class. A GPU instance is linear on allocated VRAM. A
+		// CPU-only instance (home compute) is linear on cores + memory; its
+		// rates default to 0, so it costs nothing until an operator sets a
+		// price. unitPrice is the per-hour rate for the interval, recorded
+		// for transparency on the usage record.
+		var unitPrice float64
+		if inst.GPUVRAMGB > 0 {
+			unitPrice = float64(inst.GPUVRAMGB) * vramRate
+		} else {
+			unitPrice = float64(inst.CPUUnits)*cpuRate + float64(inst.MemoryGB)*memRate
+		}
 		cost := unitPrice * hours
 
 		// Record usage
@@ -183,29 +187,33 @@ type billableInstance struct {
 	ProjectID    uuid.UUID
 	InstanceType string
 	GPUVRAMGB    int
+	CPUUnits     int
+	MemoryGB     int
 	CreatedAt    time.Time
 	TerminatedAt *time.Time
 }
 
-// getBillableInstances returns instances with unbilled GPU time:
-// running instances, and terminated instances whose terminated_at lies
+// getBillableInstances returns instances with unbilled time — GPU and CPU
+// alike. Running instances, and terminated instances whose terminated_at lies
 // beyond their last billed end_time (the unbilled tail).
+//
+// The old `gpu_vram_gb > 0` filter is gone: CPU-only instances are now
+// metered too (home compute). Whether a CPU instance actually costs anything
+// depends on the CPU/memory rates, which default to 0.
 func (c *UsageCollector) getBillableInstances(ctx context.Context) ([]billableInstance, error) {
 	query := `
 		SELECT i.id, i.account_id, i.project_id, COALESCE(i.instance_type_id, ''),
-		       COALESCE(i.gpu_vram_gb, 0), i.created_at, i.terminated_at
+		       COALESCE(i.gpu_vram_gb, 0), COALESCE(i.cpu_units, 0),
+		       COALESCE(i.memory_gb, 0), i.created_at, i.terminated_at
 		FROM compute.instances i
 		LEFT JOIN LATERAL (
 			SELECT MAX(end_time) AS last_end
 			FROM billing.usage_records ur
 			WHERE ur.instance_id = i.id
 		) b ON true
-		WHERE COALESCE(i.gpu_vram_gb, 0) > 0
-		  AND (
-			(i.status = 'running' AND i.terminated_at IS NULL)
+		WHERE (i.status = 'running' AND i.terminated_at IS NULL)
 			OR (i.terminated_at IS NOT NULL
 			    AND i.terminated_at > COALESCE(b.last_end, i.created_at) + interval '1 minute')
-		  )
 	`
 
 	rows, err := c.db.QueryContext(ctx, query)
@@ -217,7 +225,8 @@ func (c *UsageCollector) getBillableInstances(ctx context.Context) ([]billableIn
 	var instances []billableInstance
 	for rows.Next() {
 		var inst billableInstance
-		if err := rows.Scan(&inst.ID, &inst.AccountID, &inst.ProjectID, &inst.InstanceType, &inst.GPUVRAMGB, &inst.CreatedAt, &inst.TerminatedAt); err != nil {
+		if err := rows.Scan(&inst.ID, &inst.AccountID, &inst.ProjectID, &inst.InstanceType,
+			&inst.GPUVRAMGB, &inst.CPUUnits, &inst.MemoryGB, &inst.CreatedAt, &inst.TerminatedAt); err != nil {
 			return nil, fmt.Errorf("scan failed: %w", err)
 		}
 		instances = append(instances, inst)

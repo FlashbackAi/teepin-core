@@ -20,7 +20,7 @@ import (
 //
 // Capacity must come from whatever the cluster client can reach.
 func TestSnapshotter_ServesAgentReportedInventory(t *testing.T) {
-	session := NewAgentSession("p1", "us-east", "test", func(*agentpb.ControlMessage) error { return nil })
+	session := NewAgentSession("p1", "us-east", "test", "", func(*agentpb.ControlMessage) error { return nil })
 	session.setInventory([]NodeInventory{{
 		NodeName:       "gpu-node-1",
 		GPUProduct:     "NVIDIA-A6000",
@@ -61,7 +61,7 @@ func TestSnapshotter_ServesAgentReportedInventory(t *testing.T) {
 }
 
 func TestSnapshotter_DropsUnreadyNodes(t *testing.T) {
-	session := NewAgentSession("p1", "us-east", "test", func(*agentpb.ControlMessage) error { return nil })
+	session := NewAgentSession("p1", "us-east", "test", "", func(*agentpb.ControlMessage) error { return nil })
 	session.setInventory([]NodeInventory{
 		{NodeName: "healthy", GPUCount: 1, Ready: true},
 		{NodeName: "cordoned", GPUCount: 1, Ready: false},
@@ -101,7 +101,7 @@ func TestSnapshotter_UnreachableIsAnErrorNotEmpty(t *testing.T) {
 }
 
 func TestSnapshotter_StaleInventoryIsNotOffered(t *testing.T) {
-	session := NewAgentSession("p1", "us-east", "test", func(*agentpb.ControlMessage) error { return nil })
+	session := NewAgentSession("p1", "us-east", "test", "", func(*agentpb.ControlMessage) error { return nil })
 	session.setInventory([]NodeInventory{{NodeName: "gpu-1", GPUCount: 1, Ready: true}})
 
 	session.mu.Lock()

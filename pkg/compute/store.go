@@ -44,6 +44,12 @@ type InstanceRecord struct {
 	Endpoint     string
 	K8sPodName   string
 	K8sNamespace string
+	// ProviderID / NodeName record which home provider+node ran this
+	// instance. Empty for the datacenter path. ProviderID is how a later
+	// delete/logs command routes to the same agent session; NodeName is
+	// resolved to compute.nodes.id at insert time for load accounting.
+	ProviderID string
+	NodeName   string
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 	StartedAt    *time.Time
@@ -62,11 +68,16 @@ func NewStore(db *sql.DB) *Store {
 
 // Create inserts a new instance record.
 func (s *Store) Create(ctx context.Context, rec *InstanceRecord) error {
+	// node_id is resolved from node_name via a sub-select so the API layer
+	// never has to know the node's UUID. NULL for the datacenter path (no
+	// node_name) or if the name does not match a row.
 	query := `
 		INSERT INTO compute.instances
 		(id, account_id, project_id, user_id, name, image, instance_type_id, status,
-		 gpu_vram_gb, cpu_units, memory_gb, endpoint, k8s_pod_name, k8s_namespace)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		 gpu_vram_gb, cpu_units, memory_gb, endpoint, k8s_pod_name, k8s_namespace,
+		 provider_id, node_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+		 (SELECT id FROM compute.nodes WHERE node_name = $16))
 		RETURNING created_at, updated_at
 	`
 
@@ -79,6 +90,7 @@ func (s *Store) Create(ctx context.Context, rec *InstanceRecord) error {
 		rec.ID, rec.AccountID, rec.ProjectID, rec.UserID, rec.Name, rec.Image,
 		rec.InstanceType, rec.Status, vram, rec.CPUUnits, rec.MemoryGB,
 		nullIfEmpty(rec.Endpoint), nullIfEmpty(rec.K8sPodName), rec.K8sNamespace,
+		nullIfEmpty(rec.ProviderID), nullIfEmpty(rec.NodeName),
 	).Scan(&rec.CreatedAt, &rec.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("failed to persist instance %s: %w", rec.ID, err)

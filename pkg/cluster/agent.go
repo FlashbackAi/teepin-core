@@ -95,7 +95,19 @@ func scopeAllows(scope Scope, status InstanceStatus) bool {
 }
 
 func (c *AgentClient) CreateInstance(ctx context.Context, spec InstanceSpec) (*InstanceResult, error) {
-	session, ok := c.registry.Any()
+	// Route to the OWNING provider when placement resolved one (home-class,
+	// multi-provider). Falls back to Any() only for the single-provider
+	// datacenter path where no provider was resolved. Sending a create for
+	// provider B's node to provider A — the old Any()-always behaviour —
+	// would run the workload on the wrong hardware the moment two providers
+	// are connected.
+	var session *AgentSession
+	var ok bool
+	if spec.ProviderID != "" {
+		session, ok = c.registry.ByProvider(spec.ProviderID)
+	} else {
+		session, ok = c.registry.Any()
+	}
 	if !ok {
 		return nil, ErrClusterUnavailable
 	}

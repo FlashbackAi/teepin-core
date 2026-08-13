@@ -90,6 +90,33 @@ func (h *AdminHandler) UpdatePricing(c *gin.Context) {
 	c.JSON(http.StatusOK, info)
 }
 
+// UpdateCPUPricing sets the home-compute CPU and memory rates. Zero is a
+// valid value ("do not charge"), so neither field is required — a missing
+// field is treated as 0. Kept separate from UpdatePricing so the GPU rate's
+// "must be positive" contract is untouched.
+// PUT /v1/admin/pricing/cpu
+func (h *AdminHandler) UpdateCPUPricing(c *gin.Context) {
+	var req struct {
+		CPUPricePerCoreHour  float64 `json:"cpu_price_per_core_hour"`
+		MemoryPricePerGBHour float64 `json:"memory_price_per_gb_hour"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := h.billingService.SetCPUPricing(c.Request.Context(),
+		req.CPUPricePerCoreHour, req.MemoryPricePerGBHour, "admin-api"); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	info, err := h.billingService.GetPricing(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, info)
+}
+
 // ---------------------------------------------------------------------
 // Manual invoicing
 //

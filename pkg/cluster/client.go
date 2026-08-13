@@ -75,6 +75,16 @@ type InstanceSpec struct {
 	GPUVRAMGB   int    // billed VRAM, annotated for capacity accounting
 	NodeName    string // pin to the node whose capacity was accounted
 
+	// ProviderID names the agent session this instance must be dispatched
+	// to. Empty = the single-provider datacenter path (dispatch to Any()).
+	// Set for a home-class placement so the create reaches the SAME session
+	// whose node was chosen — never an arbitrary one.
+	ProviderID string
+	// NodeClass is "home" for a consumer-node placement, "" for the
+	// datacenter/GPU path. Carried through for the agent's own logging and
+	// for future class-specific handling.
+	NodeClass string
+
 	// InstanceType is the hardware-derived name ("gpu.h100.mig-2g"),
 	// annotated onto the pod so reads can report it without a database
 	// lookup.

@@ -39,6 +39,10 @@ type fakeCluster struct {
 	// failWith, when set, is returned by every operation. Used to test
 	// how handlers degrade when GPU capacity is unreachable.
 	failWith error
+
+	// lastSpec captures the most recent CreateInstance spec, so placement
+	// tests can assert what the handler resolved.
+	lastSpec cluster.InstanceSpec
 }
 
 type fakeInstance struct {
@@ -74,6 +78,7 @@ func (f *fakeCluster) visible(scope cluster.Scope, id string) (fakeInstance, boo
 }
 
 func (f *fakeCluster) CreateInstance(_ context.Context, spec cluster.InstanceSpec) (*cluster.InstanceResult, error) {
+	f.lastSpec = spec
 	if f.failWith != nil {
 		return nil, f.failWith
 	}
@@ -486,6 +491,125 @@ func createInstanceReq(server *Server, projectID uuid.UUID) *httptest.ResponseRe
 	server.CreateInstance(c)
 	return w
 }
+
+// --- Home-class placement (Stage 2) --------------------------------------
+
+// fakePlacer records whether PlaceCPU was called — the crux of the opt-in
+// guarantee — and returns a canned placement or a chosen error.
+type fakePlacer struct {
+	called    bool
+	lastArch  string
+	nodeName  string
+	provider  string
+	arch      string
+	err       error
+	noCap     bool
+	archUnav  bool
+}
+
+func (p *fakePlacer) PlaceCPU(_ context.Context, arch string) (string, string, string, error) {
+	p.called = true
+	p.lastArch = arch
+	if p.err != nil {
+		return "", "", "", p.err
+	}
+	return p.nodeName, p.provider, p.arch, nil
+}
+func (p *fakePlacer) IsNoCapacity(error) bool      { return p.noCap }
+func (p *fakePlacer) IsArchUnavailable(error) bool { return p.archUnav }
+
+func createInstanceReqBody(server *Server, projectID uuid.UUID, body string) *httptest.ResponseRecorder {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set(string(auth.ProjectIDKey), projectID)
+	c.Set(string(auth.AccountIDKey), testAccountID)
+	server.CreateInstance(c)
+	return w
+}
+
+// THE opt-in guarantee: a normal request (no node_class) must NEVER consult
+// the home placer. A bug that placed regular workloads on home nodes would
+// be caught here.
+func TestCreateInstance_DefaultNeverPlacesHome(t *testing.T) {
+	placer := &fakePlacer{nodeName: "home-1", provider: "p1"}
+	server := newTenantServer(t, newFakeCluster()).WithNodePlacer(placer)
+
+	createInstanceReqBody(server, uuid.New(),
+		`{"name":"t","image":"nginx","cpu_units":1,"memory":"1GB"}`)
+
+	if placer.called {
+		t.Fatal("home placer was called for a request that did not ask for node_class:home")
+	}
+}
+
+// A home request resolves through the placer and the create reaches the
+// cluster with the resolved provider/node on the spec. Uses a store-less
+// server (standalone) so the assertion is purely about placement, not
+// persistence — but the account/project are still injected so the gate and
+// scope run. Standalone mode (store==nil) skips persistence, so the spec the
+// cluster received is exactly what we assert.
+func TestCreateInstance_HomePlacesAndCarriesProvider(t *testing.T) {
+	placer := &fakePlacer{nodeName: "home-1", provider: "prov-home", arch: "amd64"}
+	fc := newFakeCluster()
+	// store=nil, gate=nil → standalone: no persistence, no gate; placement
+	// still runs because the placer is set.
+	server := NewServer(fc, nil, nil, nil, nil, nil).WithNodePlacer(placer)
+
+	w := createInstanceReqBody(server, uuid.New(),
+		`{"name":"t","image":"nginx","cpu_units":2,"memory":"4GB","node_class":"home"}`)
+
+	if !placer.called {
+		t.Fatal("home request did not consult the placer")
+	}
+	if w.Code != http.StatusCreated && w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if fc.lastSpec.ProviderID != "prov-home" || fc.lastSpec.NodeName != "home-1" || fc.lastSpec.NodeClass != "home" {
+		t.Errorf("spec did not carry home placement: %+v", fc.lastSpec)
+	}
+}
+
+// A home request with no placer configured (feature off) is refused cleanly.
+func TestCreateInstance_HomeWithoutPlacerRefused(t *testing.T) {
+	server := newTenantServer(t, newFakeCluster()) // no WithNodePlacer
+
+	w := createInstanceReqBody(server, uuid.New(),
+		`{"name":"t","image":"nginx","cpu_units":1,"memory":"1GB","node_class":"home"}`)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (home compute not enabled)", w.Code)
+	}
+}
+
+// No home capacity → 503 (retryable), like GPU exhaustion.
+func TestCreateInstance_HomeNoCapacity(t *testing.T) {
+	placer := &fakePlacer{err: errTest, noCap: true}
+	server := newTenantServer(t, newFakeCluster()).WithNodePlacer(placer)
+
+	w := createInstanceReqBody(server, uuid.New(),
+		`{"name":"t","image":"nginx","cpu_units":1,"memory":"1GB","node_class":"home"}`)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", w.Code)
+	}
+}
+
+// Arch mismatch → 400 (a request problem, distinct from capacity).
+func TestCreateInstance_HomeArchMismatch(t *testing.T) {
+	placer := &fakePlacer{err: errTest, archUnav: true}
+	server := newTenantServer(t, newFakeCluster()).WithNodePlacer(placer)
+
+	w := createInstanceReqBody(server, uuid.New(),
+		`{"name":"t","image":"nginx","cpu_units":1,"memory":"1GB","node_class":"home","arch":"arm64"}`)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+}
+
+var errTest = context.Canceled // any non-nil error; classification is by the Is* flags
 
 func TestRequireProjectScope_StandaloneModeAllowsAll(t *testing.T) {
 	// Without a store (no database) there is no tenancy: requests

@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 
 	"github.com/google/uuid"
@@ -13,6 +14,7 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/billing"
 	"github.com/FlashbackAi/teepin-core/pkg/cluster"
 	"github.com/FlashbackAi/teepin-core/pkg/compute"
+	"github.com/FlashbackAi/teepin-core/pkg/nodes"
 	"github.com/FlashbackAi/teepin-core/pkg/payments"
 )
 
@@ -110,6 +112,87 @@ func (a *stripeWebhookAdapter) GetCard(paymentMethodID string) (*api.CardDetails
 		ExpYear:         d.ExpYear,
 		PaymentMethodID: d.PaymentMethodID,
 	}, nil
+}
+
+// nodeAuthAdapter makes *nodes.Service satisfy cluster.NodeAuthenticator,
+// translating a resolved *nodes.Node into the neutral cluster.NodeIdentity.
+// It lives here so pkg/cluster never imports pkg/nodes (which would couple the
+// k8s-free cluster boundary to the node store).
+type nodeAuthAdapter struct {
+	svc *nodes.Service
+}
+
+func newNodeAuthAdapter(svc *nodes.Service) *nodeAuthAdapter {
+	return &nodeAuthAdapter{svc: svc}
+}
+
+func (a *nodeAuthAdapter) AuthenticateNode(ctx context.Context, credential string) (*cluster.NodeIdentity, error) {
+	n, err := a.svc.AuthenticateNode(ctx, credential)
+	if err != nil {
+		return nil, err
+	}
+	return &cluster.NodeIdentity{
+		NodeName:   n.NodeName,
+		ProviderID: n.ProviderID,
+		Class:      n.Class,
+	}, nil
+}
+
+// nodeReporterAdapter makes *nodes.Service satisfy cluster.NodeReporter. It
+// writes asynchronously with a background context so a slow DB never stalls
+// the gRPC message pump, and best-effort: a failed persist is logged, not
+// retried into the hot path (the next heartbeat will try again).
+type nodeReporterAdapter struct {
+	svc *nodes.Service
+}
+
+func newNodeReporterAdapter(svc *nodes.Service) *nodeReporterAdapter {
+	return &nodeReporterAdapter{svc: svc}
+}
+
+func (a *nodeReporterAdapter) ReportSeen(seen cluster.NodeSeen) {
+	go func() {
+		if err := a.svc.UpsertSeen(context.Background(), seen.Class, nodes.NodeSpecs{
+			NodeName:     seen.NodeName,
+			ProviderID:   seen.ProviderID,
+			Region:       seen.Region,
+			CPUCores:     seen.CPUCores,
+			MemoryGB:     seen.MemoryGB,
+			GPUModel:     seen.GPUModel,
+			GPUCount:     seen.GPUCount,
+			MIGCapable:   seen.MIGCapable,
+			AgentVersion: seen.AgentVersion,
+		}); err != nil {
+			log.Printf("WARN: node write-through failed for %s: %v", seen.NodeName, err)
+		}
+	}()
+}
+
+// nodePlacerAdapter makes *nodes.Service satisfy api.NodePlacer, translating
+// the nodes package's Placement/errors into the neutral shapes the api
+// package expects — so api never imports pkg/nodes.
+type nodePlacerAdapter struct {
+	svc *nodes.Service
+}
+
+func newNodePlacerAdapter(svc *nodes.Service) *nodePlacerAdapter {
+	return &nodePlacerAdapter{svc: svc}
+}
+
+func (a *nodePlacerAdapter) PlaceCPU(ctx context.Context, arch string) (string, string, string, error) {
+	p, err := a.svc.PlaceCPU(ctx, nodes.PlacementReq{Arch: arch})
+	if err != nil {
+		return "", "", "", err
+	}
+	return p.NodeName, p.ProviderID, p.Arch, nil
+}
+
+func (a *nodePlacerAdapter) IsNoCapacity(err error) bool {
+	return errors.Is(err, nodes.ErrNoHomeCapacity)
+}
+
+func (a *nodePlacerAdapter) IsArchUnavailable(err error) bool {
+	return errors.Is(err, nodes.ErrArchUnavailable)
 }
 
 // resourceSuspender implements billing.ResourceSuspender: it tears down

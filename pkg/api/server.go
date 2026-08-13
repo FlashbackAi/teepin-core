@@ -55,6 +55,37 @@ type Server struct {
 	store             *compute.Store  // nil in standalone mode (no database)
 	pricing           PricingProvider // nil in standalone mode (no database)
 	gate              ProvisionGate   // nil in standalone mode (no billing gate)
+
+	// nodePlacer resolves a home-class placement. Nil unless home compute is
+	// enabled, in which case a node_class:"home" request is refused cleanly
+	// (400) rather than panicking. Set via WithNodePlacer.
+	nodePlacer NodePlacer
+}
+
+// NodePlacer resolves a home CPU workload to a specific node + provider. An
+// interface so the api package does not import pkg/nodes at construction;
+// main injects the concrete nodes.Service through a thin adapter. Mirrors the
+// ProvisionGate/PricingProvider pattern.
+type NodePlacer interface {
+	PlaceCPU(ctx context.Context, arch string) (nodeName, providerID, nodeArch string, err error)
+	// Error classification so the handler can return the right status.
+	IsNoCapacity(err error) bool
+	IsArchUnavailable(err error) bool
+}
+
+// WithNodePlacer enables home-class placement. Returns the same *Server for
+// chaining, so existing NewServer call sites compile unchanged.
+func (s *Server) WithNodePlacer(p NodePlacer) *Server {
+	s.nodePlacer = p
+	return s
+}
+
+// homeTarget is a resolved home placement, carried from the placement branch
+// to the spec and the persisted instance record.
+type homeTarget struct {
+	nodeName   string
+	providerID string
+	arch       string
 }
 
 // NewServer creates a new API server. store, pricing and gate may be nil
@@ -174,10 +205,38 @@ func (s *Server) CreateInstance(c *gin.Context) {
 	instanceUUID := uuid.New()
 	instanceID := fmt.Sprintf("inst-%s", instanceUUID.String()[:8])
 
-	// Parse VRAM requirement
+	// Home-class placement — OPT-IN ONLY. This branch is entered solely
+	// when the request explicitly asks for node_class:"home", so a normal
+	// request can never land a paying customer's workload on a consumer
+	// node, even by a bug: the home path is unreachable without the flag in
+	// the request.
+	var homePlacement *homeTarget
+	if req.NodeClass == "home" {
+		if s.nodePlacer == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "home compute is not enabled on this platform"})
+			return
+		}
+		nodeName, providerID, nodeArch, err := s.nodePlacer.PlaceCPU(c.Request.Context(), req.Arch)
+		if err != nil {
+			switch {
+			case s.nodePlacer.IsArchUnavailable(err):
+				// A request problem (fixable), not transient capacity.
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			case s.nodePlacer.IsNoCapacity(err):
+				// Fail closed, like GPU exhaustion: 503 so clients retry.
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+			default:
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "home placement failed, try again"})
+			}
+			return
+		}
+		homePlacement = &homeTarget{nodeName: nodeName, providerID: providerID, arch: nodeArch}
+	}
+
+	// Parse VRAM requirement (GPU path — mutually exclusive with home).
 	var vramGB int
 	var err error
-	if req.GPUVRAM != "" {
+	if homePlacement == nil && req.GPUVRAM != "" {
 		vramGB, err = gpu.ParseVRAM(req.GPUVRAM)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid gpu_vram: %v", err)})
@@ -198,6 +257,11 @@ func (s *Server) CreateInstance(c *gin.Context) {
 	// Hand the resolved placement to the cluster layer. Everything above
 	// this point is a decision; everything below it is execution.
 	spec := s.instanceSpec(instanceID, instanceUUID, projectID, accountID, &req, allocation)
+	if homePlacement != nil {
+		spec.NodeClass = "home"
+		spec.NodeName = homePlacement.nodeName
+		spec.ProviderID = homePlacement.providerID
+	}
 
 	scope := scopeFor(projectID)
 
@@ -256,6 +320,13 @@ func (s *Server) CreateInstance(c *gin.Context) {
 		if allocation != nil {
 			record.InstanceType = allocation.InstanceType
 			record.GPUVRAMGB = allocation.AllocatedVRAM
+		}
+		if homePlacement != nil {
+			// Records which home provider+node ran this — for delete/logs
+			// routing and load-based placement of the next workload.
+			record.ProviderID = homePlacement.providerID
+			record.NodeName = homePlacement.nodeName
+			record.InstanceType = "cpu.home"
 		}
 		if endpointInfo != nil {
 			record.Endpoint = endpointInfo.HTTPSURL

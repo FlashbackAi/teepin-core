@@ -26,7 +26,7 @@ type fakeAgent struct {
 // A nil reply leaves commands unanswered, for timeout behaviour.
 func newFakeAgent(reply *agentpb.CommandResult) *fakeAgent {
 	f := &fakeAgent{}
-	f.session = NewAgentSession("provider-1", "us-east", "test", func(msg *agentpb.ControlMessage) error {
+	f.session = NewAgentSession("provider-1", "us-east", "test", "", func(msg *agentpb.ControlMessage) error {
 		f.mu.Lock()
 		f.sent = append(f.sent, msg)
 		f.mu.Unlock()
@@ -53,6 +53,60 @@ func registryWith(session *AgentSession) *Registry {
 	r := NewRegistry()
 	r.Add(session)
 	return r
+}
+
+// A create carrying a ProviderID is dispatched to THAT provider's session,
+// not an arbitrary one. This is the fix for the registry.Any() bug: with two
+// providers connected, a create for provider-2's node must reach provider-2.
+func TestAgentClient_CreateRoutesToOwningProvider(t *testing.T) {
+	reply := &agentpb.CommandResult{Success: true}
+
+	recv := func(id string) (*AgentSession, *[]string) {
+		var got []string
+		var s *AgentSession
+		s = NewAgentSession(id, "us-east", "test", "", func(msg *agentpb.ControlMessage) error {
+			got = append(got, msg.RequestId)
+			go s.deliverResult(msg.RequestId, reply)
+			return nil
+		})
+		return s, &got
+	}
+	sessA, gotA := recv("provider-1")
+	sessB, gotB := recv("provider-2")
+
+	r := NewRegistry()
+	r.Add(sessA)
+	r.Add(sessB)
+	c := NewAgentClient(r)
+
+	_, err := c.CreateInstance(context.Background(), InstanceSpec{
+		InstanceID: "inst-b", ProviderID: "provider-2",
+	})
+	if err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	if len(*gotB) != 1 {
+		t.Errorf("provider-2 received %d creates, want 1", len(*gotB))
+	}
+	if len(*gotA) != 0 {
+		t.Errorf("provider-1 wrongly received %d creates (should be 0)", len(*gotA))
+	}
+}
+
+// A create for a provider that is NOT connected is unavailable, rather than
+// silently landing on some other provider.
+func TestAgentClient_CreateUnknownProviderUnavailable(t *testing.T) {
+	sessA := NewAgentSession("provider-1", "us-east", "test", "", func(*agentpb.ControlMessage) error { return nil })
+	r := NewRegistry()
+	r.Add(sessA)
+	c := NewAgentClient(r)
+
+	_, err := c.CreateInstance(context.Background(), InstanceSpec{
+		InstanceID: "inst-x", ProviderID: "provider-missing",
+	})
+	if !errors.Is(err, ErrClusterUnavailable) {
+		t.Errorf("create for absent provider = %v, want ErrClusterUnavailable", err)
+	}
 }
 
 func TestAgentClient_NoAgentIsUnavailable(t *testing.T) {
@@ -223,7 +277,7 @@ func TestAgentSession_CloseFailsPendingCommands(t *testing.T) {
 	// A command in flight when the agent disconnects must fail promptly.
 	// Without this it blocks until the two-minute timeout, holding an
 	// HTTP request open for no reason.
-	session := NewAgentSession("p1", "us-east", "test", func(*agentpb.ControlMessage) error {
+	session := NewAgentSession("p1", "us-east", "test", "", func(*agentpb.ControlMessage) error {
 		return nil // never answers
 	})
 
@@ -252,8 +306,8 @@ func TestAgentSession_CloseFailsPendingCommands(t *testing.T) {
 func TestRegistry_ReconnectReplacesSession(t *testing.T) {
 	r := NewRegistry()
 
-	first := NewAgentSession("provider-1", "us-east", "v1", func(*agentpb.ControlMessage) error { return nil })
-	second := NewAgentSession("provider-1", "us-east", "v2", func(*agentpb.ControlMessage) error { return nil })
+	first := NewAgentSession("provider-1", "us-east", "v1", "", func(*agentpb.ControlMessage) error { return nil })
+	second := NewAgentSession("provider-1", "us-east", "v2", "", func(*agentpb.ControlMessage) error { return nil })
 
 	r.Add(first)
 	r.Add(second)
@@ -273,8 +327,8 @@ func TestRegistry_ReconnectReplacesSession(t *testing.T) {
 func TestRegistry_RemoveIgnoresSupersededSession(t *testing.T) {
 	r := NewRegistry()
 
-	first := NewAgentSession("provider-1", "us-east", "v1", func(*agentpb.ControlMessage) error { return nil })
-	second := NewAgentSession("provider-1", "us-east", "v2", func(*agentpb.ControlMessage) error { return nil })
+	first := NewAgentSession("provider-1", "us-east", "v1", "", func(*agentpb.ControlMessage) error { return nil })
+	second := NewAgentSession("provider-1", "us-east", "v2", "", func(*agentpb.ControlMessage) error { return nil })
 
 	r.Add(first)
 	r.Add(second)
@@ -290,7 +344,7 @@ func TestRegistry_RemoveIgnoresSupersededSession(t *testing.T) {
 }
 
 func TestAgentClient_StaleInventoryIsIgnored(t *testing.T) {
-	session := NewAgentSession("p1", "us-east", "test", func(*agentpb.ControlMessage) error { return nil })
+	session := NewAgentSession("p1", "us-east", "test", "", func(*agentpb.ControlMessage) error { return nil })
 	session.setInventory([]NodeInventory{{NodeName: "gpu-1", GPUCount: 1}})
 
 	// Backdate past the freshness window.
@@ -321,7 +375,7 @@ func TestAgentClient_HealthyTracksConnectedAgents(t *testing.T) {
 		t.Error("no agents connected must not report healthy")
 	}
 
-	registry.Add(NewAgentSession("p1", "us-east", "test", func(*agentpb.ControlMessage) error { return nil }))
+	registry.Add(NewAgentSession("p1", "us-east", "test", "", func(*agentpb.ControlMessage) error { return nil }))
 
 	if !c.Healthy(context.Background()) {
 		t.Error("a connected agent should report healthy")

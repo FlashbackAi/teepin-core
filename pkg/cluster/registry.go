@@ -32,6 +32,10 @@ type AgentSession struct {
 	ProviderID string
 	Region     string
 	Version    string
+	// Class is "datacenter" (shared-token agent) or "home" (per-node
+	// credential). Carried so the write-through persistence records the
+	// right class without re-resolving the credential on every report.
+	Class      string
 	ConnectedA time.Time
 
 	// send serialises writes to the stream. gRPC streams are not safe for
@@ -59,12 +63,17 @@ type AgentSession struct {
 	closed bool
 }
 
-// NewAgentSession creates a session over a stream send function.
-func NewAgentSession(providerID, region, version string, send func(*agentpb.ControlMessage) error) *AgentSession {
+// NewAgentSession creates a session over a stream send function. class is
+// "datacenter" unless the agent authenticated with a per-node credential.
+func NewAgentSession(providerID, region, version, class string, send func(*agentpb.ControlMessage) error) *AgentSession {
+	if class == "" {
+		class = "datacenter"
+	}
 	return &AgentSession{
 		ProviderID: providerID,
 		Region:     region,
 		Version:    version,
+		Class:      class,
 		ConnectedA: time.Now().UTC(),
 		send:       send,
 		pending:    make(map[string]chan *agentpb.CommandResult),
@@ -270,9 +279,9 @@ func (r *Registry) Remove(session *AgentSession) {
 
 // Any returns a connected session, or false when none are.
 //
-// Single-provider today, so any session will do. Multi-provider
-// placement — choosing by region, price or capacity — is a control-plane
-// decision that belongs with the allocator, not here.
+// Used only when the control plane has NOT resolved a specific provider —
+// the datacenter single-provider path. Multi-provider placement resolves a
+// target and calls ByProvider instead; see AgentClient.CreateInstance.
 func (r *Registry) Any() (*AgentSession, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -281,6 +290,20 @@ func (r *Registry) Any() (*AgentSession, bool) {
 		return session, true
 	}
 	return nil, false
+}
+
+// ByProvider returns the session for a specific provider, or false if that
+// provider is not currently connected.
+//
+// This is what makes multi-provider placement correct: a command allocated
+// against provider B's node MUST go to B's session, not to whichever session
+// a map iteration happened to yield first (the old Any() behaviour, which
+// was a latent bug the moment a second provider connected).
+func (r *Registry) ByProvider(providerID string) (*AgentSession, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	session, ok := r.sessions[providerID]
+	return session, ok
 }
 
 // Get returns one provider's session.

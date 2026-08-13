@@ -43,6 +43,15 @@ type CreateInstanceRequest struct {
 	InstanceType string `json:"instance_type,omitempty"` // Legacy: "gpu.h100.mig-2g"
 	CPUUnits     int    `json:"cpu_units" binding:"required,min=1"`
 	Memory       string `json:"memory" binding:"required"` // e.g., "32GB"
+	// NodeClass opts a workload onto a specific capacity class. Empty (the
+	// default) is the datacenter/GPU path — unchanged. "home" places the
+	// workload on a consumer-grade CPU node. A workload NEVER lands on a
+	// home node unless it explicitly asks: the gate is opt-in.
+	NodeClass string `json:"node_class,omitempty"`
+	// Arch constrains placement to a CPU architecture ("amd64"/"arm64") for
+	// a home workload — an amd64 image cannot run on an arm64 node. Empty
+	// means no preference (a single-arch pilot).
+	Arch string `json:"arch,omitempty"`
 	// Command and Args override the image's ENTRYPOINT and CMD. Without
 	// them an image whose default command exits (most base images,
 	// including nvidia/cuda:*-base) crash-loops forever with no way for

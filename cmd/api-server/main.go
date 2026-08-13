@@ -37,6 +37,7 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/gpu"
 	"github.com/FlashbackAi/teepin-core/pkg/harbor"
 	"github.com/FlashbackAi/teepin-core/pkg/networking"
+	"github.com/FlashbackAi/teepin-core/pkg/nodes"
 	"github.com/FlashbackAi/teepin-core/pkg/payments"
 	"github.com/FlashbackAi/teepin-core/pkg/ratelimit"
 	"github.com/FlashbackAi/teepin-core/pkg/statuspage"
@@ -153,6 +154,37 @@ func main() {
 		} else {
 			log.Println("Charge collector not started (Stripe not configured); issued invoices will not be charged")
 		}
+	}
+
+	// Home-compute pilot: consumer-grade nodes as CPU capacity. Behind a
+	// flag (default off) so the feature can be archived cleanly — flag off
+	// plus migration 016 reverted leaves the platform exactly as before.
+	// When off, nodeService/nodeHandler stay nil: no enrollment endpoint,
+	// no nodes routes, and the gRPC server keeps accepting only the shared
+	// datacenter token.
+	var nodeService *nodes.Service
+	var nodeHandler *api.NodeHandler
+	if dbClient != nil && getEnv("HOME_COMPUTE_ENABLED", "false") == "true" {
+		nodeService = nodes.NewService(dbClient.DB())
+		nodeHandler = api.NewNodeHandler(nodeService)
+		log.Println("Home compute enabled: node enrollment and per-node credentials active")
+
+		// Flip nodes with no recent heartbeat to offline. A node heartbeats
+		// on each inventory report (~30s); three missed reports is a
+		// generous staleness threshold that tolerates a blip without
+		// flapping.
+		go func() {
+			const staleAfter = 2 * time.Minute
+			ticker := time.NewTicker(time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				if n, err := nodeService.MarkStaleOffline(context.Background(), staleAfter); err != nil {
+					log.Printf("WARN: node stale sweep failed: %v", err)
+				} else if n > 0 {
+					log.Printf("Node stale sweep: %d node(s) marked offline", n)
+				}
+			}
+		}()
 	}
 
 	// Initialize Kubernetes client (optional for standalone mode)
@@ -326,6 +358,19 @@ func main() {
 		agentRegistry = cluster.NewRegistry()
 		agentClient := cluster.NewAgentClient(agentRegistry)
 		agentServer = cluster.NewAgentServer(agentRegistry, agentClient, agentToken)
+
+		// When home compute is enabled, the same gRPC channel also accepts
+		// agents presenting a PER-NODE credential (home nodes). The shared
+		// token still authenticates the datacenter agent unchanged; a
+		// per-node credential resolves to a specific node whose class the
+		// agent cannot self-assert.
+		if nodeService != nil {
+			agentServer = agentServer.
+				WithNodeAuthenticator(newNodeAuthAdapter(nodeService)).
+				WithNodeReporter(newNodeReporterAdapter(nodeService))
+			log.Println("Agent channel: per-node credentials accepted, node persistence on (home compute)")
+		}
+
 		clusterClient = agentClient
 
 		log.Println("Cluster mode: agent (gRPC control channel, no Kubernetes credentials held)")
@@ -389,6 +434,11 @@ func main() {
 		provisionGate = billingService
 	}
 	apiServer := api.NewServer(clusterClient, gpuAllocator, networkingService, instanceStore, pricingProvider, provisionGate)
+	// Enable home-class placement when home compute is on. Absent this, a
+	// node_class:"home" request is refused cleanly (the placer is nil).
+	if nodeService != nil {
+		apiServer = apiServer.WithNodePlacer(newNodePlacerAdapter(nodeService))
+	}
 
 	// Admin API (pricing management): only enabled with an explicit
 	// operator token — never on by default.
@@ -411,7 +461,7 @@ func main() {
 	}
 
 	// Setup router
-	router := setupRouter(apiServer, authHandler, accountHandler, authMiddleware, billingHandler, registryHandler, adminHandler, webhookHandler, rateLimitMiddleware)
+	router := setupRouter(apiServer, authHandler, accountHandler, authMiddleware, billingHandler, registryHandler, adminHandler, webhookHandler, nodeHandler, rateLimitMiddleware)
 
 	// Create HTTP server
 	port := getEnv("PORT", "8080")
@@ -599,7 +649,7 @@ func initRateLimiting() *ratelimit.Config {
 	return config
 }
 
-func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHandler *api.AccountHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler, registryHandler *api.RegistryHandler, adminHandler *api.AdminHandler, webhookHandler *api.WebhookHandler, rateLimitMiddleware *ratelimit.Middleware) *gin.Engine {
+func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHandler *api.AccountHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler, registryHandler *api.RegistryHandler, adminHandler *api.AdminHandler, webhookHandler *api.WebhookHandler, nodeHandler *api.NodeHandler, rateLimitMiddleware *ratelimit.Middleware) *gin.Engine {
 	// Set Gin to release mode in production
 	if os.Getenv("GIN_MODE") == "" {
 		gin.SetMode(gin.ReleaseMode)
@@ -639,6 +689,13 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 		// inside the handler, so it must sit outside every auth group.
 		if webhookHandler != nil {
 			v1.POST("/webhooks/stripe", webhookHandler.HandleStripe)
+		}
+
+		// Node enrollment — UNAUTHENTICATED at the router because the
+		// enrolling agent has no credential yet; the one-time token in the
+		// body is the authentication. Only mounted when home compute is on.
+		if nodeHandler != nil {
+			v1.POST("/nodes/enroll", nodeHandler.Enroll)
 		}
 
 		// Authentication endpoints (public)
@@ -746,6 +803,7 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 			{
 				admin.GET("/pricing", adminHandler.GetPricing)
 				admin.PUT("/pricing", adminHandler.UpdatePricing)
+				admin.PUT("/pricing/cpu", adminHandler.UpdateCPUPricing)
 
 				// Manual invoicing for the operator control centre.
 				admin.GET("/accounts", adminHandler.ListAccounts)
@@ -761,6 +819,14 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 				admin.POST("/invoices/:id/void", adminHandler.VoidInvoice)
 				admin.GET("/projects/:project_id/invoices", adminHandler.ListProjectInvoices)
 				admin.GET("/accounts/:account_id/invoices", adminHandler.ListAccountInvoices)
+
+				// Node management (home compute). Same operator-token guard
+				// as the rest of /v1/admin. Only mounted when enabled.
+				if nodeHandler != nil {
+					admin.GET("/nodes", nodeHandler.ListNodes)
+					admin.POST("/nodes/enrollment-tokens", nodeHandler.CreateEnrollmentToken)
+					admin.POST("/nodes/:id/disable", nodeHandler.DisableNode)
+				}
 			}
 		}
 
