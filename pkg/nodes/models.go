@@ -53,6 +53,13 @@ type Node struct {
 	GPUCount   int    `json:"gpu_count"`
 	MIGCapable bool   `json:"mig_capable"`
 
+	// Rentable capacity: how much of the DETECTED specs the operator has
+	// chosen to offer for rent. 0 (the default) means the node offers
+	// nothing until a reservation is set, so it is never silently rented
+	// out. Detected specs above are the ceiling these may not exceed.
+	RentableCPUCores int `json:"rentable_cpu_cores"`
+	RentableMemoryGB int `json:"rentable_memory_gb"`
+
 	OS           string `json:"os,omitempty"`
 	Arch         string `json:"arch,omitempty"`
 	AgentVersion string `json:"agent_version,omitempty"`

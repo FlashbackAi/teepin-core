@@ -166,7 +166,10 @@ func main() {
 	var nodeHandler *api.NodeHandler
 	if dbClient != nil && getEnv("HOME_COMPUTE_ENABLED", "false") == "true" {
 		nodeService = nodes.NewService(dbClient.DB())
-		nodeHandler = api.NewNodeHandler(nodeService)
+		// billingService supplies the live CPU/memory rates so home-capacity
+		// tier prices match what metering charges. It may be nil (no billing);
+		// the handler treats that as zero rates.
+		nodeHandler = api.NewNodeHandler(nodeService, billingService)
 		log.Println("Home compute enabled: node enrollment and per-node credentials active")
 
 		// Flip nodes with no recent heartbeat to offline. A node heartbeats
@@ -781,10 +784,12 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 			}
 		}
 
-		// Compute endpoints (optional auth for now, will be required later)
+		// Compute endpoints require auth — requireScope (server.go) rejects
+		// an unscoped caller anyway, so OptionalAuth bought nothing but a
+		// worse error message (401 from requireScope vs. this group).
 		compute := v1.Group("/compute")
 		if authMiddleware != nil {
-			compute.Use(authMiddleware.OptionalAuth())
+			compute.Use(authMiddleware.RequireAuth())
 		}
 		{
 			compute.GET("/instance-types", apiServer.ListInstanceTypes)
@@ -794,6 +799,13 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 			compute.DELETE("/instances/:id", apiServer.DeleteInstance)
 			compute.GET("/instances/:id/logs", apiServer.GetInstanceLogs)
 			compute.GET("/instances/:id/metrics", apiServer.GetInstanceMetrics)
+
+			// Home capacity — which CPU tiers fit right now. Only mounted
+			// when home compute is enabled; the create dialog uses it to
+			// enable/disable tiers.
+			if nodeHandler != nil {
+				compute.GET("/home-capacity", nodeHandler.HomeCapacity)
+			}
 		}
 
 		// Admin endpoints (operator token, separate from customer auth)
@@ -825,6 +837,9 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 				if nodeHandler != nil {
 					admin.GET("/nodes", nodeHandler.ListNodes)
 					admin.POST("/nodes/enrollment-tokens", nodeHandler.CreateEnrollmentToken)
+					admin.PUT("/nodes/:id/reservation", nodeHandler.SetReservation)
+					admin.PATCH("/nodes/:id", nodeHandler.RenameNode)
+					admin.DELETE("/nodes/:id", nodeHandler.DeleteNode)
 					admin.POST("/nodes/:id/disable", nodeHandler.DisableNode)
 				}
 			}

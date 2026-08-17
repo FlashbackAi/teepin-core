@@ -8,10 +8,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -63,12 +66,38 @@ func saveNodeConfig(cfg *nodeConfig) error {
 	return os.WriteFile(configPath(), data, 0o600)
 }
 
-// hostSpecs detects what this machine offers. Deliberately minimal for the
-// pilot: cores, OS and arch come from the runtime; memory is left to the
-// control plane's later inventory. A consumer GPU is reported as an
+// hostSpecs detects what this machine offers: logical CPUs, total memory, OS
+// and arch. Cores/OS/arch come from the runtime; memory is read from
+// /proc/meminfo on Linux (the agent always runs inside Linux). Memory is 0 on
+// a platform where it cannot be read — the operator's reservation is capped at
+// detected specs, so an undetected value simply means "cannot rent memory
+// until detected", never an over-offer. A consumer GPU is reported as an
 // attribute in a later stage, never as sellable VRAM.
-func hostSpecs() (cpuCores int, osName, arch string) {
-	return runtime.NumCPU(), runtime.GOOS, runtime.GOARCH
+func hostSpecs() (cpuCores, memoryGB int, osName, arch string) {
+	return runtime.NumCPU(), detectMemoryGB(), runtime.GOOS, runtime.GOARCH
+}
+
+// detectMemoryGB returns total physical memory in whole GB, read from
+// /proc/meminfo (MemTotal, in kB). Returns 0 if it cannot be read.
+func detectMemoryGB() int {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		// Format: "MemTotal:       32797156 kB"
+		if strings.HasPrefix(line, "MemTotal:") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				if kb, err := strconv.Atoi(fields[1]); err == nil {
+					// kB -> GB, rounded to the nearest whole GB.
+					return int(math.Round(float64(kb) / (1024.0 * 1024.0)))
+				}
+			}
+			break
+		}
+	}
+	return 0
 }
 
 // runEnroll implements `teepin-agent enroll --token <t>`. It exchanges the
@@ -108,7 +137,7 @@ func runEnroll(args []string) error {
 		provider = name
 	}
 
-	cores, osName, arch := hostSpecs()
+	cores, memGB, osName, arch := hostSpecs()
 
 	body, _ := json.Marshal(map[string]any{
 		"token":         *token,
@@ -116,6 +145,7 @@ func runEnroll(args []string) error {
 		"provider_id":   provider,
 		"region":        *region,
 		"cpu_cores":     cores,
+		"memory_gb":     memGB,
 		"os":            osName,
 		"arch":          arch,
 		"agent_version": Version,

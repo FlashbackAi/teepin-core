@@ -23,6 +23,9 @@ var (
 	ErrNodeDisabled  = errors.New("node is disabled")
 	ErrNodeRevoked   = errors.New("node credential has been revoked")
 	ErrNotFound      = errors.New("node not found")
+	// ErrOverCommit: an operator tried to rent out more than the node's
+	// detected specs. The API maps it to 400.
+	ErrOverCommit = errors.New("rentable capacity cannot exceed the node's detected specs")
 )
 
 // maxTokenTTL caps how long an enrollment token may live. Enrollment is a
@@ -160,12 +163,39 @@ func (s *Service) Enroll(ctx context.Context, token string, specs NodeSpecs) (cr
 		created time.Time
 		updated time.Time
 	)
+	// ON CONFLICT (node_name): re-enrolling an existing node is an UPDATE,
+	// not a hard error. node_name is UNIQUE, so without this a re-enroll
+	// (e.g. after a WSL rebuild, or to pick up newly-detected specs) would
+	// violate the constraint and 500. Re-enrollment legitimately re-issues
+	// the credential and refreshes specs; a fresh install must be able to
+	// reclaim its own node. It preserves the RENTABLE reservation (the
+	// operator's setting), only refreshing detected specs and the credential.
 	err = tx.QueryRowContext(ctx, `
 		INSERT INTO compute.nodes
 		(node_name, provider_id, class, region, cpu_cores, memory_gb,
 		 gpu_model, gpu_count, mig_capable, os, arch, agent_version,
 		 status, credential_hash, credential_prefix)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'enrolled',$13,$14)
+		ON CONFLICT (node_name) DO UPDATE SET
+			provider_id = EXCLUDED.provider_id,
+			class = EXCLUDED.class,
+			region = COALESCE(EXCLUDED.region, compute.nodes.region),
+			cpu_cores = COALESCE(EXCLUDED.cpu_cores, compute.nodes.cpu_cores),
+			memory_gb = COALESCE(EXCLUDED.memory_gb, compute.nodes.memory_gb),
+			gpu_model = COALESCE(EXCLUDED.gpu_model, compute.nodes.gpu_model),
+			gpu_count = EXCLUDED.gpu_count,
+			mig_capable = EXCLUDED.mig_capable,
+			os = COALESCE(EXCLUDED.os, compute.nodes.os),
+			arch = COALESCE(EXCLUDED.arch, compute.nodes.arch),
+			agent_version = COALESCE(EXCLUDED.agent_version, compute.nodes.agent_version),
+			-- Re-enrollment re-issues the credential and clears any prior
+			-- revoked/disabled state; the reservation columns are left as the
+			-- operator set them.
+			status = 'enrolled',
+			credential_hash = EXCLUDED.credential_hash,
+			credential_prefix = EXCLUDED.credential_prefix,
+			revoked_at = NULL,
+			updated_at = NOW()
 		RETURNING id, created_at, updated_at
 	`, specs.NodeName, specs.ProviderID, class, nullString(specs.Region),
 		nullInt(specs.CPUCores), nullInt(specs.MemoryGB), nullString(specs.GPUModel),
@@ -346,6 +376,7 @@ func (s *Service) ListNodes(ctx context.Context) ([]Node, error) {
 		       COALESCE(cpu_cores,0), COALESCE(memory_gb,0), COALESCE(gpu_model,''),
 		       gpu_count, mig_capable, COALESCE(os,''), COALESCE(arch,''),
 		       COALESCE(agent_version,''), status, last_seen_at, revoked_at,
+		       rentable_cpu_cores, rentable_memory_gb,
 		       created_at, updated_at
 		FROM compute.nodes
 		ORDER BY created_at DESC
@@ -361,12 +392,63 @@ func (s *Service) ListNodes(ctx context.Context) ([]Node, error) {
 		if err := rows.Scan(&n.ID, &n.NodeName, &n.ProviderID, &n.Class, &n.Region,
 			&n.CPUCores, &n.MemoryGB, &n.GPUModel, &n.GPUCount, &n.MIGCapable,
 			&n.OS, &n.Arch, &n.AgentVersion, &n.Status, &n.LastSeenAt, &n.RevokedAt,
+			&n.RentableCPUCores, &n.RentableMemoryGB,
 			&n.CreatedAt, &n.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("failed to scan node: %w", err)
 		}
 		out = append(out, n)
 	}
 	return out, rows.Err()
+}
+
+// ErrNodeHasInstances is returned when deleting a node that still has active
+// instances — they must be terminated first (or the node disabled instead).
+var ErrNodeHasInstances = errors.New("node has active instances; terminate them or disable the node instead")
+
+// RenameNode changes a node's display name. The node_name is also how the
+// gRPC session and instances key to it, so this is an operator label change,
+// not a re-identification — kept simple for the pilot (rename the row).
+func (s *Service) RenameNode(ctx context.Context, nodeID uuid.UUID, name string) error {
+	if strings.TrimSpace(name) == "" {
+		return fmt.Errorf("node name cannot be empty")
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE compute.nodes SET node_name = $1, updated_at = NOW() WHERE id = $2
+	`, name, nodeID)
+	if err != nil {
+		return fmt.Errorf("failed to rename node: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// DeleteNode removes a node row entirely. Refuses if the node still has active
+// (non-terminated) instances — deleting would orphan running workloads (their
+// node_id is ON DELETE SET NULL, so they'd keep running but lose their node
+// link and billing attribution). The operator should terminate those first,
+// or Disable the node instead of deleting.
+func (s *Service) DeleteNode(ctx context.Context, nodeID uuid.UUID) error {
+	var active int
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM compute.instances
+		WHERE node_id = $1 AND terminated_at IS NULL
+	`, nodeID).Scan(&active); err != nil {
+		return fmt.Errorf("failed to check node instances: %w", err)
+	}
+	if active > 0 {
+		return ErrNodeHasInstances
+	}
+
+	res, err := s.db.ExecContext(ctx, `DELETE FROM compute.nodes WHERE id = $1`, nodeID)
+	if err != nil {
+		return fmt.Errorf("failed to delete node: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // DisableNode takes a node out of service: it is no longer schedulable and

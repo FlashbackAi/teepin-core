@@ -499,24 +499,30 @@ func createInstanceReq(server *Server, projectID uuid.UUID) *httptest.ResponseRe
 type fakePlacer struct {
 	called    bool
 	lastArch  string
+	lastCPU   int
+	lastMem   int
 	nodeName  string
 	provider  string
 	arch      string
 	err       error
 	noCap     bool
 	archUnav  bool
+	insuffCap bool
 }
 
-func (p *fakePlacer) PlaceCPU(_ context.Context, arch string) (string, string, string, error) {
+func (p *fakePlacer) PlaceCPU(_ context.Context, arch string, cpuUnits, memoryGB int) (string, string, string, error) {
 	p.called = true
 	p.lastArch = arch
+	p.lastCPU = cpuUnits
+	p.lastMem = memoryGB
 	if p.err != nil {
 		return "", "", "", p.err
 	}
 	return p.nodeName, p.provider, p.arch, nil
 }
-func (p *fakePlacer) IsNoCapacity(error) bool      { return p.noCap }
-func (p *fakePlacer) IsArchUnavailable(error) bool { return p.archUnav }
+func (p *fakePlacer) IsNoCapacity(error) bool           { return p.noCap }
+func (p *fakePlacer) IsArchUnavailable(error) bool      { return p.archUnav }
+func (p *fakePlacer) IsInsufficientCapacity(error) bool { return p.insuffCap }
 
 func createInstanceReqBody(server *Server, projectID uuid.UUID, body string) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
@@ -606,6 +612,23 @@ func TestCreateInstance_HomeArchMismatch(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", w.Code)
+	}
+}
+
+// A tier too large for any node's free capacity → 503 (retryable), and the
+// requested size is threaded through to the placer.
+func TestCreateInstance_HomeInsufficientCapacity(t *testing.T) {
+	placer := &fakePlacer{err: errTest, insuffCap: true}
+	server := newTenantServer(t, newFakeCluster()).WithNodePlacer(placer)
+
+	w := createInstanceReqBody(server, uuid.New(),
+		`{"name":"t","image":"nginx","cpu_units":8,"memory":"16GB","node_class":"home"}`)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", w.Code)
+	}
+	if placer.lastCPU != 8 || placer.lastMem != 16 {
+		t.Errorf("placer got size %d vCPU / %d GB, want 8 / 16", placer.lastCPU, placer.lastMem)
 	}
 }
 

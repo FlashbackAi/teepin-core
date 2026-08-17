@@ -19,17 +19,25 @@ var (
 	// ErrArchUnavailable: home capacity exists, but none matches the
 	// requested CPU architecture — a request problem, not a transient one.
 	ErrArchUnavailable = errors.New("no home node matches the requested architecture")
+	// ErrInsufficientCapacity: arch-matched home nodes are online, but none
+	// has enough FREE (rentable - used) capacity for the requested size — a
+	// transient condition (capacity may free up), mapped to 503.
+	ErrInsufficientCapacity = errors.New("no home node has enough free capacity for this size")
 )
 
-// PlacementReq describes what a home CPU workload needs. Deliberately small
-// for the pilot: architecture is the one hard constraint (an amd64 image
-// cannot run on an arm64 node's Linux). CPU/memory sizing is enforced later
-// by the node's own scheduler once k3s is placing pods.
+// PlacementReq describes what a home CPU workload needs: the architecture
+// constraint (an amd64 image cannot run on an arm64 node's Linux) and the
+// requested size, which must fit within a node's free rentable capacity.
 type PlacementReq struct {
 	// Arch is the required CPU architecture ("amd64", "arm64"). Empty means
 	// "no preference" — used by a single-arch pilot that does not thread
 	// arch through yet.
 	Arch string
+	// CPUUnits / MemoryGB are the requested size (from the chosen instance
+	// tier). A node is eligible only if its free rentable capacity covers
+	// both. Zero means "no size constraint" (the pre-2.5 behaviour).
+	CPUUnits int
+	MemoryGB int
 }
 
 // Placement is the resolved target for a home workload.
@@ -49,49 +57,56 @@ type Placement struct {
 // customer "your amd64 image has no arm64-free home node" (fixable) apart
 // from "no home nodes are online right now" (retryable).
 func (s *Service) PlaceCPU(ctx context.Context, req PlacementReq) (*Placement, error) {
-	// First: is there ANY eligible home node, ignoring arch? This lets us
-	// return ErrArchUnavailable (vs ErrNoHomeCapacity) precisely.
-	var anyOnline int
+	// Count online home nodes, and among them how many match the requested
+	// arch. This lets us distinguish the three failure modes precisely,
+	// before considering fit.
+	var online, archMatched int
 	if err := s.db.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM compute.nodes
+		SELECT
+			COUNT(*),
+			COUNT(*) FILTER (WHERE $2 = FALSE OR arch = $1)
+		FROM compute.nodes
 		WHERE class = 'home' AND status = 'online' AND revoked_at IS NULL
-	`).Scan(&anyOnline); err != nil {
+	`, req.Arch, req.Arch != "").Scan(&online, &archMatched); err != nil {
 		return nil, fmt.Errorf("failed to check home capacity: %w", err)
 	}
-	if anyOnline == 0 {
+	if online == 0 {
 		return nil, ErrNoHomeCapacity
 	}
+	if archMatched == 0 {
+		return nil, ErrArchUnavailable
+	}
 
-	// Least-loaded eligible node. Active instances counted via node_id;
-	// an instance is active when not terminated. NULLS handled by the
-	// LEFT JOIN + COALESCE so a brand-new node (zero instances) sorts first.
-	//
-	// The arch filter is applied only when requested. $1 = requested arch,
-	// $2 = whether to apply the filter.
+	// Least-loaded arch-matched node whose FREE rentable capacity covers the
+	// request. Free = rentable - used, where used sums cpu_units/memory_gb
+	// over the node's active instances. Least-loaded = fewest active
+	// instances, so work spreads.
 	row := s.db.QueryRowContext(ctx, `
 		SELECT n.node_name, n.provider_id, COALESCE(n.arch,'')
 		FROM compute.nodes n
 		LEFT JOIN (
-			SELECT node_id, COUNT(*) AS active
+			SELECT node_id,
+			       COUNT(*) AS active,
+			       SUM(COALESCE(cpu_units,0)) AS used_cpu,
+			       SUM(COALESCE(memory_gb,0)) AS used_mem
 			FROM compute.instances
 			WHERE node_id IS NOT NULL AND terminated_at IS NULL
 			GROUP BY node_id
 		) load ON load.node_id = n.id
 		WHERE n.class = 'home' AND n.status = 'online' AND n.revoked_at IS NULL
 		  AND ($2 = FALSE OR n.arch = $1)
+		  AND n.rentable_cpu_cores - COALESCE(load.used_cpu, 0) >= $3
+		  AND n.rentable_memory_gb - COALESCE(load.used_mem, 0) >= $4
 		ORDER BY COALESCE(load.active, 0) ASC, n.last_seen_at DESC
 		LIMIT 1
-	`, req.Arch, req.Arch != "")
+	`, req.Arch, req.Arch != "", req.CPUUnits, req.MemoryGB)
 
 	var p Placement
 	err := row.Scan(&p.NodeName, &p.ProviderID, &p.Arch)
 	if err == sql.ErrNoRows {
-		// There were online home nodes (checked above) but none matched the
-		// arch filter — so this is specifically an arch problem.
-		if req.Arch != "" {
-			return nil, ErrArchUnavailable
-		}
-		return nil, ErrNoHomeCapacity
+		// Arch-matched nodes exist (checked above) but none has room for
+		// this size — a capacity problem, distinct from arch or no-nodes.
+		return nil, ErrInsufficientCapacity
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to place home workload: %w", err)

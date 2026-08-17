@@ -67,10 +67,11 @@ type Server struct {
 // main injects the concrete nodes.Service through a thin adapter. Mirrors the
 // ProvisionGate/PricingProvider pattern.
 type NodePlacer interface {
-	PlaceCPU(ctx context.Context, arch string) (nodeName, providerID, nodeArch string, err error)
+	PlaceCPU(ctx context.Context, arch string, cpuUnits, memoryGB int) (nodeName, providerID, nodeArch string, err error)
 	// Error classification so the handler can return the right status.
 	IsNoCapacity(err error) bool
 	IsArchUnavailable(err error) bool
+	IsInsufficientCapacity(err error) bool
 }
 
 // WithNodePlacer enables home-class placement. Returns the same *Server for
@@ -216,14 +217,20 @@ func (s *Server) CreateInstance(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "home compute is not enabled on this platform"})
 			return
 		}
-		nodeName, providerID, nodeArch, err := s.nodePlacer.PlaceCPU(c.Request.Context(), req.Arch)
+		// Size the request from the validated fields (which carry the chosen
+		// tier's cpu_units and memory). Placement refuses a node that cannot
+		// fit this size.
+		reqMemGB := parseMemoryGB(req.Memory)
+		nodeName, providerID, nodeArch, err := s.nodePlacer.PlaceCPU(
+			c.Request.Context(), req.Arch, req.CPUUnits, reqMemGB)
 		if err != nil {
 			switch {
 			case s.nodePlacer.IsArchUnavailable(err):
 				// A request problem (fixable), not transient capacity.
 				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-			case s.nodePlacer.IsNoCapacity(err):
-				// Fail closed, like GPU exhaustion: 503 so clients retry.
+			case s.nodePlacer.IsNoCapacity(err), s.nodePlacer.IsInsufficientCapacity(err):
+				// Fail closed, like GPU exhaustion: 503 so clients retry when
+				// capacity frees up.
 				c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 			default:
 				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "home placement failed, try again"})

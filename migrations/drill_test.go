@@ -94,11 +94,11 @@ func TestArchivabilityDrill(t *testing.T) {
 		t.Fatal("after up: compute.instances.node_id missing")
 	}
 
-	// 2. Revert down to before 016. 016 is no longer the latest migration
-	//    (017 sits on top), so step back TWO to actually undo 016 —
-	//    reverting 017 first, then 016.
-	if err := migrator(t, db).Steps(-2); err != nil {
-		t.Fatalf("down two (revert 017 then 016): %v", err)
+	// 2. Revert down to version 15 (the state AFTER 015, BEFORE 016). Using
+	//    an absolute target rather than relative Steps keeps this robust as
+	//    later migrations (017, 018, ...) are added on top.
+	if err := migrator(t, db).Migrate(15); err != nil {
+		t.Fatalf("migrate down to 015: %v", err)
 	}
 	if tableExists(t, db, "compute", "nodes") {
 		t.Error("after down: compute.nodes still present")
@@ -154,8 +154,10 @@ func TestArchivabilityDrill017(t *testing.T) {
 		t.Fatal("after up: billing.pricing.cpu_price_per_core_hour missing")
 	}
 
-	if err := migrator(t, db).Steps(-1); err != nil {
-		t.Fatalf("down one (revert 017): %v", err)
+	// Revert to version 16 (state after 016, before 017), absolute so later
+	// migrations do not shift it.
+	if err := migrator(t, db).Migrate(16); err != nil {
+		t.Fatalf("migrate down to 016: %v", err)
 	}
 	if columnExists(t, db, "compute", "instances", "provider_id") {
 		t.Error("after down: compute.instances.provider_id still present")
@@ -176,4 +178,46 @@ func TestArchivabilityDrill017(t *testing.T) {
 		t.Fatalf("re-up: %v", err)
 	}
 	t.Log("archivability drill passed: 017 applies, reverts cleanly, and re-applies")
+}
+
+// TestArchivabilityDrill018 proves Stage 2.5 (migration 018) is reversible:
+// the rentable columns exist after up, are gone after reverting one step, and
+// the node's detected specs survive.
+func TestArchivabilityDrill018(t *testing.T) {
+	dsn := os.Getenv("TEEPIN_DRILL_DSN")
+	if dsn == "" {
+		t.Skip("set TEEPIN_DRILL_DSN to run the migration drill")
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("initial up: %v", err)
+	}
+	if !columnExists(t, db, "compute", "nodes", "rentable_cpu_cores") {
+		t.Fatal("after up: compute.nodes.rentable_cpu_cores missing")
+	}
+
+	// Revert to version 17 (state after 017, before 018), absolute.
+	if err := migrator(t, db).Migrate(17); err != nil {
+		t.Fatalf("migrate down to 017: %v", err)
+	}
+	if columnExists(t, db, "compute", "nodes", "rentable_cpu_cores") {
+		t.Error("after down: rentable_cpu_cores still present")
+	}
+	if columnExists(t, db, "compute", "nodes", "rentable_memory_gb") {
+		t.Error("after down: rentable_memory_gb still present")
+	}
+	// Detected specs (migration 016) must survive.
+	if !columnExists(t, db, "compute", "nodes", "cpu_cores") {
+		t.Error("after down: detected cpu_cores was wrongly removed")
+	}
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("re-up: %v", err)
+	}
+	t.Log("archivability drill passed: 018 applies, reverts cleanly, and re-applies")
 }

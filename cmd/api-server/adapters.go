@@ -179,8 +179,8 @@ func newNodePlacerAdapter(svc *nodes.Service) *nodePlacerAdapter {
 	return &nodePlacerAdapter{svc: svc}
 }
 
-func (a *nodePlacerAdapter) PlaceCPU(ctx context.Context, arch string) (string, string, string, error) {
-	p, err := a.svc.PlaceCPU(ctx, nodes.PlacementReq{Arch: arch})
+func (a *nodePlacerAdapter) PlaceCPU(ctx context.Context, arch string, cpuUnits, memoryGB int) (string, string, string, error) {
+	p, err := a.svc.PlaceCPU(ctx, nodes.PlacementReq{Arch: arch, CPUUnits: cpuUnits, MemoryGB: memoryGB})
 	if err != nil {
 		return "", "", "", err
 	}
@@ -193,6 +193,10 @@ func (a *nodePlacerAdapter) IsNoCapacity(err error) bool {
 
 func (a *nodePlacerAdapter) IsArchUnavailable(err error) bool {
 	return errors.Is(err, nodes.ErrArchUnavailable)
+}
+
+func (a *nodePlacerAdapter) IsInsufficientCapacity(err error) bool {
+	return errors.Is(err, nodes.ErrInsufficientCapacity)
 }
 
 // resourceSuspender implements billing.ResourceSuspender: it tears down

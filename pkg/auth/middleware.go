@@ -24,6 +24,13 @@ const (
 // header.
 const apiKeyPrefix = "tpk_"
 
+// ProjectHeader carries the active project for a JWT-authenticated
+// request. A login JWT identifies a person across their whole account, not
+// one project — the console picks a project in its UI after signing in, so
+// the credential itself cannot name one. An API key has no use for this
+// header: its project is fixed at creation.
+const ProjectHeader = "X-Project-ID"
+
 // Principal is the authenticated caller, however they authenticated.
 // Both JWTs and API keys resolve to this, so handlers never need to know
 // which was used.
@@ -81,12 +88,31 @@ func (m *Middleware) authenticate(c *gin.Context) *Principal {
 	if err != nil {
 		return nil
 	}
-	return &Principal{
+	principal := &Principal{
 		UserID:    claims.UserID,
 		AccountID: claims.AccountID,
 		Role:      claims.Role,
 		ProjectID: claims.ProjectID,
 	}
+
+	// A JWT never carries a project claim (see ProjectHeader) — resolve it
+	// from the header instead, IF the caller's account actually owns that
+	// project. Never trust the header alone: without this check, any
+	// signed-in user could read another account's instances by sending
+	// their project UUID. A bad or unrecognised header is not fatal here —
+	// it just leaves ProjectID unset, and requireScope's existing "project
+	// required" 401 covers it, same as a bare JWT does today.
+	if principal.ProjectID == uuid.Nil {
+		if headerProject := c.GetHeader(ProjectHeader); headerProject != "" {
+			if projectID, err := uuid.Parse(headerProject); err == nil {
+				if _, err := m.authService.GetProject(c.Request.Context(), claims.AccountID, projectID); err == nil {
+					principal.ProjectID = projectID
+				}
+			}
+		}
+	}
+
+	return principal
 }
 
 // store publishes the principal into the request context.

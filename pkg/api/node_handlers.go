@@ -4,6 +4,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"time"
@@ -14,16 +15,28 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/nodes"
 )
 
+// CPURateProvider supplies the live CPU/memory rates so the home-capacity
+// tier prices are computed with the same formula metering uses. An interface
+// (satisfied by *billing.Service) so the handler does not hard-depend on the
+// billing service and can be tested with a stub. Nil ⇒ rates treated as 0
+// (tiers price at $0, matching the "metered but not billed until a rate is
+// set" default).
+type CPURateProvider interface {
+	CPUCoreRate(ctx context.Context) float64
+	MemoryGBRate(ctx context.Context) float64
+}
+
 // NodeHandler serves node enrollment (public, token-authenticated) and the
 // operator-only node management endpoints. It is only mounted when the
 // home-compute feature is enabled; absent that, none of these routes exist.
 type NodeHandler struct {
 	nodes *nodes.Service
+	rates CPURateProvider
 }
 
-// NewNodeHandler wires the node service.
-func NewNodeHandler(svc *nodes.Service) *NodeHandler {
-	return &NodeHandler{nodes: svc}
+// NewNodeHandler wires the node service. rates may be nil (rates default to 0).
+func NewNodeHandler(svc *nodes.Service, rates CPURateProvider) *NodeHandler {
+	return &NodeHandler{nodes: svc, rates: rates}
 }
 
 // enrollRequest is what an agent posts to redeem its one-time token. It
@@ -94,14 +107,59 @@ func (h *NodeHandler) Enroll(c *gin.Context) {
 	})
 }
 
-// ListNodes is GET /v1/admin/nodes — operator view of all nodes.
+// ListNodes is GET /v1/admin/nodes — operator view of all nodes, each with its
+// capacity breakdown (detected / rentable / used / free).
 func (h *NodeHandler) ListNodes(c *gin.Context) {
 	list, err := h.nodes.ListNodes(c.Request.Context())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list nodes"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"nodes": list, "count": len(list)})
+	// Capacity (used/free) is derived from running instances; attach it
+	// keyed by node id so the console can show "24 rented, 8 used, 16 free".
+	caps, err := h.nodes.ListNodeCapacity(c.Request.Context())
+	if err != nil {
+		// Non-fatal: the node list is still useful without the derived
+		// used/free breakdown.
+		c.JSON(http.StatusOK, gin.H{"nodes": list, "count": len(list)})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"nodes": list, "capacity": caps, "count": len(list)})
+}
+
+// reservationRequest sets how much of a node to rent out. Zero is valid (offer
+// nothing); neither field may exceed the node's detected specs.
+type reservationRequest struct {
+	CPUCores int `json:"cpu_cores"`
+	MemoryGB int `json:"memory_gb"`
+}
+
+// SetReservation is PUT /v1/admin/nodes/:id/reservation.
+func (h *NodeHandler) SetReservation(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid node id"})
+		return
+	}
+	var req reservationRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := h.nodes.SetReservation(c.Request.Context(), id, req.CPUCores, req.MemoryGB); err != nil {
+		switch {
+		case errors.Is(err, nodes.ErrOverCommit):
+			// Offering more than the machine has is a request problem.
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		case errors.Is(err, nodes.ErrNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "node not found"})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to set reservation"})
+		}
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "reservation updated", "id": id,
+		"cpu_cores": req.CPUCores, "memory_gb": req.MemoryGB})
 }
 
 // createTokenRequest mints an enrollment token. class defaults to 'home';
@@ -138,6 +196,76 @@ func (h *NodeHandler) CreateEnrollmentToken(c *gin.Context) {
 		"label":      tok.Label,
 		"expires_at": tok.ExpiresAt,
 	})
+}
+
+// HomeCapacity is GET /v1/compute/home-capacity — the customer-facing view
+// used by the create dialog: the CPU tiers with a per-tier "fits right now"
+// flag, plus free-capacity totals. JWT-authed (a capacity view is not a
+// compute resource). Exposes no per-node internals.
+func (h *NodeHandler) HomeCapacity(c *gin.Context) {
+	// Price each tier from the live CPU/memory rates so the quote matches the
+	// bill. Nil provider ⇒ zero rates (metered but not billed).
+	var rates nodes.CPURates
+	if h.rates != nil {
+		rates.CPUCoreRate = h.rates.CPUCoreRate(c.Request.Context())
+		rates.MemoryGBRate = h.rates.MemoryGBRate(c.Request.Context())
+	}
+	summary, err := h.nodes.HomeCapacitySummary(c.Request.Context(), rates)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read home capacity"})
+		return
+	}
+	c.JSON(http.StatusOK, summary)
+}
+
+// renameRequest changes a node's display name.
+type renameRequest struct {
+	NodeName string `json:"node_name" binding:"required"`
+}
+
+// RenameNode is PATCH /v1/admin/nodes/:id.
+func (h *NodeHandler) RenameNode(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid node id"})
+		return
+	}
+	var req renameRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := h.nodes.RenameNode(c.Request.Context(), id, req.NodeName); err != nil {
+		if errors.Is(err, nodes.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "node not found"})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "node renamed", "id": id, "node_name": req.NodeName})
+}
+
+// DeleteNode is DELETE /v1/admin/nodes/:id. Refuses (409) when the node still
+// has active instances — the operator must terminate them or disable instead.
+func (h *NodeHandler) DeleteNode(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid node id"})
+		return
+	}
+	if err := h.nodes.DeleteNode(c.Request.Context(), id); err != nil {
+		switch {
+		case errors.Is(err, nodes.ErrNodeHasInstances):
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		case errors.Is(err, nodes.ErrNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "node not found"})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete node"})
+		}
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "node deleted", "id": id})
 }
 
 // DisableNode is POST /v1/admin/nodes/:id/disable.
