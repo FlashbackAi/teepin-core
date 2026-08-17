@@ -158,6 +158,12 @@ message RegisterRequest {
 message GPUInventory {
   repeated GPUNode nodes = 1;
   google.protobuf.Timestamp observed_at = 2;
+  // Whether the reporting session's own cluster (its Client.Healthy check)
+  // was reachable at report time. Session-level, not per-node: a home
+  // provider reports zero GPUNodes (CPU-only) but still needs to say
+  // whether ITS k3s can schedule anything. True for the in-process
+  // datacenter client in practice.
+  bool cluster_ready = 3;
 }
 
 message GPUNode {

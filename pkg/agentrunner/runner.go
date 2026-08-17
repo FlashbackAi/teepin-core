@@ -490,6 +490,11 @@ func (r *Runner) reportInventory(ctx context.Context, s stream) {
 		Payload: &agentpb.AgentMessage_Inventory{Inventory: &agentpb.GPUInventory{
 			Nodes:      pbNodes,
 			ObservedAt: timestamppb.Now(),
+			// Whether THIS session's own cluster can schedule work right now
+			// — checked fresh on every report so a home node's k3s crashing
+			// after connect is reflected within one inventoryInterval, not
+			// frozen at whatever it was when the agent started.
+			ClusterReady: r.cfg.Cluster.Healthy(ctx),
 		}},
 	})
 }

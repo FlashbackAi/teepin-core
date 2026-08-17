@@ -53,6 +53,12 @@ type NodeSeen struct {
 	GPUCount     int
 	MIGCapable   bool
 	AgentVersion string
+	// K8sReady is the reporting session's own Client.Healthy(ctx) at report
+	// time — distinct from "connected" (the session existing at all). A
+	// node whose agent is up but whose local Kubernetes (k3s, on a home
+	// node) is unreachable reports false here, so placement can tell the
+	// two states apart instead of treating both as "online".
+	K8sReady bool
 }
 
 // NodeReporter persists node liveness/specs from the gRPC session — the
@@ -213,7 +219,7 @@ func (s *AgentServer) handleMessage(session *AgentSession, msg *agentpb.AgentMes
 		// pump or drop the live inventory the allocator depends on. This does
 		// not feed placement; it is the durable identity/liveness record.
 		if s.nodeReporter != nil {
-			s.reportInventorySeen(session, inv)
+			s.reportInventorySeen(session, inv, payload.Inventory.ClusterReady)
 		}
 
 	case *agentpb.AgentMessage_Pong:
@@ -232,7 +238,12 @@ func (s *AgentServer) handleMessage(session *AgentSession, msg *agentpb.AgentMes
 // session that carries no GPU inventory is recorded once under its own
 // identity so it still shows online. Reporting is delegated to the (async)
 // reporter, so this never blocks the message pump.
-func (s *AgentServer) reportInventorySeen(session *AgentSession, inv []NodeInventory) {
+//
+// k8sReady is the SESSION-level cluster.Client.Healthy(ctx) result carried
+// on the inventory report (GPUInventory.cluster_ready) — the same value
+// applies to every node in this report, since they all share one agent
+// process and one cluster client.
+func (s *AgentServer) reportInventorySeen(session *AgentSession, inv []NodeInventory, k8sReady bool) {
 	if len(inv) == 0 {
 		// CPU-only / home node: no GPU inventory to enumerate. Record the
 		// node under the session's own identity (provider id doubles as node
@@ -243,6 +254,7 @@ func (s *AgentServer) reportInventorySeen(session *AgentSession, inv []NodeInven
 			Class:        session.Class,
 			Region:       session.Region,
 			AgentVersion: session.Version,
+			K8sReady:     k8sReady,
 		})
 		return
 	}
@@ -257,6 +269,7 @@ func (s *AgentServer) reportInventorySeen(session *AgentSession, inv []NodeInven
 			MIGCapable:   n.MIGCapable,
 			MemoryGB:     n.MemoryGBPerGPU * n.GPUCount,
 			AgentVersion: session.Version,
+			K8sReady:     k8sReady,
 		})
 	}
 }

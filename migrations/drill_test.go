@@ -221,3 +221,42 @@ func TestArchivabilityDrill018(t *testing.T) {
 	}
 	t.Log("archivability drill passed: 018 applies, reverts cleanly, and re-applies")
 }
+
+// TestArchivabilityDrill019 proves the health-check-depth migration (019) is
+// reversible: k8s_ready exists after up, is gone after reverting one step,
+// and the rentable columns (018) survive.
+func TestArchivabilityDrill019(t *testing.T) {
+	dsn := os.Getenv("TEEPIN_DRILL_DSN")
+	if dsn == "" {
+		t.Skip("set TEEPIN_DRILL_DSN to run the migration drill")
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("initial up: %v", err)
+	}
+	if !columnExists(t, db, "compute", "nodes", "k8s_ready") {
+		t.Fatal("after up: compute.nodes.k8s_ready missing")
+	}
+
+	// Revert to version 18 (state after 018, before 019), absolute.
+	if err := migrator(t, db).Migrate(18); err != nil {
+		t.Fatalf("migrate down to 018: %v", err)
+	}
+	if columnExists(t, db, "compute", "nodes", "k8s_ready") {
+		t.Error("after down: k8s_ready still present")
+	}
+	// Rentable columns (018) must survive.
+	if !columnExists(t, db, "compute", "nodes", "rentable_cpu_cores") {
+		t.Error("after down: rentable_cpu_cores was wrongly removed")
+	}
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("re-up: %v", err)
+	}
+	t.Log("archivability drill passed: 019 applies, reverts cleanly, and re-applies")
+}

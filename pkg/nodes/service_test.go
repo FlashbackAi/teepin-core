@@ -234,11 +234,12 @@ func TestUpsertSeen(t *testing.T) {
 	mock.ExpectExec(`(?s)INSERT INTO compute\.nodes.*ON CONFLICT \(node_name\) DO UPDATE`).
 		WithArgs("gpu-node-1", "dc-provider", "datacenter", sqlmock.AnyArg(),
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), 8, true,
-			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), true).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	err := s.UpsertSeen(context.Background(), "datacenter", NodeSpecs{
 		NodeName: "gpu-node-1", ProviderID: "dc-provider", GPUCount: 8, MIGCapable: true,
+		K8sReady: true,
 	})
 	if err != nil {
 		t.Fatalf("UpsertSeen: %v", err)

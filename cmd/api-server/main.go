@@ -905,7 +905,7 @@ func corsMiddleware() gin.HandlerFunc {
 			// could serve one origin's headers to another.
 			c.Writer.Header().Add("Vary", "Origin")
 			c.Writer.Header().Set("Access-Control-Allow-Headers",
-				"Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, Accept, Origin, Cache-Control, X-Requested-With")
+				"Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, Accept, Origin, Cache-Control, X-Requested-With, "+auth.ProjectHeader)
 			c.Writer.Header().Set("Access-Control-Allow-Methods",
 				"GET, POST, PUT, PATCH, DELETE, OPTIONS")
 			c.Writer.Header().Set("Access-Control-Max-Age", "86400")

@@ -48,10 +48,12 @@ type Placement struct {
 }
 
 // PlaceCPU selects a home node to run a CPU workload on. It considers only
-// nodes that are class='home', status='online', and not disabled/revoked,
-// and (when an arch is requested) whose arch matches. Among eligible nodes it
-// picks the LEAST LOADED — fewest active instances — so work spreads rather
-// than piling onto the first node.
+// nodes that are class='home', status='online', k8s_ready (the node's own
+// Kubernetes was reachable as of its last report — "online" alone only means
+// the agent's gRPC session is connected, not that it can execute anything),
+// and not disabled/revoked, and (when an arch is requested) whose arch
+// matches. Among eligible nodes it picks the LEAST LOADED — fewest active
+// instances — so work spreads rather than piling onto the first node.
 //
 // The arch check is split from the capacity check so the caller can tell a
 // customer "your amd64 image has no arm64-free home node" (fixable) apart
@@ -66,7 +68,7 @@ func (s *Service) PlaceCPU(ctx context.Context, req PlacementReq) (*Placement, e
 			COUNT(*),
 			COUNT(*) FILTER (WHERE $2 = FALSE OR arch = $1)
 		FROM compute.nodes
-		WHERE class = 'home' AND status = 'online' AND revoked_at IS NULL
+		WHERE class = 'home' AND status = 'online' AND k8s_ready = TRUE AND revoked_at IS NULL
 	`, req.Arch, req.Arch != "").Scan(&online, &archMatched); err != nil {
 		return nil, fmt.Errorf("failed to check home capacity: %w", err)
 	}
@@ -93,7 +95,7 @@ func (s *Service) PlaceCPU(ctx context.Context, req PlacementReq) (*Placement, e
 			WHERE node_id IS NOT NULL AND terminated_at IS NULL
 			GROUP BY node_id
 		) load ON load.node_id = n.id
-		WHERE n.class = 'home' AND n.status = 'online' AND n.revoked_at IS NULL
+		WHERE n.class = 'home' AND n.status = 'online' AND n.k8s_ready = TRUE AND n.revoked_at IS NULL
 		  AND ($2 = FALSE OR n.arch = $1)
 		  AND n.rentable_cpu_cores - COALESCE(load.used_cpu, 0) >= $3
 		  AND n.rentable_memory_gb - COALESCE(load.used_mem, 0) >= $4

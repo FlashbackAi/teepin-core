@@ -67,6 +67,14 @@ type Node struct {
 	Status     string     `json:"status"`
 	LastSeenAt *time.Time `json:"last_seen_at,omitempty"`
 
+	// K8sReady is whether this node's own cluster (its agent's
+	// Client.Healthy check) was reachable as of the last report, refreshed
+	// every ~30s. Distinct from Status: a node can be "online" (its agent
+	// session is connected) while K8sReady is false (its local Kubernetes
+	// — k3s on a home node — is unreachable, so it cannot schedule pods).
+	// Placement excludes such a node the same as it would an offline one.
+	K8sReady bool `json:"k8s_ready"`
+
 	// credentialHash / credentialPrefix are never serialised — the plaintext
 	// is shown once at enrollment and only the hash is stored.
 	RevokedAt *time.Time `json:"revoked_at,omitempty"`
@@ -75,8 +83,9 @@ type Node struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// NodeSpecs is what an enrolling agent reports about its host. The class is
-// deliberately ABSENT: it is not the agent's to choose.
+// NodeSpecs is what an enrolling agent reports about its host, and (via
+// UpsertSeen) what a connected session reports on each inventory sweep. The
+// class is deliberately ABSENT: it is not the agent's to choose.
 type NodeSpecs struct {
 	NodeName     string
 	ProviderID   string
@@ -89,6 +98,11 @@ type NodeSpecs struct {
 	OS           string
 	Arch         string
 	AgentVersion string
+	// K8sReady is only meaningful from UpsertSeen (a live inventory report
+	// carries a fresh Client.Healthy result); Enroll has no cluster session
+	// yet, so it leaves this false — the correct, conservative default for
+	// a node that has not yet proven it can run anything.
+	K8sReady bool
 }
 
 // EnrollmentToken is an operator-minted, one-time, expiring credential that

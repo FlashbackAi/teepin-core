@@ -324,8 +324,8 @@ func (s *Service) UpsertSeen(ctx context.Context, class string, specs NodeSpecs)
 		INSERT INTO compute.nodes
 		(node_name, provider_id, class, region, cpu_cores, memory_gb,
 		 gpu_model, gpu_count, mig_capable, os, arch, agent_version,
-		 status, last_seen_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'online',NOW())
+		 status, last_seen_at, k8s_ready)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'online',NOW(),$13)
 		ON CONFLICT (node_name) DO UPDATE SET
 			-- Never resurrect a disabled node via a heartbeat.
 			status = CASE WHEN compute.nodes.status = 'disabled'
@@ -339,6 +339,11 @@ func (s *Service) UpsertSeen(ctx context.Context, class string, specs NodeSpecs)
 			gpu_count = EXCLUDED.gpu_count,
 			mig_capable = EXCLUDED.mig_capable,
 			agent_version = COALESCE(EXCLUDED.agent_version, compute.nodes.agent_version),
+			-- Unconditional, unlike status: there is no "never resurrect a
+			-- disabled node" concern here (placement already gates on
+			-- status='online' independently), and readiness must reflect
+			-- the LATEST report, not stick at whatever it was before.
+			k8s_ready = EXCLUDED.k8s_ready,
 			-- class is authoritative from enrollment; do NOT let a
 			-- write-through change it (a datacenter heartbeat must never flip
 			-- an enrolled home node, and vice versa).
@@ -346,7 +351,7 @@ func (s *Service) UpsertSeen(ctx context.Context, class string, specs NodeSpecs)
 	`, specs.NodeName, specs.ProviderID, class, nullString(specs.Region),
 		nullInt(specs.CPUCores), nullInt(specs.MemoryGB), nullString(specs.GPUModel),
 		specs.GPUCount, specs.MIGCapable, nullString(specs.OS), nullString(specs.Arch),
-		nullString(specs.AgentVersion))
+		nullString(specs.AgentVersion), specs.K8sReady)
 	if err != nil {
 		return fmt.Errorf("failed to upsert node: %w", err)
 	}
@@ -376,7 +381,7 @@ func (s *Service) ListNodes(ctx context.Context) ([]Node, error) {
 		       COALESCE(cpu_cores,0), COALESCE(memory_gb,0), COALESCE(gpu_model,''),
 		       gpu_count, mig_capable, COALESCE(os,''), COALESCE(arch,''),
 		       COALESCE(agent_version,''), status, last_seen_at, revoked_at,
-		       rentable_cpu_cores, rentable_memory_gb,
+		       rentable_cpu_cores, rentable_memory_gb, k8s_ready,
 		       created_at, updated_at
 		FROM compute.nodes
 		ORDER BY created_at DESC
@@ -392,7 +397,7 @@ func (s *Service) ListNodes(ctx context.Context) ([]Node, error) {
 		if err := rows.Scan(&n.ID, &n.NodeName, &n.ProviderID, &n.Class, &n.Region,
 			&n.CPUCores, &n.MemoryGB, &n.GPUModel, &n.GPUCount, &n.MIGCapable,
 			&n.OS, &n.Arch, &n.AgentVersion, &n.Status, &n.LastSeenAt, &n.RevokedAt,
-			&n.RentableCPUCores, &n.RentableMemoryGB,
+			&n.RentableCPUCores, &n.RentableMemoryGB, &n.K8sReady,
 			&n.CreatedAt, &n.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("failed to scan node: %w", err)
 		}

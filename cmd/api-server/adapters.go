@@ -162,6 +162,7 @@ func (a *nodeReporterAdapter) ReportSeen(seen cluster.NodeSeen) {
 			GPUCount:     seen.GPUCount,
 			MIGCapable:   seen.MIGCapable,
 			AgentVersion: seen.AgentVersion,
+			K8sReady:     seen.K8sReady,
 		}); err != nil {
 			log.Printf("WARN: node write-through failed for %s: %v", seen.NodeName, err)
 		}

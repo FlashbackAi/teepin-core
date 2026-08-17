@@ -83,6 +83,16 @@ func (nullCluster) StreamLogs(context.Context, cluster.Scope, string, cluster.Lo
 func (nullCluster) Inventory(context.Context) ([]cluster.NodeInventory, error) { return nil, nil }
 func (nullCluster) Healthy(context.Context) bool                               { return true }
 
+// healthCluster wraps nullCluster with a configurable Healthy result, so
+// tests can simulate a home node's k3s going from reachable to unreachable
+// without a real Kubernetes API.
+type healthCluster struct {
+	nullCluster
+	healthy bool
+}
+
+func (h healthCluster) Healthy(context.Context) bool { return h.healthy }
+
 func newTestRunner() *Runner {
 	return New(Config{
 		ProviderID: "test-provider",
@@ -280,6 +290,36 @@ func TestReconnect_ReportsEveryInstanceAgain(t *testing.T) {
 			"after reconnect only %d statuses were sent, want 2: unchanged instances "+
 				"stay invisible to the control plane and are billed but unlistable",
 			got)
+	}
+}
+
+// reportInventory sends the outgoing GPUInventory.cluster_ready field as the
+// fresh Cluster.Healthy(ctx) result — checked EVERY report, not cached from
+// startup, so a home node's k3s crashing mid-session is reflected within one
+// inventoryInterval rather than frozen at whatever it was when the agent
+// connected.
+func TestReportInventory_ReportsClusterReady(t *testing.T) {
+	for _, healthy := range []bool{true, false} {
+		r := New(Config{
+			ProviderID: "home-sreek",
+			Region:     "home",
+			Version:    "test",
+			Cluster:    healthCluster{healthy: healthy},
+		})
+		s := newStubStream()
+
+		r.reportInventory(context.Background(), s)
+
+		if s.sentCount() != 1 {
+			t.Fatalf("healthy=%v: got %d sent messages, want 1", healthy, s.sentCount())
+		}
+		inv := s.sent[0].GetInventory()
+		if inv == nil {
+			t.Fatalf("healthy=%v: first message was %T, want GPUInventory", healthy, s.sent[0].Payload)
+		}
+		if inv.ClusterReady != healthy {
+			t.Errorf("healthy=%v: ClusterReady = %v, want %v", healthy, inv.ClusterReady, healthy)
+		}
 	}
 }
 
