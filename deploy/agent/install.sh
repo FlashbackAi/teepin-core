@@ -8,13 +8,23 @@
 # present), drops the agent binary, enrolls with a one-time token, and runs
 # the agent as a systemd service that survives reboots.
 #
+# Re-run on an ALREADY-enrolled node (detected by /etc/teepin/agent.json and
+# the systemd unit both existing) to UPDATE the agent binary in place: no
+# token needed, k3s and enrollment are untouched. This exists because a plain
+# `cp` over the running binary fails with "Text file busy" — the service must
+# be stopped first — which is easy to get wrong by hand.
+#
 # This is the LINUX CORE. On Windows and macOS it is invoked INSIDE a Linux
 # environment (WSL2 / a Lima VM) by the matching bootstrap script — the agent
 # always runs inside Linux.
 #
 # Usage:
+#   # First install:
 #   sudo bash install.sh --token <tne_...> --control-plane <https-api-url> \
 #        [--grpc <host:port>] [--binary <path>] [--node-name <name>]
+#
+#   # Update an existing node (after a `go build`, or with --binary):
+#   sudo bash install.sh [--binary <path>]
 #
 # The class is NOT a flag — it is fixed on the token by the operator. There is
 # nothing here that lets a node choose to be a datacenter node.
@@ -45,6 +55,56 @@ fail() { echo "[install] ERROR: $*" >&2; exit 1; }
 # --- preconditions -------------------------------------------------------
 [ "$(uname -s)" = "Linux" ] || fail "this installer runs on Linux only. On Windows use bootstrap-windows.ps1 (WSL2); on macOS use bootstrap-macos.sh (Lima VM)."
 [ "$(id -u)" = "0" ] || fail "run as root (sudo)."
+
+# --- update mode -----------------------------------------------------------
+# An already-enrolled node (config + systemd unit already present) re-running
+# this script is updating the agent binary, not installing fresh — token and
+# control-plane are neither required nor consulted, and k3s / enrollment are
+# left untouched. This is what closes the gap that bit us in practice: a bare
+# `cp` over a running binary fails with "Text file busy" (the kernel refuses
+# to overwrite an inode an active process still maps), so the service MUST be
+# stopped before the binary is replaced and started again after.
+CONFIG_FILE_DEFAULT=/etc/teepin/agent.json
+UNIT_FILE=/etc/systemd/system/teepin-agent.service
+if [ -f "$CONFIG_FILE_DEFAULT" ] && [ -f "$UNIT_FILE" ]; then
+    info "existing enrollment found ($CONFIG_FILE_DEFAULT) — updating the agent binary only."
+    AGENT_BIN=/usr/local/bin/teepin-agent
+
+    if [ -n "$BINARY" ]; then
+        info "installing agent from $BINARY"
+        NEW_BIN="$BINARY"
+    elif [ -f "$(dirname "$0")/teepin-agent" ]; then
+        info "installing agent bundled next to this script"
+        NEW_BIN="$(dirname "$0")/teepin-agent"
+    else
+        command -v go >/dev/null 2>&1 || fail "no --binary given and 'go' is not installed to build one. Install Go, or pass --binary."
+        ARCH="$(uname -m)"
+        case "$ARCH" in
+            x86_64)  GOARCH=amd64 ;;
+            aarch64|arm64) GOARCH=arm64 ;;
+            *) fail "unsupported architecture: $ARCH" ;;
+        esac
+        info "building agent from source..."
+        repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
+        NEW_BIN="$(mktemp)"
+        ( cd "$repo_root" && GOARCH="$GOARCH" go build -o "$NEW_BIN" ./cmd/teepin-agent ) \
+            || fail "agent build failed"
+    fi
+
+    info "stopping the agent (the running binary's inode must be free before it can be replaced)..."
+    systemctl stop teepin-agent.service
+
+    install -m 0755 "$NEW_BIN" "$AGENT_BIN"
+
+    info "starting the agent..."
+    systemctl start teepin-agent.service
+
+    info "done. Check status with:  systemctl status teepin-agent"
+    info "confirm the new binary took effect via the control centre (Nodes) within ~30s."
+    exit 0
+fi
+
+# --- fresh install ---------------------------------------------------------
 [ -n "$TOKEN" ] || fail "--token is required (mint one in the control centre: Nodes -> Generate enrollment token)."
 [ -n "$CONTROL_PLANE" ] || fail "--control-plane is required (e.g. https://api.teepin.com)."
 
