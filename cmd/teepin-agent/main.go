@@ -108,8 +108,11 @@ func runAgent() {
 	inventory := gpu.NewInventory(k8sClient, simulated)
 
 	networkingService := networking.NewService(k8sClient, networking.Config{
-		Domain:    getEnv("TEEPIN_DOMAIN", "teepin.com"),
-		Namespace: getEnv("TEEPIN_INSTANCE_NAMESPACE", "default"),
+		Domain: getEnv("TEEPIN_DOMAIN", "teepin.com"),
+		// Namespace is NOT independently configured — it must always match
+		// where DirectClient actually creates pods (cluster.WorkloadNamespace),
+		// or the Service this provisions selects nothing (Stage 3 defect 3).
+		Namespace: cluster.WorkloadNamespace,
 		TLSIssuer: getEnv("TEEPIN_TLS_ISSUER", "letsencrypt-prod"),
 	})
 

@@ -53,6 +53,15 @@ type AgentSession struct {
 	// before its terminating result.
 	logStreams map[string]chan *agentpb.LogChunk
 
+	// proxyStreams maps request_id to the channel receiving one
+	// ProxyResponse (headers, exactly once) followed by ProxyData chunks
+	// (the response body) — Stage 3's HTTP tunnel for customer endpoints.
+	// Same shape as logStreams deliberately: a stalled reader (the
+	// customer's connection closed) must not block the shared stream
+	// reader that serves every other request for this provider, which is
+	// exactly what deliverLogChunk's timeout-drop already guards against.
+	proxyStreams map[string]chan proxyEvent
+
 	// inventory is the last report received. Read by the allocator on
 	// every placement decision, so it is kept here rather than fetched
 	// on demand — a round trip to the GPU datacenter per allocation
@@ -70,15 +79,25 @@ func NewAgentSession(providerID, region, version, class string, send func(*agent
 		class = "datacenter"
 	}
 	return &AgentSession{
-		ProviderID: providerID,
-		Region:     region,
-		Version:    version,
-		Class:      class,
-		ConnectedA: time.Now().UTC(),
-		send:       send,
-		pending:    make(map[string]chan *agentpb.CommandResult),
-		logStreams: make(map[string]chan *agentpb.LogChunk),
+		ProviderID:   providerID,
+		Region:       region,
+		Version:      version,
+		Class:        class,
+		ConnectedA:   time.Now().UTC(),
+		send:         send,
+		pending:      make(map[string]chan *agentpb.CommandResult),
+		logStreams:   make(map[string]chan *agentpb.LogChunk),
+		proxyStreams: make(map[string]chan proxyEvent),
 	}
+}
+
+// proxyEvent is one message on a proxy response stream: either the
+// one-time ProxyResponse (headers) or a ProxyData chunk (body), never
+// both — mirroring the order the agent actually sends them (response once,
+// then zero or more data chunks).
+type proxyEvent struct {
+	response *agentpb.ProxyResponse
+	data     *agentpb.ProxyData
 }
 
 // dispatch sends a command and waits for its result.
@@ -185,6 +204,58 @@ func (s *AgentSession) closeLogStream(requestID string) {
 	s.mu.Unlock()
 }
 
+// deliverProxyResponse routes the one-time response-headers message to its
+// stream.
+func (s *AgentSession) deliverProxyResponse(requestID string, resp *agentpb.ProxyResponse) {
+	s.mu.Lock()
+	ch, ok := s.proxyStreams[requestID]
+	s.mu.Unlock()
+
+	if !ok {
+		return
+	}
+
+	select {
+	case ch <- proxyEvent{response: resp}:
+	case <-time.After(5 * time.Second):
+		// Same reasoning as deliverLogChunk: a customer who closed their
+		// connection must not block the shared stream reader.
+	}
+}
+
+// deliverProxyData routes a response-body chunk to its stream.
+func (s *AgentSession) deliverProxyData(requestID string, data *agentpb.ProxyData) {
+	s.mu.Lock()
+	ch, ok := s.proxyStreams[requestID]
+	s.mu.Unlock()
+
+	if !ok {
+		return
+	}
+
+	select {
+	case ch <- proxyEvent{data: data}:
+	case <-time.After(5 * time.Second):
+	}
+}
+
+// openProxyStream registers a channel for one proxied HTTP request.
+func (s *AgentSession) openProxyStream(requestID string) chan proxyEvent {
+	ch := make(chan proxyEvent, 64)
+
+	s.mu.Lock()
+	s.proxyStreams[requestID] = ch
+	s.mu.Unlock()
+
+	return ch
+}
+
+func (s *AgentSession) closeProxyStream(requestID string) {
+	s.mu.Lock()
+	delete(s.proxyStreams, requestID)
+	s.mu.Unlock()
+}
+
 // setInventory stores the latest capacity report.
 func (s *AgentSession) setInventory(nodes []NodeInventory) {
 	s.mu.Lock()
@@ -230,6 +301,15 @@ func (s *AgentSession) Close() {
 	for id, ch := range s.logStreams {
 		close(ch)
 		delete(s.logStreams, id)
+	}
+
+	// Closing every proxy stream is what lets an in-flight customer HTTP
+	// request fail immediately on disconnect (502, "node became
+	// unreachable") instead of hanging until its own timeout — see Stage 3
+	// plan B6.
+	for id, ch := range s.proxyStreams {
+		close(ch)
+		delete(s.proxyStreams, id)
 	}
 }
 

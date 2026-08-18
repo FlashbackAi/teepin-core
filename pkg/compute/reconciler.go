@@ -110,11 +110,25 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 			continue
 		}
 
-		if observed.Status == inst.Status {
+		// Endpoint fields are checked independently of status: the
+		// TLS-ready flip (cert-manager finishing issuance 30-90s after
+		// create) happens with status unchanged the whole time
+		// ("running" before and after). A status-only comparison would
+		// skip this instance every single pass and the certificate
+		// becoming ready would never reach the database (Stage 3 plan A6).
+		endpointChanged := observed.EndpointURL != inst.Endpoint ||
+			observed.DNSName != inst.DNSName ||
+			observed.PublicIP != inst.PublicIP ||
+			observed.TLSEnabled != inst.TLSEnabled ||
+			observed.TLSReady != inst.TLSReady
+
+		if observed.Status == inst.Status && !endpointChanged {
 			continue
 		}
 
-		log.Printf("Instance %s: %s -> %s", inst.ID, inst.Status, observed.Status)
+		if observed.Status != inst.Status {
+			log.Printf("Instance %s: %s -> %s", inst.ID, inst.Status, observed.Status)
+		}
 		if observed.Status == StatusTerminated {
 			// Completed workloads must get terminated_at stamped so
 			// billing stops; a plain status update would not do that.
@@ -123,8 +137,21 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 			}
 			continue
 		}
-		if err := r.store.UpdateStatus(ctx, inst.ID, observed.Status); err != nil {
-			log.Printf("Failed to update %s: %v", inst.ID, err)
+		if observed.Status != inst.Status {
+			if err := r.store.UpdateStatus(ctx, inst.ID, observed.Status); err != nil {
+				log.Printf("Failed to update %s: %v", inst.ID, err)
+			}
+		}
+		if endpointChanged {
+			if err := r.store.UpdateEndpoint(ctx, inst.ID, EndpointFields{
+				Endpoint:   observed.EndpointURL,
+				DNSName:    observed.DNSName,
+				PublicIP:   observed.PublicIP,
+				TLSEnabled: observed.TLSEnabled,
+				TLSReady:   observed.TLSReady,
+			}); err != nil {
+				log.Printf("Failed to update endpoint for %s: %v", inst.ID, err)
+			}
 		}
 	}
 

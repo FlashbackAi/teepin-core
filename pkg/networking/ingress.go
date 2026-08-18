@@ -13,8 +13,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// createIngress creates a Kubernetes Ingress with TLS for an instance
-func (s *Service) createIngress(ctx context.Context, instanceID uuid.UUID, dnsName, serviceName string, port int32) (string, error) {
+// createIngress creates a Kubernetes Ingress with TLS for an instance.
+// useTLS/tlsIssuer come from the caller's resolved EndpointOptions, not
+// directly from s.useTLS/s.tlsIssuer — see EndpointOptions on why this
+// call can override the Service's configured defaults.
+func (s *Service) createIngress(ctx context.Context, instanceID uuid.UUID, dnsName, serviceName string, port int32, useTLS bool, tlsIssuer string) (string, error) {
 	ingressName := s.generateIngressName(instanceID)
 	pathTypePrefix := networkingv1.PathTypePrefix
 
@@ -67,8 +70,8 @@ func (s *Service) createIngress(ctx context.Context, instanceID uuid.UUID, dnsNa
 	}
 
 	// Add TLS configuration if enabled
-	if s.useTLS {
-		ingress.Annotations["cert-manager.io/cluster-issuer"] = s.tlsIssuer
+	if useTLS {
+		ingress.Annotations["cert-manager.io/cluster-issuer"] = tlsIssuer
 		ingress.Spec.TLS = []networkingv1.IngressTLS{
 			{
 				Hosts:      []string{dnsName},
@@ -95,8 +98,8 @@ func (s *Service) deleteIngress(ctx context.Context, ingressName string) error {
 }
 
 // isTLSReady checks if the TLS certificate has been provisioned by cert-manager
-func (s *Service) isTLSReady(ctx context.Context, ingressName string) (bool, error) {
-	if !s.useTLS {
+func (s *Service) isTLSReady(ctx context.Context, ingressName string, useTLS bool) (bool, error) {
+	if !useTLS {
 		return false, nil
 	}
 

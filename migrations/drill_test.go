@@ -260,3 +260,90 @@ func TestArchivabilityDrill019(t *testing.T) {
 	}
 	t.Log("archivability drill passed: 019 applies, reverts cleanly, and re-applies")
 }
+
+// TestArchivabilityDrill020 proves the Stage 3 endpoint-details migration
+// (020) is reversible: the four new instance columns exist after up, are
+// gone after reverting one step, and the pre-existing endpoint column (002)
+// survives.
+func TestArchivabilityDrill020(t *testing.T) {
+	dsn := os.Getenv("TEEPIN_DRILL_DSN")
+	if dsn == "" {
+		t.Skip("set TEEPIN_DRILL_DSN to run the migration drill")
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("initial up: %v", err)
+	}
+	for _, col := range []string{"dns_name", "public_ip", "tls_enabled", "tls_ready"} {
+		if !columnExists(t, db, "compute", "instances", col) {
+			t.Fatalf("after up: compute.instances.%s missing", col)
+		}
+	}
+
+	// Revert to version 19 (state after 019, before 020), absolute.
+	if err := migrator(t, db).Migrate(19); err != nil {
+		t.Fatalf("migrate down to 019: %v", err)
+	}
+	for _, col := range []string{"dns_name", "public_ip", "tls_enabled", "tls_ready"} {
+		if columnExists(t, db, "compute", "instances", col) {
+			t.Errorf("after down: %s still present", col)
+		}
+	}
+	// The pre-existing endpoint column (migration 002) must survive.
+	if !columnExists(t, db, "compute", "instances", "endpoint") {
+		t.Error("after down: endpoint (002) was wrongly removed")
+	}
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("re-up: %v", err)
+	}
+	t.Log("archivability drill passed: 020 applies, reverts cleanly, and re-applies")
+}
+
+// TestArchivabilityDrill021 proves the container_port migration (021,
+// added when the Stage 3 tunnel surfaced that the customer's container
+// port was never persisted anywhere post-create) is reversible: the
+// column exists after up, is gone after reverting one step, and every
+// column from 020 survives that revert untouched.
+func TestArchivabilityDrill021(t *testing.T) {
+	dsn := os.Getenv("TEEPIN_DRILL_DSN")
+	if dsn == "" {
+		t.Skip("set TEEPIN_DRILL_DSN to run the migration drill")
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("initial up: %v", err)
+	}
+	if !columnExists(t, db, "compute", "instances", "container_port") {
+		t.Fatal("after up: compute.instances.container_port missing")
+	}
+
+	// Revert to version 20 (state after 020, before 021), absolute.
+	if err := migrator(t, db).Migrate(20); err != nil {
+		t.Fatalf("migrate down to 020: %v", err)
+	}
+	if columnExists(t, db, "compute", "instances", "container_port") {
+		t.Error("after down: container_port still present")
+	}
+	// The 020 columns must survive this revert untouched.
+	for _, col := range []string{"dns_name", "public_ip", "tls_enabled", "tls_ready"} {
+		if !columnExists(t, db, "compute", "instances", col) {
+			t.Errorf("after down: %s (020) was wrongly removed", col)
+		}
+	}
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("re-up: %v", err)
+	}
+	t.Log("archivability drill passed: 021 applies, reverts cleanly, and re-applies")
+}

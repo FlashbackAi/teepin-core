@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"sync"
 	"time"
 
@@ -96,6 +97,17 @@ type Runner struct {
 	// scale is a lot of traffic saying nothing.
 	lastReported map[string]string
 	statusMu     sync.Mutex
+
+	// proxyBodies routes ControlMessage_ProxyData (request body chunks) to
+	// the handleProxyRequest goroutine handling the same request_id.
+	// Necessary because handleCommand dispatches every incoming
+	// ControlMessage to its own goroutine (so a slow create does not stall
+	// a delete behind it) — a ProxyRequest and its follow-up ProxyData
+	// chunks arrive as SEPARATE messages, each independently dispatched,
+	// so without this a body chunk would have no way to reach the
+	// goroutine actually waiting for it.
+	proxyBodies   map[string]chan *agentpb.ProxyData
+	proxyBodiesMu sync.Mutex
 }
 
 func New(cfg Config) *Runner {
@@ -103,6 +115,7 @@ func New(cfg Config) *Runner {
 		cfg:          cfg,
 		lastReported: make(map[string]string),
 		fail:         make(chan error, 1),
+		proxyBodies:  make(map[string]chan *agentpb.ProxyData),
 	}
 }
 
@@ -236,6 +249,12 @@ func (r *Runner) handleCommand(ctx context.Context, s stream, msg *agentpb.Contr
 			}},
 		})
 
+	case *agentpb.ControlMessage_ProxyRequest:
+		r.handleProxyRequest(ctx, s, msg.RequestId, payload.ProxyRequest)
+
+	case *agentpb.ControlMessage_ProxyData:
+		r.deliverProxyBody(msg.RequestId, payload.ProxyData)
+
 	default:
 		r.replyError(s, msg.RequestId, agentpb.ErrorCode_ERROR_CODE_INVALID_ARGUMENT,
 			"unsupported command")
@@ -305,6 +324,9 @@ func (r *Runner) handleCreate(ctx context.Context, s stream, requestID string, c
 			PodName:     result.PodName,
 			EndpointUrl: result.EndpointURL,
 			PublicIp:    result.PublicIP,
+			DnsName:     result.DNSName,
+			TlsEnabled:  result.TLSEnabled,
+			TlsReady:    result.TLSReady,
 		}},
 	})
 
@@ -390,6 +412,210 @@ func (w *chunkWriter) Write(p []byte) (int, error) {
 		return 0, err
 	}
 	return len(p), nil
+}
+
+// Stage 3 tunnel constants — the agent's half of the limits described in
+// pkg/cluster/proxy.go. Kept independent (not shared constants) because
+// they bound different things: the control plane's limits are about one
+// SHARED stream serving many providers; these are about one agent's own
+// resource use talking to its local pod.
+const (
+	// proxyRequestBodyLimit caps how much of a request body this agent
+	// will forward to a local pod — matches proxyMaxResponseBytes on the
+	// control-plane side, applied to the opposite direction.
+	proxyRequestBodyLimit = 32 * 1024 * 1024
+	// proxyLocalTimeout bounds the agent's own HTTP call to the pod. Sits
+	// safely inside the control plane's proxyRequestTimeout (60s) so the
+	// agent is always the one to give up first and report a clean error,
+	// rather than the edge timing out first with no explanation.
+	proxyLocalTimeout = 45 * time.Second
+)
+
+// deliverProxyBody routes a request-body chunk to the handleProxyRequest
+// goroutine handling the same request_id. See Runner.proxyBodies for why
+// this indirection exists — ProxyRequest and ProxyData arrive as separate
+// ControlMessages, each independently dispatched to its own goroutine.
+func (r *Runner) deliverProxyBody(requestID string, data *agentpb.ProxyData) {
+	r.proxyBodiesMu.Lock()
+	ch, ok := r.proxyBodies[requestID]
+	r.proxyBodiesMu.Unlock()
+
+	if !ok {
+		return
+	}
+	select {
+	case ch <- data:
+	case <-time.After(5 * time.Second):
+		// Mirrors deliverLogChunk's control-plane-side guard: a request
+		// whose handler has already given up must not block the shared
+		// stream reader.
+	}
+}
+
+// handleProxyRequest serves one Stage 3 tunnel request: resolve the
+// target instance to a local address, replay the HTTP request against it,
+// and stream the response back as ProxyResponse + ProxyData.
+//
+// Every failure path here reports a clean ProxyResponse.Error rather than
+// letting the request simply time out on the control-plane side — an
+// instance that is gone, unschedulable, or refusing connections is a
+// normal, expected outcome for a customer's own workload, not an agent
+// fault, and deserves a real error message at the edge (see
+// pkg/cluster/proxy.go's relayResponse, which turns Error into a 502 with
+// this text).
+func (r *Runner) handleProxyRequest(ctx context.Context, s stream, requestID string, req *agentpb.ProxyRequest) {
+	ctx, cancel := context.WithTimeout(ctx, proxyLocalTimeout)
+	defer cancel()
+
+	addr, err := r.cfg.Cluster.ResolveInstanceAddress(ctx, req.InstanceId, req.Port)
+	if err != nil {
+		_ = r.sendProxy(s, &agentpb.AgentMessage{
+			RequestId: requestID,
+			Payload: &agentpb.AgentMessage_ProxyResponse{ProxyResponse: &agentpb.ProxyResponse{
+				Error: fmt.Sprintf("instance not reachable: %v", err),
+			}},
+		})
+		return
+	}
+
+	var body io.Reader
+	if req.HasBody {
+		bodyCh := make(chan *agentpb.ProxyData, 64)
+		r.proxyBodiesMu.Lock()
+		r.proxyBodies[requestID] = bodyCh
+		r.proxyBodiesMu.Unlock()
+		defer func() {
+			r.proxyBodiesMu.Lock()
+			delete(r.proxyBodies, requestID)
+			r.proxyBodiesMu.Unlock()
+		}()
+		body = newProxyBodyReader(ctx, bodyCh, proxyRequestBodyLimit)
+	}
+
+	url := fmt.Sprintf("http://%s%s", addr, req.Path)
+	httpReq, err := http.NewRequestWithContext(ctx, req.Method, url, body)
+	if err != nil {
+		_ = r.sendProxy(s, &agentpb.AgentMessage{
+			RequestId: requestID,
+			Payload: &agentpb.AgentMessage_ProxyResponse{ProxyResponse: &agentpb.ProxyResponse{
+				Error: fmt.Sprintf("could not build request: %v", err),
+			}},
+		})
+		return
+	}
+	for _, h := range req.Headers {
+		for _, v := range h.Values {
+			httpReq.Header.Add(h.Name, v)
+		}
+	}
+
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		_ = r.sendProxy(s, &agentpb.AgentMessage{
+			RequestId: requestID,
+			Payload: &agentpb.AgentMessage_ProxyResponse{ProxyResponse: &agentpb.ProxyResponse{
+				Error: fmt.Sprintf("connection failed: %v", err),
+			}},
+		})
+		return
+	}
+	defer resp.Body.Close()
+
+	if err := r.sendProxy(s, &agentpb.AgentMessage{
+		RequestId: requestID,
+		Payload: &agentpb.AgentMessage_ProxyResponse{ProxyResponse: &agentpb.ProxyResponse{
+			StatusCode: int32(resp.StatusCode),
+			Headers:    headersFromHTTP(resp.Header),
+		}},
+	}); err != nil {
+		// The stream to the control plane is gone (proxySendTimeout, or
+		// the connection dropped) — nothing more to send.
+		return
+	}
+
+	buf := make([]byte, 32*1024)
+	for {
+		n, readErr := resp.Body.Read(buf)
+		if n > 0 {
+			chunk := make([]byte, n)
+			copy(chunk, buf[:n])
+			if sendErr := r.sendProxy(s, &agentpb.AgentMessage{
+				RequestId: requestID,
+				Payload:   &agentpb.AgentMessage_ProxyData{ProxyData: &agentpb.ProxyData{Data: chunk}},
+			}); sendErr != nil {
+				return
+			}
+		}
+		if readErr != nil {
+			eof := readErr == io.EOF
+			_ = r.sendProxy(s, &agentpb.AgentMessage{
+				RequestId: requestID,
+				Payload: &agentpb.AgentMessage_ProxyData{ProxyData: &agentpb.ProxyData{
+					Eof:   eof,
+					Reset_: !eof, // a mid-body read error is an abort, not a clean end
+				}},
+			})
+			return
+		}
+	}
+}
+
+// proxyBodyReader turns a channel of ProxyData chunks into an io.Reader,
+// so the request body can be handed to http.NewRequestWithContext exactly
+// like any other io.Reader — net/http drives the read loop, this just
+// bridges the channel.
+type proxyBodyReader struct {
+	ctx     context.Context
+	ch      <-chan *agentpb.ProxyData
+	limit   int
+	read    int
+	pending []byte
+	done    bool
+}
+
+func newProxyBodyReader(ctx context.Context, ch <-chan *agentpb.ProxyData, limit int) *proxyBodyReader {
+	return &proxyBodyReader{ctx: ctx, ch: ch, limit: limit}
+}
+
+func (b *proxyBodyReader) Read(p []byte) (int, error) {
+	for len(b.pending) == 0 {
+		if b.done {
+			return 0, io.EOF
+		}
+		select {
+		case <-b.ctx.Done():
+			return 0, b.ctx.Err()
+		case chunk, open := <-b.ch:
+			if !open {
+				b.done = true
+				return 0, io.EOF
+			}
+			if chunk.Reset_ {
+				b.done = true
+				return 0, fmt.Errorf("request body aborted by peer")
+			}
+			b.read += len(chunk.Data)
+			if b.read > b.limit {
+				b.done = true
+				return 0, fmt.Errorf("request body exceeds %d bytes", b.limit)
+			}
+			b.pending = chunk.Data
+			if chunk.Eof {
+				b.done = true
+			}
+		}
+	}
+	n := copy(p, b.pending)
+	b.pending = b.pending[n:]
+	return n, nil
+}
+
+func headersFromHTTP(h http.Header) []*agentpb.Header {
+	out := make([]*agentpb.Header, 0, len(h))
+	for name, values := range h {
+		out = append(out, &agentpb.Header{Name: name, Values: values})
+	}
+	return out
 }
 
 // heartbeatLoop writes to the control plane on a fixed interval.
@@ -517,22 +743,37 @@ func (r *Runner) reportStatuses(ctx context.Context, s stream) {
 
 		// Only report transitions. Resending unchanged state every sweep
 		// is pure noise on a shared stream.
-		if previous, ok := r.lastReported[st.InstanceID]; ok && previous == st.Status {
+		//
+		// The dedup key is composite (status PLUS endpoint fields), not
+		// status alone: the TLS-ready flip (cert-manager finishing
+		// issuance 30-90s after create) happens with the pod's status
+		// unchanged the whole time ("running" before and after). A
+		// status-only key would suppress that transition forever — it
+		// would never be seen as "changed" — and the control plane would
+		// never learn a certificate became ready (Stage 3 plan A6).
+		key := fmt.Sprintf("%s|%s|%s|%s|%t|%t",
+			st.Status, st.EndpointURL, st.DNSName, st.PublicIP, st.TLSEnabled, st.TLSReady)
+		if previous, ok := r.lastReported[st.InstanceID]; ok && previous == key {
 			continue
 		}
-		r.lastReported[st.InstanceID] = st.Status
+		r.lastReported[st.InstanceID] = key
 
 		_ = r.send(s, &agentpb.AgentMessage{
 			Payload: &agentpb.AgentMessage_InstanceStatus{
 				InstanceStatus: &agentpb.InstanceStatus{
-					InstanceId: st.InstanceID,
-					Status:     st.Status,
-					PodName:    st.PodName,
-					NodeName:   st.NodeName,
-					Message:    st.Message,
-					AccountId:  st.AccountID,
-					ProjectId:  st.ProjectID,
-					ObservedAt: timestamppb.New(st.ObservedAt),
+					InstanceId:  st.InstanceID,
+					Status:      st.Status,
+					PodName:     st.PodName,
+					NodeName:    st.NodeName,
+					Message:     st.Message,
+					AccountId:   st.AccountID,
+					ProjectId:   st.ProjectID,
+					ObservedAt:  timestamppb.New(st.ObservedAt),
+					EndpointUrl: st.EndpointURL,
+					DnsName:     st.DNSName,
+					PublicIp:    st.PublicIP,
+					TlsEnabled:  st.TLSEnabled,
+					TlsReady:    st.TLSReady,
 				},
 			},
 		})
@@ -590,6 +831,46 @@ func (r *Runner) send(s stream, msg *agentpb.AgentMessage) error {
 		err := fmt.Errorf("send timed out after %s: connection presumed dead", sendTimeout)
 		r.reportFailure(err)
 		return err
+	}
+}
+
+// proxySendTimeout bounds one write of a proxied response chunk.
+// Deliberately the SAME order of magnitude as sendTimeout, not longer —
+// see sendProxy for why a longer timeout would be the wrong fix here.
+const proxySendTimeout = 20 * time.Second
+
+// sendProxy writes a Stage 3 tunnel message (response headers or a body
+// chunk) to the control plane.
+//
+// This is deliberately NOT send: it shares send's mutex (sendMu) — gRPC
+// streams are not safe for concurrent SendMsg regardless of which logical
+// purpose is writing, so serialization is still required — but on a
+// timeout it does NOT call reportFailure. A customer's slow HTTP
+// connection is not evidence the control-plane connection is dead; send's
+// reportFailure path exists for exactly the opposite case (the CONTROL
+// channel itself hanging, e.g. a drained Fargate task behind the ALB with
+// no FIN). Routing proxy writes through send would let one slow customer
+// request tear down the entire agent connection — killing status
+// reporting, inventory, and every other in-flight request for this
+// provider — which is the single biggest risk flagged in the Stage 3 plan
+// (B5). A stuck proxy send instead just fails that one send call; the
+// caller (relayProxyResponse) treats it as "this request's stream is
+// gone" and aborts only that request.
+func (r *Runner) sendProxy(s stream, msg *agentpb.AgentMessage) error {
+	r.sendMu.Lock()
+	defer r.sendMu.Unlock()
+
+	done := make(chan error, 1)
+	go func() { done <- s.Send(msg) }()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(proxySendTimeout):
+		// Leaked goroutine is bounded the same way send's is: it exits
+		// once the underlying Send eventually returns or the stream is
+		// torn down elsewhere.
+		return fmt.Errorf("proxy send timed out after %s", proxySendTimeout)
 	}
 }
 

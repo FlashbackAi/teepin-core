@@ -68,6 +68,42 @@ func NewService(k8sClient kubernetes.Interface, config Config) *Service {
 	}
 }
 
+// EndpointOptions lets one call override the service's configured domain
+// and TLS settings. Zero values fall back to the Service's own Config, so
+// a caller that sends nothing gets exactly today's behaviour — this
+// override is additive, not a replacement for the configured defaults.
+//
+// It exists because "which domain, and does it get TLS" is not always a
+// static, per-agent fact: the control plane knows a home node's endpoint
+// is provisioned differently from a datacenter node's (see Stage 3 plan
+// A9/B8 — a home instance's endpoint is synthesized centrally, ACM
+// wildcard, always TLS-ready; a datacenter instance provisions locally via
+// this Service, cert-manager, still issuing). Before this, EndpointDomain/
+// EnableTLS/TLSIssuer were already defined on cluster.InstanceSpec and
+// carried over the wire (CreateInstanceCommand), but nothing on the
+// receiving end ever read them — this is what makes them live.
+type EndpointOptions struct {
+	Domain    string
+	UseTLS    *bool // nil = use the Service's configured default
+	TLSIssuer string
+}
+
+func (s *Service) resolveOptions(opts EndpointOptions) (domain string, useTLS bool, tlsIssuer string) {
+	domain = s.domain
+	if opts.Domain != "" {
+		domain = opts.Domain
+	}
+	useTLS = s.useTLS
+	if opts.UseTLS != nil {
+		useTLS = *opts.UseTLS
+	}
+	tlsIssuer = s.tlsIssuer
+	if opts.TLSIssuer != "" {
+		tlsIssuer = opts.TLSIssuer
+	}
+	return domain, useTLS, tlsIssuer
+}
+
 // ProvisionEndpoint gives an instance a public hostname: a ClusterIP
 // Service selecting its pod, plus an Ingress routing
 // <instance-name>.<domain> to it (with TLS when enabled).
@@ -75,15 +111,16 @@ func NewService(k8sClient kubernetes.Interface, config Config) *Service {
 // instanceName is the TEEPIN instance ID (e.g. "inst-6fea56ce") — it
 // must match the app.teepin.cloud/instance-id label on the pod, and it
 // forms the hostname the customer receives.
-func (s *Service) ProvisionEndpoint(ctx context.Context, instanceID uuid.UUID, instanceName string, port int32) (*EndpointInfo, error) {
-	dnsName := s.generateDNSNameFor(instanceName)
+func (s *Service) ProvisionEndpoint(ctx context.Context, instanceID uuid.UUID, instanceName string, port int32, opts EndpointOptions) (*EndpointInfo, error) {
+	domain, useTLS, tlsIssuer := s.resolveOptions(opts)
+	dnsName := fmt.Sprintf("%s.%s", instanceName, domain)
 
 	serviceName, err := s.createInstanceService(ctx, instanceID, instanceName, port)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Service: %w", err)
 	}
 
-	ingressName, err := s.createIngress(ctx, instanceID, dnsName, serviceName, port)
+	ingressName, err := s.createIngress(ctx, instanceID, dnsName, serviceName, port, useTLS, tlsIssuer)
 	if err != nil {
 		// Cleanup: delete service if ingress creation fails
 		_ = s.deleteInstanceService(ctx, serviceName)
@@ -95,7 +132,7 @@ func (s *Service) ProvisionEndpoint(ctx context.Context, instanceID uuid.UUID, i
 	publicIP := s.ingressPublicIP(ctx)
 
 	scheme := "http"
-	if s.useTLS {
+	if useTLS {
 		scheme = "https"
 	}
 
@@ -107,7 +144,7 @@ func (s *Service) ProvisionEndpoint(ctx context.Context, instanceID uuid.UUID, i
 		DNSName:      dnsName,
 		HTTPURL:      fmt.Sprintf("http://%s", dnsName),
 		HTTPSURL:     fmt.Sprintf("%s://%s", scheme, dnsName),
-		TLSEnabled:   s.useTLS,
+		TLSEnabled:   useTLS,
 		TLSReady:     false, // cert-manager needs time to issue
 		InternalPort: port,
 		ExternalPort: 443,
@@ -130,24 +167,30 @@ func (s *Service) RevokeEndpoint(ctx context.Context, instanceID uuid.UUID) erro
 	return nil
 }
 
-// GetEndpointInfo retrieves current networking information for an instance.
-func (s *Service) GetEndpointInfo(ctx context.Context, instanceID uuid.UUID, instanceName string) (*EndpointInfo, error) {
+// GetEndpointInfo retrieves current networking information for an
+// instance. opts must match what ProvisionEndpoint was called with for
+// this instance — this reads back live cluster state (the TLS secret,
+// the Service port) but recomputes domain/scheme from opts/config rather
+// than storing what was actually provisioned, so a mismatched opts value
+// would report a DNS name or scheme that does not match the real Ingress.
+func (s *Service) GetEndpointInfo(ctx context.Context, instanceID uuid.UUID, instanceName string, opts EndpointOptions) (*EndpointInfo, error) {
+	domain, useTLS, _ := s.resolveOptions(opts)
 	serviceName := s.generateServiceName(instanceID)
 	ingressName := s.generateIngressName(instanceID)
-	dnsName := s.generateDNSNameFor(instanceName)
+	dnsName := fmt.Sprintf("%s.%s", instanceName, domain)
 
 	port, err := s.getServicePort(ctx, serviceName)
 	if err != nil {
 		port = 0
 	}
 
-	tlsReady, err := s.isTLSReady(ctx, ingressName)
+	tlsReady, err := s.isTLSReady(ctx, ingressName, useTLS)
 	if err != nil {
 		tlsReady = false
 	}
 
 	scheme := "http"
-	if s.useTLS {
+	if useTLS {
 		scheme = "https"
 	}
 
@@ -159,7 +202,7 @@ func (s *Service) GetEndpointInfo(ctx context.Context, instanceID uuid.UUID, ins
 		DNSName:      dnsName,
 		HTTPURL:      fmt.Sprintf("http://%s", dnsName),
 		HTTPSURL:     fmt.Sprintf("%s://%s", scheme, dnsName),
-		TLSEnabled:   s.useTLS,
+		TLSEnabled:   useTLS,
 		TLSReady:     tlsReady,
 		InternalPort: port,
 		ExternalPort: 443,
@@ -176,9 +219,3 @@ func (s *Service) generateIngressName(instanceID uuid.UUID) string {
 	return fmt.Sprintf("inst-%s-ingress", instanceID.String()[:8])
 }
 
-// generateDNSNameFor builds the customer-facing hostname from the
-// TEEPIN instance ID, e.g. "inst-6fea56ce.teepin.io". Covered by the
-// wildcard record, so no DNS API call is needed.
-func (s *Service) generateDNSNameFor(instanceName string) string {
-	return fmt.Sprintf("%s.%s", instanceName, s.domain)
-}

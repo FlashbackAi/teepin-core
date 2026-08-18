@@ -48,6 +48,9 @@ func (s *stubCluster) Inventory(context.Context) ([]cluster.NodeInventory, error
 	return nil, s.err
 }
 func (s *stubCluster) Healthy(context.Context) bool { return s.err == nil }
+func (s *stubCluster) ResolveInstanceAddress(context.Context, string, int32) (string, error) {
+	return "", s.err
+}
 
 func liveInstance(id, status string) cluster.InstanceStatus {
 	return cluster.InstanceStatus{
@@ -62,7 +65,8 @@ func expectListActive(mock sqlmock.Sqlmock, id, status string) {
 		WillReturnRows(instanceRows().AddRow(
 			id, uuid.New(), uuid.New(), uuid.New(), "app", "nginx:latest",
 			"gpu.h100.2g.20gb", status, 20, 8, 32, "",
-			id+"-pod", "default", time.Now(), time.Now(), nil, nil,
+			id+"-pod", "default", "", "", "", false, false, 0,
+			time.Now(), time.Now(), nil, nil,
 		))
 }
 

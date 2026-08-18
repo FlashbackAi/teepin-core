@@ -381,3 +381,135 @@ func TestAgentClient_HealthyTracksConnectedAgents(t *testing.T) {
 		t.Error("a connected agent should report healthy")
 	}
 }
+
+// TestAgentClient_CreateRoundTripsEndpointFields covers Stage 3 defect 1
+// on the agent-mode path specifically: a datacenter agent's CommandResult
+// carries DnsName/TlsEnabled/TlsReady over gRPC, and AgentClient must
+// deserialize every one of them onto InstanceResult, not just
+// EndpointUrl/PublicIp (the two fields that existed before Stage 3).
+func TestAgentClient_CreateRoundTripsEndpointFields(t *testing.T) {
+	fake := newFakeAgent(&agentpb.CommandResult{
+		Success:     true,
+		PodName:     "inst-ep-pod",
+		EndpointUrl: "https://inst-ep12345.teepin.com",
+		PublicIp:    "203.0.113.9",
+		DnsName:     "inst-ep12345.teepin.com",
+		TlsEnabled:  true,
+		TlsReady:    false,
+	})
+	c := NewAgentClient(registryWith(fake.session))
+
+	result, err := c.CreateInstance(context.Background(), InstanceSpec{
+		InstanceID: "inst-ep12345",
+		Ports:      []PortMapping{{Container: 80, Protocol: "tcp"}},
+	})
+	if err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	if result.DNSName != "inst-ep12345.teepin.com" {
+		t.Errorf("DNSName = %q, want inst-ep12345.teepin.com", result.DNSName)
+	}
+	if result.PublicIP != "203.0.113.9" {
+		t.Errorf("PublicIP = %q, want 203.0.113.9", result.PublicIP)
+	}
+	if !result.TLSEnabled {
+		t.Error("TLSEnabled=false, want true (round-tripped from CommandResult)")
+	}
+	if result.TLSReady {
+		t.Error("TLSReady=true, want false (round-tripped from CommandResult)")
+	}
+
+	// The cache seeded on create (for immediate read-after-create) must
+	// carry the same fields — GetInstanceStatus is what the console
+	// actually reads.
+	st, err := c.GetInstanceStatus(context.Background(), AllTenants(), "inst-ep12345")
+	if err != nil {
+		t.Fatalf("GetInstanceStatus: %v", err)
+	}
+	if st.DNSName != "inst-ep12345.teepin.com" || !st.TLSEnabled {
+		t.Errorf("cached status missing endpoint fields: %+v", st)
+	}
+}
+
+// TestAgentClient_HomeNodeSynthesizesEndpoint covers Stage 3 plan B8: a
+// home-class instance never gets endpoint fields from CommandResult (the
+// home agent has no local Ingress/cert-manager — see
+// cmd/teepin-agent/main.go's homeClusterClient, which always passes nil
+// networking). AgentClient must synthesize the URL itself from
+// spec.EndpointDomain, and report TLS ready immediately: the wildcard ACM
+// cert (Stage 3 plan B7) is already issued, there is no per-instance
+// cert-manager wait to track for a home instance.
+func TestAgentClient_HomeNodeSynthesizesEndpoint(t *testing.T) {
+	// The fake agent's reply carries NO endpoint fields at all — exactly
+	// what a real home agent sends today.
+	fake := newFakeAgent(&agentpb.CommandResult{Success: true, PodName: "inst-home1-pod"})
+	c := NewAgentClient(registryWith(fake.session))
+
+	result, err := c.CreateInstance(context.Background(), InstanceSpec{
+		InstanceID:     "inst-home12345",
+		ProviderID:     "provider-1",
+		NodeClass:      "home",
+		Ports:          []PortMapping{{Container: 8080, Protocol: "tcp"}},
+		EndpointDomain: "teepin.com",
+	})
+	if err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	wantDNS := "inst-home12345.teepin.com"
+	if result.DNSName != wantDNS {
+		t.Errorf("DNSName = %q, want synthesized %q", result.DNSName, wantDNS)
+	}
+	if result.EndpointURL != "https://"+wantDNS {
+		t.Errorf("EndpointURL = %q, want https://%s", result.EndpointURL, wantDNS)
+	}
+	if !result.TLSEnabled || !result.TLSReady {
+		t.Errorf("home instance must report TLS enabled AND ready immediately (ACM wildcard, no cert-manager wait): TLSEnabled=%v TLSReady=%v", result.TLSEnabled, result.TLSReady)
+	}
+}
+
+// TestAgentClient_HomeNodeNoSynthesisWithoutPorts: an instance with no
+// requested ports gets no endpoint, home node or not — nothing is
+// listening, so a synthesized URL would just be a broken link.
+func TestAgentClient_HomeNodeNoSynthesisWithoutPorts(t *testing.T) {
+	fake := newFakeAgent(&agentpb.CommandResult{Success: true, PodName: "inst-home2-pod"})
+	c := NewAgentClient(registryWith(fake.session))
+
+	result, err := c.CreateInstance(context.Background(), InstanceSpec{
+		InstanceID:     "inst-home2xxxx",
+		ProviderID:     "provider-1",
+		NodeClass:      "home",
+		EndpointDomain: "teepin.com",
+	})
+	if err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	if result.DNSName != "" || result.EndpointURL != "" {
+		t.Errorf("expected no synthesized endpoint with no ports, got DNSName=%q EndpointURL=%q", result.DNSName, result.EndpointURL)
+	}
+}
+
+// TestAgentClient_DatacenterPathNeverSynthesizes: only NodeClass=="home"
+// triggers synthesis. A datacenter instance's endpoint fields must come
+// through untouched from CommandResult, even when empty (e.g. TLS not yet
+// enabled — Stage 3 task A5) — synthesizing a fake URL for a datacenter
+// instance would be actively wrong, since nothing there is listening on
+// the ACM-wildcard-fronted edge until Phase B's cutover.
+func TestAgentClient_DatacenterPathNeverSynthesizes(t *testing.T) {
+	fake := newFakeAgent(&agentpb.CommandResult{Success: true, PodName: "inst-dc1-pod"})
+	c := NewAgentClient(registryWith(fake.session))
+
+	result, err := c.CreateInstance(context.Background(), InstanceSpec{
+		InstanceID:     "inst-dc1xxxxxx",
+		Ports:          []PortMapping{{Container: 80, Protocol: "tcp"}},
+		EndpointDomain: "teepin.com",
+		// NodeClass left empty: the datacenter path.
+	})
+	if err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	if result.DNSName != "" || result.EndpointURL != "" || result.TLSEnabled || result.TLSReady {
+		t.Errorf("datacenter path must not synthesize an endpoint, got %+v", result)
+	}
+}

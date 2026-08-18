@@ -68,3 +68,7 @@ func (u *Unavailable) Inventory(context.Context) ([]NodeInventory, error) {
 }
 
 func (u *Unavailable) Healthy(context.Context) bool { return false }
+
+func (u *Unavailable) ResolveInstanceAddress(context.Context, string, int32) (string, error) {
+	return "", ErrClusterUnavailable
+}

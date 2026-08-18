@@ -24,7 +24,6 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/compute"
 	"github.com/FlashbackAi/teepin-core/pkg/gpu"
 	"github.com/FlashbackAi/teepin-core/pkg/models"
-	"github.com/FlashbackAi/teepin-core/pkg/networking"
 )
 
 // Server represents the API server
@@ -50,16 +49,41 @@ type Server struct {
 	// pkg/cluster for the two implementations.
 	cluster cluster.Client
 
-	gpuAllocator      *gpu.Allocator
-	networkingService *networking.Service
-	store             *compute.Store  // nil in standalone mode (no database)
-	pricing           PricingProvider // nil in standalone mode (no database)
-	gate              ProvisionGate   // nil in standalone mode (no billing gate)
+	gpuAllocator *gpu.Allocator
+	store        *compute.Store  // nil in standalone mode (no database)
+	pricing      PricingProvider // nil in standalone mode (no database)
+	gate         ProvisionGate   // nil in standalone mode (no billing gate)
 
 	// nodePlacer resolves a home-class placement. Nil unless home compute is
 	// enabled, in which case a node_class:"home" request is refused cleanly
 	// (400) rather than panicking. Set via WithNodePlacer.
 	nodePlacer NodePlacer
+
+	// endpointDomain/enableTLS/tlsIssuer are stamped onto every placement's
+	// InstanceSpec (see instanceSpec below) so the customer-visible hostname
+	// and TLS policy are a control-plane fact, not independently configured
+	// per agent (TEEPIN_DOMAIN previously existed on both the ECS task AND
+	// every agent process — two sources of truth for the same URL, which
+	// drift). Zero values leave a spec's EndpointDomain/EnableTLS/TLSIssuer
+	// at their own zero values, which DirectClient/AgentClient treat as "use
+	// the agent's own configured default" — see cluster.EndpointOptions.
+	// Set via WithEndpointConfig.
+	endpointDomain string
+	enableTLS      bool
+	tlsIssuer      string
+}
+
+// WithEndpointConfig sets the domain/TLS policy stamped onto every
+// instance's placement. Returns the same *Server for chaining, so existing
+// NewServer call sites compile unchanged. Not calling this at all preserves
+// today's behaviour exactly: every field defaults to the zero value, which
+// means "let the agent's own configuration decide" (see EndpointDomain/
+// EnableTLS/TLSIssuer's use in instanceSpec).
+func (s *Server) WithEndpointConfig(domain string, enableTLS bool, tlsIssuer string) *Server {
+	s.endpointDomain = domain
+	s.enableTLS = enableTLS
+	s.tlsIssuer = tlsIssuer
+	return s
 }
 
 // NodePlacer resolves a home CPU workload to a specific node + provider. An
@@ -93,14 +117,21 @@ type homeTarget struct {
 // when the platform runs without a database (local standalone mode); in
 // that case instances are not persisted, not billed, priced at the
 // compiled-in default rate, and not gated on payment.
-func NewServer(clusterClient cluster.Client, gpuAllocator *gpu.Allocator, networkingService *networking.Service, store *compute.Store, pricing PricingProvider, gate ProvisionGate) *Server {
+//
+// Endpoint provisioning (Service/Ingress) is NOT wired here — it is owned
+// entirely by the cluster layer (pkg/cluster, backed by pkg/networking on
+// the agent side), which reports what it provisioned back over gRPC as
+// part of CreateInstance's result. The API server previously held its own
+// *networking.Service and called GetEndpointInfo directly, which only ever
+// worked in the (unused in production) direct cluster mode — see Stage 3
+// plan defects 1/2.
+func NewServer(clusterClient cluster.Client, gpuAllocator *gpu.Allocator, store *compute.Store, pricing PricingProvider, gate ProvisionGate) *Server {
 	return &Server{
-		cluster:           clusterClient,
-		gpuAllocator:      gpuAllocator,
-		networkingService: networkingService,
-		store:             store,
-		pricing:           pricing,
-		gate:              gate,
+		cluster:      clusterClient,
+		gpuAllocator: gpuAllocator,
+		store:        store,
+		pricing:      pricing,
+		gate:         gate,
 	}
 }
 
@@ -167,6 +198,34 @@ func (s *Server) CreateInstance(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+
+	// There is no per-instance public port in this architecture: every
+	// instance is reached by hostname on 443 through the shared edge
+	// (pkg/networking's ProvisionEndpoint hardcodes ExternalPort 443).
+	// Silently accepting a port the platform cannot honour is worse than
+	// rejecting it — a customer who set `public` and got a different port
+	// (or none) would have no way to know their request was ignored.
+	//
+	// Protocol is validated here rather than left to silently fall back to
+	// TCP downstream: a typo ("udp " with a trailing space, "UDP1") should
+	// be a 400 the customer can fix, not a request that quietly runs as
+	// something other than what was asked for.
+	for _, port := range req.Ports {
+		if port.Public != 0 {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": "public port assignment is not supported; instances are reached by hostname on 443, not a chosen port",
+			})
+			return
+		}
+		switch strings.ToLower(port.Protocol) {
+		case "", "tcp", "udp":
+		default:
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": fmt.Sprintf("invalid port protocol %q: must be tcp or udp", port.Protocol),
+			})
+			return
+		}
 	}
 
 	// Billing integrity: when persistence is enabled, every instance
@@ -294,19 +353,13 @@ func (s *Server) CreateInstance(c *gin.Context) {
 		return
 	}
 
-	// The endpoint is provisioned by the cluster layer alongside the pod:
-	// it must happen next to the cluster, not from the control plane,
-	// which has no Kubernetes access once the agent split completes.
-	var endpointInfo *networking.EndpointInfo
-	if s.networkingService != nil && len(req.Ports) > 0 {
-		// Read back what the cluster layer provisioned so the response
-		// carries DNS and TLS state. Best-effort: a missing endpoint
-		// record must not fail an instance that is already running.
-		if info, epErr := s.networkingService.GetEndpointInfo(
-			c.Request.Context(), instanceUUID, instanceID); epErr == nil {
-			endpointInfo = info
-		}
-	}
+	// The endpoint is provisioned by the cluster layer alongside the pod,
+	// and reported back on `result` — the control plane must never call
+	// back into a networking client of its own to read it: in production
+	// (TEEPIN_CLUSTER_MODE=agent) this process has no Kubernetes access at
+	// all, so that call always silently found nothing (Stage 3 defects
+	// 1/2). `result` already carries everything the agent provisioned,
+	// over the same gRPC response that reported PodName.
 
 	// Persist the instance — this is what billing meters. If it fails
 	// the workload must not keep running unbilled: roll back.
@@ -335,8 +388,17 @@ func (s *Server) CreateInstance(c *gin.Context) {
 			record.NodeName = homePlacement.nodeName
 			record.InstanceType = "cpu.home"
 		}
-		if endpointInfo != nil {
-			record.Endpoint = endpointInfo.HTTPSURL
+		record.Endpoint = result.EndpointURL
+		record.DNSName = result.DNSName
+		record.PublicIP = result.PublicIP
+		record.TLSEnabled = result.TLSEnabled
+		record.TLSReady = result.TLSReady
+		// The Stage 3 tunnel needs to know which port to proxy to for an
+		// already-running instance — persisted here rather than re-derived
+		// later, since spec.Ports[0] (the source of truth at create time)
+		// is not available on any subsequent read path.
+		if len(req.Ports) > 0 {
+			record.ContainerPort = req.Ports[0].Container
 		}
 
 		if err := s.store.Create(c.Request.Context(), record); err != nil {
@@ -386,14 +448,13 @@ func (s *Server) CreateInstance(c *gin.Context) {
 		}
 	}
 
-	// Add endpoint information
-	if endpointInfo != nil {
-		instance.Endpoint = endpointInfo.HTTPSURL
-		instance.PublicIP = endpointInfo.PublicIP
-		instance.DNSName = endpointInfo.DNSName
-		instance.TLSEnabled = endpointInfo.TLSEnabled
-		instance.TLSReady = endpointInfo.TLSReady
-	}
+	// Endpoint information, straight from the gRPC result — see the note
+	// above CreateInstance's persistence block.
+	instance.Endpoint = result.EndpointURL
+	instance.PublicIP = result.PublicIP
+	instance.DNSName = result.DNSName
+	instance.TLSEnabled = result.TLSEnabled
+	instance.TLSReady = result.TLSReady
 
 	c.JSON(http.StatusCreated, instance)
 }
@@ -722,6 +783,13 @@ func (s *Server) instanceSpec(instanceID string, instanceUUID, projectID, accoun
 		Labels:     labels,
 		CPUUnits:   req.CPUUnits,
 		MemoryGB:   parseMemoryGB(req.Memory),
+		// Control-plane policy, not agent-local config — see
+		// WithEndpointConfig. Zero values are indistinguishable from "not
+		// set" downstream, which is deliberate: an operator who never calls
+		// WithEndpointConfig gets exactly today's behaviour.
+		EndpointDomain: s.endpointDomain,
+		EnableTLS:      s.enableTLS,
+		TLSIssuer:      s.tlsIssuer,
 	}
 
 	if projectID != uuid.Nil {
@@ -745,9 +813,18 @@ func (s *Server) instanceSpec(instanceID string, instanceUUID, projectID, accoun
 	}
 
 	for _, port := range req.Ports {
+		// Protocol previously always hardcoded "tcp" here, discarding
+		// whatever the customer sent — buildPod already honours Protocol
+		// (setting corev1.ProtocolUDP when asked), so this was a real
+		// customer-visible bug, not just an omission. Default preserved
+		// for a request that leaves it unset.
+		protocol := port.Protocol
+		if protocol == "" {
+			protocol = "tcp"
+		}
 		spec.Ports = append(spec.Ports, cluster.PortMapping{
 			Container: port.Container,
-			Protocol:  "tcp",
+			Protocol:  protocol,
 		})
 	}
 
@@ -787,6 +864,10 @@ func statusToInstance(st cluster.InstanceStatus, record *compute.InstanceRecord,
 	instance.Memory = fmt.Sprintf("%dGB", record.MemoryGB)
 	instance.InstanceType = record.InstanceType
 	instance.Endpoint = record.Endpoint
+	instance.DNSName = record.DNSName
+	instance.PublicIP = record.PublicIP
+	instance.TLSEnabled = record.TLSEnabled
+	instance.TLSReady = record.TLSReady
 
 	if record.GPUVRAMGB > 0 {
 		instance.GPUVRAM = fmt.Sprintf("%dGB", record.GPUVRAMGB)

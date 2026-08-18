@@ -8,15 +8,19 @@
 # (install.sh) INSIDE the distro. The node is CPU-only (WSL2 GPU passthrough
 # is not relied on).
 #
-# Run in an ADMINISTRATOR PowerShell:
+# Run in an ADMINISTRATOR PowerShell, first install:
 #   .\bootstrap-windows.ps1 -Token <tne_...> -ControlPlane https://api.teepin.com
 #
 # If WSL2 was not already installed, Windows may require a REBOOT after the
 # first run; re-run this script afterwards to finish.
+#
+# Re-run with NO ARGUMENTS to update an already-enrolled node's agent binary
+# (install.sh detects the existing enrollment itself and skips straight to
+# update mode) -- Token/ControlPlane are only required the first time.
 
 param(
-    [Parameter(Mandatory = $true)][string]$Token,
-    [Parameter(Mandatory = $true)][string]$ControlPlane,
+    [string]$Token = "",
+    [string]$ControlPlane = "",
     # Distro is OPTIONAL. If omitted, the script uses an existing Ubuntu distro
     # (e.g. Ubuntu-22.04) when one is present, and only installs a fresh
     # "Ubuntu" when none exists. Passing -Distro forces a specific one.
@@ -69,6 +73,13 @@ $isAdmin = ([Security.Principal.WindowsPrincipal] `
     [Security.Principal.WindowsIdentity]::GetCurrent()
 ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) { Fail "run this in an Administrator PowerShell." }
+
+# Token/ControlPlane are only required for a first install. A re-run against
+# an already-enrolled distro is an update -- install.sh detects that itself
+# (existing /etc/teepin/agent.json + systemd unit) and needs neither. Whether
+# THIS run is fresh or an update is not known yet at this point (it depends
+# on the distro this script is about to resolve/create below), so the actual
+# gate is deferred to just before the install.sh invocation.
 
 # --- 1. WSL2 + distro ----------------------------------------------------
 $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
@@ -270,11 +281,28 @@ if ($here -match '^([A-Za-z]):\\(.*)$') {
 if (-not $wslPath) { Fail "could not resolve the WSL path for '$here'." }
 Info "installer path in WSL: $wslPath"
 
-$grpcArg = ""
-if ($Grpc -ne "") { $grpcArg = "--grpc $Grpc" }
+# Whether this is a fresh install or an update of an already-enrolled node is
+# install.sh's own call (it checks for /etc/teepin/agent.json + the systemd
+# unit) -- but Token/ControlPlane must be validated HERE, before invoking it,
+# because install.sh's fresh-install argument parsing runs inside the distro
+# and a missing -Token there would surface as a confusing bash error instead
+# of a clear PowerShell one.
+$alreadyEnrolled = (wsl -d $Distro -u root -- bash -c "[ -f /etc/teepin/agent.json ] && [ -f /etc/systemd/system/teepin-agent.service ] && echo yes || echo no").Trim()
+
+if ($alreadyEnrolled -eq "yes") {
+    Info "existing enrollment found inside $Distro -- updating the agent binary only (Token/ControlPlane not needed)."
+    $installArgs = ""
+} else {
+    if (-not $Token -or -not $ControlPlane) {
+        Fail "-Token and -ControlPlane are required for a first install (no existing enrollment found inside $Distro)."
+    }
+    $grpcArg = ""
+    if ($Grpc -ne "") { $grpcArg = "--grpc $Grpc" }
+    $installArgs = "--token '$Token' --control-plane '$ControlPlane' $grpcArg"
+}
 
 Info "running the Linux installer inside $Distro..."
-wsl -d $Distro -u root -- bash -c "cd '$wslPath' && bash install.sh --token '$Token' --control-plane '$ControlPlane' $grpcArg"
+wsl -d $Distro -u root -- bash -c "cd '$wslPath' && bash install.sh $installArgs"
 
 Info "done. The node should appear in the control centre (Nodes) as online within a minute."
 Info "check inside WSL:  wsl -d $Distro -- systemctl status teepin-agent"

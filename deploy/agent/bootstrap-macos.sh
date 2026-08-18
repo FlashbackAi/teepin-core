@@ -10,7 +10,12 @@
 # reach the Mac's GPU).
 #
 # Usage:
+#   # First install:
 #   bash bootstrap-macos.sh --token <tne_...> --control-plane https://api.teepin.com
+#
+#   # Update an already-enrolled node's agent binary (no token needed --
+#   # install.sh detects the existing enrollment inside the VM itself):
+#   bash bootstrap-macos.sh
 #
 # Requires Homebrew (to install Lima). The VM's arch matches the Mac (arm64 on
 # Apple Silicon, amd64 on Intel), which is what the node reports.
@@ -36,8 +41,12 @@ info() { echo "[bootstrap] $*"; }
 fail() { echo "[bootstrap] ERROR: $*" >&2; exit 1; }
 
 [ "$(uname -s)" = "Darwin" ] || fail "this bootstrap is for macOS. On Linux run install.sh directly; on Windows use bootstrap-windows.ps1."
-[ -n "$TOKEN" ] || fail "--token is required."
-[ -n "$CONTROL_PLANE" ] || fail "--control-plane is required."
+# --token/--control-plane are only required for a first install. A re-run
+# against an already-enrolled VM is an update, and install.sh detects that
+# itself (existing /etc/teepin/agent.json + systemd unit) -- but whether
+# THIS run is fresh or an update depends on the VM this script is about to
+# ensure exists below, so the actual requirement check is deferred until
+# after that VM is confirmed running (see "install mode" below).
 
 # --- 1. Lima -------------------------------------------------------------
 if ! command -v limactl >/dev/null 2>&1; then
@@ -65,8 +74,25 @@ limactl start-at-login "$VM_NAME" >/dev/null 2>&1 || \
 # --- 3. run the Linux core installer inside the VM ----------------------
 here="$(cd "$(dirname "$0")" && pwd)"
 
-grpc_arg=""
-[ -n "$GRPC_ADDR" ] && grpc_arg="--grpc $GRPC_ADDR"
+# install.sh decides fresh-vs-update for itself once it runs (existing
+# /etc/teepin/agent.json + systemd unit inside the VM), but --token/
+# --control-plane must be validated HERE: a missing --token would otherwise
+# surface as install.sh's bash error from inside the VM instead of a clear
+# message at this script's own usage boundary.
+already_enrolled="$(limactl shell "$VM_NAME" -- bash -c \
+    '[ -f /etc/teepin/agent.json ] && [ -f /etc/systemd/system/teepin-agent.service ] && echo yes || echo no' \
+    2>/dev/null || echo no)"
+
+if [ "$already_enrolled" = "yes" ]; then
+    info "existing enrollment found inside the VM -- updating the agent binary only (--token/--control-plane not needed)."
+    install_args=""
+else
+    [ -n "$TOKEN" ] || fail "--token is required for a first install (no existing enrollment found inside the VM)."
+    [ -n "$CONTROL_PLANE" ] || fail "--control-plane is required for a first install (no existing enrollment found inside the VM)."
+    grpc_arg=""
+    [ -n "$GRPC_ADDR" ] && grpc_arg="--grpc $GRPC_ADDR"
+    install_args="--token '$TOKEN' --control-plane '$CONTROL_PLANE' $grpc_arg"
+fi
 
 info "running the Linux installer inside the VM..."
 # Lima mounts the host home read-only by default; copy the script dir into the
@@ -75,7 +101,7 @@ limactl shell "$VM_NAME" -- bash -c "
     set -e
     rm -rf /tmp/teepin-agent-install && mkdir -p /tmp/teepin-agent-install
     cp -r '$here'/. /tmp/teepin-agent-install/
-    sudo bash /tmp/teepin-agent-install/install.sh --token '$TOKEN' --control-plane '$CONTROL_PLANE' $grpc_arg
+    sudo bash /tmp/teepin-agent-install/install.sh $install_args
 "
 
 info "done. The node should appear in the control centre (Nodes) as online within a minute."

@@ -48,12 +48,33 @@ type InstanceRecord struct {
 	// instance. Empty for the datacenter path. ProviderID is how a later
 	// delete/logs command routes to the same agent session; NodeName is
 	// resolved to compute.nodes.id at insert time for load accounting.
+	//
+	// ProviderID was write-only until Stage 3: Create persisted it but
+	// selectColumns never read it back, so every GET/LIST saw an empty
+	// string regardless of what was stored. Stage 3's tunnel depends on
+	// this being readable — it is the hostname -> instance -> provider ->
+	// agent session lookup for every proxied request.
 	ProviderID string
 	NodeName   string
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
-	StartedAt    *time.Time
-	TerminatedAt *time.Time
+	// DNSName / PublicIP / TLSEnabled / TLSReady are the public-endpoint
+	// facts the agent reports back over gRPC (CommandResult / InstanceStatus
+	// — see pkg/cluster.InstanceResult). Never set locally; the control
+	// plane has no Kubernetes client in production and cannot compute these
+	// itself (see Stage 3 plan, defect 1/2).
+	DNSName    string
+	PublicIP   string
+	TLSEnabled bool
+	TLSReady   bool
+	// ContainerPort is the customer's container port from the create
+	// request's ports[0].container — 0 when the instance was created with
+	// no ports. Persisted so the Stage 3 tunnel's proxy handler can look
+	// up which port to route to for an already-running instance, without
+	// re-deriving or guessing it.
+	ContainerPort int
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+	StartedAt     *time.Time
+	TerminatedAt  *time.Time
 }
 
 // Store provides CRUD access to compute.instances.
@@ -75,9 +96,9 @@ func (s *Store) Create(ctx context.Context, rec *InstanceRecord) error {
 		INSERT INTO compute.instances
 		(id, account_id, project_id, user_id, name, image, instance_type_id, status,
 		 gpu_vram_gb, cpu_units, memory_gb, endpoint, k8s_pod_name, k8s_namespace,
-		 provider_id, node_id)
+		 provider_id, node_id, dns_name, public_ip, tls_enabled, tls_ready, container_port)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-		 (SELECT id FROM compute.nodes WHERE node_name = $16))
+		 (SELECT id FROM compute.nodes WHERE node_name = $16), $17, $18, $19, $20, $21)
 		RETURNING created_at, updated_at
 	`
 
@@ -85,17 +106,55 @@ func (s *Store) Create(ctx context.Context, rec *InstanceRecord) error {
 	if rec.GPUVRAMGB > 0 {
 		vram = sql.NullInt64{Int64: int64(rec.GPUVRAMGB), Valid: true}
 	}
+	var containerPort sql.NullInt64
+	if rec.ContainerPort > 0 {
+		containerPort = sql.NullInt64{Int64: int64(rec.ContainerPort), Valid: true}
+	}
 
 	err := s.db.QueryRowContext(ctx, query,
 		rec.ID, rec.AccountID, rec.ProjectID, rec.UserID, rec.Name, rec.Image,
 		rec.InstanceType, rec.Status, vram, rec.CPUUnits, rec.MemoryGB,
 		nullIfEmpty(rec.Endpoint), nullIfEmpty(rec.K8sPodName), rec.K8sNamespace,
 		nullIfEmpty(rec.ProviderID), nullIfEmpty(rec.NodeName),
+		nullIfEmpty(rec.DNSName), nullIfEmpty(rec.PublicIP), rec.TLSEnabled, rec.TLSReady,
+		containerPort,
 	).Scan(&rec.CreatedAt, &rec.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("failed to persist instance %s: %w", rec.ID, err)
 	}
 
+	return nil
+}
+
+// EndpointFields is the subset of a record's public-endpoint facts that can
+// change after creation — the TLS-ready flip in particular, which lands
+// 30-90s after create as cert-manager (datacenter) issues a certificate, or
+// immediately for a home node (ACM is always ready, see Stage 3 plan A6/B8).
+type EndpointFields struct {
+	Endpoint   string
+	DNSName    string
+	PublicIP   string
+	TLSEnabled bool
+	TLSReady   bool
+}
+
+// UpdateEndpoint persists a later report of an instance's public-endpoint
+// state — the reconcile path for facts the agent could not report at
+// create time (see Stage 3 plan A6: the status sweep, not create, is what
+// flips tls_ready once a certificate actually issues).
+func (s *Store) UpdateEndpoint(ctx context.Context, id string, fields EndpointFields) error {
+	query := `
+		UPDATE compute.instances
+		SET endpoint = $1, dns_name = $2, public_ip = $3,
+		    tls_enabled = $4, tls_ready = $5
+		WHERE id = $6 AND terminated_at IS NULL
+	`
+	if _, err := s.db.ExecContext(ctx, query,
+		nullIfEmpty(fields.Endpoint), nullIfEmpty(fields.DNSName), nullIfEmpty(fields.PublicIP),
+		fields.TLSEnabled, fields.TLSReady, id,
+	); err != nil {
+		return fmt.Errorf("failed to update endpoint for %s: %w", id, err)
+	}
 	return nil
 }
 
@@ -179,11 +238,16 @@ func (s *Store) ListByProject(ctx context.Context, accountID, projectID uuid.UUI
 		accountID, projectID)
 }
 
+// selectColumns previously omitted provider_id even though Create wrote
+// it — every GET/LIST saw an empty ProviderID regardless of what was
+// stored (Stage 3 defect 8). Now selected and scanned below.
 const selectColumns = `
 	SELECT id, account_id, project_id, user_id, name, image,
 	       COALESCE(instance_type_id, ''), status, COALESCE(gpu_vram_gb, 0),
 	       cpu_units, memory_gb, COALESCE(endpoint, ''),
 	       COALESCE(k8s_pod_name, ''), COALESCE(k8s_namespace, ''),
+	       COALESCE(provider_id, ''), COALESCE(dns_name, ''), COALESCE(public_ip, ''),
+	       tls_enabled, tls_ready, COALESCE(container_port, 0),
 	       created_at, updated_at, started_at, terminated_at
 	FROM compute.instances
 `
@@ -203,6 +267,8 @@ func (s *Store) query(ctx context.Context, where string, args ...interface{}) ([
 			&rec.InstanceType, &rec.Status, &rec.GPUVRAMGB,
 			&rec.CPUUnits, &rec.MemoryGB, &rec.Endpoint,
 			&rec.K8sPodName, &rec.K8sNamespace,
+			&rec.ProviderID, &rec.DNSName, &rec.PublicIP, &rec.TLSEnabled, &rec.TLSReady,
+			&rec.ContainerPort,
 			&rec.CreatedAt, &rec.UpdatedAt, &rec.StartedAt, &rec.TerminatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan instance: %w", err)

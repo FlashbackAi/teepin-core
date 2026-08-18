@@ -9,9 +9,12 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/google/uuid"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/FlashbackAi/teepin-core/pkg/networking"
 )
 
 // newTestClient builds a DirectClient over a fake cluster.
@@ -454,5 +457,195 @@ func TestNodeReadiness_CordonedNodeIsNotReady(t *testing.T) {
 	}
 	if ready["notready"] {
 		t.Error("NotReady node must not be reported ready")
+	}
+}
+
+// fakeProvisioner is a minimal EndpointProvisioner that returns a fixed
+// EndpointInfo, so CreateInstance's endpoint-field population can be
+// tested without a fake Kubernetes Ingress/Service round trip (that part
+// is already covered by pkg/networking's own tests).
+type fakeProvisioner struct {
+	info *networking.EndpointInfo
+	err  error
+
+	lastPort int32
+	lastOpts networking.EndpointOptions
+}
+
+func (f *fakeProvisioner) ProvisionEndpoint(_ context.Context, _ uuid.UUID, _ string, port int32, opts networking.EndpointOptions) (*networking.EndpointInfo, error) {
+	f.lastPort = port
+	f.lastOpts = opts
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.info, nil
+}
+
+func (f *fakeProvisioner) RevokeEndpoint(context.Context, uuid.UUID) error { return nil }
+
+func (f *fakeProvisioner) GetEndpointInfo(context.Context, uuid.UUID, string, networking.EndpointOptions) (*networking.EndpointInfo, error) {
+	return f.info, f.err
+}
+
+// TestCreateInstance_PopulatesEndpointFieldsFromProvisioner is Stage 3
+// defect 1's origin, closed: CreateInstance must carry every field the
+// EndpointProvisioner returns onto InstanceResult, not just EndpointURL —
+// this is what lets a caller with no Kubernetes access of its own (the
+// control plane, in production) persist and serve the full endpoint
+// picture from the result alone (see client.go's InstanceResult doc).
+func TestCreateInstance_PopulatesEndpointFieldsFromProvisioner(t *testing.T) {
+	provisioner := &fakeProvisioner{info: &networking.EndpointInfo{
+		HTTPSURL:   "https://inst-endpoint1.teepin.com",
+		HTTPURL:    "http://inst-endpoint1.teepin.com",
+		PublicIP:   "203.0.113.5",
+		DNSName:    "inst-endpoint1.teepin.com",
+		TLSEnabled: true,
+		TLSReady:   false, // cert-manager has not issued yet
+	}}
+	c := NewDirectClient(fake.NewSimpleClientset(), provisioner, nil, "nvidia")
+
+	instanceUUID := uuid.New()
+	result, err := c.CreateInstance(context.Background(), InstanceSpec{
+		InstanceID: "inst-endpoint1",
+		Image:      "nginx:latest",
+		CPUUnits:   1,
+		MemoryGB:   2,
+		Ports:      []PortMapping{{Container: 8080, Protocol: "tcp"}},
+		Labels:     map[string]string{labelInstanceUUID: instanceUUID.String()},
+	})
+	if err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	if result.DNSName != "inst-endpoint1.teepin.com" {
+		t.Errorf("DNSName = %q, want inst-endpoint1.teepin.com", result.DNSName)
+	}
+	if result.PublicIP != "203.0.113.5" {
+		t.Errorf("PublicIP = %q, want 203.0.113.5", result.PublicIP)
+	}
+	if !result.TLSEnabled {
+		t.Error("TLSEnabled=false, want true (from provisioner)")
+	}
+	if result.TLSReady {
+		t.Error("TLSReady=true immediately after create — cert-manager issues asynchronously")
+	}
+	// TLS is enabled but not yet ready: the customer-visible URL must be
+	// the HTTP one, not a broken HTTPS link waiting on a cert that has not
+	// issued yet.
+	if result.EndpointURL != "http://inst-endpoint1.teepin.com" {
+		t.Errorf("EndpointURL = %q, want the HTTP URL while TLS is not ready", result.EndpointURL)
+	}
+
+	if provisioner.lastPort != 8080 {
+		t.Errorf("provisioner received port %d, want 8080 (the customer's container port)", provisioner.lastPort)
+	}
+}
+
+// TestCreateInstance_PrefersHTTPSWhenTLSReady covers the other half of the
+// scheme-selection logic: once TLS IS ready, the HTTPS URL wins.
+func TestCreateInstance_PrefersHTTPSWhenTLSReady(t *testing.T) {
+	provisioner := &fakeProvisioner{info: &networking.EndpointInfo{
+		HTTPSURL:   "https://inst-endpoint2.teepin.com",
+		HTTPURL:    "http://inst-endpoint2.teepin.com",
+		DNSName:    "inst-endpoint2.teepin.com",
+		TLSEnabled: true,
+		TLSReady:   true,
+	}}
+	c := NewDirectClient(fake.NewSimpleClientset(), provisioner, nil, "nvidia")
+
+	result, err := c.CreateInstance(context.Background(), InstanceSpec{
+		InstanceID: "inst-endpoint2",
+		Image:      "nginx:latest",
+		CPUUnits:   1,
+		MemoryGB:   2,
+		Ports:      []PortMapping{{Container: 80, Protocol: "tcp"}},
+		Labels:     map[string]string{labelInstanceUUID: uuid.New().String()},
+	})
+	if err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	if result.EndpointURL != "https://inst-endpoint2.teepin.com" {
+		t.Errorf("EndpointURL = %q, want the HTTPS URL once TLS is ready", result.EndpointURL)
+	}
+}
+
+// TestCreateInstance_EndpointOptionsPassedThrough covers Stage 3 A9: a
+// spec's EndpointDomain/EnableTLS/TLSIssuer must reach the provisioner as
+// an override, not be silently dropped (the original defect 6).
+func TestCreateInstance_EndpointOptionsPassedThrough(t *testing.T) {
+	provisioner := &fakeProvisioner{info: &networking.EndpointInfo{DNSName: "inst-optthru01.custom.io"}}
+	c := NewDirectClient(fake.NewSimpleClientset(), provisioner, nil, "nvidia")
+
+	_, err := c.CreateInstance(context.Background(), InstanceSpec{
+		InstanceID:     "inst-optthru01",
+		Image:          "nginx:latest",
+		CPUUnits:       1,
+		MemoryGB:       2,
+		Ports:          []PortMapping{{Container: 80, Protocol: "tcp"}},
+		Labels:         map[string]string{labelInstanceUUID: uuid.New().String()},
+		EndpointDomain: "custom.io",
+		EnableTLS:      true,
+		TLSIssuer:      "letsencrypt-staging",
+	})
+	if err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	if provisioner.lastOpts.Domain != "custom.io" {
+		t.Errorf("provisioner received Domain=%q, want custom.io", provisioner.lastOpts.Domain)
+	}
+	if provisioner.lastOpts.UseTLS == nil || !*provisioner.lastOpts.UseTLS {
+		t.Error("provisioner did not receive a UseTLS=true override")
+	}
+	if provisioner.lastOpts.TLSIssuer != "letsencrypt-staging" {
+		t.Errorf("provisioner received TLSIssuer=%q, want letsencrypt-staging", provisioner.lastOpts.TLSIssuer)
+	}
+}
+
+// TestCreateInstance_NoPortsSkipsProvisioning: an instance with no
+// requested ports gets no endpoint at all — provisioning an Ingress for a
+// workload with nothing listening would be pointless and would leak an
+// orphaned resource on delete paths that assume "ports means endpoint".
+func TestCreateInstance_NoPortsSkipsProvisioning(t *testing.T) {
+	provisioner := &fakeProvisioner{info: &networking.EndpointInfo{DNSName: "should-not-be-used"}}
+	c := NewDirectClient(fake.NewSimpleClientset(), provisioner, nil, "nvidia")
+
+	result, err := c.CreateInstance(context.Background(), InstanceSpec{
+		InstanceID: "inst-noports01",
+		Image:      "nginx:latest",
+		CPUUnits:   1,
+		MemoryGB:   2,
+	})
+	if err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	if result.DNSName != "" || result.EndpointURL != "" {
+		t.Errorf("expected no endpoint fields set with no ports requested, got DNSName=%q EndpointURL=%q", result.DNSName, result.EndpointURL)
+	}
+}
+
+// TestCreateInstance_ProvisioningFailureIsNonFatal: endpoint provisioning
+// is best-effort. A provisioner error must not fail the whole create — a
+// running instance the customer can reach some other way beats one
+// deleted because DNS provisioning had a transient failure.
+func TestCreateInstance_ProvisioningFailureIsNonFatal(t *testing.T) {
+	provisioner := &fakeProvisioner{err: errors.New("ingress controller unavailable")}
+	c := NewDirectClient(fake.NewSimpleClientset(), provisioner, nil, "nvidia")
+
+	result, err := c.CreateInstance(context.Background(), InstanceSpec{
+		InstanceID: "inst-provfail1",
+		Image:      "nginx:latest",
+		CPUUnits:   1,
+		MemoryGB:   2,
+		Ports:      []PortMapping{{Container: 80, Protocol: "tcp"}},
+		Labels:     map[string]string{labelInstanceUUID: uuid.New().String()},
+	})
+	if err != nil {
+		t.Fatalf("CreateInstance should not fail when endpoint provisioning fails, got: %v", err)
+	}
+	if result.PodName == "" {
+		t.Error("pod should still have been created despite the provisioning failure")
+	}
+	if result.EndpointURL != "" {
+		t.Error("EndpointURL should be empty when provisioning failed")
 	}
 }

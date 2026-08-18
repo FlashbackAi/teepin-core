@@ -43,6 +43,11 @@ type fakeCluster struct {
 	// lastSpec captures the most recent CreateInstance spec, so placement
 	// tests can assert what the handler resolved.
 	lastSpec cluster.InstanceSpec
+
+	// nextResult, when set, is returned verbatim (PodName defaulted if
+	// empty) by the next CreateInstance call — lets endpoint-field tests
+	// control exactly what the "agent" reports back.
+	nextResult *cluster.InstanceResult
 }
 
 type fakeInstance struct {
@@ -85,6 +90,13 @@ func (f *fakeCluster) CreateInstance(_ context.Context, spec cluster.InstanceSpe
 	f.instances[spec.InstanceID] = fakeInstance{
 		projectID: spec.ProjectID,
 		status:    compute.StatusPending,
+	}
+	if f.nextResult != nil {
+		result := *f.nextResult
+		if result.PodName == "" {
+			result.PodName = spec.InstanceID + "-pod"
+		}
+		return &result, nil
 	}
 	return &cluster.InstanceResult{PodName: spec.InstanceID + "-pod"}, nil
 }
@@ -154,6 +166,10 @@ func (f *fakeCluster) Inventory(context.Context) ([]cluster.NodeInventory, error
 
 func (f *fakeCluster) Healthy(context.Context) bool { return f.failWith == nil }
 
+func (f *fakeCluster) ResolveInstanceAddress(context.Context, string, int32) (string, error) {
+	return "", f.failWith
+}
+
 // newTenantServer builds a Server with tenancy active (store present)
 // over a fake cluster, with a permissive payment gate so tenancy tests
 // are not blocked by billing.
@@ -173,7 +189,7 @@ func newTenantServerWithGate(t *testing.T, fc *fakeCluster, gate ProvisionGate) 
 	}
 	t.Cleanup(func() { db.Close() })
 
-	return NewServer(fc, nil, nil, compute.NewStore(db), nil, gate)
+	return NewServer(fc, nil, compute.NewStore(db), nil, gate)
 }
 
 // A fixed account for tenancy tests. requireScope now requires an
@@ -561,7 +577,7 @@ func TestCreateInstance_HomePlacesAndCarriesProvider(t *testing.T) {
 	fc := newFakeCluster()
 	// store=nil, gate=nil → standalone: no persistence, no gate; placement
 	// still runs because the placer is set.
-	server := NewServer(fc, nil, nil, nil, nil, nil).WithNodePlacer(placer)
+	server := NewServer(fc, nil, nil, nil, nil).WithNodePlacer(placer)
 
 	w := createInstanceReqBody(server, uuid.New(),
 		`{"name":"t","image":"nginx","cpu_units":2,"memory":"4GB","node_class":"home"}`)
@@ -637,7 +653,7 @@ var errTest = context.Canceled // any non-nil error; classification is by the Is
 func TestRequireProjectScope_StandaloneModeAllowsAll(t *testing.T) {
 	// Without a store (no database) there is no tenancy: requests
 	// proceed unscoped, preserving the zero-dependency local dev flow.
-	server := NewServer(newFakeCluster(), nil, nil, nil, nil, nil)
+	server := NewServer(newFakeCluster(), nil, nil, nil, nil)
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -661,5 +677,191 @@ func TestScopeFor_StandaloneIsUnrestricted(t *testing.T) {
 	}
 	if !scopeFor(uuid.New()).IsRestricted() {
 		t.Error("a project scope must be restricted")
+	}
+}
+
+// TestCreateInstance_ResponsePopulatesEndpointFields is Stage 3 defect 1,
+// closed on the response path: the create response must carry every
+// endpoint field straight from cluster.CreateInstance's result — never
+// from a separate networkingService.GetEndpointInfo call (removed
+// entirely; see the comment above this block in server.go).
+func TestCreateInstance_ResponsePopulatesEndpointFields(t *testing.T) {
+	fc := newFakeCluster()
+	fc.nextResult = &cluster.InstanceResult{
+		EndpointURL: "https://inst-resp0001.teepin.com",
+		PublicIP:    "203.0.113.7",
+		DNSName:     "inst-resp0001.teepin.com",
+		TLSEnabled:  true,
+		TLSReady:    false,
+	}
+	// store=nil: exercises the response-building path independent of
+	// persistence, which pkg/compute's own tests already cover.
+	server := NewServer(fc, nil, nil, nil, nil)
+
+	w := createInstanceReqBody(server, uuid.New(),
+		`{"name":"t","image":"nginx","cpu_units":1,"memory":"2GB","ports":[{"container":8080}]}`)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body: %s)", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Endpoint   string `json:"endpoint"`
+		PublicIP   string `json:"public_ip"`
+		DNSName    string `json:"dns_name"`
+		TLSEnabled bool   `json:"tls_enabled"`
+		TLSReady   bool   `json:"tls_ready"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("bad response: %v", err)
+	}
+	if resp.Endpoint != "https://inst-resp0001.teepin.com" {
+		t.Errorf("endpoint = %q, want the result's EndpointURL", resp.Endpoint)
+	}
+	if resp.PublicIP != "203.0.113.7" {
+		t.Errorf("public_ip = %q, want 203.0.113.7", resp.PublicIP)
+	}
+	if resp.DNSName != "inst-resp0001.teepin.com" {
+		t.Errorf("dns_name = %q, want inst-resp0001.teepin.com", resp.DNSName)
+	}
+	if !resp.TLSEnabled {
+		t.Error("tls_enabled = false, want true")
+	}
+	if resp.TLSReady {
+		t.Error("tls_ready = true, want false (cert-manager has not issued yet)")
+	}
+}
+
+// TestCreateInstance_PublicPortRejected covers Stage 3 A8: the platform
+// has no per-instance public port (every instance is reached by hostname
+// on 443 through the shared edge) — accepting a Public field the platform
+// cannot honour would be worse than rejecting it outright.
+func TestCreateInstance_PublicPortRejected(t *testing.T) {
+	server := NewServer(newFakeCluster(), nil, nil, nil, nil)
+
+	w := createInstanceReqBody(server, uuid.New(),
+		`{"name":"t","image":"nginx","cpu_units":1,"memory":"2GB","ports":[{"container":8080,"public":8080}]}`)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for a nonzero Public port", w.Code)
+	}
+}
+
+// TestCreateInstance_ProtocolPassedThrough covers the other half of A8:
+// Protocol must reach the cluster spec, not be silently hardcoded to
+// "tcp" regardless of what the customer requested.
+func TestCreateInstance_ProtocolPassedThrough(t *testing.T) {
+	fc := newFakeCluster()
+	server := NewServer(fc, nil, nil, nil, nil)
+
+	w := createInstanceReqBody(server, uuid.New(),
+		`{"name":"t","image":"nginx","cpu_units":1,"memory":"2GB","ports":[{"container":53,"protocol":"udp"}]}`)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body: %s)", w.Code, w.Body.String())
+	}
+	if len(fc.lastSpec.Ports) != 1 || fc.lastSpec.Ports[0].Protocol != "udp" {
+		t.Errorf("spec.Ports = %+v, want protocol udp passed through", fc.lastSpec.Ports)
+	}
+}
+
+// TestStatusToInstance_PopulatesAllEndpointFields is the pure-function
+// version of the same guarantee: every endpoint field on the stored
+// record must reach models.Instance. This is what GetInstance and
+// ListInstances both funnel through, so one test covers both read paths.
+func TestStatusToInstance_PopulatesAllEndpointFields(t *testing.T) {
+	record := &compute.InstanceRecord{
+		Name:       "my-app",
+		Image:      "nginx:latest",
+		Endpoint:   "https://inst-read0001.teepin.com",
+		DNSName:    "inst-read0001.teepin.com",
+		PublicIP:   "203.0.113.11",
+		TLSEnabled: true,
+		TLSReady:   true,
+	}
+	status := cluster.InstanceStatus{InstanceID: "inst-read0001", Status: compute.StatusRunning}
+
+	instance := statusToInstance(status, record, 0)
+
+	if instance.Endpoint != record.Endpoint {
+		t.Errorf("Endpoint = %q, want %q", instance.Endpoint, record.Endpoint)
+	}
+	if instance.DNSName != record.DNSName {
+		t.Errorf("DNSName = %q, want %q", instance.DNSName, record.DNSName)
+	}
+	if instance.PublicIP != record.PublicIP {
+		t.Errorf("PublicIP = %q, want %q", instance.PublicIP, record.PublicIP)
+	}
+	if instance.TLSEnabled != record.TLSEnabled {
+		t.Errorf("TLSEnabled = %v, want %v", instance.TLSEnabled, record.TLSEnabled)
+	}
+	if instance.TLSReady != record.TLSReady {
+		t.Errorf("TLSReady = %v, want %v", instance.TLSReady, record.TLSReady)
+	}
+}
+
+// TestStatusToInstance_NilRecordOmitsEndpointFields: a status with no
+// backing record (persistence disabled, or a race with the reconciler)
+// must not panic and must simply omit the endpoint fields rather than
+// fabricate them.
+func TestStatusToInstance_NilRecordOmitsEndpointFields(t *testing.T) {
+	status := cluster.InstanceStatus{InstanceID: "inst-norecord1", Status: compute.StatusPending}
+
+	instance := statusToInstance(status, nil, 0)
+
+	if instance.Endpoint != "" || instance.DNSName != "" || instance.TLSEnabled || instance.TLSReady {
+		t.Errorf("expected zero-value endpoint fields with a nil record, got %+v", instance)
+	}
+	if instance.ID != "inst-norecord1" || instance.Status != compute.StatusPending {
+		t.Errorf("basic status fields lost with a nil record: %+v", instance)
+	}
+}
+
+// TestCreateInstance_PersistsEndpointFields drives CreateInstance with a
+// real *compute.Store over sqlmock, asserting the endpoint columns in the
+// INSERT match what cluster.CreateInstance returned — the persistence
+// half of defect 1, distinct from the response half tested above (a bug
+// could populate the JSON response correctly while never writing the
+// columns the reconciler and every SUBSEQUENT read depend on).
+func TestCreateInstance_PersistsEndpointFields(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	fc := newFakeCluster()
+	fc.nextResult = &cluster.InstanceResult{
+		EndpointURL: "https://inst-persist01.teepin.com",
+		PublicIP:    "203.0.113.20",
+		DNSName:     "inst-persist01.teepin.com",
+		TLSEnabled:  true,
+		TLSReady:    false,
+	}
+	server := NewServer(fc, nil, compute.NewStore(db), nil, allowGate{})
+
+	// The INSERT's exact column count/order is pkg/compute/store_test.go's
+	// contract to maintain; here we only need to assert the endpoint-field
+	// ARGS are the ones matching() would reject if wrong, via a custom
+	// matcher rather than a full literal WithArgs list (which would
+	// duplicate store_test.go and break every time an unrelated column is
+	// added there).
+	mock.ExpectQuery(`INSERT INTO compute\.instances`).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), "203.0.113.20", true, false, sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"created_at", "updated_at"}).
+			AddRow(time.Now(), time.Now()))
+
+	w := createInstanceReqBody(server, uuid.New(),
+		`{"name":"t","image":"nginx","cpu_units":1,"memory":"2GB","ports":[{"container":8080}]}`)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body: %s)", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("INSERT did not carry the expected endpoint-field args: %v", err)
 	}
 }

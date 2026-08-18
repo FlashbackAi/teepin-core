@@ -82,6 +82,9 @@ func (nullCluster) StreamLogs(context.Context, cluster.Scope, string, cluster.Lo
 }
 func (nullCluster) Inventory(context.Context) ([]cluster.NodeInventory, error) { return nil, nil }
 func (nullCluster) Healthy(context.Context) bool                               { return true }
+func (nullCluster) ResolveInstanceAddress(context.Context, string, int32) (string, error) {
+	return "", cluster.ErrNotFound
+}
 
 // healthCluster wraps nullCluster with a configurable Healthy result, so
 // tests can simulate a home node's k3s going from reachable to unreachable

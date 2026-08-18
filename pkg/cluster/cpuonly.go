@@ -58,3 +58,7 @@ func (c *CPUOnly) Inventory(context.Context) ([]NodeInventory, error) {
 }
 
 func (c *CPUOnly) Healthy(context.Context) bool { return true }
+
+func (c *CPUOnly) ResolveInstanceAddress(context.Context, string, int32) (string, error) {
+	return "", ErrClusterUnavailable
+}

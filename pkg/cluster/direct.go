@@ -23,10 +23,23 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/networking"
 )
 
-// Namespace holding customer workloads. Single namespace today; tenancy
-// is enforced by label selectors and the account_id predicate in the
-// database, not by namespace boundaries.
-const workloadNamespace = "default"
+// WorkloadNamespace is the namespace holding customer workloads. Single
+// namespace today; tenancy is enforced by label selectors and the
+// account_id predicate in the database, not by namespace boundaries.
+//
+// Exported because it is not just an internal detail: it is the ONE
+// correct value for any Service that needs to select these pods
+// (pkg/networking). A namespace passed in independently (previously
+// TEEPIN_NAMESPACE, defaulting to "teepin" while pods ran in "default")
+// has no way to be right except by accident — a Service in the wrong
+// namespace matches nothing and every customer request 503s (Stage 3
+// defect 3). Making this a shared constant instead of two configured
+// values removes the class of bug rather than fixing one instance of it.
+const WorkloadNamespace = "default"
+
+// workloadNamespace is a package-local alias so every existing call site
+// in this file did not need touching when the constant was exported.
+const workloadNamespace = WorkloadNamespace
 
 // Label and annotation keys. Duplicated from pkg/api rather than
 // imported: pkg/api depends on this package, and the reverse would be a
@@ -52,6 +65,32 @@ const (
 	annotationInstanceType = "teepin.io/instance-type"
 )
 
+// EndpointProvisioner gives an instance a public address. The only
+// implementation today is *networking.Service (local Ingress via
+// cert-manager, the datacenter path); Stage 3's home-node tunnel adds a
+// second one at the control-plane edge, which is the reason this is an
+// interface rather than DirectClient holding *networking.Service directly
+// as it did before.
+//
+// Deliberately defined here rather than in client.go: client.go's own
+// Client interface is k8s-import-clean by design ("nothing above this
+// interface may import k8s.io/client-go"), and networking.EndpointInfo
+// transitively pulls in client-go through pkg/networking. direct.go is
+// already the one file in this package allowed to depend on it.
+type EndpointProvisioner interface {
+	ProvisionEndpoint(ctx context.Context, instanceID uuid.UUID, instanceName string, port int32, opts networking.EndpointOptions) (*networking.EndpointInfo, error)
+	RevokeEndpoint(ctx context.Context, instanceID uuid.UUID) error
+	// GetEndpointInfo reads back an instance's live endpoint state — used
+	// by the status sweep (statusWithEndpoint) to catch the TLS-ready
+	// transition, which ProvisionEndpoint cannot report at create time
+	// (cert-manager issues asynchronously). See Stage 3 plan A6.
+	GetEndpointInfo(ctx context.Context, instanceID uuid.UUID, instanceName string, opts networking.EndpointOptions) (*networking.EndpointInfo, error)
+}
+
+// Compile-time check that the concrete networking.Service satisfies the
+// interface DirectClient now depends on.
+var _ EndpointProvisioner = (*networking.Service)(nil)
+
 // DirectClient talks to Kubernetes with client-go, for when the control
 // plane runs beside the GPUs.
 //
@@ -62,7 +101,7 @@ const (
 // is checked against.
 type DirectClient struct {
 	k8s        kubernetes.Interface
-	networking *networking.Service
+	networking EndpointProvisioner
 	inventory  *gpu.Inventory
 
 	// RuntimeClass for GPU pods. Empty disables it, for clusters where
@@ -77,13 +116,42 @@ var _ Client = (*DirectClient)(nil)
 // NewDirectClient builds a cluster client backed by client-go.
 // networkingService may be nil, in which case instances get no public
 // endpoint.
-func NewDirectClient(k8s kubernetes.Interface, networkingService *networking.Service, inventory *gpu.Inventory, gpuRuntimeClass string) *DirectClient {
+//
+// Pass a concrete *networking.Service (or nil) here, never a variable of
+// interface type holding a nil *networking.Service — an interface value
+// wrapping a typed nil is non-nil under `== nil`, which is exactly the
+// footgun already documented for PricingProvider in cmd/api-server/main.go.
+// A literal `nil` (as cmd/teepin-agent/main.go's home-node path passes)
+// remains safe; only an already-boxed nil is the hazard.
+func NewDirectClient(k8s kubernetes.Interface, networkingService EndpointProvisioner, inventory *gpu.Inventory, gpuRuntimeClass string) *DirectClient {
 	return &DirectClient{
 		k8s:             k8s,
 		networking:      networkingService,
 		inventory:       inventory,
 		gpuRuntimeClass: gpuRuntimeClass,
 	}
+}
+
+// endpointOptionsFor derives the networking override from a placement
+// decision. spec.EnableTLS is a plain bool (not a pointer), so there is no
+// wire-level way to distinguish "the caller wants TLS off" from "the
+// caller said nothing" — only the true case is treated as an override;
+// false always falls through to the agent's own configured default. This
+// keeps a spec with EndpointDomain/EnableTLS/TLSIssuer left at their zero
+// values byte-for-byte equivalent to calling ProvisionEndpoint with no
+// options at all, which is what every datacenter request did before these
+// fields were wired (Stage 3 plan A9) — nothing regresses for a caller
+// that never sets them.
+func endpointOptionsFor(spec InstanceSpec) networking.EndpointOptions {
+	opts := networking.EndpointOptions{
+		Domain:    spec.EndpointDomain,
+		TLSIssuer: spec.TLSIssuer,
+	}
+	if spec.EnableTLS {
+		t := true
+		opts.UseTLS = &t
+	}
+	return opts
 }
 
 // CreateInstance builds the pod and, when ports are requested, its
@@ -124,7 +192,8 @@ func (c *DirectClient) CreateInstance(ctx context.Context, spec InstanceSpec) (*
 		}
 		if parseErr == nil {
 			endpoint, epErr := c.networking.ProvisionEndpoint(
-				ctx, instanceUUID, spec.InstanceID, int32(spec.Ports[0].Container))
+				ctx, instanceUUID, spec.InstanceID, int32(spec.Ports[0].Container),
+				endpointOptionsFor(spec))
 			if epErr == nil && endpoint != nil {
 				// Prefer HTTPS, but report the HTTP URL while cert-manager
 				// is still issuing — an endpoint the customer can reach now
@@ -134,11 +203,52 @@ func (c *DirectClient) CreateInstance(ctx context.Context, spec InstanceSpec) (*
 					result.EndpointURL = endpoint.HTTPURL
 				}
 				result.PublicIP = endpoint.PublicIP
+				// Carried on the result (not just used locally) so a caller
+				// with no Kubernetes access of its own — the control plane,
+				// in production — can persist and serve the full picture
+				// without ever calling networking.Service itself. See
+				// Stage 3 plan defects 1/2.
+				result.DNSName = endpoint.DNSName
+				result.TLSEnabled = endpoint.TLSEnabled
+				result.TLSReady = endpoint.TLSReady
 			}
 		}
 	}
 
 	return result, nil
+}
+
+// ResolveInstanceAddress returns instanceID's pod IP, for the Stage 3
+// tunnel's agent-side proxy handler. Deliberately the pod IP, not a
+// Service ClusterIP — a home node has no Service at all (networking is nil
+// there; see homeClusterClient in cmd/teepin-agent), and the datacenter
+// path's Service exists only for the public Ingress path, which is a
+// different concern from "where does this agent send a proxied request
+// locally". One lookup mechanism covers both node classes.
+//
+// AllTenants scope: the agent proxies whatever instance ID the control
+// plane told it to (already resolved and authorized upstream, at the
+// hostname->provider lookup in pkg/cluster's ProxyHandler) — the agent has
+// no tenancy of its own to check.
+func (c *DirectClient) ResolveInstanceAddress(ctx context.Context, instanceID string, port int32) (string, error) {
+	pods, err := c.k8s.CoreV1().Pods(workloadNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: instanceSelector(AllTenants(), instanceID),
+	})
+	if err != nil {
+		return "", fmt.Errorf("list pods: %w", err)
+	}
+	if len(pods.Items) == 0 {
+		return "", ErrNotFound
+	}
+	ip := pods.Items[0].Status.PodIP
+	if ip == "" {
+		// Pod exists but has no IP yet (still scheduling/starting) —
+		// distinct from "does not exist", but the caller only has one
+		// error to work with; ErrNotFound is the closer of the two (both
+		// mean "cannot proxy to it right now").
+		return "", ErrNotFound
+	}
+	return fmt.Sprintf("%s:%d", ip, port), nil
 }
 
 // instanceSelector builds the label selector for one instance within a
@@ -210,7 +320,7 @@ func (c *DirectClient) GetInstanceStatus(ctx context.Context, scope Scope, insta
 		return nil, ErrNotFound
 	}
 
-	status := podStatus(&pods.Items[0])
+	status := c.statusWithEndpoint(ctx, &pods.Items[0])
 	return &status, nil
 }
 
@@ -228,9 +338,57 @@ func (c *DirectClient) ListInstanceStatuses(ctx context.Context, scope Scope) ([
 
 	statuses := make([]InstanceStatus, 0, len(pods.Items))
 	for i := range pods.Items {
-		statuses = append(statuses, podStatus(&pods.Items[i]))
+		statuses = append(statuses, c.statusWithEndpoint(ctx, &pods.Items[i]))
 	}
 	return statuses, nil
+}
+
+// statusWithEndpoint reports podStatus plus, when the pod has a
+// provisioned endpoint, its current DNS/TLS state — this is what lets a
+// TLS-ready flip (cert-manager finishing issuance 30-90s after create)
+// reach the control plane on the next sweep instead of never at all
+// (Stage 3 plan A6). Best-effort: a pod with no UUID label (never had an
+// endpoint) or a lookup failure just reports the bare pod status, same as
+// before this method existed.
+func (c *DirectClient) statusWithEndpoint(ctx context.Context, pod *corev1.Pod) InstanceStatus {
+	status := podStatus(pod)
+	if c.networking == nil {
+		return status
+	}
+	raw, ok := pod.Labels[labelInstanceUUID]
+	if !ok {
+		return status
+	}
+	instanceUUID, err := uuid.Parse(raw)
+	if err != nil {
+		return status
+	}
+	// EndpointOptions{} here (not the create-time spec's options) is safe
+	// ONLY because every instance created through this agent's DirectClient
+	// shares one server-wide domain/TLS config today (server.go's
+	// endpointDomain/enableTLS/tlsIssuer, set once via WithEndpointConfig) —
+	// there is no per-instance divergence yet, so the sweep's resolved
+	// defaults always match what create-time actually used. If a future
+	// change makes EndpointDomain/EnableTLS genuinely vary per instance
+	// (this DirectClient never runs Phase B's home path, which synthesizes
+	// endpoints elsewhere — see AgentClient.CreateInstance for home nodes —
+	// but a future per-project domain override would reach here too), this
+	// call must instead resolve the SAME options create-time used, which
+	// means persisting them (e.g. as pod annotations) rather than
+	// recomputing from current agent config.
+	endpoint, err := c.networking.GetEndpointInfo(ctx, instanceUUID, status.InstanceID, networking.EndpointOptions{})
+	if err != nil || endpoint == nil {
+		return status
+	}
+	status.EndpointURL = endpoint.HTTPSURL
+	if !endpoint.TLSReady || status.EndpointURL == "" {
+		status.EndpointURL = endpoint.HTTPURL
+	}
+	status.DNSName = endpoint.DNSName
+	status.PublicIP = endpoint.PublicIP
+	status.TLSEnabled = endpoint.TLSEnabled
+	status.TLSReady = endpoint.TLSReady
+	return status
 }
 
 // StreamLogs copies container logs to w.

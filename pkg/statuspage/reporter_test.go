@@ -34,6 +34,9 @@ func (stubCluster) StreamLogs(context.Context, cluster.Scope, string, cluster.Lo
 	return nil
 }
 func (stubCluster) Healthy(context.Context) bool { return true }
+func (stubCluster) ResolveInstanceAddress(context.Context, string, int32) (string, error) {
+	return "", nil
+}
 
 func reporterWith(nodes []cluster.NodeInventory, err error) *Reporter {
 	return New(Config{APIKey: "k", PageID: "p", MetricID: "m"},

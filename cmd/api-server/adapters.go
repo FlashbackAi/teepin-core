@@ -200,6 +200,57 @@ func (a *nodePlacerAdapter) IsInsufficientCapacity(err error) bool {
 	return errors.Is(err, nodes.ErrInsufficientCapacity)
 }
 
+// instanceProxyTarget makes *compute.Store (+ a *cluster.Registry for the
+// single-session fallback below) satisfy cluster.ProxyTarget — the Stage 3
+// tunnel's hostname-to-session lookup (plan B2). Lives here, not in
+// pkg/cluster, for the same reason every other adapter does: it needs
+// pkg/compute's concrete store, and pkg/cluster must not import it.
+type instanceProxyTarget struct {
+	store    *compute.Store
+	registry *cluster.Registry
+}
+
+func newInstanceProxyTarget(store *compute.Store, registry *cluster.Registry) *instanceProxyTarget {
+	return &instanceProxyTarget{store: store, registry: registry}
+}
+
+// ResolveProvider looks up instanceID's owning provider and container port.
+//
+// Home-class instances always carry a ProviderID (Stage 2's dispatch fix —
+// see AgentClient.CreateInstance — requires it to route the create itself,
+// so it is never empty here). Datacenter instances predate per-instance
+// ProviderID entirely: the single-agent datacenter path dispatches via
+// registry.Any() and never had a reason to record which provider it landed
+// on. Rather than leave datacenter instances unreachable through the
+// unified edge (Stage 3 plan B1) until every instance record is backfilled,
+// an empty ProviderID falls back to the registry's own session — correct
+// as long as there is at most one non-home agent connected, exactly the
+// assumption registry.Any() already makes everywhere else in this
+// datacenter-single-agent pilot.
+func (t *instanceProxyTarget) ResolveProvider(ctx context.Context, instanceID string) (string, int32, bool) {
+	rec, err := t.store.Get(ctx, instanceID)
+	if err != nil || rec == nil || rec.TerminatedAt != nil {
+		return "", 0, false
+	}
+
+	port := int32(rec.ContainerPort)
+
+	if rec.ProviderID != "" {
+		return rec.ProviderID, port, true
+	}
+
+	// No provider recorded (pre-Stage-3 datacenter instance) — fall back to
+	// the sole connected session, if there is exactly one to be unambiguous
+	// about.
+	if t.registry != nil && t.registry.Count() == 1 {
+		if session, ok := t.registry.Any(); ok {
+			return session.ProviderID, port, true
+		}
+	}
+
+	return "", 0, false
+}
+
 // resourceSuspender implements billing.ResourceSuspender: it tears down
 // an account's running instances at the cluster and marks each
 // terminated in the store. Lives here because it needs both the cluster

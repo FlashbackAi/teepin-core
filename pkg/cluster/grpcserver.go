@@ -201,14 +201,19 @@ func (s *AgentServer) handleMessage(session *AgentSession, msg *agentpb.AgentMes
 	case *agentpb.AgentMessage_InstanceStatus:
 		st := payload.InstanceStatus
 		s.client.RecordStatus(InstanceStatus{
-			InstanceID: st.InstanceId,
-			Status:     st.Status,
-			PodName:    st.PodName,
-			NodeName:   st.NodeName,
-			Message:    st.Message,
-			AccountID:  st.AccountId,
-			ProjectID:  st.ProjectId,
-			ObservedAt: st.ObservedAt.AsTime(),
+			InstanceID:  st.InstanceId,
+			Status:      st.Status,
+			PodName:     st.PodName,
+			NodeName:    st.NodeName,
+			Message:     st.Message,
+			AccountID:   st.AccountId,
+			ProjectID:   st.ProjectId,
+			ObservedAt:  st.ObservedAt.AsTime(),
+			EndpointURL: st.EndpointUrl,
+			DNSName:     st.DnsName,
+			PublicIP:    st.PublicIp,
+			TLSEnabled:  st.TlsEnabled,
+			TLSReady:    st.TlsReady,
 		})
 
 	case *agentpb.AgentMessage_Inventory:
@@ -227,6 +232,12 @@ func (s *AgentServer) handleMessage(session *AgentSession, msg *agentpb.AgentMes
 
 	case *agentpb.AgentMessage_Register:
 		// Re-registration on an established stream. Harmless, ignored.
+
+	case *agentpb.AgentMessage_ProxyResponse:
+		session.deliverProxyResponse(msg.RequestId, payload.ProxyResponse)
+
+	case *agentpb.AgentMessage_ProxyData:
+		session.deliverProxyData(msg.RequestId, payload.ProxyData)
 
 	default:
 		log.Printf("Agent sent unknown message type from provider=%s", session.ProviderID)

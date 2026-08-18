@@ -155,21 +155,55 @@ func (c *AgentClient) CreateInstance(ctx context.Context, spec InstanceSpec) (*I
 		return nil, errorFromResult(result)
 	}
 
+	endpointURL, dnsName, tlsEnabled, tlsReady := result.EndpointUrl, result.DnsName, result.TlsEnabled, result.TlsReady
+
+	// Home nodes never provision an Ingress of their own (see
+	// cmd/teepin-agent/main.go's homeClusterClient — networking is always
+	// nil there, on purpose: nothing can reach a home node directly from
+	// the internet regardless of what a local Ingress claimed). The only
+	// way in is the Stage 3 tunnel through this same agent session, so the
+	// control plane is the endpoint's provisioner for home instances,
+	// exactly as the Stage 3 plan's EndpointProvisioner seam anticipates —
+	// it synthesizes the URL here rather than expecting one from
+	// CommandResult, which for a home agent is always empty.
+	//
+	// TLS is reported ready immediately: the wildcard ACM cert on
+	// *.teepin.com (Stage 3 plan B7) is already issued and covers every
+	// instance hostname the moment DNS resolves — there is no per-instance
+	// cert-manager wait to track here, unlike the datacenter path.
+	if spec.NodeClass == "home" && len(spec.Ports) > 0 {
+		domain := spec.EndpointDomain
+		if domain != "" {
+			dnsName = spec.InstanceID + "." + domain
+			endpointURL = "https://" + dnsName
+			tlsEnabled = true
+			tlsReady = true
+		}
+	}
+
 	// Seed the cache so an immediate read-after-create does not report
 	// the instance missing while waiting for the first status push.
 	c.RecordStatus(InstanceStatus{
-		InstanceID: spec.InstanceID,
-		AccountID:  spec.AccountID,
-		ProjectID:  spec.ProjectID,
-		Status:     "pending",
-		PodName:    result.PodName,
-		ObservedAt: time.Now().UTC(),
+		InstanceID:  spec.InstanceID,
+		AccountID:   spec.AccountID,
+		ProjectID:   spec.ProjectID,
+		Status:      "pending",
+		PodName:     result.PodName,
+		ObservedAt:  time.Now().UTC(),
+		EndpointURL: endpointURL,
+		DNSName:     dnsName,
+		PublicIP:    result.PublicIp,
+		TLSEnabled:  tlsEnabled,
+		TLSReady:    tlsReady,
 	})
 
 	return &InstanceResult{
 		PodName:     result.PodName,
-		EndpointURL: result.EndpointUrl,
+		EndpointURL: endpointURL,
 		PublicIP:    result.PublicIp,
+		DNSName:     dnsName,
+		TLSEnabled:  tlsEnabled,
+		TLSReady:    tlsReady,
 	}, nil
 }
 
@@ -339,6 +373,17 @@ func (c *AgentClient) Inventory(context.Context) ([]NodeInventory, error) {
 
 func (c *AgentClient) Healthy(context.Context) bool {
 	return c.registry.Count() > 0
+}
+
+// ResolveInstanceAddress is not meaningful on AgentClient: the control
+// plane holds no Kubernetes credentials in agent mode and never resolves a
+// pod address itself — that is exactly what the Stage 3 tunnel
+// (pkg/cluster.ProxyHandler, dispatching over the same Registry this
+// client uses) exists to do instead, on the AGENT side of the connection
+// (see DirectClient.ResolveInstanceAddress). Implemented only to satisfy
+// the Client interface.
+func (c *AgentClient) ResolveInstanceAddress(context.Context, string, int32) (string, error) {
+	return "", fmt.Errorf("%w: address resolution happens agent-side, not on the control plane", ErrClusterUnavailable)
 }
 
 // visible reports whether an instance is in scope, failing closed when

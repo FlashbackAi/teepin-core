@@ -247,8 +247,13 @@ func main() {
 		log.Println("⚠️  Public endpoint provisioning DISABLED (TEEPIN_DISABLE_ENDPOINTS=true) — access instances via port-forward")
 	} else if k8sClient != nil {
 		networkingConfig := networking.Config{
-			Domain:    getEnv("TEEPIN_DOMAIN", "teepin.io"),
-			Namespace: getEnv("TEEPIN_NAMESPACE", "teepin"),
+			Domain: getEnv("TEEPIN_DOMAIN", "teepin.com"),
+			// Namespace is NOT independently configured — it must always
+			// match where DirectClient actually creates pods
+			// (cluster.WorkloadNamespace), or the Service this provisions
+			// selects nothing (Stage 3 defect 3: this used to default to
+			// "teepin" while pods ran in "default").
+			Namespace: cluster.WorkloadNamespace,
 			UseTLS:    getEnv("ENABLE_TLS", "true") == "true",
 			TLSIssuer: getEnv("TLS_ISSUER", "letsencrypt-prod"),
 		}
@@ -436,7 +441,28 @@ func main() {
 		pricingProvider = billingService
 		provisionGate = billingService
 	}
-	apiServer := api.NewServer(clusterClient, gpuAllocator, networkingService, instanceStore, pricingProvider, provisionGate)
+	apiServer := api.NewServer(clusterClient, gpuAllocator, instanceStore, pricingProvider, provisionGate).
+		// Stamped onto every instance's placement so the customer-visible
+		// hostname/TLS policy is a control-plane fact, read once here,
+		// rather than independently configured per agent (TEEPIN_DOMAIN
+		// previously existed on both this process and every agent process
+		// — two sources of truth for the same URL).
+		//
+		// ENABLE_TLS default here is deliberately "false", NOT the "true"
+		// the direct-mode networkingConfig above defaults to: this value
+		// OVERRIDES whatever the agent's own TLS config says (see
+		// cluster.endpointOptionsFor — true always overrides, false always
+		// defers to the agent). Defaulting it true here would force TLS on
+		// everywhere the instant this deployed, including before the
+		// wildcard DNS record exists and HTTP-01 can resolve (Stage 3 plan
+		// A7) — cert-manager would fail indefinitely and every endpoint
+		// would stay HTTP-only anyway, for a worse, harder-to-diagnose
+		// reason. Set ENABLE_TLS=true only after A7 verifies reachability.
+		WithEndpointConfig(
+			getEnv("TEEPIN_DOMAIN", "teepin.com"),
+			getEnv("ENABLE_TLS", "false") == "true",
+			getEnv("TLS_ISSUER", "letsencrypt-prod"),
+		)
 	// Enable home-class placement when home compute is on. Absent this, a
 	// node_class:"home" request is refused cleanly (the placer is nil).
 	if nodeService != nil {
@@ -463,8 +489,23 @@ func main() {
 		webhookHandler = api.NewWebhookHandler(newStripeWebhookAdapter(stripeClient), billingService)
 	}
 
+	// Stage 3 tunnel edge (plan B1+B2): proxies *.{instanceDomain} traffic
+	// to whichever agent session owns the target instance, over the same
+	// gRPC channel that session already holds open. Needs both the
+	// instance store (hostname -> provider/port, plan B2) and the agent
+	// registry (provider -> live session) — only buildable in "agent"
+	// cluster mode, where agentRegistry is non-nil. In "direct" mode there
+	// is no agent session to tunnel through at all; the in-cluster
+	// Ingress path (Phase A) is that deployment's only endpoint mechanism,
+	// unchanged.
+	var proxyHandler *cluster.ProxyHandler
+	if agentRegistry != nil && instanceStore != nil {
+		proxyHandler = cluster.NewProxyHandler(agentRegistry, newInstanceProxyTarget(instanceStore, agentRegistry))
+		log.Println("Stage 3 tunnel edge enabled (instance traffic proxied over agent sessions)")
+	}
+
 	// Setup router
-	router := setupRouter(apiServer, authHandler, accountHandler, authMiddleware, billingHandler, registryHandler, adminHandler, webhookHandler, nodeHandler, rateLimitMiddleware)
+	router := setupRouter(apiServer, authHandler, accountHandler, authMiddleware, billingHandler, registryHandler, adminHandler, webhookHandler, nodeHandler, rateLimitMiddleware, proxyHandler, getEnv("TEEPIN_DOMAIN", "teepin.com"))
 
 	// Create HTTP server
 	port := getEnv("PORT", "8080")
@@ -652,7 +693,7 @@ func initRateLimiting() *ratelimit.Config {
 	return config
 }
 
-func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHandler *api.AccountHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler, registryHandler *api.RegistryHandler, adminHandler *api.AdminHandler, webhookHandler *api.WebhookHandler, nodeHandler *api.NodeHandler, rateLimitMiddleware *ratelimit.Middleware) *gin.Engine {
+func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHandler *api.AccountHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler, registryHandler *api.RegistryHandler, adminHandler *api.AdminHandler, webhookHandler *api.WebhookHandler, nodeHandler *api.NodeHandler, rateLimitMiddleware *ratelimit.Middleware, proxyHandler *cluster.ProxyHandler, instanceDomain string) *gin.Engine {
 	// Set Gin to release mode in production
 	if os.Getenv("GIN_MODE") == "" {
 		gin.SetMode(gin.ReleaseMode)
@@ -673,6 +714,18 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 	router.Use(gin.Recovery())
 	router.Use(corsMiddleware())
 	router.Use(requestIDMiddleware())
+
+	// Stage 3 tunnel edge: *.{instanceDomain} traffic (excluding api./
+	// console., the control plane's own hostnames) is a customer's
+	// instance, not an API call — it bypasses auth and rate limiting
+	// entirely and is handed straight to the proxy. Mounted first, before
+	// anything that assumes an authenticated API request, exactly like the
+	// unauthenticated Stripe-webhook and node-enroll routes below (see plan
+	// B1: "bypasses the normal auth middleware — this is public customer
+	// traffic, not authenticated API traffic").
+	if proxyHandler != nil && instanceDomain != "" {
+		router.Use(tunnelMiddleware(proxyHandler, instanceDomain))
+	}
 
 	// Rate limiting middleware (applies to all routes)
 	// Note: Applied AFTER auth middleware so we can use user tier
@@ -931,5 +984,41 @@ func requestIDMiddleware() gin.HandlerFunc {
 		c.Set("request_id", requestID)
 		c.Writer.Header().Set("X-Request-ID", requestID)
 		c.Next()
+	}
+}
+
+// tunnelMiddleware routes customer instance traffic (Stage 3 plan B1).
+//
+// A request's Host decides everything: "inst-6fea56ce.teepin.com" is a
+// customer's instance and goes to the tunnel; "api.teepin.com",
+// "console.teepin.com", and every other host (including no dot at all —
+// health checks from inside the VPC, bare IPs) fall through to the normal
+// v1 routes unchanged. The reserved-label check must come before the
+// wildcard match: without it, a customer who names an instance "api" or
+// "console" (instance IDs are server-generated "inst-xxxxxxxx" today, but
+// nothing here should depend on that not changing) could shadow the
+// control plane's own endpoints.
+func tunnelMiddleware(handler *cluster.ProxyHandler, domain string) gin.HandlerFunc {
+	suffix := "." + domain
+	reserved := map[string]bool{"api": true, "console": true}
+
+	return func(c *gin.Context) {
+		host := c.Request.Host
+		if idx := strings.IndexByte(host, ':'); idx != -1 {
+			host = host[:idx]
+		}
+
+		if !strings.HasSuffix(host, suffix) {
+			c.Next()
+			return
+		}
+		label := strings.TrimSuffix(host, suffix)
+		if label == "" || strings.Contains(label, ".") || reserved[label] {
+			c.Next()
+			return
+		}
+
+		handler.ServeInstance(c.Writer, c.Request, label)
+		c.Abort()
 	}
 }

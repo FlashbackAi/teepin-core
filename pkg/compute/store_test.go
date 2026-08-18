@@ -29,7 +29,7 @@ func TestCreate_PersistsGPUInstance(t *testing.T) {
 	mock.ExpectQuery(`INSERT INTO compute\.instances`).
 		WithArgs("inst-abc12345", accountID, projectID, userID, "my-app", "nginx:latest",
 			"gpu.h100.2g.20gb", StatusPending, int64(20), 8, 32,
-			nil, "my-app-x1y2z", "default", nil, nil).
+			nil, "my-app-x1y2z", "default", nil, nil, nil, nil, false, false, nil).
 		WillReturnRows(sqlmock.NewRows([]string{"created_at", "updated_at"}).
 			AddRow(time.Now(), time.Now()))
 
@@ -67,7 +67,7 @@ func TestCreate_CPUInstanceStoresNullVRAM(t *testing.T) {
 	// gpu_vram_gb must be NULL (not 0) for CPU-only instances.
 	mock.ExpectQuery(`INSERT INTO compute\.instances`).
 		WithArgs("inst-cpu00001", accountID, projectID, userID, "web", "nginx:latest",
-			"", StatusPending, nil, 2, 4, nil, "web-abcde", "default", nil, nil).
+			"", StatusPending, nil, 2, 4, nil, "web-abcde", "default", nil, nil, nil, nil, false, false, nil).
 		WillReturnRows(sqlmock.NewRows([]string{"created_at", "updated_at"}).
 			AddRow(time.Now(), time.Now()))
 
@@ -125,12 +125,17 @@ func TestMarkTerminated_Idempotent(t *testing.T) {
 	}
 }
 
+// instanceRows builds a result set matching selectColumns' shape — used by
+// every test across this package that reads instances (also
+// reconciler_test.go). Keep the column list here in sync with
+// store.go:selectColumns.
 func instanceRows() *sqlmock.Rows {
 	return sqlmock.NewRows([]string{
 		"id", "account_id", "project_id", "user_id", "name", "image",
 		"instance_type_id", "status", "gpu_vram_gb",
 		"cpu_units", "memory_gb", "endpoint",
 		"k8s_pod_name", "k8s_namespace",
+		"provider_id", "dns_name", "public_ip", "tls_enabled", "tls_ready", "container_port",
 		"created_at", "updated_at", "started_at", "terminated_at",
 	})
 }
@@ -145,6 +150,7 @@ func TestListActive(t *testing.T) {
 			"gpu.h100.custom-25gb", StatusRunning, 25,
 			8, 32, "https://inst-abc12345.teepin.io",
 			"my-app-x1y2z", "default",
+			"", "", "", false, false, 0,
 			time.Now(), time.Now(), time.Now(), nil,
 		))
 

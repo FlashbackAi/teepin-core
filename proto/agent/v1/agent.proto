@@ -53,6 +53,8 @@ message ControlMessage {
     FetchLogsCommand      fetch_logs      = 4;
     ExecCommand           exec            = 5;
     Ping                  ping            = 6;
+    ProxyRequest          proxy_request   = 7;  // Stage 3: HTTP request for a customer endpoint
+    ProxyData             proxy_data      = 8;  // Stage 3: request body chunk(s), same request_id
   }
 }
 
@@ -131,12 +133,14 @@ message AgentMessage {
   string request_id = 1;  // echoes the command being answered; empty for unsolicited events
 
   oneof payload {
-    RegisterRequest register       = 2;
-    GPUInventory    inventory      = 3;
+    RegisterRequest register        = 2;
+    GPUInventory    inventory       = 3;
     InstanceStatus  instance_status = 4;
-    LogChunk        log_chunk      = 5;
-    CommandResult   result         = 6;
-    Pong            pong           = 7;
+    LogChunk        log_chunk       = 5;
+    CommandResult   result          = 6;
+    Pong            pong            = 7;
+    ProxyResponse   proxy_response  = 8;  // Stage 3: response headers, once per request_id
+    ProxyData       proxy_data      = 9;  // Stage 3: response body chunk(s), same request_id
   }
 }
 
@@ -207,12 +211,82 @@ message InstanceStatus {
   // cache would either leak across tenants or be useless.
   string account_id = 7;
   string project_id = 8;
+
+  // Endpoint state, re-reported on every sweep so a later transition (most
+  // notably cert-manager finishing certificate issuance, 30-90s after
+  // create) reaches the control plane without a separate mechanism. See
+  // Stage 3 plan A6 — reportStatuses' change-detection key must include
+  // these fields, or a tls_ready flip with no status change is silently
+  // dropped.
+  string endpoint_url = 9;
+  string dns_name     = 10;
+  string public_ip    = 11;
+  bool   tls_enabled  = 12;
+  bool   tls_ready    = 13;
 }
 
 message LogChunk {
   string instance_id = 1;
   bytes  data        = 2;
   bool   eof         = 3;  // final chunk for this request_id
+}
+
+// ---------------------------------------------------------------------
+// Stage 3: HTTP tunnel for public instance endpoints.
+//
+// Reuses this stream rather than a second connection — the same
+// per-node-credential auth, reconnect/backoff, and half-open-connection
+// detection the control channel already has, applied to customer HTTP
+// traffic instead of commands. request_id correlates a proxied request's
+// messages exactly as it already does for FetchLogsCommand/LogChunk.
+//
+// HTTP semantics only in this version (headers + body), not a raw byte
+// tunnel — the edge needs to enforce per-request timeouts/size limits and
+// return a real error page, which a raw TCP relay could not do. ProxyData's
+// `reset` field leaves room for a later WebSocket upgrade on the same
+// request_id without a wire-format change.
+// ---------------------------------------------------------------------
+
+message Header {
+  string name            = 1;
+  repeated string values = 2;
+}
+
+// ProxyRequest is sent control-plane -> agent to start proxying one HTTP
+// request to a running instance. The agent resolves instance_id to a
+// pod/Service address locally — the control plane never learns cluster
+// topology, matching the rest of this protocol's split of responsibility.
+message ProxyRequest {
+  string instance_id      = 1;
+  string method           = 2;
+  string path             = 3;  // path + query string
+  repeated Header headers = 4;
+  bool   has_body         = 5;  // if true, ProxyData chunks for the body follow
+  // The customer's container port to route to (from ports[0].container at
+  // create time — see compute.instances.container_port). Resolved by the
+  // control plane, not re-derived by the agent, so a home node with
+  // multiple instances proxies each to the right port without guessing.
+  int32  port              = 6;
+}
+
+// ProxyResponse is sent once per request_id, agent -> control plane,
+// before any response-body ProxyData. error is set (status_code left at 0)
+// when the agent could not reach the instance at all (pod gone, connection
+// refused) — the edge maps that to a customer-facing 502 with a clear
+// reason rather than serving a Kubernetes-shaped error.
+message ProxyResponse {
+  int32  status_code      = 1;
+  repeated Header headers = 2;
+  string error            = 3;
+}
+
+// ProxyData carries a chunk of a request or response body, in either
+// direction, keyed by request_id and the enclosing oneof (proxy_data on
+// ControlMessage = request body; on AgentMessage = response body).
+message ProxyData {
+  bytes data  = 1;
+  bool  eof   = 2;  // final chunk; no reset
+  bool  reset = 3;  // abort: a limit was hit, or the peer went away mid-stream
 }
 
 // CommandResult answers a command. Failure carries a machine-readable
@@ -227,6 +301,15 @@ message CommandResult {
   string pod_name = 4;
   string endpoint_url = 5;
   string public_ip = 6;
+  // dns_name / tls_enabled / tls_ready travel alongside endpoint_url so the
+  // control plane (which has no Kubernetes client in production — see
+  // Stage 3 plan) can persist and serve the full endpoint picture without
+  // ever calling back into the agent's networking layer itself. TLS is
+  // typically still issuing at create time (cert-manager takes 30-90s); the
+  // tls_ready flip arrives later via InstanceStatus, not here.
+  string dns_name    = 7;
+  bool   tls_enabled = 8;
+  bool   tls_ready   = 9;
 }
 
 enum ErrorCode {

@@ -108,6 +108,16 @@ type InstanceResult struct {
 	PodName     string
 	EndpointURL string
 	PublicIP    string
+	// DNSName / TLSEnabled / TLSReady travel alongside EndpointURL so a
+	// caller with no Kubernetes access of its own (the control plane, in
+	// production — see Stage 3 plan defects 1/2) can persist and serve the
+	// full endpoint picture from this result alone, never by calling back
+	// into networking.Service itself. TLSReady is typically false here even
+	// when TLSEnabled is true — cert-manager issues asynchronously; the
+	// later flip arrives via InstanceStatus, not this result.
+	DNSName    string
+	TLSEnabled bool
+	TLSReady   bool
 }
 
 // InstanceStatus is the cluster's view of an instance. The reconciler
@@ -128,6 +138,18 @@ type InstanceStatus struct {
 	// whose instance it was looking at.
 	AccountID string
 	ProjectID string
+
+	// Endpoint state, re-reported on every sweep so a later transition —
+	// most notably cert-manager finishing certificate issuance, 30-90s
+	// after create — reaches the control plane without a separate
+	// mechanism. See Stage 3 plan A6. Empty/false when the instance has no
+	// endpoint (no ports requested) or the caller has no networking
+	// provisioner configured.
+	EndpointURL string
+	DNSName     string
+	PublicIP    string
+	TLSEnabled  bool
+	TLSReady    bool
 }
 
 // NodeInventory is a point-in-time report of one node's GPU capacity.
@@ -245,4 +267,14 @@ type Client interface {
 	// False means new instances are refused while account, billing and
 	// usage endpoints continue to serve — the point of the split.
 	Healthy(ctx context.Context) bool
+
+	// ResolveInstanceAddress returns the in-cluster address (host:port) a
+	// proxied HTTP request should be sent to for instanceID — Stage 3's
+	// tunnel, agent side. This is deliberately narrower than exposing a
+	// Kubernetes client: the agent decides how to reach its own instance
+	// (pod IP today; nothing stops a future implementation resolving to a
+	// Service ClusterIP instead), and the caller (agentrunner) never learns
+	// cluster topology beyond one address string. ErrNotFound when the
+	// instance is not running here.
+	ResolveInstanceAddress(ctx context.Context, instanceID string, port int32) (string, error)
 }
