@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/time/rate"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	agentpb "github.com/FlashbackAi/teepin-core/pkg/agentpb"
@@ -108,6 +109,14 @@ type Runner struct {
 	// goroutine actually waiting for it.
 	proxyBodies   map[string]chan *agentpb.ProxyData
 	proxyBodiesMu sync.Mutex
+
+	// execInputs routes ControlMessage_ExecInput (stdin bytes, resize,
+	// cancel) to the handleExecStart goroutine handling the same
+	// request_id — same reason proxyBodies exists: ExecStart and its
+	// follow-up ExecInput messages arrive as separate, independently
+	// dispatched ControlMessages.
+	execInputs   map[string]chan *agentpb.ExecInput
+	execInputsMu sync.Mutex
 }
 
 func New(cfg Config) *Runner {
@@ -116,6 +125,7 @@ func New(cfg Config) *Runner {
 		lastReported: make(map[string]string),
 		fail:         make(chan error, 1),
 		proxyBodies:  make(map[string]chan *agentpb.ProxyData),
+		execInputs:   make(map[string]chan *agentpb.ExecInput),
 	}
 }
 
@@ -254,6 +264,12 @@ func (r *Runner) handleCommand(ctx context.Context, s stream, msg *agentpb.Contr
 
 	case *agentpb.ControlMessage_ProxyData:
 		r.deliverProxyBody(msg.RequestId, payload.ProxyData)
+
+	case *agentpb.ControlMessage_ExecStart:
+		r.handleExecStart(ctx, s, msg.RequestId, payload.ExecStart)
+
+	case *agentpb.ControlMessage_ExecInput:
+		r.deliverExecInput(msg.RequestId, payload.ExecInput)
 
 	default:
 		r.replyError(s, msg.RequestId, agentpb.ErrorCode_ERROR_CODE_INVALID_ARGUMENT,
@@ -610,6 +626,271 @@ func (b *proxyBodyReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+// ---------------------------------------------------------------------
+// Interactive exec — "connect to instance terminal" from the console or
+// the teepin CLI. Same request_id-correlation discipline as the Stage 3
+// tunnel above, reusing cluster.ExecCapable's type assertion (see
+// pkg/cluster/exec.go) so CPUOnly/Unavailable need no stub methods.
+// ---------------------------------------------------------------------
+
+// execAgentMaxDuration bounds one exec session on the agent side.
+// Deliberately LONGER than the control plane's own session cap (60m,
+// pkg/cluster's ExecHandler) — the agent holds the real resource (a
+// live shell in a customer's pod), so a vanished or misbehaving control
+// plane must not leave it running forever, but the CONTROL PLANE should
+// be the one to produce the clean "session ended" message under normal
+// operation, not have the agent cut it off first.
+const execAgentMaxDuration = 65 * time.Minute
+
+// deliverExecInput routes one ExecInput (stdin bytes, resize, stdin-close,
+// or cancel) to the handleExecStart goroutine handling the same
+// request_id. See Runner.execInputs for why this indirection exists.
+func (r *Runner) deliverExecInput(requestID string, input *agentpb.ExecInput) {
+	r.execInputsMu.Lock()
+	ch, ok := r.execInputs[requestID]
+	r.execInputsMu.Unlock()
+
+	if !ok {
+		return
+	}
+	select {
+	case ch <- input:
+	case <-time.After(5 * time.Second):
+		// Mirrors deliverProxyBody's guard: a session whose handler has
+		// already given up must not block the shared stream reader.
+	}
+}
+
+// handleExecStart opens one interactive exec session: resolve the
+// cluster client's exec capability, attach to the target pod/container,
+// and pump stdin in / stdout out over the gRPC stream until the session
+// ends.
+func (r *Runner) handleExecStart(ctx context.Context, s stream, requestID string, req *agentpb.ExecStart) {
+	// Register the input channel as the LITERAL FIRST statement, before
+	// any resolution work below — a customer can type before ExecAttach
+	// has even resolved the pod, and without this, handleProxyRequest's
+	// same late-registration shape (a real, known gap there, papered
+	// over only by a test-only poll helper) would silently drop those
+	// keystrokes here instead of just delaying an HTTP body chunk.
+	inputCh := make(chan *agentpb.ExecInput, 64)
+	r.execInputsMu.Lock()
+	r.execInputs[requestID] = inputCh
+	r.execInputsMu.Unlock()
+	defer func() {
+		r.execInputsMu.Lock()
+		delete(r.execInputs, requestID)
+		r.execInputsMu.Unlock()
+	}()
+
+	ctx, cancel := context.WithTimeout(ctx, execAgentMaxDuration)
+	defer cancel()
+
+	execer, ok := r.cfg.Cluster.(cluster.ExecCapable)
+	if !ok {
+		_ = r.sendExec(s, &agentpb.AgentMessage{
+			RequestId: requestID,
+			Payload: &agentpb.AgentMessage_ExecEnd{ExecEnd: &agentpb.ExecEnd{
+				ErrorCode:    agentpb.ErrorCode_ERROR_CODE_EXEC_UNSUPPORTED,
+				ErrorMessage: "this node cannot run interactive sessions",
+			}},
+		})
+		return
+	}
+
+	stdinReader, stdinWriter := io.Pipe()
+	resizeCh := make(chan cluster.TerminalSize, 1)
+
+	// Demux goroutine: handleCommand dispatches ExecStart and every
+	// follow-up ExecInput as independent messages (same reason
+	// proxyBodies exists for the HTTP tunnel), so routing them onto the
+	// single ExecIO the executor expects needs its own goroutine here.
+	go func() {
+		defer stdinWriter.Close()
+		for {
+			select {
+			case in, open := <-inputCh:
+				if !open {
+					return
+				}
+				if len(in.Stdin) > 0 {
+					if _, err := stdinWriter.Write(in.Stdin); err != nil {
+						return
+					}
+				}
+				if in.StdinClose {
+					return
+				}
+				if in.Rows > 0 && in.Cols > 0 {
+					sz := cluster.TerminalSize{Rows: uint16(in.Rows), Cols: uint16(in.Cols)}
+					select {
+					case resizeCh <- sz:
+					default:
+						// Non-blocking replace: last-write-wins, matching
+						// terminalSizeQueue's own semantics on the other
+						// side of this channel.
+						select {
+						case <-resizeCh:
+						default:
+						}
+						select {
+						case resizeCh <- sz:
+						default:
+						}
+					}
+				}
+				if in.Cancel {
+					cancel()
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	out := newExecOutputSender(ctx, r, s, requestID, agentpb.Stream_STREAM_STDOUT)
+	defer out.flush()
+
+	outcome, err := execer.ExecAttach(ctx, cluster.ExecRequest{
+		InstanceID: req.InstanceId,
+		Container:  req.Container,
+		Command:    req.Command,
+		TTY:        req.Tty,
+		Rows:       uint16(req.Rows),
+		Cols:       uint16(req.Cols),
+	}, cluster.ExecIO{
+		Stdin:  stdinReader,
+		Stdout: out,
+		Stderr: nil, // v1 is TTY-only; the API server rejects stderr alongside tty anyway
+		Resize: resizeCh,
+		OnOpen: func(podName, container string) {
+			_ = r.sendExec(s, &agentpb.AgentMessage{
+				RequestId: requestID,
+				Payload: &agentpb.AgentMessage_ExecOpen{ExecOpen: &agentpb.ExecOpen{
+					PodName:   podName,
+					Container: container,
+				}},
+			})
+		},
+	})
+
+	out.flush()
+
+	if err != nil {
+		code := agentpb.ErrorCode_ERROR_CODE_CLUSTER_ERROR
+		switch {
+		case errors.Is(err, cluster.ErrExecUnsupported):
+			code = agentpb.ErrorCode_ERROR_CODE_EXEC_UNSUPPORTED
+		case errors.Is(err, cluster.ErrNotFound):
+			code = agentpb.ErrorCode_ERROR_CODE_NOT_FOUND
+		}
+		_ = r.sendExec(s, &agentpb.AgentMessage{
+			RequestId: requestID,
+			Payload: &agentpb.AgentMessage_ExecEnd{ExecEnd: &agentpb.ExecEnd{
+				ErrorCode:    code,
+				ErrorMessage: err.Error(),
+			}},
+		})
+		return
+	}
+
+	_ = r.sendExec(s, &agentpb.AgentMessage{
+		RequestId: requestID,
+		Payload: &agentpb.AgentMessage_ExecEnd{ExecEnd: &agentpb.ExecEnd{
+			ExitCode: int32(outcome.ExitCode),
+		}},
+	})
+}
+
+// Exec output tuning. Coalescing cuts message count 10-100x for chatty
+// output (a build log, `cat` on a large file) at latency no human
+// notices — SSH implementations do the same. The rate limit is the real
+// protection for a residential uplink: WaitN blocks INSIDE Write, which
+// blocks client-go's own SPDY read loop, which fills the pty buffer,
+// which blocks the customer's process on write() — genuine end-to-end
+// backpressure. There is deliberately no buffer here beyond the bounded
+// coalescing window: turning that into a bytes.Buffer "to smooth things
+// out" would convert real backpressure into unbounded memory growth,
+// which is the single most damaging change anyone could make to this
+// path (see the Stage 3 plan's head-of-line-blocking note — every write
+// from an agent, including heartbeats, shares one sendMu).
+const (
+	execCoalesceWindow       = 10 * time.Millisecond
+	execCoalesceMax          = 32 * 1024
+	execOutputRateBytesPerSec = 2 * 1024 * 1024
+	execOutputRateBurst       = 64 * 1024
+)
+
+// execOutputSender is the io.Writer handed to ExecIO.Stdout/Stderr. One
+// per session, one per stream (stdout is a separate instance from
+// stderr when both are in use).
+type execOutputSender struct {
+	ctx       context.Context
+	r         *Runner
+	s         stream
+	requestID string
+	kind      agentpb.Stream
+	limiter   *rate.Limiter
+
+	mu    sync.Mutex
+	buf   []byte
+	timer *time.Timer
+}
+
+func newExecOutputSender(ctx context.Context, r *Runner, s stream, requestID string, kind agentpb.Stream) *execOutputSender {
+	return &execOutputSender{
+		ctx:       ctx,
+		r:         r,
+		s:         s,
+		requestID: requestID,
+		kind:      kind,
+		limiter:   rate.NewLimiter(rate.Limit(execOutputRateBytesPerSec), execOutputRateBurst),
+	}
+}
+
+func (o *execOutputSender) Write(p []byte) (int, error) {
+	if err := o.limiter.WaitN(o.ctx, len(p)); err != nil {
+		return 0, err
+	}
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.buf = append(o.buf, p...)
+	if o.timer == nil {
+		o.timer = time.AfterFunc(execCoalesceWindow, o.flush)
+	}
+	if len(o.buf) >= execCoalesceMax {
+		o.flushLocked()
+	}
+	return len(p), nil
+}
+
+func (o *execOutputSender) flush() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.flushLocked()
+}
+
+// flushLocked must be called with mu held.
+func (o *execOutputSender) flushLocked() {
+	if o.timer != nil {
+		o.timer.Stop()
+		o.timer = nil
+	}
+	if len(o.buf) == 0 {
+		return
+	}
+	data := o.buf
+	o.buf = nil
+	_ = o.r.sendExec(o.s, &agentpb.AgentMessage{
+		RequestId: o.requestID,
+		Payload: &agentpb.AgentMessage_ExecOutput{ExecOutput: &agentpb.ExecOutput{
+			Data:   data,
+			Stream: o.kind,
+		}},
+	})
+}
+
 func headersFromHTTP(h http.Header) []*agentpb.Header {
 	out := make([]*agentpb.Header, 0, len(h))
 	for name, values := range h {
@@ -839,24 +1120,30 @@ func (r *Runner) send(s stream, msg *agentpb.AgentMessage) error {
 // see sendProxy for why a longer timeout would be the wrong fix here.
 const proxySendTimeout = 20 * time.Second
 
-// sendProxy writes a Stage 3 tunnel message (response headers or a body
-// chunk) to the control plane.
-//
-// This is deliberately NOT send: it shares send's mutex (sendMu) — gRPC
-// streams are not safe for concurrent SendMsg regardless of which logical
-// purpose is writing, so serialization is still required — but on a
-// timeout it does NOT call reportFailure. A customer's slow HTTP
-// connection is not evidence the control-plane connection is dead; send's
+// execSendTimeout bounds one write of exec output or an ExecOpen/ExecEnd
+// message. Tighter than proxySendTimeout: an exec session is long-lived
+// (minutes to hours, not one 60s request), so every write from an agent —
+// heartbeats, inventory, HTTP proxy chunks, now exec output — serializes
+// behind the same sendMu for that much longer. A write that cannot finish
+// in 5 seconds means the shared connection is congested; killing one
+// shell beats stalling every heartbeat and status report for 20 seconds.
+const execSendTimeout = 5 * time.Second
+
+// sendWithTimeout is the shared body of sendProxy and sendExec: a write
+// that shares sendMu (gRPC forbids concurrent SendMsg regardless of which
+// logical purpose is writing) but, unlike send, does NOT call
+// reportFailure on timeout. A customer's slow HTTP connection or shell
+// session is not evidence the control-plane connection is dead; send's
 // reportFailure path exists for exactly the opposite case (the CONTROL
 // channel itself hanging, e.g. a drained Fargate task behind the ALB with
-// no FIN). Routing proxy writes through send would let one slow customer
-// request tear down the entire agent connection — killing status
-// reporting, inventory, and every other in-flight request for this
-// provider — which is the single biggest risk flagged in the Stage 3 plan
-// (B5). A stuck proxy send instead just fails that one send call; the
-// caller (relayProxyResponse) treats it as "this request's stream is
-// gone" and aborts only that request.
-func (r *Runner) sendProxy(s stream, msg *agentpb.AgentMessage) error {
+// no FIN). Routing these writes through send would let one slow customer
+// request or session tear down the entire agent connection — killing
+// status reporting, inventory, and every other in-flight request for
+// this provider — which is the single biggest risk flagged in the
+// Stage 3 plan (B5). A stuck send here instead just fails that one call;
+// the caller treats it as "this request's stream is gone" and aborts
+// only that request.
+func (r *Runner) sendWithTimeout(s stream, msg *agentpb.AgentMessage, timeout time.Duration) error {
 	r.sendMu.Lock()
 	defer r.sendMu.Unlock()
 
@@ -866,12 +1153,20 @@ func (r *Runner) sendProxy(s stream, msg *agentpb.AgentMessage) error {
 	select {
 	case err := <-done:
 		return err
-	case <-time.After(proxySendTimeout):
+	case <-time.After(timeout):
 		// Leaked goroutine is bounded the same way send's is: it exits
 		// once the underlying Send eventually returns or the stream is
 		// torn down elsewhere.
-		return fmt.Errorf("proxy send timed out after %s", proxySendTimeout)
+		return fmt.Errorf("stream send timed out after %s", timeout)
 	}
+}
+
+func (r *Runner) sendProxy(s stream, msg *agentpb.AgentMessage) error {
+	return r.sendWithTimeout(s, msg, proxySendTimeout)
+}
+
+func (r *Runner) sendExec(s stream, msg *agentpb.AgentMessage) error {
+	return r.sendWithTimeout(s, msg, execSendTimeout)
 }
 
 // reportFailure records the first error that indicates a dead

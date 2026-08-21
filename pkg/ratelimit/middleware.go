@@ -35,6 +35,31 @@ func (m *Middleware) Handler() gin.HandlerFunc {
 			return
 		}
 
+		// Skip if an earlier handler opted this request out via
+		// c.Set("skip_rate_limit", true) — SkipRateLimitForPaths already
+		// did this for a set of EXACT paths, but nothing here ever read
+		// the flag it set: dead code masquerading as a working opt-out.
+		// Fixed as part of wiring interactive exec's WS attach route,
+		// which needs exactly this — it is unauthenticated (getKey falls
+		// back to per-IP) and its own single-use ticket is already the
+		// real gate, so a tier-wide limit only hurts customers sharing
+		// one NAT'd IP.
+		if skip, exists := c.Get("skip_rate_limit"); exists {
+			if v, ok := skip.(bool); ok && v {
+				c.Next()
+				return
+			}
+		}
+		// c.FullPath() is the matched ROUTE TEMPLATE (e.g.
+		// "/v1/compute/instances/:id/exec/attach"), available here
+		// because gin resolves routing before running Use() middleware —
+		// a template match, not a raw-path guess, so a differently-named
+		// route ending similarly can never collide with it.
+		if c.FullPath() == "/v1/compute/instances/:id/exec/attach" {
+			c.Next()
+			return
+		}
+
 		// Get rate limit key (user ID or IP address)
 		key := m.getKey(c)
 

@@ -504,8 +504,35 @@ func main() {
 		log.Println("Stage 3 tunnel edge enabled (instance traffic proxied over agent sessions)")
 	}
 
+	// Interactive exec ("connect to instance terminal"): the REST half
+	// (ticket issuance, apiServer.CreateExecSession) is wired onto
+	// apiServer below; this is the WebSocket-attach half, same
+	// availability condition as the HTTP tunnel above — both need a live
+	// agent registry and a way to resolve instance -> provider.
+	var execHandler *cluster.ExecHandler
+	if agentRegistry != nil && instanceStore != nil {
+		execTickets := cluster.NewTicketStore()
+		go execTickets.Reap(context.Background())
+
+		checkOrigin := func(r *http.Request) bool {
+			origin := r.Header.Get("Origin")
+			if origin == "" {
+				return true // non-browser client (e.g. the teepin CLI) — no Origin header at all
+			}
+			return allowedOrigins()[origin]
+		}
+		execHandler = cluster.NewExecHandler(agentRegistry, newInstanceProxyTarget(instanceStore, agentRegistry), execTickets, checkOrigin).
+			WithSessionRecorder(func(ticketID, podName string, exitCode *int, closeReason string) {
+				if err := instanceStore.EndExecSession(context.Background(), ticketID, podName, exitCode, closeReason); err != nil {
+					log.Printf("AUDIT WARNING: failed to close exec_sessions row for ticket %s: %v", ticketID, err)
+				}
+			})
+		apiServer.WithExecTickets(execTickets)
+		log.Println("Interactive exec enabled (terminal sessions tunneled over agent sessions)")
+	}
+
 	// Setup router
-	router := setupRouter(apiServer, authHandler, accountHandler, authMiddleware, billingHandler, registryHandler, adminHandler, webhookHandler, nodeHandler, rateLimitMiddleware, proxyHandler, getEnv("TEEPIN_DOMAIN", "teepin.com"))
+	router := setupRouter(apiServer, authHandler, accountHandler, authMiddleware, billingHandler, registryHandler, adminHandler, webhookHandler, nodeHandler, rateLimitMiddleware, proxyHandler, execHandler, getEnv("TEEPIN_DOMAIN", "teepin.com"))
 
 	// Create HTTP server
 	port := getEnv("PORT", "8080")
@@ -693,7 +720,7 @@ func initRateLimiting() *ratelimit.Config {
 	return config
 }
 
-func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHandler *api.AccountHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler, registryHandler *api.RegistryHandler, adminHandler *api.AdminHandler, webhookHandler *api.WebhookHandler, nodeHandler *api.NodeHandler, rateLimitMiddleware *ratelimit.Middleware, proxyHandler *cluster.ProxyHandler, instanceDomain string) *gin.Engine {
+func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHandler *api.AccountHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler, registryHandler *api.RegistryHandler, adminHandler *api.AdminHandler, webhookHandler *api.WebhookHandler, nodeHandler *api.NodeHandler, rateLimitMiddleware *ratelimit.Middleware, proxyHandler *cluster.ProxyHandler, execHandler *cluster.ExecHandler, instanceDomain string) *gin.Engine {
 	// Set Gin to release mode in production
 	if os.Getenv("GIN_MODE") == "" {
 		gin.SetMode(gin.ReleaseMode)
@@ -745,6 +772,20 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 		// inside the handler, so it must sit outside every auth group.
 		if webhookHandler != nil {
 			v1.POST("/webhooks/stripe", webhookHandler.HandleStripe)
+		}
+
+		// Interactive exec's WebSocket attach — UNAUTHENTICATED at the
+		// router because the WS handshake carries no Authorization
+		// header at all; the single-use ticket presented as the first
+		// frame (see ExecHandler.ServeInstance) IS the credential. Must
+		// use the SAME param name ":id" as the /compute group below —
+		// gin panics at startup on conflicting wildcard names at the
+		// same route-tree position, since this shares the
+		// /compute/instances/:id prefix with those routes.
+		if execHandler != nil {
+			v1.GET("/compute/instances/:id/exec/attach", func(c *gin.Context) {
+				execHandler.ServeInstance(c.Writer, c.Request, c.Param("id"))
+			})
 		}
 
 		// Node enrollment — UNAUTHENTICATED at the router because the
@@ -853,6 +894,13 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 			compute.DELETE("/instances/:id", apiServer.DeleteInstance)
 			compute.GET("/instances/:id/logs", apiServer.GetInstanceLogs)
 			compute.GET("/instances/:id/metrics", apiServer.GetInstanceMetrics)
+			// Issues the exec ticket only — the WebSocket attach itself
+			// is a separate, UNAUTHENTICATED route below (the WS
+			// handshake carries no Authorization header; the ticket IS
+			// the credential there).
+			if execHandler != nil {
+				compute.POST("/instances/:id/exec", apiServer.CreateExecSession)
+			}
 
 			// Home capacity — which CPU tiers fit right now. Only mounted
 			// when home compute is enabled; the create dialog uses it to
@@ -935,9 +983,15 @@ func versionHandler(c *gin.Context) {
 // authenticated cross-origin request could ever succeed. The allowlist
 // also stops arbitrary sites driving the API with a user's cookies.
 //
-// Configure with TEEPIN_CORS_ORIGINS (comma-separated). Defaults cover
-// the production console and local development.
-func corsMiddleware() gin.HandlerFunc {
+// allowedOrigins parses TEEPIN_CORS_ORIGINS (comma-separated) once, into
+// the set both corsMiddleware and the exec WebSocket upgrade's Origin
+// check consume. A single parse shared between the two, rather than each
+// reading the env var independently, so they can never drift apart —
+// a terminal that CORS would allow but the WS check rejects (or the
+// reverse) is exactly the kind of environment-specific breakage that is
+// hard to reproduce and easy to introduce by editing only one of two
+// copies.
+func allowedOrigins() map[string]bool {
 	raw := getEnv("TEEPIN_CORS_ORIGINS",
 		"https://console.teepin.com,http://localhost:3000")
 
@@ -947,7 +1001,14 @@ func corsMiddleware() gin.HandlerFunc {
 			allowed[o] = true
 		}
 	}
-	log.Printf("CORS allowed origins: %s", raw)
+	return allowed
+}
+
+// Configure with TEEPIN_CORS_ORIGINS (comma-separated). Defaults cover
+// the production console and local development.
+func corsMiddleware() gin.HandlerFunc {
+	allowed := allowedOrigins()
+	log.Printf("CORS allowed origins: %v", allowed)
 
 	return func(c *gin.Context) {
 		origin := c.GetHeader("Origin")

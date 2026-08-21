@@ -98,7 +98,7 @@ func runAgent() {
 	providerID := getEnv("TEEPIN_PROVIDER_ID", "default")
 	region := getEnv("TEEPIN_REGION", "us-east")
 
-	k8sClient, err := newKubernetesClient()
+	k8sClient, restConfig, err := newKubernetesClient()
 	if err != nil {
 		log.Fatalf("Kubernetes client: %v", err)
 	}
@@ -125,7 +125,7 @@ func runAgent() {
 		networkingService,
 		inventory,
 		getEnv("TEEPIN_GPU_RUNTIME_CLASS", "nvidia"),
-	)
+	).WithRESTConfig(restConfig)
 
 	runner := agentrunner.New(agentrunner.Config{
 		ProviderID: providerID,
@@ -185,7 +185,7 @@ func runEnrolledAgent(cfg *nodeConfig) {
 // falls back to CPUOnly so the agent still connects and heartbeats (the node
 // shows online), it simply cannot run workloads until k3s is up.
 func homeClusterClient() cluster.Client {
-	k8s, err := newKubernetesClient()
+	k8s, restConfig, err := newKubernetesClient()
 	if err != nil {
 		log.Printf("WARN: no Kubernetes reachable (%v); running CPU-only without execution. "+
 			"Install k3s and restart the agent to run workloads.", err)
@@ -197,7 +197,7 @@ func homeClusterClient() cluster.Client {
 		nil, // networking: public endpoints are Stage 3
 		nil, // inventory: CPU-only, no GPU
 		getEnv("TEEPIN_GPU_RUNTIME_CLASS", ""), // no GPU runtime class on a home node
-	)
+	).WithRESTConfig(restConfig)
 }
 
 // shutdownContext returns a context cancelled on SIGINT/SIGTERM. Closing the
@@ -309,19 +309,26 @@ func connectOnce(ctx context.Context, address, token, providerID string, runner 
 	return runner.Run(ctx, stream)
 }
 
-func newKubernetesClient() (kubernetes.Interface, error) {
+// newKubernetesClient also returns the *rest.Config it built, alongside
+// the clientset — needed by DirectClient.WithRESTConfig for interactive
+// exec (remotecommand.NewSPDYExecutor requires the config directly; a
+// kubernetes.Interface clientset alone cannot provide it). Both callers
+// below pass it straight through.
+func newKubernetesClient() (kubernetes.Interface, *rest.Config, error) {
 	// In-cluster first: the agent normally runs as a pod beside the
 	// workloads it manages.
 	if config, err := rest.InClusterConfig(); err == nil {
-		return kubernetes.NewForConfig(config)
+		client, err := kubernetes.NewForConfig(config)
+		return client, config, err
 	}
 
 	kubeconfig := getEnv("KUBECONFIG", clientcmd.RecommendedHomeFile)
 	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return kubernetes.NewForConfig(config)
+	client, err := kubernetes.NewForConfig(config)
+	return client, config, err
 }
 
 func getEnv(key, fallback string) string {

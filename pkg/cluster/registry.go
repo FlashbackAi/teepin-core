@@ -62,6 +62,14 @@ type AgentSession struct {
 	// exactly what deliverLogChunk's timeout-drop already guards against.
 	proxyStreams map[string]chan proxyEvent
 
+	// execStreams maps request_id to one interactive exec session:
+	// ExecOpen (once), ExecOutput chunks, then a terminating ExecEnd.
+	// Buffered deeper than proxyStreams (256 vs 64) — terminal output
+	// bursts harder than an HTTP response body. Wrapped in *execStream
+	// rather than a bare channel so a stalled-delivery timeout and
+	// AgentSession.Close() can't race to close the same channel twice.
+	execStreams map[string]*execStream
+
 	// inventory is the last report received. Read by the allocator on
 	// every placement decision, so it is kept here rather than fetched
 	// on demand — a round trip to the GPU datacenter per allocation
@@ -88,6 +96,7 @@ func NewAgentSession(providerID, region, version, class string, send func(*agent
 		pending:      make(map[string]chan *agentpb.CommandResult),
 		logStreams:   make(map[string]chan *agentpb.LogChunk),
 		proxyStreams: make(map[string]chan proxyEvent),
+		execStreams:  make(map[string]*execStream),
 	}
 }
 
@@ -98,6 +107,25 @@ func NewAgentSession(providerID, region, version, class string, send func(*agent
 type proxyEvent struct {
 	response *agentpb.ProxyResponse
 	data     *agentpb.ProxyData
+}
+
+// execStream is one interactive exec session's delivery channel, plus a
+// closed flag guarded by AgentSession.mu so a stalled-delivery timeout
+// (deliverExecEvent) and a normal session end (closeExecStream) or an
+// agent disconnect (Close) can never double-close the same channel.
+type execStream struct {
+	ch     chan execEvent
+	closed bool
+}
+
+// execEvent is one message on an exec stream: an ExecOpen (exactly
+// once, first), any number of ExecOutput chunks, or a terminating
+// ExecEnd — never more than one field set, mirroring the order the
+// agent actually sends them.
+type execEvent struct {
+	open   *agentpb.ExecOpen
+	output *agentpb.ExecOutput
+	end    *agentpb.ExecEnd
 }
 
 // dispatch sends a command and waits for its result.
@@ -256,6 +284,76 @@ func (s *AgentSession) closeProxyStream(requestID string) {
 	s.mu.Unlock()
 }
 
+// deliverExecOpen, deliverExecOutput and deliverExecEnd all route through
+// deliverExecEvent — the three message kinds share one delivery/timeout
+// discipline.
+func (s *AgentSession) deliverExecOpen(requestID string, open *agentpb.ExecOpen) {
+	s.deliverExecEvent(requestID, execEvent{open: open})
+}
+
+func (s *AgentSession) deliverExecOutput(requestID string, output *agentpb.ExecOutput) {
+	s.deliverExecEvent(requestID, execEvent{output: output})
+}
+
+func (s *AgentSession) deliverExecEnd(requestID string, end *agentpb.ExecEnd) {
+	s.deliverExecEvent(requestID, execEvent{end: end})
+}
+
+// deliverExecEvent is deliberately NOT deliverProxyData's shape: on a
+// stalled-consumer timeout, deliverProxyData silently drops the event
+// (correct for a truncated HTTP body — the edge already has an honest
+// "response was truncated" story). For a terminal, a silently dropped
+// chunk is a lie the customer cannot detect — corrupted or gapped output
+// with no error shown. So here, a timeout closes the stream instead: the
+// relay observes the closed channel and reports "session ended: output
+// could not be delivered fast enough" rather than staying silent.
+func (s *AgentSession) deliverExecEvent(requestID string, ev execEvent) {
+	s.mu.Lock()
+	es, ok := s.execStreams[requestID]
+	s.mu.Unlock()
+	if !ok {
+		return
+	}
+
+	select {
+	case es.ch <- ev:
+	case <-time.After(5 * time.Second):
+		s.mu.Lock()
+		// Re-check identity and closed state: the stream may have already
+		// ended normally (closeExecStream) or the session may have
+		// disconnected (Close) while this delivery was blocked.
+		if cur, stillOpen := s.execStreams[requestID]; stillOpen && cur == es && !es.closed {
+			es.closed = true
+			close(es.ch)
+			delete(s.execStreams, requestID)
+		}
+		s.mu.Unlock()
+	}
+}
+
+// openExecStream registers a channel for one interactive exec session.
+func (s *AgentSession) openExecStream(requestID string) chan execEvent {
+	es := &execStream{ch: make(chan execEvent, 256)}
+	s.mu.Lock()
+	s.execStreams[requestID] = es
+	s.mu.Unlock()
+	return es.ch
+}
+
+// closeExecStream ends a session normally (the handler is done reading,
+// whether the session succeeded, failed, or the caller gave up).
+func (s *AgentSession) closeExecStream(requestID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	es, ok := s.execStreams[requestID]
+	if !ok || es.closed {
+		return
+	}
+	es.closed = true
+	close(es.ch)
+	delete(s.execStreams, requestID)
+}
+
 // setInventory stores the latest capacity report.
 func (s *AgentSession) setInventory(nodes []NodeInventory) {
 	s.mu.Lock()
@@ -310,6 +408,17 @@ func (s *AgentSession) Close() {
 	for id, ch := range s.proxyStreams {
 		close(ch)
 		delete(s.proxyStreams, id)
+	}
+
+	// Same reasoning for exec: an agent disconnecting mid-session must
+	// surface immediately, not leave the browser hanging until the exec
+	// handler's own idle timeout.
+	for id, es := range s.execStreams {
+		if !es.closed {
+			es.closed = true
+			close(es.ch)
+		}
+		delete(s.execStreams, id)
 	}
 }
 

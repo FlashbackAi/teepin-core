@@ -45,6 +45,14 @@ rules:
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get", "list"]
+  # Interactive exec (customer terminal sessions). "create" only — not a
+  # meaningful escalation on top of the pods/secrets access above: this
+  # role can already create a pod running arbitrary code and read image
+  # pull secrets, so attaching to a pod it already controls adds nothing
+  # a compromised agent couldn't already do.
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
   # Endpoint provisioning.
   - apiGroups: [""]
     resources: ["services"]

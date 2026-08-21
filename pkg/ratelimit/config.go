@@ -130,6 +130,14 @@ func DefaultConfig() *Config {
 				Period: time.Minute,
 				Burst:  10,
 			},
+			// Issues a short-lived exec ticket, not the WS attach itself
+			// (that route is exempted entirely — see middleware.go's
+			// FullPath check — the ticket it issues is already the gate).
+			"POST /v1/compute/instances/:id/exec": {
+				Rate:   10,
+				Period: time.Minute,
+				Burst:  5,
+			},
 			"POST /v1/projects/:id/registry": {
 				Rate:   5,
 				Period: time.Minute,

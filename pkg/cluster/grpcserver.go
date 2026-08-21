@@ -239,6 +239,15 @@ func (s *AgentServer) handleMessage(session *AgentSession, msg *agentpb.AgentMes
 	case *agentpb.AgentMessage_ProxyData:
 		session.deliverProxyData(msg.RequestId, payload.ProxyData)
 
+	case *agentpb.AgentMessage_ExecOpen:
+		session.deliverExecOpen(msg.RequestId, payload.ExecOpen)
+
+	case *agentpb.AgentMessage_ExecOutput:
+		session.deliverExecOutput(msg.RequestId, payload.ExecOutput)
+
+	case *agentpb.AgentMessage_ExecEnd:
+		session.deliverExecEnd(msg.RequestId, payload.ExecEnd)
+
 	default:
 		log.Printf("Agent sent unknown message type from provider=%s", session.ProviderID)
 	}

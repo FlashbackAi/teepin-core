@@ -55,6 +55,8 @@ message ControlMessage {
     Ping                  ping            = 6;
     ProxyRequest          proxy_request   = 7;  // Stage 3: HTTP request for a customer endpoint
     ProxyData             proxy_data      = 8;  // Stage 3: request body chunk(s), same request_id
+    ExecStart             exec_start      = 9;  // interactive exec: open one session
+    ExecInput             exec_input      = 10; // interactive exec: stdin/resize/cancel, same request_id
   }
 }
 
@@ -117,6 +119,13 @@ message FetchLogsCommand {
 
 // ExecCommand runs a command inside a customer container. Used by
 // diagnostics (e.g. verifying GPU visibility); NOT exposed to customers.
+//
+// Dead field: handleCommand has no case for ControlMessage_Exec, so this
+// has never been wired up (any message sent here falls into "unsupported
+// command"). Left in place at field number 5 rather than removed —
+// renumbering a oneof is a wire break for every agent binary in the
+// field — but superseded by ExecStart/ExecInput below for the real,
+// interactive, customer-facing feature.
 message ExecCommand {
   string instance_id      = 1;
   repeated string command = 2;
@@ -141,6 +150,9 @@ message AgentMessage {
     Pong            pong            = 7;
     ProxyResponse   proxy_response  = 8;  // Stage 3: response headers, once per request_id
     ProxyData       proxy_data      = 9;  // Stage 3: response body chunk(s), same request_id
+    ExecOpen        exec_open       = 10; // interactive exec: attached ack, once per request_id
+    ExecOutput      exec_output     = 11; // interactive exec: stdout/stderr bytes
+    ExecEnd         exec_end        = 12; // interactive exec: terminal state, once per request_id
   }
 }
 
@@ -289,6 +301,71 @@ message ProxyData {
   bool  reset = 3;  // abort: a limit was hit, or the peer went away mid-stream
 }
 
+// ---------------------------------------------------------------------
+// Interactive exec: "connect to instance terminal" from the console or
+// the teepin CLI. Same stream, same request_id-correlation discipline as
+// the Stage 3 HTTP tunnel above — a genuinely separate message family
+// rather than a reuse of ProxyData, because: (1) proxyStreams is keyed
+// only by request_id in a map typed for HTTP body chunks — a stray exec
+// frame delivered there would silently corrupt an HTTP response instead
+// of failing loudly; (2) exec needs things ProxyData has no field for
+// (resize, stdin-close, a stdout/stderr split, an exit code).
+// ---------------------------------------------------------------------
+
+// ExecStart opens one interactive exec session against a running
+// instance. Mirrors ProxyRequest: the control plane names the instance,
+// the agent resolves it to a pod/container locally.
+message ExecStart {
+  string instance_id      = 1;
+  repeated string command = 2;  // empty = the agent probes for a shell
+  bool   tty               = 3;
+  uint32 rows               = 4;  // initial terminal size; ignored when tty=false
+  uint32 cols               = 5;
+  string container          = 6;  // empty = the pod's first/only container
+}
+
+// ExecInput is every browser/CLI -> pod event on one session, in one
+// message type deliberately: stdin bytes and a resize must stay ordered
+// relative to each other, and one oneof arm keeps the agent's routing to
+// one map of one channel type.
+message ExecInput {
+  bytes  stdin       = 1;
+  bool   stdin_close = 2;  // customer sent EOF on stdin
+  uint32 rows        = 3;  // resize when rows and cols are both non-zero
+  uint32 cols        = 4;
+  bool   cancel      = 5;  // browser/CLI went away: kill this session now
+}
+
+// ExecOpen is the "attached" acknowledgement. It exists because there is
+// otherwise no early signal at all: a quiet shell prints nothing, so
+// "first byte of stdout" cannot distinguish "attached and idle" from
+// "agent wedged".
+message ExecOpen {
+  string pod_name  = 1;
+  string container = 2;
+}
+
+message ExecOutput {
+  bytes  data   = 1;
+  Stream stream = 2;
+}
+
+// A TTY session merges stdout/stderr into one stream (stdout) at the
+// kernel pty layer, so v1 always reports STREAM_STDOUT. The discriminator
+// is kept now, at zero cost, for a later non-TTY exec mode.
+enum Stream {
+  STREAM_STDOUT = 0;
+  STREAM_STDERR = 1;
+}
+
+// ExecEnd terminates a session. exit_code is meaningful only when
+// error_code is ERROR_CODE_UNSPECIFIED.
+message ExecEnd {
+  int32     exit_code     = 1;
+  ErrorCode error_code    = 2;
+  string    error_message = 3;
+}
+
 // CommandResult answers a command. Failure carries a machine-readable
 // code so the control plane can react (reallocate, surface to the
 // customer, or retry) rather than parsing strings.
@@ -320,6 +397,7 @@ enum ErrorCode {
   ERROR_CODE_CLUSTER_ERROR    = 4;  // Kubernetes API failure; retryable
   ERROR_CODE_IMAGE_PULL       = 5;  // bad image or missing credentials — customer-visible
   ERROR_CODE_TIMEOUT          = 6;
+  ERROR_CODE_EXEC_UNSUPPORTED = 7;  // no shell in the image, or this node cannot exec
 }
 
 message Pong {

@@ -72,6 +72,23 @@ type Server struct {
 	endpointDomain string
 	enableTLS      bool
 	tlsIssuer      string
+
+	// execTickets issues short-lived, single-use credentials for
+	// interactive exec's WebSocket attach step (pkg/cluster.ExecHandler
+	// redeems them — see the ticket auth design in the interactive-exec
+	// plan). Nil disables the feature cleanly: CreateExecSession returns
+	// 404, matching how home-capacity behaves when home compute is off.
+	execTickets *cluster.TicketStore
+}
+
+// WithExecTickets enables interactive exec's REST half (ticket issuance).
+// Returns the same *Server for chaining. The WebSocket attach half is a
+// separate handler (cluster.ExecHandler) mounted directly in
+// cmd/api-server/main.go, outside gin's JWT-auth group — the WS
+// handshake carries no Authorization header.
+func (s *Server) WithExecTickets(tickets *cluster.TicketStore) *Server {
+	s.execTickets = tickets
+	return s
 }
 
 // WithEndpointConfig sets the domain/TLS policy stamped onto every

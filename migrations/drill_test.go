@@ -347,3 +347,42 @@ func TestArchivabilityDrill021(t *testing.T) {
 	}
 	t.Log("archivability drill passed: 021 applies, reverts cleanly, and re-applies")
 }
+
+// TestArchivabilityDrill022 proves the exec_sessions migration (022,
+// interactive exec's audit trail) is reversible: the table exists after
+// up, is gone after reverting one step, and every 021 column survives
+// that revert untouched.
+func TestArchivabilityDrill022(t *testing.T) {
+	dsn := os.Getenv("TEEPIN_DRILL_DSN")
+	if dsn == "" {
+		t.Skip("set TEEPIN_DRILL_DSN to run the migration drill")
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("initial up: %v", err)
+	}
+	if !tableExists(t, db, "compute", "exec_sessions") {
+		t.Fatal("after up: compute.exec_sessions missing")
+	}
+
+	// Revert to version 21 (state after 021, before 022), absolute.
+	if err := migrator(t, db).Migrate(21); err != nil {
+		t.Fatalf("migrate down to 021: %v", err)
+	}
+	if tableExists(t, db, "compute", "exec_sessions") {
+		t.Error("after down: exec_sessions still present")
+	}
+	if !columnExists(t, db, "compute", "instances", "container_port") {
+		t.Error("after down: container_port (021) was wrongly removed")
+	}
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("re-up: %v", err)
+	}
+	t.Log("archivability drill passed: 022 applies, reverts cleanly, and re-applies")
+}

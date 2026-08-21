@@ -5,6 +5,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -17,6 +18,10 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/remotecommand"
+	clientexec "k8s.io/client-go/util/exec"
 
 	"github.com/google/uuid"
 
@@ -108,6 +113,12 @@ type DirectClient struct {
 	// RuntimeClass for GPU pods. Empty disables it, for clusters where
 	// nvidia is already containerd's default runtime.
 	gpuRuntimeClass string
+
+	// rest is required for ExecAttach — remotecommand.NewSPDYExecutor
+	// needs a *rest.Config, which kubernetes.Interface alone cannot
+	// provide. Nil until WithRESTConfig is called, in which case
+	// ExecAttach returns ErrExecUnsupported rather than a nil-deref.
+	rest *rest.Config
 }
 
 // Compile-time check. Cheap, and it fails the build rather than a
@@ -131,6 +142,16 @@ func NewDirectClient(k8s kubernetes.Interface, networkingService EndpointProvisi
 		inventory:       inventory,
 		gpuRuntimeClass: gpuRuntimeClass,
 	}
+}
+
+// WithRESTConfig enables ExecAttach. A chaining setter rather than a
+// NewDirectClient parameter — matching WithEndpointConfig/WithNodePlacer
+// elsewhere in this codebase — so the dozen existing construction sites
+// (including every fake.Clientset-backed test, which has no rest config
+// to give) compile unchanged. Returns the same *DirectClient.
+func (c *DirectClient) WithRESTConfig(cfg *rest.Config) *DirectClient {
+	c.rest = cfg
+	return c
 }
 
 // endpointOptionsFor derives the networking override from a placement
@@ -323,6 +344,235 @@ func (c *DirectClient) GetInstanceStatus(ctx context.Context, scope Scope, insta
 
 	status := c.statusWithEndpoint(ctx, &pods.Items[0])
 	return &status, nil
+}
+
+// ErrExecUnsupported means this client cannot attach an interactive
+// session — no *rest.Config was ever supplied (WithRESTConfig), which is
+// the case for every client until the agent's exec support ships.
+var ErrExecUnsupported = errors.New("interactive exec is not supported on this node")
+
+// Compile-time check that DirectClient satisfies ExecCapable.
+var _ ExecCapable = (*DirectClient)(nil)
+
+// ExecAttach implements ExecCapable. It resolves instance_id to a live
+// pod exactly like GetInstanceStatus (list by instanceSelector,
+// AllTenants — the agent has no tenancy view of its own and trusts the
+// control plane's check, same as every other agent-side operation),
+// then attaches via Kubernetes' pods/exec subresource.
+//
+// ioStreams.OnOpen fires once pod+container are resolved, before any
+// shell is attempted — it reports "attached to this pod/container", not
+// "a shell exists there". A distroless image still gets an OnOpen
+// followed quickly by an EXEC_UNSUPPORTED end, which is correct: the
+// customer WAS attached to their container, it just has no shell.
+func (c *DirectClient) ExecAttach(ctx context.Context, req ExecRequest, ioStreams ExecIO) (ExecOutcome, error) {
+	if c.rest == nil {
+		return ExecOutcome{}, ErrExecUnsupported
+	}
+
+	pods, err := c.k8s.CoreV1().Pods(workloadNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: instanceSelector(AllTenants(), req.InstanceID),
+	})
+	if err != nil {
+		return ExecOutcome{}, fmt.Errorf("list pods: %w", err)
+	}
+	if len(pods.Items) == 0 {
+		return ExecOutcome{}, ErrNotFound
+	}
+	pod := pods.Items[0]
+	if pod.Status.Phase != corev1.PodRunning {
+		return ExecOutcome{}, fmt.Errorf("instance is %s, not running", strings.ToLower(string(pod.Status.Phase)))
+	}
+
+	container := req.Container
+	if container == "" {
+		if len(pod.Spec.Containers) == 0 {
+			return ExecOutcome{}, fmt.Errorf("pod has no containers")
+		}
+		container = pod.Spec.Containers[0].Name
+	}
+	running := false
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.Name == container && cs.State.Running != nil {
+			running = true
+			break
+		}
+	}
+	if !running {
+		return ExecOutcome{}, fmt.Errorf("container %q is not running", container)
+	}
+
+	if ioStreams.OnOpen != nil {
+		ioStreams.OnOpen(pod.Name, container)
+	}
+
+	probeShell := len(req.Command) == 0
+	command := req.Command
+	if probeShell {
+		command = []string{"/bin/bash", "-i"}
+	}
+
+	outcome, err := c.streamExec(ctx, pod.Name, container, command, req, ioStreams)
+	if err != nil && probeShell && isMissingShellError(err) {
+		outcome, err = c.streamExec(ctx, pod.Name, container, []string{"/bin/sh", "-i"}, req, ioStreams)
+		if err != nil && isMissingShellError(err) {
+			return ExecOutcome{}, fmt.Errorf("%w: no shell found (tried /bin/bash, /bin/sh)", ErrExecUnsupported)
+		}
+	}
+	return outcome, err
+}
+
+// streamExec makes one pods/exec attempt with a specific command. Split
+// out of ExecAttach so the /bin/bash -> /bin/sh fallback is a plain
+// retry rather than duplicated setup.
+func (c *DirectClient) streamExec(ctx context.Context, podName, container string, command []string, req ExecRequest, ioStreams ExecIO) (ExecOutcome, error) {
+	// The Kubernetes API server rejects a stderr stream alongside a tty
+	// (400) — enforce this here rather than trusting the caller.
+	stderr := ioStreams.Stderr
+	if req.TTY {
+		stderr = nil
+	}
+
+	execReq := c.k8s.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Name(podName).
+		Namespace(workloadNamespace).
+		SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Container: container,
+			Command:   command,
+			Stdin:     true,
+			Stdout:    true,
+			Stderr:    stderr != nil,
+			TTY:       req.TTY,
+		}, scheme.ParameterCodec)
+
+	executor, err := remotecommand.NewSPDYExecutor(c.rest, "POST", execReq.URL())
+	if err != nil {
+		return ExecOutcome{}, fmt.Errorf("build exec executor: %w", err)
+	}
+
+	var sizeQ *terminalSizeQueue
+	var streamSizeQueue remotecommand.TerminalSizeQueue
+	if req.TTY {
+		// Seeded with the initial size: client-go calls Next() immediately,
+		// and an unseeded queue renders every full-screen program at 0x0.
+		sizeQ = newTerminalSizeQueue(remotecommand.TerminalSize{Width: req.Cols, Height: req.Rows})
+		streamSizeQueue = sizeQ
+		if ioStreams.Resize != nil {
+			resizeDone := make(chan struct{})
+			defer close(resizeDone)
+			go func() {
+				for {
+					select {
+					case sz, ok := <-ioStreams.Resize:
+						if !ok {
+							return
+						}
+						sizeQ.push(remotecommand.TerminalSize{Width: sz.Cols, Height: sz.Rows})
+					case <-resizeDone:
+						return
+					}
+				}
+			}()
+		}
+	}
+
+	err = executor.StreamWithContext(ctx, remotecommand.StreamOptions{
+		Stdin:             ioStreams.Stdin,
+		Stdout:            ioStreams.Stdout,
+		Stderr:            stderr,
+		Tty:               req.TTY,
+		TerminalSizeQueue: streamSizeQueue,
+	})
+	if sizeQ != nil {
+		sizeQ.close()
+	}
+
+	if err != nil {
+		// A non-zero shell exit is a normal, successful exec SESSION
+		// outcome, not a platform error — ExecEnd.exit_code is exactly
+		// for this.
+		if exitErr, ok := err.(clientexec.ExitError); ok {
+			return ExecOutcome{ExitCode: exitErr.ExitStatus()}, nil
+		}
+		return ExecOutcome{}, err
+	}
+	return ExecOutcome{ExitCode: 0}, nil
+}
+
+// isMissingShellError reports whether err looks like "the requested
+// executable does not exist in the image" rather than some other exec
+// failure. Runtime-dependent (containerd and cri-o phrase this
+// differently), so this matches on the two shapes actually observed:
+// an ExitError with the shell's conventional 126/127 status, or a
+// stream-setup error whose text names the failure.
+func isMissingShellError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if exitErr, ok := err.(clientexec.ExitError); ok {
+		code := exitErr.ExitStatus()
+		return code == 126 || code == 127
+	}
+	msg := err.Error()
+	for _, needle := range []string{
+		"executable file not found",
+		"no such file or directory",
+		"OCI runtime exec failed",
+	} {
+		if strings.Contains(msg, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// terminalSizeQueue implements remotecommand.TerminalSizeQueue over a
+// 1-slot, replace-not-block channel: a resize mid-drag must never block
+// the demux goroutine feeding it, and only the latest pending size
+// matters (last-write-wins). Single producer (the caller's demux
+// goroutine via push), single consumer (client-go's own resize-watcher
+// goroutine via Next) — no additional locking needed.
+type terminalSizeQueue struct {
+	ch chan remotecommand.TerminalSize
+}
+
+func newTerminalSizeQueue(initial remotecommand.TerminalSize) *terminalSizeQueue {
+	q := &terminalSizeQueue{ch: make(chan remotecommand.TerminalSize, 1)}
+	q.ch <- initial
+	return q
+}
+
+func (q *terminalSizeQueue) Next() *remotecommand.TerminalSize {
+	sz, ok := <-q.ch
+	if !ok {
+		return nil // ends client-go's resize-watcher goroutine
+	}
+	return &sz
+}
+
+func (q *terminalSizeQueue) push(sz remotecommand.TerminalSize) {
+	select {
+	case q.ch <- sz:
+		return
+	default:
+	}
+	// Full: drop the stale pending value, then push the new one. Best
+	// effort — if a Next() call wins the race for the slot in between,
+	// the new size is simply dropped and picked up by the next resize.
+	select {
+	case <-q.ch:
+	default:
+	}
+	select {
+	case q.ch <- sz:
+	default:
+	}
+}
+
+func (q *terminalSizeQueue) close() {
+	close(q.ch)
 }
 
 // ListInstanceStatuses returns every TEEPIN-managed instance in the

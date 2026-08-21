@@ -12,19 +12,21 @@ require (
 	github.com/golang-migrate/migrate/v4 v4.17.0
 	github.com/google/go-containerregistry v0.21.9
 	github.com/google/uuid v1.6.0
+	github.com/gorilla/websocket v1.5.3
 	github.com/lib/pq v1.10.9
-	github.com/mittwald/goharbor-client/v5 v5.6.5
+	github.com/mittwald/goharbor-client/v5 v5.5.4
 	github.com/redis/go-redis/v9 v9.5.1
 	github.com/spf13/cobra v1.10.2
 	github.com/stripe/stripe-go/v79 v79.12.0
 	github.com/ulule/limiter/v3 v3.11.2
 	golang.org/x/crypto v0.51.0
 	golang.org/x/term v0.43.0
+	golang.org/x/time v0.3.0
 	google.golang.org/grpc v1.83.0
 	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1
 	k8s.io/api v0.28.4
-	k8s.io/apimachinery v0.29.0
+	k8s.io/apimachinery v0.28.4
 	k8s.io/client-go v0.28.4
 )
 
@@ -90,6 +92,7 @@ require (
 	github.com/mailru/easyjson v0.7.7 // indirect
 	github.com/mattn/go-isatty v0.0.19 // indirect
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
+	github.com/moby/spdystream v0.2.0 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
@@ -115,7 +118,6 @@ require (
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
-	golang.org/x/time v0.3.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
