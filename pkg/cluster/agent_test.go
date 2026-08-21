@@ -273,6 +273,80 @@ func TestAgentClient_TerminatedIsFinal(t *testing.T) {
 	}
 }
 
+// TestAgentClient_EndpointFieldsSurviveAPartialStatusReport is the
+// regression test for a real production bug found live (2026-08-18): an
+// agent build that predates the endpoint fields — or a home node's
+// periodic status sweep, which never reports them at all — sends
+// InstanceStatus with every endpoint field at its zero value. Before this
+// fix, RecordStatus's plain map assignment let that blank report erase a
+// correctly-synthesized endpoint from the cache, which the reconciler
+// then persisted as an erasure to the database — a customer's working
+// https://inst-xxxx.teepin.com URL going 404/empty on the very next
+// ~15-30s status sweep after create, for no reason visible in the create
+// response itself.
+func TestAgentClient_EndpointFieldsSurviveAPartialStatusReport(t *testing.T) {
+	c := NewAgentClient(NewRegistry())
+
+	// The synthesized endpoint from create (see AgentClient.CreateInstance,
+	// Stage 3 plan B8) — or an agent's own correctly-populated report.
+	c.RecordStatus(InstanceStatus{
+		InstanceID:  "inst-endpoint1",
+		Status:      "running",
+		EndpointURL: "https://inst-endpoint1.teepin.com",
+		DNSName:     "inst-endpoint1.teepin.com",
+		TLSEnabled:  true,
+		TLSReady:    true,
+	})
+
+	// A later periodic report that carries no endpoint fields at all —
+	// exactly what an old/home agent sends.
+	c.RecordStatus(InstanceStatus{InstanceID: "inst-endpoint1", Status: "running"})
+
+	c.mu.RLock()
+	got := c.statuses["inst-endpoint1"]
+	c.mu.RUnlock()
+
+	if got.EndpointURL != "https://inst-endpoint1.teepin.com" || got.DNSName != "inst-endpoint1.teepin.com" ||
+		!got.TLSEnabled || !got.TLSReady {
+		t.Errorf("endpoint fields were erased by a partial status report: %+v", got)
+	}
+}
+
+// TestAgentClient_EndpointFieldsUpdateWhenReported confirms the fix above
+// does not make endpoint fields permanently sticky: a report that DOES
+// carry new endpoint values (e.g. the TLS-ready flip, Stage 3 plan A6)
+// must still overwrite the cache normally.
+func TestAgentClient_EndpointFieldsUpdateWhenReported(t *testing.T) {
+	c := NewAgentClient(NewRegistry())
+
+	c.RecordStatus(InstanceStatus{
+		InstanceID:  "inst-endpoint2",
+		Status:      "running",
+		EndpointURL: "http://inst-endpoint2.teepin.com", // HTTP: TLS not ready yet
+		DNSName:     "inst-endpoint2.teepin.com",
+		TLSEnabled:  true,
+		TLSReady:    false,
+	})
+
+	// cert-manager finishes issuing; the next sweep reports the flip.
+	c.RecordStatus(InstanceStatus{
+		InstanceID:  "inst-endpoint2",
+		Status:      "running",
+		EndpointURL: "https://inst-endpoint2.teepin.com",
+		DNSName:     "inst-endpoint2.teepin.com",
+		TLSEnabled:  true,
+		TLSReady:    true,
+	})
+
+	c.mu.RLock()
+	got := c.statuses["inst-endpoint2"]
+	c.mu.RUnlock()
+
+	if got.EndpointURL != "https://inst-endpoint2.teepin.com" || !got.TLSReady {
+		t.Errorf("a real endpoint update was not applied: %+v", got)
+	}
+}
+
 func TestAgentSession_CloseFailsPendingCommands(t *testing.T) {
 	// A command in flight when the agent disconnects must fail promptly.
 	// Without this it blocks until the two-minute timeout, holding an

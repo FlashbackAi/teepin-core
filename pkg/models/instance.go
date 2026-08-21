@@ -29,6 +29,7 @@ type Instance struct {
 	DNSName        string            `json:"dns_name,omitempty"`    // DNS hostname
 	TLSEnabled     bool              `json:"tls_enabled,omitempty"` // SSL/TLS configured
 	TLSReady       bool              `json:"tls_ready,omitempty"`   // SSL certificate provisioned
+	ContainerPort  int               `json:"container_port,omitempty"` // the customer's exposed port; 0 when no port was requested
 	InternalIP     string            `json:"internal_ip,omitempty"`
 	CreatedAt      time.Time         `json:"created_at"`
 	UpdatedAt      time.Time         `json:"updated_at"`
@@ -68,6 +69,14 @@ type PortMapping struct {
 	Container int    `json:"container" binding:"required"`
 	Public    int    `json:"public,omitempty"`
 	Protocol  string `json:"protocol,omitempty"` // tcp, udp
+}
+
+// ImagePort is one port a container image declares via EXPOSE, returned
+// by GET /v1/compute/image-ports as a default suggestion for the
+// create-instance form's Port field.
+type ImagePort struct {
+	Port     int    `json:"port"`
+	Protocol string `json:"protocol"`
 }
 
 // InstanceType represents available instance configurations

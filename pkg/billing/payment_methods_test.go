@@ -146,3 +146,80 @@ func TestRemovePaymentMethod_OneOfManySucceeds(t *testing.T) {
 		t.Errorf("unmet expectations: %v", err)
 	}
 }
+
+// TestCreateSetupIntent_ReturnsPendingRowID is the regression test for a
+// real bug found live (2026-08-21): a customer's browser failed to load
+// Stripe's Payment Element, the failure was silently swallowed by the
+// console (a separate bug, fixed in add-card-dialog.tsx), and the
+// customer was left staring at a permanent, un-removable "Validating…"
+// card despite never entering anything. The pending row IS created here,
+// deliberately, before any card is entered — that part is correct
+// (Stripe requires a SetupIntent to exist before the Payment Element can
+// even render) — but until this fix, nothing let the CALLER clean it up
+// if the customer never finished. Returning the row's own id is what
+// makes that possible: the console now removes it on Cancel or on a
+// failure to load Stripe, via the existing RemovePaymentMethod endpoint
+// (which already treats removing a pending/non-verified card as always
+// allowed — see TestRemovePaymentMethod_OneOfManySucceeds's sibling
+// coverage of that invariant).
+func TestCreateSetupIntent_ReturnsPendingRowID(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	s := NewService(db).WithStripe(&fakeGateway{})
+	account := uuid.New()
+	wantID := uuid.New()
+
+	mock.ExpectQuery(`SELECT stripe_customer_id, billing_email, account_number, display_name, legal_name`).
+		WithArgs(account).
+		WillReturnRows(sqlmock.NewRows(
+			[]string{"stripe_customer_id", "billing_email", "account_number", "display_name", "legal_name"},
+		).AddRow(nil, "a@example.com", "ACC-001", "Acme", nil))
+
+	// No existing Stripe customer id -> EnsureCustomer mints one (fakeGateway
+	// returns "cus_test"), which must be persisted back onto the account.
+	mock.ExpectExec(`UPDATE auth\.accounts SET stripe_customer_id`).
+		WithArgs("cus_test", account).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	mock.ExpectQuery(`INSERT INTO billing\.payment_methods`).
+		WithArgs(account, "cus_test", "seti_test").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(wantID))
+
+	secret, pmID, err := s.CreateSetupIntent(context.Background(), account)
+	if err != nil {
+		t.Fatalf("CreateSetupIntent: %v", err)
+	}
+	if secret != "seti_secret" {
+		t.Errorf("client secret = %q, want the gateway's seti_secret", secret)
+	}
+	if pmID != wantID {
+		t.Errorf("payment method id = %v, want %v (the console needs this to clean up an abandoned attempt)", pmID, wantID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// TestCreateSetupIntent_NotConfiguredReturnsZeroID guards the error path:
+// a zero uuid.UUID{} alongside a non-nil error, never a value that looks
+// like it could be a real (if empty) row id.
+func TestCreateSetupIntent_NotConfiguredReturnsZeroID(t *testing.T) {
+	db, _, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	s := NewService(db) // no WithStripe — payments not configured
+	_, pmID, err := s.CreateSetupIntent(context.Background(), uuid.New())
+	if err == nil {
+		t.Fatal("expected an error when Stripe is not configured")
+	}
+	if pmID != uuid.Nil {
+		t.Errorf("payment method id = %v, want uuid.Nil on error", pmID)
+	}
+}

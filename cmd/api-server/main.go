@@ -846,6 +846,7 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 		}
 		{
 			compute.GET("/instance-types", apiServer.ListInstanceTypes)
+			compute.GET("/image-ports", apiServer.ImagePorts)
 			compute.POST("/instances", apiServer.CreateInstance)
 			compute.GET("/instances", apiServer.ListInstances)
 			compute.GET("/instances/:id", apiServer.GetInstance)

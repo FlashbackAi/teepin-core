@@ -23,6 +23,7 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/cluster"
 	"github.com/FlashbackAi/teepin-core/pkg/compute"
 	"github.com/FlashbackAi/teepin-core/pkg/gpu"
+	"github.com/FlashbackAi/teepin-core/pkg/imageinfo"
 	"github.com/FlashbackAi/teepin-core/pkg/models"
 )
 
@@ -192,6 +193,49 @@ func (s *Server) ListInstanceTypes(c *gin.Context) {
 	})
 }
 
+// imagePortsTimeout bounds the whole request, including gin's own
+// overhead around ResolvePorts' own internal timeout — a defensive
+// outer bound, not the primary one (that lives in pkg/imageinfo).
+const imagePortsTimeout = 6 * time.Second
+
+// ImagePorts looks up the ports a container image declares via EXPOSE, so
+// the create-instance form can default the "Port" field instead of
+// requiring every customer to already know what their image listens on.
+//
+// Never a hard dependency: an image whose registry isn't on the
+// allowlist, that declares no ports, or that can't be reached at all
+// returns an empty list with 200, exactly like "no ports found" — the
+// customer can always type the port manually, same as before this
+// endpoint existed. Nothing here can block instance creation.
+func (s *Server) ImagePorts(c *gin.Context) {
+	image := strings.TrimSpace(c.Query("image"))
+	if image == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "image query parameter is required"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), imagePortsTimeout)
+	defer cancel()
+
+	ports, err := imageinfo.ResolvePorts(ctx, image)
+	if err != nil {
+		// The only error case is a malformed reference — everything else
+		// (unreachable registry, missing image, no EXPOSE) already
+		// degrades to an empty list inside ResolvePorts. A malformed
+		// image string is also not fatal here: the customer's own
+		// CreateInstance call will separately validate the image field
+		// when they actually submit, so this just reports nothing found.
+		c.JSON(http.StatusOK, gin.H{"ports": []models.ImagePort{}})
+		return
+	}
+
+	out := make([]models.ImagePort, 0, len(ports))
+	for _, p := range ports {
+		out = append(out, models.ImagePort{Port: p.Port, Protocol: p.Protocol})
+	}
+	c.JSON(http.StatusOK, gin.H{"ports": out})
+}
+
 // CreateInstance creates a new compute instance
 func (s *Server) CreateInstance(c *gin.Context) {
 	var req models.CreateInstanceRequest
@@ -223,6 +267,20 @@ func (s *Server) CreateInstance(c *gin.Context) {
 		default:
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error": fmt.Sprintf("invalid port protocol %q: must be tcp or udp", port.Protocol),
+			})
+			return
+		}
+		// The valid TCP/UDP port range. Below this, 0 is "no port" (should
+		// never reach here as a real request) and negative values are a
+		// client bug; above it, the value cannot be a port at all. This is
+		// a sanity bound, not a privilege restriction — containers in this
+		// platform are free to listen on any port including <1024 (e.g.
+		// nginx's default of 80), since that is a container-namespace bind,
+		// not a host one, and carries none of a bare process's root
+		// requirement.
+		if port.Container < 1 || port.Container > 65535 {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": fmt.Sprintf("invalid container port %d: must be between 1 and 65535", port.Container),
 			})
 			return
 		}
@@ -455,6 +513,9 @@ func (s *Server) CreateInstance(c *gin.Context) {
 	instance.DNSName = result.DNSName
 	instance.TLSEnabled = result.TLSEnabled
 	instance.TLSReady = result.TLSReady
+	if len(req.Ports) > 0 {
+		instance.ContainerPort = req.Ports[0].Container
+	}
 
 	c.JSON(http.StatusCreated, instance)
 }
@@ -868,6 +929,7 @@ func statusToInstance(st cluster.InstanceStatus, record *compute.InstanceRecord,
 	instance.PublicIP = record.PublicIP
 	instance.TLSEnabled = record.TLSEnabled
 	instance.TLSReady = record.TLSReady
+	instance.ContainerPort = record.ContainerPort
 
 	if record.GPUVRAMGB > 0 {
 		instance.GPUVRAM = fmt.Sprintf("%dGB", record.GPUVRAMGB)

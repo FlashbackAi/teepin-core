@@ -99,10 +99,22 @@ func (s *Service) AccountCanProvision(ctx context.Context, accountID uuid.UUID) 
 // account has a Stripe customer, opens a SetupIntent, and records a
 // PENDING payment-method row keyed to that intent. The card is not yet
 // usable — the webhook flips it to verified when Stripe confirms it.
-// Returns the client secret the browser needs to confirm the card.
-func (s *Service) CreateSetupIntent(ctx context.Context, accountID uuid.UUID) (clientSecret string, err error) {
+// Returns the client secret the browser needs to confirm the card, and
+// the pending row's own id.
+//
+// The id is returned specifically so the caller can clean the row up if
+// the customer never completes the flow (closes the dialog, the Payment
+// Element fails to load, a network error, etc.) — this row is created
+// BEFORE any card is entered, so without a way to remove it, every
+// abandoned attempt leaves a permanent, un-removable-by-anything-but-hand
+// "Validating…" card behind. Found live 2026-08-21: the console's Stripe
+// Elements failed to load (a null loadStripe() result was silently
+// swallowed, a separate bug fixed in add-card-dialog.tsx), and the
+// customer was left looking at a phantom pending card despite never
+// entering anything and clicking Cancel.
+func (s *Service) CreateSetupIntent(ctx context.Context, accountID uuid.UUID) (clientSecret string, paymentMethodID uuid.UUID, err error) {
 	if s.stripe == nil {
-		return "", fmt.Errorf("payments not configured")
+		return "", uuid.Nil, fmt.Errorf("payments not configured")
 	}
 
 	// Resolve the account's billing identity and existing Stripe customer.
@@ -118,10 +130,10 @@ func (s *Service) CreateSetupIntent(ctx context.Context, accountID uuid.UUID) (c
 		FROM auth.accounts WHERE id = $1
 	`, accountID).Scan(&customerID, &email, &accountNo, &display, &legal)
 	if err == sql.ErrNoRows {
-		return "", fmt.Errorf("account not found")
+		return "", uuid.Nil, fmt.Errorf("account not found")
 	}
 	if err != nil {
-		return "", fmt.Errorf("failed to load account: %w", err)
+		return "", uuid.Nil, fmt.Errorf("failed to load account: %w", err)
 	}
 
 	name := legal.String
@@ -131,34 +143,36 @@ func (s *Service) CreateSetupIntent(ctx context.Context, accountID uuid.UUID) (c
 
 	newCustomerID, err := s.stripe.EnsureCustomer(customerID.String, email.String, name, accountNo)
 	if err != nil {
-		return "", err
+		return "", uuid.Nil, err
 	}
 	// Persist a freshly created customer id so we never create a second.
 	if !customerID.Valid || customerID.String == "" {
 		if _, err := s.db.ExecContext(ctx,
 			`UPDATE auth.accounts SET stripe_customer_id = $1, updated_at = NOW() WHERE id = $2`,
 			newCustomerID, accountID); err != nil {
-			return "", fmt.Errorf("failed to store stripe customer: %w", err)
+			return "", uuid.Nil, fmt.Errorf("failed to store stripe customer: %w", err)
 		}
 	}
 
 	secret, intentID, err := s.stripe.CreateSetupIntent(newCustomerID, "usd")
 	if err != nil {
-		return "", err
+		return "", uuid.Nil, err
 	}
 
 	// Record the pending card. stripe_payment_method_id is empty until
 	// the webhook learns it; the intent id is how the webhook finds this
-	// row again.
-	if _, err := s.db.ExecContext(ctx, `
+	// row again. RETURNING id so the caller can remove this row if the
+	// customer never completes the flow — see the doc comment above.
+	if err := s.db.QueryRowContext(ctx, `
 		INSERT INTO billing.payment_methods
 		(account_id, stripe_customer_id, stripe_payment_method_id, stripe_setup_intent_id, type, status)
 		VALUES ($1, $2, '', $3, 'card', 'pending')
-	`, accountID, newCustomerID, intentID); err != nil {
-		return "", fmt.Errorf("failed to record pending payment method: %w", err)
+		RETURNING id
+	`, accountID, newCustomerID, intentID).Scan(&paymentMethodID); err != nil {
+		return "", uuid.Nil, fmt.Errorf("failed to record pending payment method: %w", err)
 	}
 
-	return secret, nil
+	return secret, paymentMethodID, nil
 }
 
 // MarkPaymentMethodVerified is called from the Stripe webhook when a

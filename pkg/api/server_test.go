@@ -747,6 +747,66 @@ func TestCreateInstance_PublicPortRejected(t *testing.T) {
 	}
 }
 
+// TestCreateInstance_ContainerPortOutOfRangeRejected: a container port
+// outside 1-65535 is a client bug (0, negative, or >65535 cannot be a
+// real port) and must be rejected up front rather than silently reaching
+// the pod builder with a value it was never validated against.
+func TestCreateInstance_ContainerPortOutOfRangeRejected(t *testing.T) {
+	server := NewServer(newFakeCluster(), nil, nil, nil, nil)
+
+	for _, body := range []string{
+		`{"name":"t","image":"nginx","cpu_units":1,"memory":"2GB","ports":[{"container":0}]}`,
+		`{"name":"t","image":"nginx","cpu_units":1,"memory":"2GB","ports":[{"container":70000}]}`,
+	} {
+		w := createInstanceReqBody(server, uuid.New(), body)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("body=%s: status = %d, want 400", body, w.Code)
+		}
+	}
+}
+
+// TestCreateInstance_ContainerPortBelow1024Allowed confirms the range
+// check is a sanity bound, not a privilege restriction: a container is
+// free to listen on well-known ports like 80 (nginx's default) — that is
+// a container-namespace bind, not a host one, and carries none of a bare
+// process's root requirement.
+func TestCreateInstance_ContainerPortBelow1024Allowed(t *testing.T) {
+	server := NewServer(newFakeCluster(), nil, nil, nil, nil)
+
+	w := createInstanceReqBody(server, uuid.New(),
+		`{"name":"t","image":"nginx","cpu_units":1,"memory":"2GB","ports":[{"container":80}]}`)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 for port 80 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+// TestCreateInstance_ResponseIncludesContainerPort: the port the customer
+// requested must be visible on the create response — before this fix it
+// was persisted to compute.instances but never copied onto the
+// customer-facing models.Instance, so a customer (and the console) had no
+// way to confirm what port their instance was actually listening on.
+func TestCreateInstance_ResponseIncludesContainerPort(t *testing.T) {
+	server := NewServer(newFakeCluster(), nil, nil, nil, nil)
+
+	w := createInstanceReqBody(server, uuid.New(),
+		`{"name":"t","image":"nginx","cpu_units":1,"memory":"2GB","ports":[{"container":8080}]}`)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body: %s)", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		ContainerPort int `json:"container_port"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("bad response: %v", err)
+	}
+	if resp.ContainerPort != 8080 {
+		t.Errorf("container_port = %d, want 8080", resp.ContainerPort)
+	}
+}
+
 // TestCreateInstance_ProtocolPassedThrough covers the other half of A8:
 // Protocol must reach the cluster spec, not be silently hardcoded to
 // "tcp" regardless of what the customer requested.
@@ -863,5 +923,52 @@ func TestCreateInstance_PersistsEndpointFields(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("INSERT did not carry the expected endpoint-field args: %v", err)
+	}
+}
+
+// TestImagePorts_MissingImageParamIs400: the one piece of validation this
+// handler owns directly (everything past that is pkg/imageinfo's own
+// tested behaviour) — an empty/missing image query param is a client
+// error, not an empty successful lookup.
+func TestImagePorts_MissingImageParamIs400(t *testing.T) {
+	server := NewServer(newFakeCluster(), nil, nil, nil, nil)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/compute/image-ports", nil)
+	server.ImagePorts(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for a missing image param", w.Code)
+	}
+}
+
+// TestImagePorts_UnresolvableImageReturns200WithEmptyPorts: this endpoint
+// is a convenience default, never a hard dependency — an image on a
+// registry outside the allowlist (see pkg/imageinfo's SSRF guard) must
+// degrade to 200 with an empty list, not an error the console would have
+// to handle specially.
+func TestImagePorts_UnresolvableImageReturns200WithEmptyPorts(t *testing.T) {
+	server := NewServer(newFakeCluster(), nil, nil, nil, nil)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/compute/image-ports?image=internal.example.com/some-service:latest", nil)
+	server.ImagePorts(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Ports []struct {
+			Port int `json:"port"`
+		} `json:"ports"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("bad response: %v", err)
+	}
+	if len(resp.Ports) != 0 {
+		t.Errorf("ports = %+v, want empty for a non-allowlisted registry", resp.Ports)
 	}
 }

@@ -55,12 +55,35 @@ func (c *AgentClient) RecordStatus(status InstanceStatus) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Terminated is final. A late-arriving "running" for an instance
-	// already reported gone would otherwise resurrect it in the cache and
-	// restart billing for a workload that no longer exists.
 	if existing, ok := c.statuses[status.InstanceID]; ok {
+		// Terminated is final. A late-arriving "running" for an instance
+		// already reported gone would otherwise resurrect it in the cache
+		// and restart billing for a workload that no longer exists.
 		if existing.Status == "terminated" && status.Status != "terminated" {
 			return
+		}
+
+		// A report with no endpoint fields does not mean "the endpoint is
+		// now gone" — it means THIS report did not carry them. The only
+		// wire source of empty endpoint fields today is an agent build
+		// that predates them entirely (or a home node's periodic sweep,
+		// which never reports endpoint state at all — only CreateInstance
+		// synthesizes it, see Stage 3 plan B8). Blindly overwriting here
+		// would let a stale-but-still-connected agent silently erase a
+		// correctly-set endpoint on its very next heartbeat: the
+		// reconciler compares this cache against the database and would
+		// then persist the erasure via UpdateEndpoint, exactly reproducing
+		// the datacenter-side defect 1 bug this cache exists to prevent —
+		// just triggered by a partial report instead of a missing one. The
+		// only real way to lose an endpoint is deletion, which goes
+		// through ForgetInstance, not a status update.
+		if status.EndpointURL == "" && status.DNSName == "" && status.PublicIP == "" &&
+			!status.TLSEnabled && !status.TLSReady {
+			status.EndpointURL = existing.EndpointURL
+			status.DNSName = existing.DNSName
+			status.PublicIP = existing.PublicIP
+			status.TLSEnabled = existing.TLSEnabled
+			status.TLSReady = existing.TLSReady
 		}
 	}
 

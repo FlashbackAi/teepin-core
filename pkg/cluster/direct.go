@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"strconv"
 	"strings"
 	"time"
@@ -525,7 +526,17 @@ func (c *DirectClient) Healthy(ctx context.Context) bool {
 	defer cancel()
 
 	_, err := c.k8s.CoreV1().Nodes().List(ctx, metav1.ListOptions{Limit: 1})
-	return err == nil
+	if err != nil {
+		// Reported to the control plane as a plain bool (GPUInventory's
+		// cluster_ready field, see agentrunner.reportInventory) — WHY it
+		// failed is otherwise invisible on both sides. This showed up as a
+		// live "not schedulable" investigation (2026-08-19) that had
+		// nothing but a bare false to go on. Called every inventoryInterval
+		// (30s), so this logs at most once per interval, never a hot loop.
+		log.Printf("cluster health check failed: %v", err)
+		return false
+	}
+	return true
 }
 
 // buildPod translates a placement decision into a pod definition.

@@ -30,14 +30,18 @@ func (h *BillingHandler) CreateSetupIntent(c *gin.Context) {
 		return
 	}
 
-	secret, err := h.billingService.CreateSetupIntent(c.Request.Context(), accountID)
+	secret, paymentMethodID, err := h.billingService.CreateSetupIntent(c.Request.Context(), accountID)
 	if err != nil {
 		// Most likely payments not configured; a 503 tells the console the
 		// feature is unavailable rather than the request being malformed.
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"client_secret": secret})
+	// payment_method_id lets the console remove this pending row if the
+	// customer never completes the flow (cancels, or the Payment Element
+	// fails to load) — otherwise it is a permanent orphaned "Validating…"
+	// card with nothing that can ever clean it up.
+	c.JSON(http.StatusOK, gin.H{"client_secret": secret, "payment_method_id": paymentMethodID})
 }
 
 // ListPaymentMethods returns the account's cards.
