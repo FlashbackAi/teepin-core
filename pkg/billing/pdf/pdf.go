@@ -49,12 +49,12 @@ const (
 // three columns of the totals block and the line-item table stay in
 // register when any one margin is tweaked.
 const (
-	pageWidth   = 210.0
-	marginX     = 18.0
-	contentW    = pageWidth - 2*marginX // usable width between margins
-	logoDrawW   = 42.0                  // logo width; height follows its aspect
-	logoAspect  = 709.0 / 2218.0        // height / width of logo-black.png
-	dateLayout  = "Jan 2, 2006"
+	pageWidth  = 210.0
+	marginX    = 18.0
+	contentW   = pageWidth - 2*marginX // usable width between margins
+	logoDrawW  = 83.0                  // logo width; height follows its aspect
+	logoAspect = 120.0 / 744.0         // height / width of logo-black.png (TeepinWordmark's viewBox)
+	dateLayout = "Jan 2, 2006"
 )
 
 // Greys used for secondary text and table rules. The document is

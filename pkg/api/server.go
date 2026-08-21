@@ -535,7 +535,7 @@ func (s *Server) ListInstances(c *gin.Context) {
 			// which, so a customer does not read this as their instances
 			// having been destroyed.
 			c.JSON(http.StatusServiceUnavailable, gin.H{
-				"error": "GPU capacity is temporarily unreachable; instance state cannot be read right now",
+				"error": "Capacity is temporarily unreachable; instance state cannot be read right now",
 			})
 			return
 		}
@@ -605,7 +605,7 @@ func (s *Server) GetInstance(c *gin.Context) {
 		}
 		if errors.Is(err, cluster.ErrClusterUnavailable) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{
-				"error": "GPU capacity is temporarily unreachable; instance state cannot be read right now",
+				"error": "Capacity is temporarily unreachable; instance state cannot be read right now",
 			})
 			return
 		}
@@ -644,7 +644,7 @@ func (s *Server) DeleteInstance(c *gin.Context) {
 		}
 		if errors.Is(err, cluster.ErrClusterUnavailable) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{
-				"error": "GPU capacity is temporarily unreachable; the instance cannot be deleted right now",
+				"error": "Capacity is temporarily unreachable; the instance cannot be deleted right now",
 			})
 			return
 		}
@@ -705,7 +705,7 @@ func (s *Server) GetInstanceLogs(c *gin.Context) {
 		}
 		if errors.Is(err, cluster.ErrClusterUnavailable) {
 			c.JSON(http.StatusServiceUnavailable, gin.H{
-				"error": "GPU capacity is temporarily unreachable; logs cannot be fetched right now",
+				"error": "Capacity is temporarily unreachable; logs cannot be fetched right now",
 			})
 			return
 		}
