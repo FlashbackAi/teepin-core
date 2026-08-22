@@ -13,6 +13,11 @@ import (
 	"github.com/google/uuid"
 )
 
+// hoursPerMonth converts the storage rate's GB-month unit to the hourly
+// tick this collector meters everything else on: 365*24/12, the standard
+// average-month conversion.
+const hoursPerMonth = 730.0
+
 // UsageCollector periodically collects usage metrics
 type UsageCollector struct {
 	db                 *sql.DB
@@ -91,6 +96,7 @@ func (c *UsageCollector) collectUsage(ctx context.Context) error {
 	vramRate := 0.0
 	cpuRate := 0.0
 	memRate := 0.0
+	storageRate := 0.0
 	rateFetched := false
 
 	for _, inst := range instances {
@@ -126,6 +132,7 @@ func (c *UsageCollector) collectUsage(ctx context.Context) error {
 			vramRate = c.billingService.VRAMPricePerGBHour(ctx)
 			cpuRate = c.billingService.CPUCoreRate(ctx)
 			memRate = c.billingService.MemoryGBRate(ctx)
+			storageRate = c.billingService.StorageGBMonthRate(ctx)
 			rateFetched = true
 		}
 
@@ -141,6 +148,17 @@ func (c *UsageCollector) collectUsage(ctx context.Context) error {
 			unitPrice = float64(inst.CPUUnits)*cpuRate + float64(inst.MemoryGB)*memRate
 		}
 		cost := unitPrice * hours
+
+		// Storage is priced per GB-MONTH, not per hour like everything
+		// above — converted here rather than folded into unitPrice, which
+		// would misrepresent the per-hour rate recorded on the usage
+		// record. hoursPerMonth (730 = 365*24/12, the standard average
+		// used for this conversion) is a deliberate constant rather than a
+		// calendar-specific calculation, which would drift the same
+		// instance's hourly rate depending on which actual month elapsed.
+		if inst.StorageGB > 0 && storageRate > 0 {
+			cost += float64(inst.StorageGB) * storageRate / hoursPerMonth * hours
+		}
 
 		// Record usage
 		record := &UsageRecord{
@@ -189,6 +207,7 @@ type billableInstance struct {
 	GPUVRAMGB    int
 	CPUUnits     int
 	MemoryGB     int
+	StorageGB    int
 	CreatedAt    time.Time
 	TerminatedAt *time.Time
 }
@@ -204,7 +223,8 @@ func (c *UsageCollector) getBillableInstances(ctx context.Context) ([]billableIn
 	query := `
 		SELECT i.id, i.account_id, i.project_id, COALESCE(i.instance_type_id, ''),
 		       COALESCE(i.gpu_vram_gb, 0), COALESCE(i.cpu_units, 0),
-		       COALESCE(i.memory_gb, 0), i.created_at, i.terminated_at
+		       COALESCE(i.memory_gb, 0), COALESCE(i.storage_gb, 0),
+		       i.created_at, i.terminated_at
 		FROM compute.instances i
 		LEFT JOIN LATERAL (
 			SELECT MAX(end_time) AS last_end
@@ -226,7 +246,8 @@ func (c *UsageCollector) getBillableInstances(ctx context.Context) ([]billableIn
 	for rows.Next() {
 		var inst billableInstance
 		if err := rows.Scan(&inst.ID, &inst.AccountID, &inst.ProjectID, &inst.InstanceType,
-			&inst.GPUVRAMGB, &inst.CPUUnits, &inst.MemoryGB, &inst.CreatedAt, &inst.TerminatedAt); err != nil {
+			&inst.GPUVRAMGB, &inst.CPUUnits, &inst.MemoryGB, &inst.StorageGB,
+			&inst.CreatedAt, &inst.TerminatedAt); err != nil {
 			return nil, fmt.Errorf("scan failed: %w", err)
 		}
 		instances = append(instances, inst)

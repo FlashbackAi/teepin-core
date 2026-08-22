@@ -24,12 +24,13 @@ type Instance struct {
 	AllocationNote string            `json:"allocation_note,omitempty"` // set when allocated > requested
 	CPUUnits       int               `json:"cpu_units"`
 	Memory         string            `json:"memory"`
-	Endpoint       string            `json:"endpoint,omitempty"`    // HTTPS endpoint URL
-	PublicIP       string            `json:"public_ip,omitempty"`   // LoadBalancer IP
-	DNSName        string            `json:"dns_name,omitempty"`    // DNS hostname
-	TLSEnabled     bool              `json:"tls_enabled,omitempty"` // SSL/TLS configured
-	TLSReady       bool              `json:"tls_ready,omitempty"`   // SSL certificate provisioned
+	Endpoint       string            `json:"endpoint,omitempty"`       // HTTPS endpoint URL
+	PublicIP       string            `json:"public_ip,omitempty"`      // LoadBalancer IP
+	DNSName        string            `json:"dns_name,omitempty"`       // DNS hostname
+	TLSEnabled     bool              `json:"tls_enabled,omitempty"`    // SSL/TLS configured
+	TLSReady       bool              `json:"tls_ready,omitempty"`      // SSL certificate provisioned
 	ContainerPort  int               `json:"container_port,omitempty"` // the customer's exposed port; 0 when no port was requested
+	StorageGB      int               `json:"storage_gb,omitempty"`     // persistent volume size; 0 means no volume
 	InternalIP     string            `json:"internal_ip,omitempty"`
 	CreatedAt      time.Time         `json:"created_at"`
 	UpdatedAt      time.Time         `json:"updated_at"`
@@ -62,6 +63,11 @@ type CreateInstanceRequest struct {
 	Ports   []PortMapping     `json:"ports,omitempty"`
 	Env     map[string]string `json:"env,omitempty"`
 	Labels  map[string]string `json:"labels,omitempty"`
+	// StorageGB provisions a persistent volume mounted at /data, billed by
+	// GB-month. 0 (default) means no volume — the instance stays ephemeral.
+	// On a home node the volume is node-local: it does not survive that
+	// node going offline, unlike datacenter storage.
+	StorageGB int `json:"storage_gb,omitempty"`
 }
 
 // PortMapping defines port exposure

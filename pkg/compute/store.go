@@ -71,10 +71,14 @@ type InstanceRecord struct {
 	// up which port to route to for an already-running instance, without
 	// re-deriving or guessing it.
 	ContainerPort int
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
-	StartedAt     *time.Time
-	TerminatedAt  *time.Time
+	// StorageGB is the persistent volume size requested at create time; 0
+	// means no volume was provisioned. Not called PersistentStorageGB —
+	// matches the JSON/proto field name used everywhere else in this flow.
+	StorageGB    int
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+	StartedAt    *time.Time
+	TerminatedAt *time.Time
 }
 
 // Store provides CRUD access to compute.instances.
@@ -96,9 +100,10 @@ func (s *Store) Create(ctx context.Context, rec *InstanceRecord) error {
 		INSERT INTO compute.instances
 		(id, account_id, project_id, user_id, name, image, instance_type_id, status,
 		 gpu_vram_gb, cpu_units, memory_gb, endpoint, k8s_pod_name, k8s_namespace,
-		 provider_id, node_id, dns_name, public_ip, tls_enabled, tls_ready, container_port)
+		 provider_id, node_id, dns_name, public_ip, tls_enabled, tls_ready, container_port,
+		 storage_gb)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-		 (SELECT id FROM compute.nodes WHERE node_name = $16), $17, $18, $19, $20, $21)
+		 (SELECT id FROM compute.nodes WHERE node_name = $16), $17, $18, $19, $20, $21, $22)
 		RETURNING created_at, updated_at
 	`
 
@@ -117,7 +122,7 @@ func (s *Store) Create(ctx context.Context, rec *InstanceRecord) error {
 		nullIfEmpty(rec.Endpoint), nullIfEmpty(rec.K8sPodName), rec.K8sNamespace,
 		nullIfEmpty(rec.ProviderID), nullIfEmpty(rec.NodeName),
 		nullIfEmpty(rec.DNSName), nullIfEmpty(rec.PublicIP), rec.TLSEnabled, rec.TLSReady,
-		containerPort,
+		containerPort, rec.StorageGB,
 	).Scan(&rec.CreatedAt, &rec.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("failed to persist instance %s: %w", rec.ID, err)
@@ -247,7 +252,7 @@ const selectColumns = `
 	       cpu_units, memory_gb, COALESCE(endpoint, ''),
 	       COALESCE(k8s_pod_name, ''), COALESCE(k8s_namespace, ''),
 	       COALESCE(provider_id, ''), COALESCE(dns_name, ''), COALESCE(public_ip, ''),
-	       tls_enabled, tls_ready, COALESCE(container_port, 0),
+	       tls_enabled, tls_ready, COALESCE(container_port, 0), storage_gb,
 	       created_at, updated_at, started_at, terminated_at
 	FROM compute.instances
 `
@@ -268,7 +273,7 @@ func (s *Store) query(ctx context.Context, where string, args ...interface{}) ([
 			&rec.CPUUnits, &rec.MemoryGB, &rec.Endpoint,
 			&rec.K8sPodName, &rec.K8sNamespace,
 			&rec.ProviderID, &rec.DNSName, &rec.PublicIP, &rec.TLSEnabled, &rec.TLSReady,
-			&rec.ContainerPort,
+			&rec.ContainerPort, &rec.StorageGB,
 			&rec.CreatedAt, &rec.UpdatedAt, &rec.StartedAt, &rec.TerminatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan instance: %w", err)

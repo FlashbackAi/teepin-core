@@ -4,6 +4,7 @@
 package cluster
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"sync"
@@ -106,6 +107,72 @@ func TestAgentClient_CreateUnknownProviderUnavailable(t *testing.T) {
 	})
 	if !errors.Is(err, ErrClusterUnavailable) {
 		t.Errorf("create for absent provider = %v, want ErrClusterUnavailable", err)
+	}
+}
+
+// TestAgentClient_StreamLogsRoutesToOwningProvider is the regression test
+// for a latent bug found live 2026-08-22: StreamLogs used registry.Any()
+// while CreateInstance already correctly routed by provider — with two
+// sessions connected, a log fetch could land on the agent that never ran
+// the pod, which would 404 rather than return the real logs.
+func TestAgentClient_StreamLogsRoutesToOwningProvider(t *testing.T) {
+	createReply := &agentpb.CommandResult{Success: true}
+
+	recv := func(id string) (*AgentSession, *[]string) {
+		var got []string
+		var s *AgentSession
+		s = NewAgentSession(id, "us-east", "test", "", func(msg *agentpb.ControlMessage) error {
+			got = append(got, msg.RequestId)
+			switch msg.Payload.(type) {
+			case *agentpb.ControlMessage_CreateInstance:
+				go s.deliverResult(msg.RequestId, createReply)
+			case *agentpb.ControlMessage_FetchLogs:
+				go s.deliverLogChunk(msg.RequestId, &agentpb.LogChunk{
+					InstanceId: "inst-b", Data: []byte("hello"), Eof: true,
+				})
+			}
+			return nil
+		})
+		return s, &got
+	}
+	sessA, gotA := recv("provider-1")
+	sessB, gotB := recv("provider-2")
+
+	r := NewRegistry()
+	r.Add(sessA)
+	r.Add(sessB)
+	c := NewAgentClient(r)
+
+	if _, err := c.CreateInstance(context.Background(), InstanceSpec{
+		InstanceID: "inst-b", ProviderID: "provider-2",
+	}); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := c.StreamLogs(context.Background(), AllTenants(), "inst-b", LogOptions{}, &buf); err != nil {
+		t.Fatalf("StreamLogs: %v", err)
+	}
+	if buf.String() != "hello" {
+		t.Errorf("logs = %q, want %q", buf.String(), "hello")
+	}
+
+	fetchesOnB := 0
+	for _, id := range *gotB {
+		if id != "inst-b" { // the create's own RequestId is the instance id
+			fetchesOnB++
+		}
+	}
+	if fetchesOnB != 1 {
+		t.Errorf("provider-2 (the owning provider) received %d FetchLogs, want 1", fetchesOnB)
+	}
+	for _, id := range *gotA {
+		if id != "inst-b" && id != "" {
+			t.Errorf("provider-1 (not the owner) wrongly received a command: %q", id)
+		}
+	}
+	if len(*gotA) != 0 {
+		t.Errorf("provider-1 received %d messages, want 0 (it never created inst-b)", len(*gotA))
 	}
 }
 

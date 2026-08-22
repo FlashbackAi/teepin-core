@@ -66,6 +66,18 @@ type InstanceSpec struct {
 	CPUUnits int
 	MemoryGB int
 
+	// EphemeralStorageGB caps the pod's writable-layer disk usage. A
+	// safety guard rail, not a customer-selectable/billed field — see
+	// StorageGB for that. Zero means "use the deployment's configured
+	// default", never "unlimited"; buildPod always sets some limit so a
+	// single workload can never exhaust a shared node's disk.
+	EphemeralStorageGB int
+	// StorageGB, when > 0, provisions a PersistentVolumeClaim mounted at
+	// /data and billed by GB-month. On a home node the volume is
+	// node-local (k3s local-path) — it does not survive the node going
+	// offline, unlike datacenter network-attached storage.
+	StorageGB int
+
 	// GPUResource empty means either CPU-only, or a simulated allocation
 	// on a local-dev node: those account VRAM but request no device,
 	// because no device plugin advertises the resource and the pod would

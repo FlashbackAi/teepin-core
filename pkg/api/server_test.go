@@ -402,7 +402,7 @@ func TestStatusToInstance_UsesRecordForCommercialFields(t *testing.T) {
 		MemoryGB:     32,
 	}
 
-	inst := statusToInstance(st, record, gpu.DefaultPricePerGBHour)
+	inst := statusToInstance(st, record, gpu.DefaultPricePerGBHour, "")
 
 	// Status comes from the cluster (it observes reality)...
 	if inst.Status != compute.StatusRunning {
@@ -432,7 +432,7 @@ func TestStatusToInstance_SurfacesFailureReason(t *testing.T) {
 		ObservedAt: time.Now().UTC(),
 	}
 
-	inst := statusToInstance(st, nil, gpu.DefaultPricePerGBHour)
+	inst := statusToInstance(st, nil, gpu.DefaultPricePerGBHour, "")
 
 	// "failed" with no reason sends the customer to support to learn
 	// something the cluster already knew.
@@ -446,7 +446,7 @@ func TestStatusToInstance_NoRecordIsNotAPanic(t *testing.T) {
 	// produce a usable response rather than nil-dereferencing.
 	st := cluster.InstanceStatus{InstanceID: "inst-solo0001", Status: compute.StatusRunning}
 
-	inst := statusToInstance(st, nil, gpu.DefaultPricePerGBHour)
+	inst := statusToInstance(st, nil, gpu.DefaultPricePerGBHour, "")
 
 	if inst.ID != "inst-solo0001" || inst.Status != compute.StatusRunning {
 		t.Errorf("standalone conversion lost data: %+v", inst)
@@ -841,7 +841,7 @@ func TestStatusToInstance_PopulatesAllEndpointFields(t *testing.T) {
 	}
 	status := cluster.InstanceStatus{InstanceID: "inst-read0001", Status: compute.StatusRunning}
 
-	instance := statusToInstance(status, record, 0)
+	instance := statusToInstance(status, record, 0, "")
 
 	if instance.Endpoint != record.Endpoint {
 		t.Errorf("Endpoint = %q, want %q", instance.Endpoint, record.Endpoint)
@@ -867,13 +867,86 @@ func TestStatusToInstance_PopulatesAllEndpointFields(t *testing.T) {
 func TestStatusToInstance_NilRecordOmitsEndpointFields(t *testing.T) {
 	status := cluster.InstanceStatus{InstanceID: "inst-norecord1", Status: compute.StatusPending}
 
-	instance := statusToInstance(status, nil, 0)
+	instance := statusToInstance(status, nil, 0, "")
 
 	if instance.Endpoint != "" || instance.DNSName != "" || instance.TLSEnabled || instance.TLSReady {
 		t.Errorf("expected zero-value endpoint fields with a nil record, got %+v", instance)
 	}
 	if instance.ID != "inst-norecord1" || instance.Status != compute.StatusPending {
 		t.Errorf("basic status fields lost with a nil record: %+v", instance)
+	}
+}
+
+// TestStatusToInstance_DerivesEndpointWhenRecordIsEmpty is the regression
+// test for a real bug found live (2026-08-21): the tunnel routes by
+// hostname convention and never consults record.Endpoint, so an instance
+// can be genuinely reachable at https://<id>.<domain> while its stored
+// endpoint/dns_name/tls_ready are all NULL — confirmed against a real
+// instance (inst-0f0bdb64) that returned null fields from the API despite
+// curl succeeding against its derived hostname. Every already-created
+// instance with NULL endpoint columns is fixed by this with no migration
+// and no backfill.
+func TestStatusToInstance_DerivesEndpointWhenRecordIsEmpty(t *testing.T) {
+	record := &compute.InstanceRecord{
+		ID:            "inst-0f0bdb64",
+		Name:          "scrapper1",
+		Image:         "nginx",
+		ContainerPort: 80,
+		// Endpoint/DNSName/TLSEnabled/TLSReady deliberately left at their
+		// zero values — this is exactly the NULL-from-the-database state.
+	}
+	status := cluster.InstanceStatus{InstanceID: "inst-0f0bdb64", Status: compute.StatusRunning}
+
+	instance := statusToInstance(status, record, 0, "dev.teepin.com")
+
+	want := "https://inst-0f0bdb64.dev.teepin.com"
+	if instance.Endpoint != want {
+		t.Errorf("Endpoint = %q, want derived %q", instance.Endpoint, want)
+	}
+	if instance.DNSName != "inst-0f0bdb64.dev.teepin.com" {
+		t.Errorf("DNSName = %q, want the derived hostname", instance.DNSName)
+	}
+	if !instance.TLSEnabled || !instance.TLSReady {
+		t.Errorf("TLSEnabled/TLSReady = %v/%v, want both true (the ACM wildcard is always ready)", instance.TLSEnabled, instance.TLSReady)
+	}
+}
+
+// TestStatusToInstance_NeverOverridesAPopulatedEndpoint guards the other
+// half of the fix: a datacenter instance's real cert-manager-issued
+// endpoint must never be replaced by the derived fallback, even when a
+// domain is configured and a container port is set.
+func TestStatusToInstance_NeverOverridesAPopulatedEndpoint(t *testing.T) {
+	record := &compute.InstanceRecord{
+		ID:            "inst-real0001",
+		Endpoint:      "https://inst-real0001.teepin.com",
+		DNSName:       "inst-real0001.teepin.com",
+		ContainerPort: 8080,
+		TLSEnabled:    true,
+		TLSReady:      false, // cert-manager still issuing
+	}
+	status := cluster.InstanceStatus{InstanceID: "inst-real0001", Status: compute.StatusRunning}
+
+	instance := statusToInstance(status, record, 0, "dev.teepin.com")
+
+	if instance.Endpoint != record.Endpoint {
+		t.Errorf("Endpoint = %q, want the stored value %q untouched", instance.Endpoint, record.Endpoint)
+	}
+	if instance.TLSReady {
+		t.Error("TLSReady was flipped to true by the fallback despite a real stored value of false")
+	}
+}
+
+// TestStatusToInstance_NoContainerPortNeverDerivesAnEndpoint: an instance
+// with no exposed port genuinely has nothing to reach — deriving a
+// hostname for it would be a broken link, not a helpful fallback.
+func TestStatusToInstance_NoContainerPortNeverDerivesAnEndpoint(t *testing.T) {
+	record := &compute.InstanceRecord{ID: "inst-noport001"}
+	status := cluster.InstanceStatus{InstanceID: "inst-noport001", Status: compute.StatusRunning}
+
+	instance := statusToInstance(status, record, 0, "dev.teepin.com")
+
+	if instance.Endpoint != "" {
+		t.Errorf("Endpoint = %q, want empty (no port was ever exposed)", instance.Endpoint)
 	}
 }
 
@@ -911,7 +984,7 @@ func TestCreateInstance_PersistsEndpointFields(t *testing.T) {
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
-			sqlmock.AnyArg(), "203.0.113.20", true, false, sqlmock.AnyArg()).
+			sqlmock.AnyArg(), "203.0.113.20", true, false, sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"created_at", "updated_at"}).
 			AddRow(time.Now(), time.Now()))
 

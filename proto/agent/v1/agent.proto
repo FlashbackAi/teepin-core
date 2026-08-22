@@ -98,6 +98,15 @@ message CreateInstanceCommand {
 
   // Registry credentials for private images, if the project has them.
   string image_pull_secret = 19;
+
+  // storage_gb provisions a PersistentVolumeClaim mounted at /data,
+  // billed by GB-month. 0 means no volume. ephemeral_storage_gb is a
+  // safety cap on the pod's writable-layer disk usage — not customer-
+  // selectable or billed; the control plane fills in its configured
+  // default before this ever reaches the wire. Both additive, agent.pb.go
+  // regenerated 2026-08-22, no renumbering.
+  int32 storage_gb           = 20;
+  int32 ephemeral_storage_gb = 21;
 }
 
 message PortMapping {

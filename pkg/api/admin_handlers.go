@@ -117,6 +117,32 @@ func (h *AdminHandler) UpdateCPUPricing(c *gin.Context) {
 	c.JSON(http.StatusOK, info)
 }
 
+// UpdateStoragePricing sets the persistent-storage GB-month rate. Zero is
+// valid ("do not charge"). A separate endpoint from UpdatePricing, same
+// reasoning as UpdateCPUPricing: the GPU rate's "must be positive"
+// contract stays untouched.
+// PUT /v1/admin/pricing/storage
+func (h *AdminHandler) UpdateStoragePricing(c *gin.Context) {
+	var req struct {
+		StoragePricePerGBMonth float64 `json:"storage_price_per_gb_month"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := h.billingService.SetStoragePricing(c.Request.Context(),
+		req.StoragePricePerGBMonth, "admin-api"); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	info, err := h.billingService.GetPricing(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, info)
+}
+
 // ---------------------------------------------------------------------
 // Manual invoicing
 //

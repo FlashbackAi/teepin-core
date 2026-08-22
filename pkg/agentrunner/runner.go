@@ -287,25 +287,27 @@ func (r *Runner) handleCreate(ctx context.Context, s stream, requestID string, c
 	}
 
 	spec := cluster.InstanceSpec{
-		InstanceID:      cmd.InstanceId,
-		AccountID:       cmd.AccountId,
-		ProjectID:       cmd.ProjectId,
-		Image:           cmd.Image,
-		Command:         cmd.Command,
-		Args:            cmd.Args,
-		Env:             cmd.Env,
-		Labels:          cmd.Labels,
-		CPUUnits:        int(cmd.CpuUnits),
-		MemoryGB:        int(cmd.MemoryGb),
-		GPUResource:     cmd.GpuResource,
-		GPUQuantity:     int(cmd.GpuQuantity),
-		GPUVRAMGB:       int(cmd.GpuVramGb),
-		NodeName:        cmd.NodeName,
-		Ports:           ports,
-		EndpointDomain:  cmd.EndpointDomain,
-		EnableTLS:       cmd.EnableTls,
-		TLSIssuer:       cmd.TlsIssuer,
-		ImagePullSecret: cmd.ImagePullSecret,
+		InstanceID:         cmd.InstanceId,
+		AccountID:          cmd.AccountId,
+		ProjectID:          cmd.ProjectId,
+		Image:              cmd.Image,
+		Command:            cmd.Command,
+		Args:               cmd.Args,
+		Env:                cmd.Env,
+		Labels:             cmd.Labels,
+		CPUUnits:           int(cmd.CpuUnits),
+		MemoryGB:           int(cmd.MemoryGb),
+		GPUResource:        cmd.GpuResource,
+		GPUQuantity:        int(cmd.GpuQuantity),
+		GPUVRAMGB:          int(cmd.GpuVramGb),
+		NodeName:           cmd.NodeName,
+		Ports:              ports,
+		EndpointDomain:     cmd.EndpointDomain,
+		EnableTLS:          cmd.EnableTls,
+		TLSIssuer:          cmd.TlsIssuer,
+		ImagePullSecret:    cmd.ImagePullSecret,
+		StorageGB:          int(cmd.StorageGb),
+		EphemeralStorageGB: int(cmd.EphemeralStorageGb),
 	}
 
 	// Idempotency: a command redelivered after a reconnect must not
@@ -567,7 +569,7 @@ func (r *Runner) handleProxyRequest(ctx context.Context, s stream, requestID str
 			_ = r.sendProxy(s, &agentpb.AgentMessage{
 				RequestId: requestID,
 				Payload: &agentpb.AgentMessage_ProxyData{ProxyData: &agentpb.ProxyData{
-					Eof:   eof,
+					Eof:    eof,
 					Reset_: !eof, // a mid-body read error is an abort, not a clean end
 				}},
 			})
@@ -815,8 +817,8 @@ func (r *Runner) handleExecStart(ctx context.Context, s stream, requestID string
 // path (see the Stage 3 plan's head-of-line-blocking note — every write
 // from an agent, including heartbeats, shares one sendMu).
 const (
-	execCoalesceWindow       = 10 * time.Millisecond
-	execCoalesceMax          = 32 * 1024
+	execCoalesceWindow        = 10 * time.Millisecond
+	execCoalesceMax           = 32 * 1024
 	execOutputRateBytesPerSec = 2 * 1024 * 1024
 	execOutputRateBurst       = 64 * 1024
 )

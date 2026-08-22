@@ -14,9 +14,11 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -119,7 +121,16 @@ type DirectClient struct {
 	// provide. Nil until WithRESTConfig is called, in which case
 	// ExecAttach returns ErrExecUnsupported rather than a nil-deref.
 	rest *rest.Config
+
+	// podCIDR is the cluster's pod network range, needed to write a
+	// NetworkPolicy that blocks pod-to-pod traffic without also blocking
+	// the node/ingress/internet (see buildNetworkPolicy). Defaults to
+	// k3s's own default — every home node runs k3s today — overridable
+	// via WithPodCIDR for a cluster configured differently.
+	podCIDR string
 }
+
+const defaultPodCIDR = "10.42.0.0/16"
 
 // Compile-time check. Cheap, and it fails the build rather than a
 // request when the interface and implementation drift apart.
@@ -154,6 +165,26 @@ func (c *DirectClient) WithRESTConfig(cfg *rest.Config) *DirectClient {
 	return c
 }
 
+// WithPodCIDR overrides the default pod network range used to build each
+// instance's NetworkPolicy. Same chaining-setter shape as WithRESTConfig.
+func (c *DirectClient) WithPodCIDR(cidr string) *DirectClient {
+	c.podCIDR = cidr
+	return c
+}
+
+// effectivePodCIDR returns the configured pod CIDR, or the k3s default
+// when none was set — so an existing NewDirectClient call site that never
+// calls WithPodCIDR still gets a correct, working NetworkPolicy rather
+// than one built against an empty CIDR (which would match nothing,
+// silently making the "except" clause a no-op and blocking everything
+// including DNS and the node itself).
+func (c *DirectClient) effectivePodCIDR() string {
+	if c.podCIDR != "" {
+		return c.podCIDR
+	}
+	return defaultPodCIDR
+}
+
 // endpointOptionsFor derives the networking override from a placement
 // decision. spec.EnableTLS is a plain bool (not a pointer), so there is no
 // wire-level way to distinguish "the caller wants TLS off" from "the
@@ -179,9 +210,35 @@ func endpointOptionsFor(spec InstanceSpec) networking.EndpointOptions {
 // CreateInstance builds the pod and, when ports are requested, its
 // endpoint.
 func (c *DirectClient) CreateInstance(ctx context.Context, spec InstanceSpec) (*InstanceResult, error) {
+	// Volume before pod: buildPod references the PVC by name in its
+	// Volumes spec, so the claim must exist (or already have existed —
+	// IsAlreadyExists is success, matching every other idempotent create
+	// in this file) before the pod is created, or the pod would sit in
+	// ContainerCreating waiting on a claim that never arrives.
+	if spec.StorageGB > 0 {
+		pvc, pvcErr := buildPVC(spec)
+		if pvcErr != nil {
+			return nil, pvcErr
+		}
+		if _, err := c.k8s.CoreV1().PersistentVolumeClaims(workloadNamespace).Create(ctx, pvc, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+			return nil, fmt.Errorf("create pvc: %w", err)
+		}
+	}
+
 	pod, err := c.buildPod(spec)
 	if err != nil {
 		return nil, err
+	}
+
+	// Isolation before the pod goes live: NetworkPolicy selects by the
+	// instance label the pod will carry, so creating it first (or
+	// concurrently — order between these two doesn't matter, only that
+	// both exist before traffic flows) means there is never a window
+	// where a freshly-started pod is reachable pod-to-pod before its
+	// policy attaches.
+	netpol := buildNetworkPolicy(spec, c.effectivePodCIDR())
+	if _, err := c.k8s.NetworkingV1().NetworkPolicies(workloadNamespace).Create(ctx, netpol, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return nil, fmt.Errorf("create network policy: %w", err)
 	}
 
 	created, err := c.k8s.CoreV1().Pods(workloadNamespace).Create(ctx, pod, metav1.CreateOptions{})
@@ -325,6 +382,20 @@ func (c *DirectClient) DeleteInstance(ctx context.Context, scope Scope, instance
 				}
 			}
 		}
+	}
+
+	// PVC and NetworkPolicy are named deterministically from instanceID
+	// (see pvcName/networkPolicyName), so no lookup is needed — just
+	// delete by name, same idempotent IsNotFound-is-success idiom as the
+	// pod delete above. A PVC delete when StorageGB was never set simply
+	// finds nothing, which is not an error.
+	if err := c.k8s.CoreV1().PersistentVolumeClaims(workloadNamespace).Delete(
+		ctx, pvcName(instanceID), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete pvc: %w", err)
+	}
+	if err := c.k8s.NetworkingV1().NetworkPolicies(workloadNamespace).Delete(
+		ctx, networkPolicyName(instanceID), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete network policy: %w", err)
 	}
 
 	return nil
@@ -827,6 +898,25 @@ func (c *DirectClient) buildPod(spec InstanceSpec) (*corev1.Pod, error) {
 		return nil, fmt.Errorf("invalid memory %dGB: %w", spec.MemoryGB, err)
 	}
 
+	// Ephemeral-storage limit: a safety guard rail, not a customer choice.
+	// Found live 2026-08-21: buildPod set no storage limit at all, so a
+	// workload's writable layer was backed directly by the host's full
+	// disk (1007G on Srialla for a "2 vCPU / 4GB" instance) — any single
+	// instance could exhaust a shared home node's disk and take down k3s,
+	// the agent, and every other tenant on it. EphemeralStorageGB is
+	// always > 0 by the time it reaches here (callers default it), but
+	// zero is tolerated as "no limit set" rather than parsed into a
+	// zero-quantity limit, which Kubernetes would treat as "must not use
+	// any disk at all" and evict the pod immediately.
+	var ephemeral resource.Quantity
+	hasEphemeral := spec.EphemeralStorageGB > 0
+	if hasEphemeral {
+		ephemeral, err = resource.ParseQuantity(fmt.Sprintf("%dGi", spec.EphemeralStorageGB))
+		if err != nil {
+			return nil, fmt.Errorf("invalid ephemeral storage %dGB: %w", spec.EphemeralStorageGB, err)
+		}
+	}
+
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("%s-%s", spec.InstanceID, uuid.New().String()[:5]),
@@ -841,6 +931,17 @@ func (c *DirectClient) buildPod(spec InstanceSpec) (*corev1.Pod, error) {
 			// cover IPv6 nodes) — without a token, reaching it gains
 			// nothing.
 			AutomountServiceAccountToken: boolPtr(false),
+			// Pod-level hardening, added 2026-08-22 alongside the NetworkPolicy
+			// this pod is also given (see the caller of buildPod). Deliberately
+			// NOT RunAsNonRoot: the stock nginx image (and most base images)
+			// run as root and bind port 80, and this platform does not control
+			// what a customer's image does internally — enforcing non-root
+			// would break the exact workload running in production. Privilege
+			// escalation and every capability except binding a low port are
+			// still denied regardless of what the image asks for.
+			SecurityContext: &corev1.PodSecurityContext{
+				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+			},
 			Containers: []corev1.Container{
 				{
 					Name: "app",
@@ -850,6 +951,17 @@ func (c *DirectClient) buildPod(spec InstanceSpec) (*corev1.Pod, error) {
 					Command: spec.Command,
 					Args:    spec.Args,
 					Image:   spec.Image,
+					SecurityContext: &corev1.SecurityContext{
+						AllowPrivilegeEscalation: boolPtr(false),
+						Capabilities: &corev1.Capabilities{
+							Drop: []corev1.Capability{"ALL"},
+							// Re-added deliberately: without it, an image that
+							// binds a port below 1024 as root (nginx's default
+							// config does exactly this) fails to start once
+							// every other capability is dropped.
+							Add: []corev1.Capability{"NET_BIND_SERVICE"},
+						},
+					},
 					Resources: corev1.ResourceRequirements{
 						Requests: corev1.ResourceList{
 							corev1.ResourceCPU:    cpu,
@@ -863,6 +975,35 @@ func (c *DirectClient) buildPod(spec InstanceSpec) (*corev1.Pod, error) {
 				},
 			},
 		},
+	}
+
+	if hasEphemeral {
+		pod.Spec.Containers[0].Resources.Requests[corev1.ResourceEphemeralStorage] = ephemeral
+		pod.Spec.Containers[0].Resources.Limits[corev1.ResourceEphemeralStorage] = ephemeral
+	}
+
+	// Persistent volume: customer-chosen size, billed by GB-month (see
+	// pkg/billing). Deleted with the instance — reattaching a volume to a
+	// later instance is a possible future feature, not built. On a home
+	// node this is k3s's local-path provisioner: the data lives on that
+	// node's own disk and is unreachable while the node is offline, a
+	// materially different durability story than datacenter network
+	// storage. The console must say so; buildPod only wires the mount.
+	if spec.StorageGB > 0 {
+		const volumeName = "data"
+		pod.Spec.Volumes = []corev1.Volume{
+			{
+				Name: volumeName,
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+						ClaimName: pvcName(spec.InstanceID),
+					},
+				},
+			},
+		}
+		pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{
+			{Name: volumeName, MountPath: "/data"},
+		}
 	}
 
 	if spec.ImagePullSecret != "" {
@@ -943,6 +1084,122 @@ func (c *DirectClient) buildPod(spec InstanceSpec) (*corev1.Pod, error) {
 	}
 
 	return pod, nil
+}
+
+// pvcName and networkPolicyName are deterministic from the instance ID so
+// create/delete never need to look anything up first — they just name the
+// object and act.
+func pvcName(instanceID string) string           { return "pvc-" + instanceID }
+func networkPolicyName(instanceID string) string { return "netpol-" + instanceID }
+
+// buildPVC builds the PersistentVolumeClaim for an instance's /data mount
+// (see buildPod). StorageClassName is left nil so it resolves to the
+// cluster's default — k3s's local-path provisioner on a home node,
+// whatever a datacenter cluster defines otherwise. Carries the same
+// tenancy labels as the pod so a scoped list/delete of PVCs is possible
+// later without a schema change.
+func buildPVC(spec InstanceSpec) (*corev1.PersistentVolumeClaim, error) {
+	size, err := resource.ParseQuantity(fmt.Sprintf("%dGi", spec.StorageGB))
+	if err != nil {
+		return nil, fmt.Errorf("invalid storage size %dGB: %w", spec.StorageGB, err)
+	}
+	return &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pvcName(spec.InstanceID),
+			Namespace: workloadNamespace,
+			Labels: map[string]string{
+				labelManaged:       "true",
+				labelInstanceShort: spec.InstanceID,
+				labelInstanceID:    spec.InstanceID,
+				labelAccountID:     spec.AccountID,
+				labelProjectID:     spec.ProjectID,
+			},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: size},
+			},
+		},
+	}, nil
+}
+
+// buildNetworkPolicy default-denies pod-to-pod traffic for one instance
+// while leaving everything else open — the node (the agent proxies tunnel
+// requests to the pod IP from a host process, outside the pod network),
+// the ingress controller, and the public internet.
+//
+// NetworkPolicy is allow-list once a pod is selected by any policy, so
+// every direction actually needed must be listed explicitly:
+//   - Ingress: 0.0.0.0/0 except the pod CIDR — blocks pod-to-pod inbound,
+//     permits the node and anything routing in from outside the cluster.
+//   - Egress: CoreDNS first, by name (kube-dns's pod IP is itself inside
+//     the pod CIDR — a naive "except pod CIDR" block breaks ALL name
+//     resolution, the classic NetworkPolicy footgun), then 0.0.0.0/0
+//     except the pod CIDR and the cloud metadata address.
+//
+// podCIDR is operator-configured (TEEPIN_POD_CIDR) because it varies by
+// cluster — k3s defaults to 10.42.0.0/16, confirmed against a live
+// instance's pod IP (10.42.0.64) this session; a datacenter cluster would
+// supply its own.
+func buildNetworkPolicy(spec InstanceSpec, podCIDR string) *networkingv1.NetworkPolicy {
+	tcp := corev1.ProtocolTCP
+	udp := corev1.ProtocolUDP
+	dnsPort := intstr.FromInt(53)
+
+	return &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      networkPolicyName(spec.InstanceID),
+			Namespace: workloadNamespace,
+			Labels: map[string]string{
+				labelManaged:       "true",
+				labelInstanceShort: spec.InstanceID,
+				labelInstanceID:    spec.InstanceID,
+				labelAccountID:     spec.AccountID,
+				labelProjectID:     spec.ProjectID,
+			},
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{
+				MatchLabels: map[string]string{labelInstanceShort: spec.InstanceID},
+			},
+			PolicyTypes: []networkingv1.PolicyType{
+				networkingv1.PolicyTypeIngress,
+				networkingv1.PolicyTypeEgress,
+			},
+			Ingress: []networkingv1.NetworkPolicyIngressRule{
+				{
+					From: []networkingv1.NetworkPolicyPeer{
+						{IPBlock: &networkingv1.IPBlock{CIDR: "0.0.0.0/0", Except: []string{podCIDR}}},
+					},
+				},
+			},
+			Egress: []networkingv1.NetworkPolicyEgressRule{
+				{
+					To: []networkingv1.NetworkPolicyPeer{
+						{
+							NamespaceSelector: &metav1.LabelSelector{},
+							PodSelector: &metav1.LabelSelector{
+								MatchLabels: map[string]string{"k8s-app": "kube-dns"},
+							},
+						},
+					},
+					Ports: []networkingv1.NetworkPolicyPort{
+						{Protocol: &udp, Port: &dnsPort},
+						{Protocol: &tcp, Port: &dnsPort},
+					},
+				},
+				{
+					To: []networkingv1.NetworkPolicyPeer{
+						{IPBlock: &networkingv1.IPBlock{
+							CIDR:   "0.0.0.0/0",
+							Except: []string{podCIDR, "169.254.169.254/32"},
+						}},
+					},
+				},
+			},
+		},
+	}
 }
 
 // podStatus maps a pod to the interface's status view.

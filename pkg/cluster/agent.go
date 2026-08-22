@@ -34,15 +34,48 @@ type AgentClient struct {
 	// statuses is the last known state of every instance, keyed by
 	// instance ID. Updated by unsolicited InstanceStatus messages.
 	statuses map[string]InstanceStatus
+	// providers remembers which session's provider created each
+	// instance, so a later StreamLogs/DeleteInstance routes back to the
+	// SAME agent rather than registry.Any() — an arbitrary session in a
+	// multi-provider deployment. Found live 2026-08-22 while researching
+	// the logs pipeline: CreateInstance already routes by ByProvider(),
+	// but StreamLogs and DeleteInstance both still used Any(), a latent
+	// bug from before a second provider (a home node) ever connected.
+	// Set at create time; cleared in ForgetInstance.
+	providers map[string]string
 }
 
 var _ Client = (*AgentClient)(nil)
 
 func NewAgentClient(registry *Registry) *AgentClient {
 	return &AgentClient{
-		registry: registry,
-		statuses: make(map[string]InstanceStatus),
+		registry:  registry,
+		statuses:  make(map[string]InstanceStatus),
+		providers: make(map[string]string),
 	}
+}
+
+// sessionForInstance resolves the session that should handle a command
+// for an already-existing instance: the SAME provider that created it,
+// when known, falling back to Any() for the single-provider datacenter
+// path (or an instance created before this routing existed).
+func (c *AgentClient) sessionForInstance(instanceID string) (*AgentSession, bool) {
+	c.mu.RLock()
+	providerID := c.providers[instanceID]
+	c.mu.RUnlock()
+
+	if providerID != "" {
+		if session, ok := c.registry.ByProvider(providerID); ok {
+			return session, true
+		}
+		// The owning provider is known but not currently connected — do
+		// NOT fall back to Any() here. Routing a home instance's logs to
+		// a different provider's session would return "not found" from
+		// an agent that never had this pod, a more confusing failure
+		// than a clean "unavailable".
+		return nil, false
+	}
+	return c.registry.Any()
 }
 
 // RecordStatus stores a status reported by an agent. Called by the gRPC
@@ -95,6 +128,7 @@ func (c *AgentClient) ForgetInstance(instanceID string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.statuses, instanceID)
+	delete(c.providers, instanceID)
 }
 
 // scopeAllows reports whether a cached status is visible to a scope.
@@ -144,25 +178,27 @@ func (c *AgentClient) CreateInstance(ctx context.Context, spec InstanceSpec) (*I
 	}
 
 	cmd := &agentpb.CreateInstanceCommand{
-		InstanceId:      spec.InstanceID,
-		AccountId:       spec.AccountID,
-		ProjectId:       spec.ProjectID,
-		Image:           spec.Image,
-		Command:         spec.Command,
-		Args:            spec.Args,
-		CpuUnits:        int32(spec.CPUUnits),
-		MemoryGb:        int32(spec.MemoryGB),
-		GpuResource:     spec.GPUResource,
-		GpuQuantity:     int32(spec.GPUQuantity),
-		GpuVramGb:       int32(spec.GPUVRAMGB),
-		NodeName:        spec.NodeName,
-		Env:             spec.Env,
-		Labels:          spec.Labels,
-		Ports:           ports,
-		EndpointDomain:  spec.EndpointDomain,
-		EnableTls:       spec.EnableTLS,
-		TlsIssuer:       spec.TLSIssuer,
-		ImagePullSecret: spec.ImagePullSecret,
+		InstanceId:         spec.InstanceID,
+		AccountId:          spec.AccountID,
+		ProjectId:          spec.ProjectID,
+		Image:              spec.Image,
+		Command:            spec.Command,
+		Args:               spec.Args,
+		CpuUnits:           int32(spec.CPUUnits),
+		MemoryGb:           int32(spec.MemoryGB),
+		GpuResource:        spec.GPUResource,
+		GpuQuantity:        int32(spec.GPUQuantity),
+		GpuVramGb:          int32(spec.GPUVRAMGB),
+		NodeName:           spec.NodeName,
+		Env:                spec.Env,
+		Labels:             spec.Labels,
+		Ports:              ports,
+		EndpointDomain:     spec.EndpointDomain,
+		EnableTls:          spec.EnableTLS,
+		TlsIssuer:          spec.TLSIssuer,
+		ImagePullSecret:    spec.ImagePullSecret,
+		StorageGb:          int32(spec.StorageGB),
+		EphemeralStorageGb: int32(spec.EphemeralStorageGB),
 	}
 
 	// The instance ID is the idempotency key: a command redelivered after
@@ -177,6 +213,16 @@ func (c *AgentClient) CreateInstance(ctx context.Context, spec InstanceSpec) (*I
 	if !result.Success {
 		return nil, errorFromResult(result)
 	}
+
+	// Remember which session actually created this instance — session's
+	// own ProviderID, not spec.ProviderID, since the Any() fallback path
+	// (datacenter, no ProviderID resolved by placement) still lands on a
+	// real session with a real provider identity. This is what lets
+	// StreamLogs/DeleteInstance route back to the SAME agent later
+	// instead of an arbitrary one.
+	c.mu.Lock()
+	c.providers[spec.InstanceID] = session.ProviderID
+	c.mu.Unlock()
 
 	endpointURL, dnsName, tlsEnabled, tlsReady := result.EndpointUrl, result.DnsName, result.TlsEnabled, result.TlsReady
 
@@ -239,7 +285,7 @@ func (c *AgentClient) DeleteInstance(ctx context.Context, scope Scope, instanceI
 		return nil
 	}
 
-	session, ok := c.registry.Any()
+	session, ok := c.sessionForInstance(instanceID)
 	if !ok {
 		return ErrClusterUnavailable
 	}
@@ -305,7 +351,7 @@ func (c *AgentClient) StreamLogs(ctx context.Context, scope Scope, instanceID st
 		return ErrNotFound
 	}
 
-	session, ok := c.registry.Any()
+	session, ok := c.sessionForInstance(instanceID)
 	if !ok {
 		return ErrClusterUnavailable
 	}

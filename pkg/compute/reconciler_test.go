@@ -66,6 +66,7 @@ func expectListActive(mock sqlmock.Sqlmock, id, status string) {
 			id, uuid.New(), uuid.New(), uuid.New(), "app", "nginx:latest",
 			"gpu.h100.2g.20gb", status, 20, 8, 32, "",
 			id+"-pod", "default", "", "", "", false, false, 0,
+			0,
 			time.Now(), time.Now(), nil, nil,
 		))
 }

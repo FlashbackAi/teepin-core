@@ -18,10 +18,15 @@ type PricingInfo struct {
 	// CPU/memory rates for home-class (CPU) compute. Default 0 — CPU
 	// instances bill nothing until an operator sets a rate, so nothing
 	// running free today is retroactively charged.
-	CPUPricePerCoreHour  float64    `json:"cpu_price_per_core_hour"`
-	MemoryPricePerGBHour float64    `json:"memory_price_per_gb_hour"`
-	UpdatedBy            *string    `json:"updated_by,omitempty"`
-	UpdatedAt            *time.Time `json:"updated_at,omitempty"`
+	CPUPricePerCoreHour  float64 `json:"cpu_price_per_core_hour"`
+	MemoryPricePerGBHour float64 `json:"memory_price_per_gb_hour"`
+	// StoragePricePerGBMonth is a GB-MONTH rate, unlike every other rate
+	// here (per-hour) — the collector converts it (see hoursPerMonth in
+	// collector.go). Same "default 0, ships on, bills nothing until an
+	// operator sets it" pattern as the CPU/memory rates.
+	StoragePricePerGBMonth float64    `json:"storage_price_per_gb_month"`
+	UpdatedBy              *string    `json:"updated_by,omitempty"`
+	UpdatedAt              *time.Time `json:"updated_at,omitempty"`
 }
 
 // VRAMPricePerGBHour returns the live GPU VRAM rate from billing.pricing.
@@ -59,6 +64,12 @@ func (s *Service) MemoryGBRate(ctx context.Context) float64 {
 	return s.rate(ctx, "memory_price_per_gb_hour")
 }
 
+// StorageGBMonthRate returns the live per-GB-month persistent-storage
+// rate. Same 0-default, no-compiled-fallback contract as CPUCoreRate.
+func (s *Service) StorageGBMonthRate(ctx context.Context) float64 {
+	return s.rate(ctx, "storage_price_per_gb_month")
+}
+
 // rate reads one numeric pricing column, returning 0 on any error (the
 // safe direction for a rate that defaults to "free").
 func (s *Service) rate(ctx context.Context, column string) float64 {
@@ -82,10 +93,12 @@ func (s *Service) GetPricing(ctx context.Context) (*PricingInfo, error) {
 	info := &PricingInfo{}
 	err := s.db.QueryRowContext(ctx,
 		`SELECT vram_price_per_gb_hour, cpu_price_per_core_hour,
-		        memory_price_per_gb_hour, updated_by, updated_at
+		        memory_price_per_gb_hour, storage_price_per_gb_month,
+		        updated_by, updated_at
 		 FROM billing.pricing WHERE id = 1`,
 	).Scan(&info.VRAMPricePerGBHour, &info.CPUPricePerCoreHour,
-		&info.MemoryPricePerGBHour, &info.UpdatedBy, &info.UpdatedAt)
+		&info.MemoryPricePerGBHour, &info.StoragePricePerGBMonth,
+		&info.UpdatedBy, &info.UpdatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read pricing: %w", err)
 	}
@@ -113,6 +126,29 @@ func (s *Service) SetCPUPricing(ctx context.Context, cpuRate, memRate float64, u
 		return fmt.Errorf("pricing row missing; set the GPU rate first")
 	}
 	log.Printf("CPU pricing updated to $%.4f/core-hr, $%.4f/GB-hr by %s", cpuRate, memRate, updatedBy)
+	return nil
+}
+
+// SetStoragePricing updates the persistent-storage GB-month rate. Zero is
+// allowed (means "do not charge"), same as CPU/memory — a separate
+// endpoint from the GPU rate's PUT so that rate's "must be positive"
+// contract stays untouched.
+func (s *Service) SetStoragePricing(ctx context.Context, gbMonthRate float64, updatedBy string) error {
+	if gbMonthRate < 0 {
+		return fmt.Errorf("rate must be non-negative")
+	}
+	result, err := s.db.ExecContext(ctx,
+		`UPDATE billing.pricing
+		 SET storage_price_per_gb_month = $1, updated_by = $2, updated_at = NOW()
+		 WHERE id = 1`,
+		gbMonthRate, updatedBy)
+	if err != nil {
+		return fmt.Errorf("failed to update storage pricing: %w", err)
+	}
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		return fmt.Errorf("pricing row missing; set the GPU rate first")
+	}
+	log.Printf("Storage pricing updated to $%.4f/GB-month by %s", gbMonthRate, updatedBy)
 	return nil
 }
 

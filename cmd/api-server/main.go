@@ -462,7 +462,8 @@ func main() {
 			getEnv("TEEPIN_DOMAIN", "teepin.com"),
 			getEnv("ENABLE_TLS", "false") == "true",
 			getEnv("TLS_ISSUER", "letsencrypt-prod"),
-		)
+		).
+		WithEphemeralStorageGB(getEnvInt("TEEPIN_EPHEMERAL_STORAGE_GB", 0))
 	// Enable home-class placement when home compute is on. Absent this, a
 	// node_class:"home" request is refused cleanly (the placer is nil).
 	if nodeService != nil {
@@ -688,6 +689,19 @@ func initKubernetesClient() (*kubernetes.Clientset, error) {
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
+	}
+	return defaultValue
+}
+
+// getEnvInt reads an integer environment variable, falling back to
+// defaultValue when unset OR unparseable — a malformed value should not
+// crash startup, since a typo'd override is far less severe than the
+// service refusing to boot.
+func getEnvInt(key string, defaultValue int) int {
+	if value := os.Getenv(key); value != "" {
+		if n, err := strconv.Atoi(value); err == nil {
+			return n
+		}
 	}
 	return defaultValue
 }
@@ -918,6 +932,7 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 				admin.GET("/pricing", adminHandler.GetPricing)
 				admin.PUT("/pricing", adminHandler.UpdatePricing)
 				admin.PUT("/pricing/cpu", adminHandler.UpdateCPUPricing)
+				admin.PUT("/pricing/storage", adminHandler.UpdateStoragePricing)
 
 				// Manual invoicing for the operator control centre.
 				admin.GET("/accounts", adminHandler.ListAccounts)

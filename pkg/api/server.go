@@ -73,6 +73,15 @@ type Server struct {
 	enableTLS      bool
 	tlsIssuer      string
 
+	// ephemeralStorageGB is the safety cap stamped onto every instance's
+	// InstanceSpec (not customer-selectable; see StorageGB for the billed,
+	// customer-chosen volume). Zero here means "not configured", in which
+	// case instanceSpec falls back to defaultEphemeralStorageGB rather
+	// than leaving the pod's disk unbounded — found live 2026-08-22: a
+	// pod with no limit at all was backed directly by the host's full
+	// disk. Set via WithEphemeralStorageGB.
+	ephemeralStorageGB int
+
 	// execTickets issues short-lived, single-use credentials for
 	// interactive exec's WebSocket attach step (pkg/cluster.ExecHandler
 	// redeems them — see the ticket auth design in the interactive-exec
@@ -101,6 +110,19 @@ func (s *Server) WithEndpointConfig(domain string, enableTLS bool, tlsIssuer str
 	s.endpointDomain = domain
 	s.enableTLS = enableTLS
 	s.tlsIssuer = tlsIssuer
+	return s
+}
+
+// defaultEphemeralStorageGB is used whenever WithEphemeralStorageGB is
+// never called (every existing NewServer call site) or is called with 0.
+const defaultEphemeralStorageGB = 10
+
+// WithEphemeralStorageGB sets the per-instance disk-usage safety cap.
+// Returns the same *Server for chaining, so existing NewServer call sites
+// compile unchanged and keep working (via defaultEphemeralStorageGB)
+// without needing to be updated.
+func (s *Server) WithEphemeralStorageGB(gb int) *Server {
+	s.ephemeralStorageGB = gb
 	return s
 }
 
@@ -301,6 +323,17 @@ func (s *Server) CreateInstance(c *gin.Context) {
 			})
 			return
 		}
+	}
+
+	// 1000GB is an operator-chosen sanity bound, not a technical limit —
+	// there is no plan tier anywhere near it yet, and it exists purely to
+	// reject a fat-fingered request (or an integer overflow upstream)
+	// before it reaches PVC provisioning.
+	if req.StorageGB < 0 || req.StorageGB > 1000 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": fmt.Sprintf("invalid storage_gb %d: must be between 0 and 1000", req.StorageGB),
+		})
+		return
 	}
 
 	// Billing integrity: when persistence is enabled, every instance
@@ -565,7 +598,7 @@ func (s *Server) ListInstances(c *gin.Context) {
 	rate := s.vramRate(c.Request.Context())
 	instances := make([]models.Instance, 0, len(statuses))
 	for _, st := range statuses {
-		instances = append(instances, statusToInstance(st, records[st.InstanceID], rate))
+		instances = append(instances, statusToInstance(st, records[st.InstanceID], rate, s.endpointDomain))
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -635,7 +668,7 @@ func (s *Server) GetInstance(c *gin.Context) {
 		record, _ = s.store.Get(c.Request.Context(), instanceID)
 	}
 
-	c.JSON(http.StatusOK, statusToInstance(*st, record, s.vramRate(c.Request.Context())))
+	c.JSON(http.StatusOK, statusToInstance(*st, record, s.vramRate(c.Request.Context()), s.endpointDomain))
 }
 
 // DeleteInstance deletes an instance. Scoped to the caller's project:
@@ -868,6 +901,13 @@ func (s *Server) instanceSpec(instanceID string, instanceUUID, projectID, accoun
 		EndpointDomain: s.endpointDomain,
 		EnableTLS:      s.enableTLS,
 		TLSIssuer:      s.tlsIssuer,
+		StorageGB:      req.StorageGB,
+	}
+
+	if s.ephemeralStorageGB > 0 {
+		spec.EphemeralStorageGB = s.ephemeralStorageGB
+	} else {
+		spec.EphemeralStorageGB = defaultEphemeralStorageGB
 	}
 
 	if projectID != uuid.Nil {
@@ -921,7 +961,11 @@ func (s *Server) instanceSpec(instanceID string, instanceUUID, projectID, accoun
 //
 // record may be nil in standalone mode (no database), in which case the
 // commercial fields are simply absent rather than guessed.
-func statusToInstance(st cluster.InstanceStatus, record *compute.InstanceRecord, vramRate float64) models.Instance {
+//
+// domain is s.endpointDomain, passed in because statusToInstance is a
+// package-level function with no Server access of its own — needed for
+// the endpoint-derivation fallback below.
+func statusToInstance(st cluster.InstanceStatus, record *compute.InstanceRecord, vramRate float64, domain string) models.Instance {
 	instance := models.Instance{
 		ID:     st.InstanceID,
 		Status: st.Status,
@@ -947,6 +991,25 @@ func statusToInstance(st cluster.InstanceStatus, record *compute.InstanceRecord,
 	instance.TLSEnabled = record.TLSEnabled
 	instance.TLSReady = record.TLSReady
 	instance.ContainerPort = record.ContainerPort
+	instance.StorageGB = record.StorageGB
+
+	// Self-healing fallback: the tunnel (pkg/api's tunnelMiddleware) routes
+	// by hostname convention alone and never consults record.Endpoint, so
+	// an instance can be genuinely reachable while these columns are NULL
+	// — found live 2026-08-21 against a real running instance
+	// (inst-0f0bdb64), whose endpoint/dns_name/tls_ready all came back
+	// null from the API despite curl succeeding against its derived
+	// hostname. Only fires when the stored value is empty — never
+	// overrides a populated one, so a datacenter instance's real
+	// cert-manager-issued endpoint is untouched. Requires ContainerPort >
+	// 0: an instance with no exposed port genuinely has no endpoint, and
+	// deriving one would be a broken link, not a helpful fallback.
+	if instance.Endpoint == "" && record.ContainerPort > 0 && domain != "" {
+		instance.DNSName = record.ID + "." + domain
+		instance.Endpoint = "https://" + instance.DNSName
+		instance.TLSEnabled = true
+		instance.TLSReady = true
+	}
 
 	if record.GPUVRAMGB > 0 {
 		instance.GPUVRAM = fmt.Sprintf("%dGB", record.GPUVRAMGB)

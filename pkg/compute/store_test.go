@@ -29,7 +29,7 @@ func TestCreate_PersistsGPUInstance(t *testing.T) {
 	mock.ExpectQuery(`INSERT INTO compute\.instances`).
 		WithArgs("inst-abc12345", accountID, projectID, userID, "my-app", "nginx:latest",
 			"gpu.h100.2g.20gb", StatusPending, int64(20), 8, 32,
-			nil, "my-app-x1y2z", "default", nil, nil, nil, nil, false, false, nil).
+			nil, "my-app-x1y2z", "default", nil, nil, nil, nil, false, false, nil, 0).
 		WillReturnRows(sqlmock.NewRows([]string{"created_at", "updated_at"}).
 			AddRow(time.Now(), time.Now()))
 
@@ -67,7 +67,7 @@ func TestCreate_CPUInstanceStoresNullVRAM(t *testing.T) {
 	// gpu_vram_gb must be NULL (not 0) for CPU-only instances.
 	mock.ExpectQuery(`INSERT INTO compute\.instances`).
 		WithArgs("inst-cpu00001", accountID, projectID, userID, "web", "nginx:latest",
-			"", StatusPending, nil, 2, 4, nil, "web-abcde", "default", nil, nil, nil, nil, false, false, nil).
+			"", StatusPending, nil, 2, 4, nil, "web-abcde", "default", nil, nil, nil, nil, false, false, nil, 0).
 		WillReturnRows(sqlmock.NewRows([]string{"created_at", "updated_at"}).
 			AddRow(time.Now(), time.Now()))
 
@@ -136,6 +136,7 @@ func instanceRows() *sqlmock.Rows {
 		"cpu_units", "memory_gb", "endpoint",
 		"k8s_pod_name", "k8s_namespace",
 		"provider_id", "dns_name", "public_ip", "tls_enabled", "tls_ready", "container_port",
+		"storage_gb",
 		"created_at", "updated_at", "started_at", "terminated_at",
 	})
 }
@@ -151,6 +152,7 @@ func TestListActive(t *testing.T) {
 			8, 32, "https://inst-abc12345.teepin.io",
 			"my-app-x1y2z", "default",
 			"", "", "", false, false, 0,
+			0,
 			time.Now(), time.Now(), time.Now(), nil,
 		))
 

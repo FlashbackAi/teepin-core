@@ -386,3 +386,48 @@ func TestArchivabilityDrill022(t *testing.T) {
 	}
 	t.Log("archivability drill passed: 022 applies, reverts cleanly, and re-applies")
 }
+
+// TestArchivabilityDrill023 proves the instance-storage migration (023,
+// persistent volumes + storage billing) is reversible: both new columns
+// exist after up, are gone after reverting one step, and 022's
+// exec_sessions table survives that revert untouched.
+func TestArchivabilityDrill023(t *testing.T) {
+	dsn := os.Getenv("TEEPIN_DRILL_DSN")
+	if dsn == "" {
+		t.Skip("set TEEPIN_DRILL_DSN to run the migration drill")
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("initial up: %v", err)
+	}
+	if !columnExists(t, db, "compute", "instances", "storage_gb") {
+		t.Fatal("after up: compute.instances.storage_gb missing")
+	}
+	if !columnExists(t, db, "billing", "pricing", "storage_price_per_gb_month") {
+		t.Fatal("after up: billing.pricing.storage_price_per_gb_month missing")
+	}
+
+	// Revert to version 22 (state after 022, before 023), absolute.
+	if err := migrator(t, db).Migrate(22); err != nil {
+		t.Fatalf("migrate down to 022: %v", err)
+	}
+	if columnExists(t, db, "compute", "instances", "storage_gb") {
+		t.Error("after down: storage_gb still present")
+	}
+	if columnExists(t, db, "billing", "pricing", "storage_price_per_gb_month") {
+		t.Error("after down: storage_price_per_gb_month still present")
+	}
+	if !tableExists(t, db, "compute", "exec_sessions") {
+		t.Error("after down: exec_sessions (022) was wrongly removed")
+	}
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("re-up: %v", err)
+	}
+	t.Log("archivability drill passed: 023 applies, reverts cleanly, and re-applies")
+}
