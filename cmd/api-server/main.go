@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
@@ -31,11 +32,14 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/auth"
 	"github.com/FlashbackAi/teepin-core/pkg/billing"
 	billingpdf "github.com/FlashbackAi/teepin-core/pkg/billing/pdf"
+	"github.com/FlashbackAi/teepin-core/pkg/build"
 	"github.com/FlashbackAi/teepin-core/pkg/cluster"
 	"github.com/FlashbackAi/teepin-core/pkg/compute"
 	"github.com/FlashbackAi/teepin-core/pkg/database"
 	"github.com/FlashbackAi/teepin-core/pkg/gpu"
 	"github.com/FlashbackAi/teepin-core/pkg/harbor"
+	"github.com/FlashbackAi/teepin-core/pkg/inference"
+	"github.com/FlashbackAi/teepin-core/pkg/kumbha"
 	"github.com/FlashbackAi/teepin-core/pkg/networking"
 	"github.com/FlashbackAi/teepin-core/pkg/nodes"
 	"github.com/FlashbackAi/teepin-core/pkg/payments"
@@ -470,6 +474,123 @@ func main() {
 		apiServer = apiServer.WithNodePlacer(newNodePlacerAdapter(nodeService))
 	}
 
+	// kumbhaEventTickets is set inside the Kumbha Gateway block below, but
+	// declared out here because kumbhaEventsHandler (the WS half) is built
+	// later, once checkOrigin exists — mirroring execTickets/execHandler's
+	// own two-stage construction for the same reason.
+	var kumbhaEventTickets *kumbha.EventTicketStore
+
+	// Kumbha Gateway: wraps the operator's own vLLM endpoint (and,
+	// optionally, Anthropic for frontier routing) in Teepin auth +
+	// sessions + credits (KUMBHA-DESIGN.md). Requires a database (sessions,
+	// credits, pricing all live there — billingService doubles as
+	// PricingProvider and UsageRecorder, same "one service, two
+	// interfaces" pattern as the compute pricing/gate above) and at least
+	// the vLLM endpoint to route to; either being unconfigured leaves every
+	// Kumbha endpoint returning 404, same as execTickets when home compute
+	// is off.
+	if billingService != nil {
+		if vllmBaseURL := os.Getenv("TEEPIN_VLLM_BASE_URL"); vllmBaseURL != "" {
+			vllmModel := getEnv("TEEPIN_VLLM_MODEL", "")
+			if vllmModel == "" {
+				log.Println("WARN: TEEPIN_VLLM_BASE_URL is set but TEEPIN_VLLM_MODEL is not — Kumbha Gateway disabled")
+			} else {
+				vllmProvider := inference.NewVLLM(inference.VLLMConfig{
+					BaseURL:       vllmBaseURL,
+					Model:         vllmModel,
+					APIKey:        os.Getenv("TEEPIN_VLLM_API_KEY"),
+					ContextWindow: getEnvInt("TEEPIN_VLLM_CONTEXT_WINDOW", 32768),
+					SupportsTools: getEnv("TEEPIN_VLLM_SUPPORTS_TOOLS", "true") == "true",
+				})
+				routes := map[string]kumbha.Route{
+					"teepin/fast": {Provider: vllmProvider, ProviderName: vllmProvider.Name()},
+				}
+
+				// teepin/deep (frontier routing) is optional: an operator who
+				// has not set an Anthropic key still gets teepin/fast working
+				// end to end, and a request routed to teepin/deep gets a
+				// clean "unknown model" (Router.Resolve treats an absent
+				// route that way) rather than a nil-Provider panic.
+				if anthropicModel := getEnv("TEEPIN_ANTHROPIC_MODEL", ""); anthropicModel != "" {
+					anthropicProvider := inference.NewAnthropic(inference.AnthropicConfig{
+						Model:           anthropicModel,
+						APIKey:          os.Getenv("ANTHROPIC_API_KEY"),
+						ContextWindow:   getEnvInt("TEEPIN_ANTHROPIC_CONTEXT_WINDOW", 200000),
+						MaxOutputTokens: getEnvInt("TEEPIN_ANTHROPIC_MAX_OUTPUT_TOKENS", 4096),
+					})
+					routes["teepin/deep"] = kumbha.Route{Provider: anthropicProvider, ProviderName: anthropicProvider.Name()}
+					log.Printf("Kumbha frontier route enabled (teepin/deep -> anthropic %s)", anthropicModel)
+				} else {
+					log.Println("Kumbha frontier route not configured (TEEPIN_ANTHROPIC_MODEL unset) — teepin/deep unavailable")
+				}
+
+				kumbhaStore := kumbha.NewStore(dbClient.DB())
+				kumbhaRouter := kumbha.NewRouter(routes)
+				kumbhaGateway := kumbha.NewGateway(kumbhaStore, kumbhaRouter, billingService, billingService, billingService)
+
+				// A Kumbha agent credential (auth.MintSessionToken) is
+				// validated against session-open status on every request —
+				// see auth.Middleware.WithSessionChecker. Without this, a
+				// deployment with Kumbha enabled would still reject every
+				// agent credential outright (fail-closed default), so this
+				// is not optional the way WithAgent below is.
+				if authMiddleware != nil {
+					authMiddleware.WithSessionChecker(kumbhaStore)
+				}
+
+				// Agent pod orchestration (LaunchAgent) stays off until a
+				// real Kumbha agent image exists to run — see the Kumbha
+				// plan's M3. Configuring TEEPIN_KUMBHA_AGENT_IMAGE turns it
+				// on; until then LaunchAgent returns ErrAgentNotConfigured
+				// cleanly rather than launching pods with no image to run.
+				if agentImage := getEnv("TEEPIN_KUMBHA_AGENT_IMAGE", ""); agentImage != "" && os.Getenv("TEEPIN_KUMBHA_AGENT_API_BASE_URL") == "" {
+					log.Println("WARN: TEEPIN_KUMBHA_AGENT_IMAGE is set but TEEPIN_KUMBHA_AGENT_API_BASE_URL is not — agent pods would have no way to call back; Kumbha agent orchestration disabled")
+				} else if agentImage != "" {
+					mintToken := func(accountID, projectID, sessionID uuid.UUID, ttl time.Duration) (string, error) {
+						return auth.MintSessionToken(accountID, projectID, sessionID, ttl, jwtSecret)
+					}
+					kumbhaGateway = kumbhaGateway.WithAgent(clusterClient, mintToken, kumbha.AgentConfig{
+						Image:              agentImage,
+						CPUUnits:           getEnvInt("TEEPIN_KUMBHA_AGENT_CPU_UNITS", 2),
+						MemoryGB:           getEnvInt("TEEPIN_KUMBHA_AGENT_MEMORY_GB", 4),
+						StorageGB:          getEnvInt("TEEPIN_KUMBHA_AGENT_STORAGE_GB", 10),
+						EphemeralStorageGB: getEnvInt("TEEPIN_KUMBHA_AGENT_EPHEMERAL_STORAGE_GB", 10),
+						SessionTokenTTL:    time.Duration(getEnvInt("TEEPIN_KUMBHA_AGENT_TOKEN_TTL_MINUTES", 120)) * time.Minute,
+						APIBaseURL:         getEnv("TEEPIN_KUMBHA_AGENT_API_BASE_URL", ""),
+					})
+					log.Printf("✅ Kumbha agent pod orchestration enabled (image %s)", agentImage)
+				} else {
+					log.Println("Kumbha agent pod orchestration not configured (TEEPIN_KUMBHA_AGENT_IMAGE unset) — LaunchAgent unavailable")
+				}
+
+				apiServer = apiServer.WithKumbha(kumbhaGateway)
+
+				kumbhaEventTickets = kumbha.NewEventTicketStore()
+				go kumbhaEventTickets.Reap(context.Background())
+				apiServer = apiServer.WithKumbhaEventTickets(kumbhaEventTickets)
+
+				// The "deploy" MCP verb's build step (Kaniko) — needs both
+				// Harbor (a registry to push to) and a local Kubernetes
+				// client (pkg/build follows pkg/harbor's own established
+				// exception to the "no k8s client above pkg/cluster" rule;
+				// see pkg/build's package doc comment). Absent either, the
+				// verb stays an honest stub (teepin-mcp-server's own
+				// fallback message), not a broken endpoint.
+				if harborService != nil && k8sClient != nil {
+					kumbhaBuildService := build.NewService(k8sClient, harborService, build.DefaultConfig())
+					apiServer = apiServer.WithKumbhaBuild(kumbhaBuildService)
+					log.Println("✅ Kumbha build pipeline enabled (Kaniko -> Harbor)")
+				} else {
+					log.Println("Kumbha build pipeline not configured (Harbor or a local Kubernetes client is unavailable) — the deploy MCP verb stays a stub")
+				}
+
+				log.Printf("✅ Kumbha Gateway enabled (teepin/fast -> vLLM at %s)", vllmBaseURL)
+			}
+		} else {
+			log.Println("Kumbha Gateway not configured (TEEPIN_VLLM_BASE_URL unset)")
+		}
+	}
+
 	// Admin API (pricing management): only enabled with an explicit
 	// operator token — never on by default.
 	var adminHandler *api.AdminHandler
@@ -505,6 +626,18 @@ func main() {
 		log.Println("Stage 3 tunnel edge enabled (instance traffic proxied over agent sessions)")
 	}
 
+	// Shared by both WebSocket endpoints below (exec and Kumbha's event
+	// relay) — defense in depth alongside the ticket auth each already
+	// requires, since the issuing POST is already CORS-protected and needs
+	// a JWT.
+	checkOrigin := func(r *http.Request) bool {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true // non-browser client (e.g. the teepin CLI) — no Origin header at all
+		}
+		return allowedOrigins()[origin]
+	}
+
 	// Interactive exec ("connect to instance terminal"): the REST half
 	// (ticket issuance, apiServer.CreateExecSession) is wired onto
 	// apiServer below; this is the WebSocket-attach half, same
@@ -515,13 +648,6 @@ func main() {
 		execTickets := cluster.NewTicketStore()
 		go execTickets.Reap(context.Background())
 
-		checkOrigin := func(r *http.Request) bool {
-			origin := r.Header.Get("Origin")
-			if origin == "" {
-				return true // non-browser client (e.g. the teepin CLI) — no Origin header at all
-			}
-			return allowedOrigins()[origin]
-		}
 		execHandler = cluster.NewExecHandler(agentRegistry, newInstanceProxyTarget(instanceStore, agentRegistry), execTickets, checkOrigin).
 			WithSessionRecorder(func(ticketID, podName string, exitCode *int, closeReason string) {
 				if err := instanceStore.EndExecSession(context.Background(), ticketID, podName, exitCode, closeReason); err != nil {
@@ -532,8 +658,19 @@ func main() {
 		log.Println("Interactive exec enabled (terminal sessions tunneled over agent sessions)")
 	}
 
+	// Kumbha's event-relay WebSocket — the console's live activity feed.
+	// Unlike exec, this does NOT need the agent registry/tunnel: it tails
+	// cluster.Client.StreamLogs, which already works in both "direct" and
+	// "agent" cluster modes, so the only gate is Kumbha itself being
+	// configured (kumbhaEventTickets is non-nil only then).
+	var kumbhaEventsHandler *kumbha.EventsHandler
+	if kumbhaEventTickets != nil {
+		kumbhaEventsHandler = kumbha.NewEventsHandler(clusterClient, kumbhaEventTickets, checkOrigin)
+		log.Println("Kumbha event relay enabled (agent activity streamed over the existing log pipeline)")
+	}
+
 	// Setup router
-	router := setupRouter(apiServer, authHandler, accountHandler, authMiddleware, billingHandler, registryHandler, adminHandler, webhookHandler, nodeHandler, rateLimitMiddleware, proxyHandler, execHandler, getEnv("TEEPIN_DOMAIN", "teepin.com"))
+	router := setupRouter(apiServer, authHandler, accountHandler, authMiddleware, billingHandler, registryHandler, adminHandler, webhookHandler, nodeHandler, rateLimitMiddleware, proxyHandler, execHandler, kumbhaEventsHandler, getEnv("TEEPIN_DOMAIN", "teepin.com"))
 
 	// Create HTTP server
 	port := getEnv("PORT", "8080")
@@ -734,7 +871,7 @@ func initRateLimiting() *ratelimit.Config {
 	return config
 }
 
-func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHandler *api.AccountHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler, registryHandler *api.RegistryHandler, adminHandler *api.AdminHandler, webhookHandler *api.WebhookHandler, nodeHandler *api.NodeHandler, rateLimitMiddleware *ratelimit.Middleware, proxyHandler *cluster.ProxyHandler, execHandler *cluster.ExecHandler, instanceDomain string) *gin.Engine {
+func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHandler *api.AccountHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler, registryHandler *api.RegistryHandler, adminHandler *api.AdminHandler, webhookHandler *api.WebhookHandler, nodeHandler *api.NodeHandler, rateLimitMiddleware *ratelimit.Middleware, proxyHandler *cluster.ProxyHandler, execHandler *cluster.ExecHandler, kumbhaEventsHandler *kumbha.EventsHandler, instanceDomain string) *gin.Engine {
 	// Set Gin to release mode in production
 	if os.Getenv("GIN_MODE") == "" {
 		gin.SetMode(gin.ReleaseMode)
@@ -799,6 +936,18 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 		if execHandler != nil {
 			v1.GET("/compute/instances/:id/exec/attach", func(c *gin.Context) {
 				execHandler.ServeInstance(c.Writer, c.Request, c.Param("id"))
+			})
+		}
+
+		// Kumbha's event-relay WebSocket attach — UNAUTHENTICATED at the
+		// router for the same reason as exec's above: no Authorization
+		// header on a WS handshake, the single-use ticket (see
+		// EventsHandler.ServeSession) IS the credential. Must share the
+		// param name ":id" with the /kumbha group below, same gin
+		// wildcard-conflict reasoning as exec's shared ":id" with /compute.
+		if kumbhaEventsHandler != nil {
+			v1.GET("/kumbha/sessions/:id/events/attach", func(c *gin.Context) {
+				kumbhaEventsHandler.ServeSession(c.Writer, c.Request, c.Param("id"))
 			})
 		}
 
@@ -889,7 +1038,27 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 				billing.GET("/invoices/:id/pdf", billingHandler.DownloadInvoicePDF)
 				billing.POST("/invoices", billingHandler.CreateInvoice)
 				billing.GET("/credits", billingHandler.GetCreditBalance)
+				billing.GET("/pricing", billingHandler.GetPricing)
 			}
+		}
+
+		// Kumbha Gateway endpoints — same auth requirement as compute (an
+		// unscoped caller is rejected by requireScope regardless). Every
+		// handler here already 404s cleanly when apiServer was built
+		// without WithKumbha, so the group is registered unconditionally
+		// rather than gated on a nil check here too.
+		kumbhaGroup := v1.Group("/kumbha")
+		if authMiddleware != nil {
+			kumbhaGroup.Use(authMiddleware.RequireAuth())
+		}
+		{
+			kumbhaGroup.POST("/sessions", apiServer.CreateKumbhaSession)
+			kumbhaGroup.GET("/sessions/:id", apiServer.GetKumbhaSession)
+			kumbhaGroup.POST("/sessions/:id/close", apiServer.CloseKumbhaSession)
+			kumbhaGroup.POST("/sessions/:id/approve-deploy", apiServer.ApproveKumbhaDeploy)
+			kumbhaGroup.POST("/sessions/:id/events", apiServer.CreateKumbhaEventTicket)
+			kumbhaGroup.POST("/sessions/:id/build", apiServer.BuildKumbhaSession)
+			kumbhaGroup.POST("/chat/completions", apiServer.KumbhaChatCompletions)
 		}
 
 		// Compute endpoints require auth — requireScope (server.go) rejects

@@ -91,7 +91,8 @@ func TestCollectUsage_BillsCustomSizeLinearly(t *testing.T) {
 
 	// Usage record: unit price must be exactly 25 * $0.10 = $2.50/hr.
 	mock.ExpectQuery(`INSERT INTO billing\.usage_records`).
-		WithArgs(accountID, projectID, "inst-25gb0001", "gpu.h100.custom-25gb",
+		WithArgs(accountID, projectID, "inst-25gb0001", "instance", "inst-25gb0001",
+			0.0, nil, "gpu.h100.custom-25gb",
 			sqlmock.AnyArg(), // hours (wall-clock dependent)
 			"hours",
 			2.50,             // unit price — the regression this test guards
@@ -125,7 +126,8 @@ func TestCollectUsage_UsesAdminConfiguredRate(t *testing.T) {
 	expectPricingRead(mock, 0.20)
 
 	mock.ExpectQuery(`INSERT INTO billing\.usage_records`).
-		WithArgs(accountID, projectID, "inst-20gb0001", "gpu.a100.2g.20gb",
+		WithArgs(accountID, projectID, "inst-20gb0001", "instance", "inst-20gb0001",
+			0.0, nil, "gpu.a100.2g.20gb",
 			sqlmock.AnyArg(), "hours",
 			4.00, // 20GB at the admin-configured $0.20/GB-hr
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
@@ -161,7 +163,8 @@ func TestCollectUsage_BillsTerminatedTail(t *testing.T) {
 
 	// The record must end exactly at terminated_at — not at "now".
 	mock.ExpectQuery(`INSERT INTO billing\.usage_records`).
-		WithArgs(accountID, projectID, "inst-short001", "gpu.a100.2g.20gb",
+		WithArgs(accountID, projectID, "inst-short001", "instance", "inst-short001",
+			0.0, nil, "gpu.a100.2g.20gb",
 			sqlmock.AnyArg(), "hours",
 			2.00,             // 20GB * $0.10
 			sqlmock.AnyArg(), // total cost
@@ -200,7 +203,8 @@ func TestCollectUsage_MetersCPUInstance(t *testing.T) {
 	expectPricingReadFull(mock, 0.10, 1.25, 0.60, 0)
 
 	mock.ExpectQuery(`INSERT INTO billing\.usage_records`).
-		WithArgs(accountID, projectID, "inst-cpu00001", "cpu.home",
+		WithArgs(accountID, projectID, "inst-cpu00001", "instance", "inst-cpu00001",
+			0.0, nil, "cpu.home",
 			sqlmock.AnyArg(), "hours",
 			9.80, // the CPU cost formula — the regression this guards
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
@@ -232,7 +236,8 @@ func TestCollectUsage_CPUAtZeroRateRecordsZero(t *testing.T) {
 	expectPricingReadFull(mock, 0.10, 0, 0, 0)
 
 	mock.ExpectQuery(`INSERT INTO billing\.usage_records`).
-		WithArgs(accountID, projectID, "inst-cpu00002", "cpu.home",
+		WithArgs(accountID, projectID, "inst-cpu00002", "instance", "inst-cpu00002",
+			0.0, nil, "cpu.home",
 			sqlmock.AnyArg(), "hours",
 			0.0, // unit price 0 at default rates
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
@@ -281,7 +286,8 @@ func TestCollectUsage_MetersStorage(t *testing.T) {
 	})
 
 	mock.ExpectQuery(`INSERT INTO billing\.usage_records`).
-		WithArgs(accountID, projectID, "inst-vol00001", "cpu.home",
+		WithArgs(accountID, projectID, "inst-vol00001", "instance", "inst-vol00001",
+			0.0, nil, "cpu.home",
 			captureArg{&observedHours}, "hours",
 			0.0, // unit price — storage never touches it, only TotalCost
 			wantCost,

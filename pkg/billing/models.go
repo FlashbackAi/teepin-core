@@ -10,7 +10,19 @@ import (
 	"github.com/google/uuid"
 )
 
-// UsageRecord represents a metered usage record
+// UsageRecord represents a metered usage record.
+//
+// SubjectType/SubjectID (migration 024) are the general replacement for
+// InstanceID: every usage record describes SOME billable subject, and
+// after 024 that subject is not always a compute instance (an inference
+// session, a future bucket or database, ...). InstanceID is kept for one
+// more release for read compatibility with anything not yet moved over —
+// see the migration's own comment — but RecordUsage derives it from
+// SubjectType/SubjectID rather than requiring a caller to set both.
+//
+// A caller that leaves SubjectType empty (every call site written before
+// 024) is treated as "instance" with SubjectID = InstanceID, so
+// collector.go's existing construction keeps working unchanged.
 type UsageRecord struct {
 	ID uuid.UUID `json:"id"`
 	// AccountID is the billed tenant. NOT NULL in the schema: a usage
@@ -18,15 +30,26 @@ type UsageRecord struct {
 	// always carry it.
 	AccountID    uuid.UUID `json:"account_id"`
 	ProjectID    uuid.UUID `json:"project_id"`
-	InstanceID   string    `json:"instance_id"`
+	InstanceID   string    `json:"instance_id,omitempty"`
+	SubjectType  string    `json:"subject_type,omitempty"`
+	SubjectID    string    `json:"subject_id,omitempty"`
 	ResourceType string    `json:"resource_type"`
 	Quantity     float64   `json:"quantity"`
 	Unit         string    `json:"unit"`
 	UnitPrice    float64   `json:"unit_price"`
 	TotalCost    float64   `json:"total_cost"`
-	StartTime    time.Time `json:"start_time"`
-	EndTime      time.Time `json:"end_time"`
-	CreatedAt    time.Time `json:"created_at"`
+	// CostBasis is what this usage cost TEEPIN — 0 for own-compute/own-
+	// inference until GPU-hour attribution exists, the provider's actual
+	// price for a resold third-party model. Powers the admin margin view
+	// (SUM(total_cost) - SUM(cost_basis) GROUP BY provider); never shown
+	// to the customer.
+	CostBasis float64 `json:"-"`
+	// Provider is which backend served it: "vllm" | "anthropic" | "openai"
+	// | "teepin-compute". Billing-internal, like CostBasis.
+	Provider  string    `json:"-"`
+	StartTime time.Time `json:"start_time"`
+	EndTime   time.Time `json:"end_time"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // Invoice represents a billing invoice

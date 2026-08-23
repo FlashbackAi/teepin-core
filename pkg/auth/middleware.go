@@ -4,6 +4,7 @@
 package auth
 
 import (
+	"context"
 	"net/http"
 	"strings"
 
@@ -18,7 +19,23 @@ const (
 	AccountIDKey contextKey = "account_id"
 	RoleKey      contextKey = "role"
 	ProjectIDKey contextKey = "project_id"
+	SessionIDKey contextKey = "session_id"
 )
+
+// SessionChecker answers whether a Kumbha session-scoped credential
+// (minted by MintSessionToken) is still usable — i.e. the session it
+// names is open. Implemented by kumbha.Store; injected via
+// WithSessionChecker rather than imported directly so pkg/auth has no
+// dependency on pkg/kumbha, the same ProvisionGate/PricingProvider
+// pattern used throughout pkg/api.
+type SessionChecker interface {
+	// IsSessionOpen reports whether sessionID belongs to accountID and is
+	// currently open. A false result covers "not found", "wrong account"
+	// and "closed" alike — deliberately indistinguishable, matching the
+	// platform's existing "existence must not leak" convention (see
+	// requireScope elsewhere in this codebase).
+	IsSessionOpen(ctx context.Context, sessionID, accountID uuid.UUID) (bool, error)
+}
 
 // apiKeyPrefix identifies an API key from a JWT in the Authorization
 // header.
@@ -41,11 +58,20 @@ type Principal struct {
 	// ProjectID is set when the credential is scoped to one project —
 	// always for API keys, optionally for JWTs.
 	ProjectID uuid.UUID
+	// SessionID is set only for a Kumbha agent credential (MintSessionToken)
+	// — nil for every human login or API key.
+	SessionID uuid.UUID
 }
 
 type Middleware struct {
 	authService *Service
 	jwtSecret   string
+	// sessionChecker validates a Kumbha session-scoped credential's
+	// SessionID claim on every request. Nil disables the capability
+	// cleanly: a token carrying a SessionID claim is treated as invalid
+	// rather than trusted unconditionally, matching how every other
+	// optional dependency in this codebase fails closed when unset.
+	sessionChecker SessionChecker
 }
 
 func NewMiddleware(authService *Service, jwtSecret string) *Middleware {
@@ -53,6 +79,14 @@ func NewMiddleware(authService *Service, jwtSecret string) *Middleware {
 		authService: authService,
 		jwtSecret:   jwtSecret,
 	}
+}
+
+// WithSessionChecker enables validating Kumbha session-scoped credentials.
+// Returns the same *Middleware for chaining, so existing NewMiddleware
+// call sites compile unchanged.
+func (m *Middleware) WithSessionChecker(checker SessionChecker) *Middleware {
+	m.sessionChecker = checker
+	return m
 }
 
 // authenticate resolves the Authorization header to a Principal.
@@ -88,11 +122,32 @@ func (m *Middleware) authenticate(c *gin.Context) *Principal {
 	if err != nil {
 		return nil
 	}
+
+	// A session-scoped credential (MintSessionToken) is only valid while
+	// its session is open — checked on EVERY request, not just at mint
+	// time, which is what makes closing the session revoke the credential
+	// immediately rather than leaving it live until ttl expiry. A token
+	// carrying this claim with no checker wired, or whose session has
+	// closed or errors on lookup, is rejected outright: this is the
+	// platform's most narrowly-scoped credential and the one most exposed
+	// to prompt injection (KUMBHA-DESIGN.md's Topology section), so it
+	// fails closed rather than falling back to ordinary JWT trust.
+	if claims.SessionID != uuid.Nil {
+		if m.sessionChecker == nil {
+			return nil
+		}
+		open, err := m.sessionChecker.IsSessionOpen(c.Request.Context(), claims.SessionID, claims.AccountID)
+		if err != nil || !open {
+			return nil
+		}
+	}
+
 	principal := &Principal{
 		UserID:    claims.UserID,
 		AccountID: claims.AccountID,
 		Role:      claims.Role,
 		ProjectID: claims.ProjectID,
+		SessionID: claims.SessionID,
 	}
 
 	// A JWT never carries a project claim (see ProjectHeader) — resolve it
@@ -126,6 +181,9 @@ func store(c *gin.Context, p *Principal) {
 	}
 	if p.ProjectID != uuid.Nil {
 		c.Set(string(ProjectIDKey), p.ProjectID)
+	}
+	if p.SessionID != uuid.Nil {
+		c.Set(string(SessionIDKey), p.SessionID)
 	}
 }
 
@@ -189,6 +247,12 @@ func GetAccountID(c *gin.Context) (uuid.UUID, bool) {
 // GetProjectID extracts the project the credential is scoped to, if any.
 func GetProjectID(c *gin.Context) (uuid.UUID, bool) {
 	return uuidFromContext(c, ProjectIDKey)
+}
+
+// GetSessionID extracts the Kumbha session a credential is scoped to, if
+// any — set only for an agent credential minted by MintSessionToken.
+func GetSessionID(c *gin.Context) (uuid.UUID, bool) {
+	return uuidFromContext(c, SessionIDKey)
 }
 
 // GetRole extracts the caller's role within their account.

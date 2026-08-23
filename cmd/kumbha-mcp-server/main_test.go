@@ -1,0 +1,263 @@
+// Copyright 2026 TEEPIN Project
+// Licensed under the Apache License, Version 2.0
+
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+// newTestClient points a teepinClient at a local mux instead of the real
+// control plane, mirroring the vLLM/Anthropic provider tests' own
+// newTest* helpers in pkg/inference.
+func newTestClient(t *testing.T, mux *http.ServeMux) *teepinClient {
+	t.Helper()
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return &teepinClient{
+		baseURL:   srv.URL,
+		token:     "test-session-token",
+		sessionID: "sess-test",
+		http:      srv.Client(),
+	}
+}
+
+func TestPresentDeploymentPlan_ComputesCostFromLiveRates(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/billing/pricing", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer test-session-token" {
+			t.Errorf("Authorization header = %q, want the session token as a bearer credential", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"cpu_price_per_core_hour":1.25,"memory_price_per_gb_hour":0.60,"storage_price_per_gb_month":0.10}`))
+	})
+	c := newTestClient(t, mux)
+
+	result, _, err := c.presentDeploymentPlan(context.Background(), &mcp.CallToolRequest{}, presentDeploymentPlanArgs{
+		Resources: []resourceRequest{
+			{Name: "web", CPUUnits: 2, MemoryGB: 4, StorageGB: 0},
+		},
+	})
+	if err != nil {
+		t.Fatalf("presentDeploymentPlan: %v", err)
+	}
+
+	text := result.Content[0].(*mcp.TextContent).Text
+	var plan struct {
+		Resources []struct {
+			Name        string  `json:"name"`
+			CostPerHour float64 `json:"cost_per_hour"`
+		} `json:"resources"`
+		TotalCostPerHour float64 `json:"total_cost_per_hour"`
+	}
+	if err := json.Unmarshal([]byte(text), &plan); err != nil {
+		t.Fatalf("result is not the expected JSON shape: %v\ngot: %s", err, text)
+	}
+
+	// 2 cores * $1.25 + 4GB * $0.60 = $2.50 + $2.40 = $4.90/hr
+	want := 2*1.25 + 4*0.60
+	if plan.Resources[0].CostPerHour != want {
+		t.Errorf("cost_per_hour = %v, want %v", plan.Resources[0].CostPerHour, want)
+	}
+	if plan.TotalCostPerHour != want {
+		t.Errorf("total_cost_per_hour = %v, want %v", plan.TotalCostPerHour, want)
+	}
+}
+
+func TestPresentDeploymentPlan_IncludesStorageConvertedFromGBMonth(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/billing/pricing", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"cpu_price_per_core_hour":0,"memory_price_per_gb_hour":0,"storage_price_per_gb_month":0.10}`))
+	})
+	c := newTestClient(t, mux)
+
+	result, _, err := c.presentDeploymentPlan(context.Background(), &mcp.CallToolRequest{}, presentDeploymentPlanArgs{
+		Resources: []resourceRequest{{Name: "db", StorageGB: 100}},
+	})
+	if err != nil {
+		t.Fatalf("presentDeploymentPlan: %v", err)
+	}
+
+	var plan struct {
+		TotalCostPerHour float64 `json:"total_cost_per_hour"`
+	}
+	json.Unmarshal([]byte(result.Content[0].(*mcp.TextContent).Text), &plan)
+
+	// The same hoursPerMonth conversion pkg/billing/collector.go uses —
+	// this must match what the customer is actually billed, not a second
+	// formula that could drift from it.
+	want := 100 * 0.10 / hoursPerMonth
+	if plan.TotalCostPerHour < want*0.9999 || plan.TotalCostPerHour > want*1.0001 {
+		t.Errorf("total_cost_per_hour = %v, want ~%v", plan.TotalCostPerHour, want)
+	}
+}
+
+func TestPresentDeploymentPlan_RejectsEmptyResources(t *testing.T) {
+	c := newTestClient(t, http.NewServeMux())
+	result, _, err := c.presentDeploymentPlan(context.Background(), &mcp.CallToolRequest{}, presentDeploymentPlanArgs{})
+	if err != nil {
+		t.Fatalf("presentDeploymentPlan: %v", err)
+	}
+	if !strings.Contains(result.Content[0].(*mcp.TextContent).Text, "at least one resource") {
+		t.Errorf("got %q, want a message about needing at least one resource", result.Content[0].(*mcp.TextContent).Text)
+	}
+}
+
+func TestCreateInstance_BlockedBeforeApproval(t *testing.T) {
+	mux := http.NewServeMux()
+	called := false
+	mux.HandleFunc("/v1/kumbha/sessions/sess-test", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"deploy_approved":false}`))
+	})
+	mux.HandleFunc("/v1/compute/instances", func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.Write([]byte(`{}`))
+	})
+	c := newTestClient(t, mux)
+
+	result, _, err := c.createInstance(context.Background(), &mcp.CallToolRequest{}, createInstanceArgs{
+		Name: "app", Image: "nginx:latest", CPUUnits: 1, MemoryGB: 1,
+	})
+	if err != nil {
+		t.Fatalf("createInstance: %v", err)
+	}
+	if called {
+		t.Error("POST /v1/compute/instances was called despite the session not being approved")
+	}
+	text := result.Content[0].(*mcp.TextContent).Text
+	if !strings.Contains(text, "present_deployment_plan") {
+		t.Errorf("got %q, want guidance to call present_deployment_plan", text)
+	}
+}
+
+func TestCreateInstance_ProceedsAfterApproval(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/kumbha/sessions/sess-test", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"deploy_approved":true}`))
+	})
+	mux.HandleFunc("/v1/compute/instances", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer test-session-token" {
+			t.Errorf("Authorization = %q, want the session token — this IS the real customer-facing API call", got)
+		}
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		if body["image"] != "nginx:latest" {
+			t.Errorf("image = %v, want nginx:latest", body["image"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"inst-abc123","status":"running","endpoint":"https://inst-abc123.teepin.com","price_per_hour":0.20}`))
+	})
+	c := newTestClient(t, mux)
+
+	result, _, err := c.createInstance(context.Background(), &mcp.CallToolRequest{}, createInstanceArgs{
+		Name: "app", Image: "nginx:latest", CPUUnits: 1, MemoryGB: 1,
+	})
+	if err != nil {
+		t.Fatalf("createInstance: %v", err)
+	}
+	text := result.Content[0].(*mcp.TextContent).Text
+	if !strings.Contains(text, "inst-abc123") || !strings.Contains(text, "https://inst-abc123.teepin.com") {
+		t.Errorf("got %q, want the created instance's id and endpoint", text)
+	}
+}
+
+func TestDeploy_HonestStubStillChecksApproval(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/kumbha/sessions/sess-test", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"deploy_approved":false}`))
+	})
+	c := newTestClient(t, mux)
+
+	result, _, err := c.deploy(context.Background(), &mcp.CallToolRequest{}, deployArgs{Name: "app"})
+	if err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	if !strings.Contains(result.Content[0].(*mcp.TextContent).Text, "present_deployment_plan") {
+		t.Error("deploy did not enforce the approval gate before falling through to its stub message")
+	}
+}
+
+// When the control plane has no build pipeline configured, POST .../build
+// 404s (see BuildKumbhaSession's own s.kumbhaBuild == nil check) — deploy
+// must translate that into an honest "not available" message, not a raw
+// HTTP error.
+func TestDeploy_Approved_NoBuildPipelineConfiguredIsHonestMessage(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/kumbha/sessions/sess-test", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"deploy_approved":true}`))
+	})
+	// No handler registered for .../build — ServeMux answers 404, exactly
+	// what the real control plane returns when kumbhaBuild is nil.
+	c := newTestClient(t, mux)
+
+	result, _, err := c.deploy(context.Background(), &mcp.CallToolRequest{}, deployArgs{Name: "app"})
+	if err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	text := result.Content[0].(*mcp.TextContent).Text
+	if !strings.Contains(text, "not available") {
+		t.Errorf("got %q, want an honest not-available message", text)
+	}
+}
+
+func TestDeploy_Approved_BuildsAndCreatesInstance(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/kumbha/sessions/sess-test", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"deploy_approved":true}`))
+	})
+	mux.HandleFunc("/v1/kumbha/sessions/sess-test/build", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		if body["dockerfile_path"] != "Dockerfile" {
+			t.Errorf("dockerfile_path = %v, want the default Dockerfile", body["dockerfile_path"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"image_ref":"registry.teepin.cloud/teepin-app-abc123:sess-tes"}`))
+	})
+	mux.HandleFunc("/v1/compute/instances", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		if body["image"] != "registry.teepin.cloud/teepin-app-abc123:sess-tes" {
+			t.Errorf("image = %v, want the image deploy just built", body["image"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"inst-xyz789","status":"running","endpoint":"https://inst-xyz789.teepin.com","price_per_hour":0.20}`))
+	})
+	c := newTestClient(t, mux)
+
+	result, _, err := c.deploy(context.Background(), &mcp.CallToolRequest{}, deployArgs{Name: "app", CPUUnits: 1, MemoryGB: 1})
+	if err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	text := result.Content[0].(*mcp.TextContent).Text
+	if !strings.Contains(text, "inst-xyz789") || !strings.Contains(text, "teepin-app-abc123") {
+		t.Errorf("got %q, want the built image ref and the created instance id", text)
+	}
+}
+
+func TestDeploy_Approved_BuildFailureIsReportedNotSwallowed(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/kumbha/sessions/sess-test", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"deploy_approved":true}`))
+	})
+	mux.HandleFunc("/v1/kumbha/sessions/sess-test/build", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"build failed: exit code 1: Error","log":"COPY failed: file not found"}`, http.StatusUnprocessableEntity)
+	})
+	c := newTestClient(t, mux)
+
+	result, _, err := c.deploy(context.Background(), &mcp.CallToolRequest{}, deployArgs{Name: "app"})
+	if err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	text := result.Content[0].(*mcp.TextContent).Text
+	if !strings.Contains(text, "build failed") {
+		t.Errorf("got %q, want the build failure reason surfaced to the agent", text)
+	}
+}

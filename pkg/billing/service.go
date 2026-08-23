@@ -71,13 +71,32 @@ func (s *Service) WithPDFStorage(render PDFRenderer, store PDFStore) *Service {
 	return s
 }
 
-// RecordUsage records a usage event for billing
+// RecordUsage records a usage event for billing.
+//
+// SubjectType/SubjectID default to "instance"/InstanceID when the caller
+// leaves SubjectType empty — see the UsageRecord doc comment. instance_id
+// on the row is populated ONLY when the subject actually is an instance;
+// a non-instance subject (e.g. an inference session) leaves it NULL rather
+// than writing a value that would misrepresent what the row is about.
 func (s *Service) RecordUsage(ctx context.Context, record *UsageRecord) error {
+	subjectType := record.SubjectType
+	subjectID := record.SubjectID
+	if subjectType == "" {
+		subjectType = "instance"
+		subjectID = record.InstanceID
+	}
+
+	var instanceID any
+	if subjectType == "instance" {
+		instanceID = subjectID
+	}
+
 	query := `
 		INSERT INTO billing.usage_records
-		(account_id, project_id, instance_id, resource_type, quantity, unit,
+		(account_id, project_id, instance_id, subject_type, subject_id,
+		 cost_basis, provider, resource_type, quantity, unit,
 		 unit_price, total_cost, start_time, end_time)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		RETURNING id, created_at
 	`
 
@@ -85,7 +104,11 @@ func (s *Service) RecordUsage(ctx context.Context, record *UsageRecord) error {
 		ctx, query,
 		record.AccountID,
 		record.ProjectID,
-		record.InstanceID,
+		instanceID,
+		subjectType,
+		subjectID,
+		record.CostBasis,
+		nullIfEmpty(record.Provider),
 		record.ResourceType,
 		record.Quantity,
 		record.Unit,
@@ -104,8 +127,14 @@ func (s *Service) RecordUsage(ctx context.Context, record *UsageRecord) error {
 
 // GetUsageRecords retrieves usage records for a project
 func (s *Service) GetUsageRecords(ctx context.Context, projectID uuid.UUID, start, end time.Time) ([]UsageRecord, error) {
+	// COALESCE instance_id: after migration 024 a usage record's subject is
+	// not always an instance (a Kumbha inference session, e.g.), so the
+	// column is nullable — scanning a NULL straight into UsageRecord's
+	// plain string field would error.
 	query := `
-		SELECT id, project_id, instance_id, resource_type, quantity, unit,
+		SELECT id, project_id, COALESCE(instance_id, ''),
+		       COALESCE(subject_type, ''), COALESCE(subject_id, ''),
+		       resource_type, quantity, unit,
 		       unit_price, total_cost, start_time, end_time, created_at
 		FROM billing.usage_records
 		WHERE project_id = $1 AND start_time >= $2 AND end_time <= $3
@@ -122,8 +151,8 @@ func (s *Service) GetUsageRecords(ctx context.Context, projectID uuid.UUID, star
 	for rows.Next() {
 		var r UsageRecord
 		err := rows.Scan(
-			&r.ID, &r.ProjectID, &r.InstanceID, &r.ResourceType,
-			&r.Quantity, &r.Unit, &r.UnitPrice, &r.TotalCost,
+			&r.ID, &r.ProjectID, &r.InstanceID, &r.SubjectType, &r.SubjectID,
+			&r.ResourceType, &r.Quantity, &r.Unit, &r.UnitPrice, &r.TotalCost,
 			&r.StartTime, &r.EndTime, &r.CreatedAt,
 		)
 		if err != nil {
@@ -140,7 +169,7 @@ func (s *Service) GetUsageSummary(ctx context.Context, projectID uuid.UUID, star
 	query := `
 		SELECT
 			resource_type,
-			instance_id,
+			COALESCE(instance_id, ''),
 			SUM(total_cost) as cost
 		FROM billing.usage_records
 		WHERE project_id = $1 AND start_time >= $2 AND end_time <= $3

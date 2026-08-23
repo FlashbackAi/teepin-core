@@ -20,10 +20,12 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/FlashbackAi/teepin-core/pkg/auth"
+	"github.com/FlashbackAi/teepin-core/pkg/build"
 	"github.com/FlashbackAi/teepin-core/pkg/cluster"
 	"github.com/FlashbackAi/teepin-core/pkg/compute"
 	"github.com/FlashbackAi/teepin-core/pkg/gpu"
 	"github.com/FlashbackAi/teepin-core/pkg/imageinfo"
+	"github.com/FlashbackAi/teepin-core/pkg/kumbha"
 	"github.com/FlashbackAi/teepin-core/pkg/models"
 )
 
@@ -88,6 +90,24 @@ type Server struct {
 	// plan). Nil disables the feature cleanly: CreateExecSession returns
 	// 404, matching how home-capacity behaves when home compute is off.
 	execTickets *cluster.TicketStore
+
+	// kumbha is the Kumbha Gateway's business logic (pkg/kumbha) — session
+	// budgets, routing, metering. Nil disables the feature cleanly: every
+	// Kumbha handler returns 404, matching execTickets' pattern above.
+	kumbha *kumbha.Gateway
+
+	// kumbhaEventTickets issues short-lived, single-use credentials for
+	// the Kumbha event-relay WebSocket attach step (pkg/kumbha.EventsHandler
+	// redeems them) — same ticket-auth shape as execTickets, for the same
+	// reason (a WS handshake carries no Authorization header). Nil
+	// disables the feature cleanly.
+	kumbhaEventTickets *kumbha.EventTicketStore
+
+	// kumbhaBuild runs Kaniko builds of a Kumbha session's workspace
+	// (pkg/build) — what the "deploy" MCP verb calls once approved. Nil
+	// disables the feature cleanly: BuildKumbhaSession returns 404, same
+	// as every other optional Kumbha capability.
+	kumbhaBuild *build.Service
 }
 
 // WithExecTickets enables interactive exec's REST half (ticket issuance).
@@ -97,6 +117,34 @@ type Server struct {
 // handshake carries no Authorization header.
 func (s *Server) WithExecTickets(tickets *cluster.TicketStore) *Server {
 	s.execTickets = tickets
+	return s
+}
+
+// WithKumbha enables the Kumbha Gateway endpoints. Returns the same
+// *Server for chaining, so existing NewServer call sites compile
+// unchanged — a server built without this call keeps every Kumbha
+// endpoint returning 404, same as execTickets when home compute is off.
+func (s *Server) WithKumbha(gw *kumbha.Gateway) *Server {
+	s.kumbha = gw
+	return s
+}
+
+// WithKumbhaEventTickets enables the event-relay WebSocket's REST half
+// (ticket issuance). Returns the same *Server for chaining. The WebSocket
+// attach half is a separate handler (kumbha.EventsHandler) mounted
+// directly in cmd/api-server/main.go, outside gin's JWT-auth group — same
+// reasoning as WithExecTickets.
+func (s *Server) WithKumbhaEventTickets(tickets *kumbha.EventTicketStore) *Server {
+	s.kumbhaEventTickets = tickets
+	return s
+}
+
+// WithKumbhaBuild enables the Kumbha "deploy" verb's build step (Kaniko).
+// Returns the same *Server for chaining, so existing NewServer call sites
+// compile unchanged — a server built without this call keeps
+// BuildKumbhaSession returning 404.
+func (s *Server) WithKumbhaBuild(b *build.Service) *Server {
+	s.kumbhaBuild = b
 	return s
 }
 

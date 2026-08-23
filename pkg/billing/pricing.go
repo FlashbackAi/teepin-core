@@ -24,9 +24,15 @@ type PricingInfo struct {
 	// here (per-hour) — the collector converts it (see hoursPerMonth in
 	// collector.go). Same "default 0, ships on, bills nothing until an
 	// operator sets it" pattern as the CPU/memory rates.
-	StoragePricePerGBMonth float64    `json:"storage_price_per_gb_month"`
-	UpdatedBy              *string    `json:"updated_by,omitempty"`
-	UpdatedAt              *time.Time `json:"updated_at,omitempty"`
+	StoragePricePerGBMonth float64 `json:"storage_price_per_gb_month"`
+	// LLM rates are per-MILLION tokens, priced separately for input and
+	// output because the two cost very differently on every backend this
+	// gateway routes to. Same "default 0, ships on, bills nothing until an
+	// operator sets it" pattern as CPU/memory/storage.
+	LLMPricePerMillionInput  float64    `json:"llm_price_per_million_input"`
+	LLMPricePerMillionOutput float64    `json:"llm_price_per_million_output"`
+	UpdatedBy                *string    `json:"updated_by,omitempty"`
+	UpdatedAt                *time.Time `json:"updated_at,omitempty"`
 }
 
 // VRAMPricePerGBHour returns the live GPU VRAM rate from billing.pricing.
@@ -70,6 +76,18 @@ func (s *Service) StorageGBMonthRate(ctx context.Context) float64 {
 	return s.rate(ctx, "storage_price_per_gb_month")
 }
 
+// LLMPriceInputPerMillion / LLMPriceOutputPerMillion return the live Kumbha
+// Gateway rates, per million tokens. Same 0-default, no-compiled-fallback
+// contract as CPUCoreRate — inference bills nothing until an operator sets
+// a rate, same as every other dimension added after launch.
+func (s *Service) LLMPriceInputPerMillion(ctx context.Context) float64 {
+	return s.rate(ctx, "llm_price_per_million_input")
+}
+
+func (s *Service) LLMPriceOutputPerMillion(ctx context.Context) float64 {
+	return s.rate(ctx, "llm_price_per_million_output")
+}
+
 // rate reads one numeric pricing column, returning 0 on any error (the
 // safe direction for a rate that defaults to "free").
 func (s *Service) rate(ctx context.Context, column string) float64 {
@@ -94,15 +112,41 @@ func (s *Service) GetPricing(ctx context.Context) (*PricingInfo, error) {
 	err := s.db.QueryRowContext(ctx,
 		`SELECT vram_price_per_gb_hour, cpu_price_per_core_hour,
 		        memory_price_per_gb_hour, storage_price_per_gb_month,
+		        llm_price_per_million_input, llm_price_per_million_output,
 		        updated_by, updated_at
 		 FROM billing.pricing WHERE id = 1`,
 	).Scan(&info.VRAMPricePerGBHour, &info.CPUPricePerCoreHour,
 		&info.MemoryPricePerGBHour, &info.StoragePricePerGBMonth,
+		&info.LLMPricePerMillionInput, &info.LLMPricePerMillionOutput,
 		&info.UpdatedBy, &info.UpdatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read pricing: %w", err)
 	}
 	return info, nil
+}
+
+// SetLLMPricing updates the Kumbha Gateway's per-million-token rates. Zero
+// is allowed (means "do not charge"), same as CPU/memory/storage — a
+// separate endpoint from the GPU rate's PUT so that rate's "must be
+// positive" contract stays untouched.
+func (s *Service) SetLLMPricing(ctx context.Context, inputRate, outputRate float64, updatedBy string) error {
+	if inputRate < 0 || outputRate < 0 {
+		return fmt.Errorf("rates must be non-negative")
+	}
+	result, err := s.db.ExecContext(ctx,
+		`UPDATE billing.pricing
+		 SET llm_price_per_million_input = $1, llm_price_per_million_output = $2,
+		     updated_by = $3, updated_at = NOW()
+		 WHERE id = 1`,
+		inputRate, outputRate, updatedBy)
+	if err != nil {
+		return fmt.Errorf("failed to update LLM pricing: %w", err)
+	}
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		return fmt.Errorf("pricing row missing; set the GPU rate first")
+	}
+	log.Printf("LLM pricing updated to $%.4f/M input, $%.4f/M output tokens by %s", inputRate, outputRate, updatedBy)
+	return nil
 }
 
 // SetCPUPricing updates the CPU and memory rates for home-class metering.

@@ -1,0 +1,376 @@
+// Copyright 2026 TEEPIN Project
+// Licensed under the Apache License, Version 2.0
+
+package api
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+
+	"github.com/FlashbackAi/teepin-core/pkg/auth"
+	"github.com/FlashbackAi/teepin-core/pkg/billing"
+	"github.com/FlashbackAi/teepin-core/pkg/compute"
+	"github.com/FlashbackAi/teepin-core/pkg/inference"
+	"github.com/FlashbackAi/teepin-core/pkg/kumbha"
+)
+
+// nowStub / sqlNoRows are tiny readability helpers so the sqlmock setup
+// below reads as "a timestamp" / "not found" rather than bare package
+// calls repeated at every call site.
+func nowStub() time.Time { return time.Now() }
+func sqlNoRows() error   { return sql.ErrNoRows }
+
+// noopUsageRecorder satisfies kumbha.UsageRecorder for handler tests that
+// never reach session close (settlement is covered at the pkg/kumbha
+// level, not re-tested here).
+type noopUsageRecorder struct{}
+
+func (noopUsageRecorder) RecordUsage(context.Context, *billing.UsageRecord) error { return nil }
+func (noopUsageRecorder) ConsumeCredit(context.Context, uuid.UUID, uuid.UUID, float64) (float64, error) {
+	return 0, nil
+}
+
+// stubProvider is a minimal inference.Provider for exercising the HTTP
+// layer's success path without touching a real backend.
+type stubProvider struct {
+	body  []byte
+	usage inference.Usage
+	err   error
+}
+
+func (s *stubProvider) Name() string { return "vllm" }
+func (s *stubProvider) Complete(context.Context, inference.Request) (*inference.Response, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return &inference.Response{Usage: s.usage, Model: "qwen3-coder-30b", Body: s.body}, nil
+}
+func (s *stubProvider) Stream(context.Context, inference.Request, func(inference.Chunk) error) error {
+	return nil
+}
+func (s *stubProvider) Capabilities() inference.Capabilities { return inference.Capabilities{} }
+
+// kumbhaRequest performs a request against a Kumbha handler with the
+// caller's project/account injected the way auth middleware would (same
+// idiom as doRequest in server_test.go, extended with a body and headers
+// since every Kumbha endpoint needs both).
+func kumbhaRequest(handler gin.HandlerFunc, method, path string, params gin.Params, projectID uuid.UUID, body any, headers map[string]string) *httptest.ResponseRecorder {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+
+	var bodyReader *bytes.Reader
+	if body != nil {
+		b, _ := json.Marshal(body)
+		bodyReader = bytes.NewReader(b)
+	} else {
+		bodyReader = bytes.NewReader(nil)
+	}
+	c.Request = httptest.NewRequest(method, path, bodyReader)
+	c.Request.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		c.Request.Header.Set(k, v)
+	}
+	c.Params = params
+	if projectID != uuid.Nil {
+		c.Set(string(auth.ProjectIDKey), projectID)
+		c.Set(string(auth.AccountIDKey), testAccountID)
+	}
+	handler(c)
+	return w
+}
+
+// newMockKumbhaDB returns a mocked DB plus stores built on it for both
+// kumbha (what the test actually drives) and compute (needed only to make
+// Server.store non-nil — see the comment on newTestServerWithKumbha). The
+// compute store is never queried in these tests.
+func newMockKumbhaDB(t *testing.T) (sqlmock.Sqlmock, *kumbha.Store, *compute.Store) {
+	t.Helper()
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return mock, kumbha.NewStore(db), compute.NewStore(db)
+}
+
+type fakeKPricing struct{ in, out float64 }
+
+func (f *fakeKPricing) LLMPriceInputPerMillion(context.Context) float64  { return f.in }
+func (f *fakeKPricing) LLMPriceOutputPerMillion(context.Context) float64 { return f.out }
+
+// newTestServerWithKumbha builds a Server with a non-nil store (so
+// requireScope actually resolves tenancy from the gin context instead of
+// short-circuiting into "standalone mode", which requireScope treats a
+// nil store as meaning) plus a wired Kumbha Gateway.
+func newTestServerWithKumbha(t *testing.T, gate kumbha.ProvisionGate, router *kumbha.Router) *Server {
+	t.Helper()
+	_, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, router, gate, &fakeKPricing{in: 1, out: 1}, noopUsageRecorder{})
+	return (&Server{store: cStore}).WithKumbha(gw)
+}
+
+func TestCreateKumbhaSession_NotAvailableWhenKumbhaNil(t *testing.T) {
+	server := &Server{}
+	w := kumbhaRequest(server.CreateKumbhaSession, http.MethodPost, "/v1/kumbha/sessions", nil,
+		uuid.New(), createKumbhaSessionRequest{Budget: 5}, nil)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestCreateKumbhaSession_RequiresProjectScope(t *testing.T) {
+	server := newTestServerWithKumbha(t, allowGate{}, kumbha.NewRouter(nil))
+	w := kumbhaRequest(server.CreateKumbhaSession, http.MethodPost, "/v1/kumbha/sessions", nil,
+		uuid.Nil, createKumbhaSessionRequest{Budget: 5}, nil)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401 (no project scope)", w.Code)
+	}
+}
+
+func TestCreateKumbhaSession_PaymentRequiredMapsTo402(t *testing.T) {
+	server := newTestServerWithKumbha(t, denyGate{reason: "no card on file"}, kumbha.NewRouter(nil))
+	w := kumbhaRequest(server.CreateKumbhaSession, http.MethodPost, "/v1/kumbha/sessions", nil,
+		uuid.New(), createKumbhaSessionRequest{Budget: 5}, nil)
+	if w.Code != http.StatusPaymentRequired {
+		t.Fatalf("status = %d, want 402 (body: %s)", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["code"] != "payment_method_required" {
+		t.Errorf("code = %v, want payment_method_required", resp["code"])
+	}
+}
+
+func TestCreateKumbhaSession_InvalidBudgetIs400(t *testing.T) {
+	server := newTestServerWithKumbha(t, allowGate{}, kumbha.NewRouter(nil))
+	w := kumbhaRequest(server.CreateKumbhaSession, http.MethodPost, "/v1/kumbha/sessions", nil,
+		uuid.New(), createKumbhaSessionRequest{Budget: 0}, nil)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for a non-positive budget", w.Code)
+	}
+}
+
+func TestCreateKumbhaSession_Success(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	server := (&Server{store: cStore}).WithKumbha(gw)
+
+	projectID := uuid.New()
+	sessionID := uuid.New()
+	mock.ExpectQuery(`INSERT INTO billing\.inference_sessions`).
+		WithArgs(testAccountID, projectID, 5.0, "test build").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "spent", "status", "started_at"}).
+			AddRow(sessionID, 0.0, "open", nowStub()))
+
+	w := kumbhaRequest(server.CreateKumbhaSession, http.MethodPost, "/v1/kumbha/sessions", nil,
+		projectID, createKumbhaSessionRequest{Budget: 5, Label: "test build"}, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body: %s)", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["status"] != "open" {
+		t.Errorf("status field = %v, want open", resp["status"])
+	}
+	if resp["agent_running"] != false {
+		t.Errorf("agent_running = %v, want false (no prompt was sent)", resp["agent_running"])
+	}
+}
+
+// A prompt is supplied but this test server was never given WithAgent
+// (see newTestServerWithKumbha) — CreateKumbhaSession must not report 201
+// success for a build that never actually started.
+func TestCreateKumbhaSession_PromptWithoutAgentConfiguredIs503(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	server := (&Server{store: cStore}).WithKumbha(gw)
+
+	projectID := uuid.New()
+	sessionID := uuid.New()
+	mock.ExpectQuery(`INSERT INTO billing\.inference_sessions`).
+		WithArgs(testAccountID, projectID, 5.0, nil).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "spent", "status", "started_at"}).
+			AddRow(sessionID, 0.0, "open", nowStub()))
+
+	w := kumbhaRequest(server.CreateKumbhaSession, http.MethodPost, "/v1/kumbha/sessions", nil,
+		projectID, createKumbhaSessionRequest{Budget: 5, Prompt: "build me a booking app"}, nil)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (body: %s)", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["code"] != "agent_not_configured" {
+		t.Errorf("code = %v, want agent_not_configured", resp["code"])
+	}
+}
+
+func TestKumbhaChatCompletions_NotAvailableWhenKumbhaNil(t *testing.T) {
+	server := &Server{}
+	w := kumbhaRequest(server.KumbhaChatCompletions, http.MethodPost, "/v1/kumbha/chat/completions", nil,
+		uuid.New(), map[string]any{"model": "teepin/fast"}, nil)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestKumbhaChatCompletions_MissingSessionHeaderIs400(t *testing.T) {
+	server := newTestServerWithKumbha(t, allowGate{}, kumbha.NewRouter(nil))
+	w := kumbhaRequest(server.KumbhaChatCompletions, http.MethodPost, "/v1/kumbha/chat/completions", nil,
+		uuid.New(), map[string]any{"model": "teepin/fast", "messages": []any{map[string]string{"role": "user", "content": "hi"}}}, nil)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 (missing X-Teepin-Session)", w.Code)
+	}
+}
+
+func TestKumbhaChatCompletions_InvalidSessionHeaderIs400(t *testing.T) {
+	server := newTestServerWithKumbha(t, allowGate{}, kumbha.NewRouter(nil))
+	w := kumbhaRequest(server.KumbhaChatCompletions, http.MethodPost, "/v1/kumbha/chat/completions", nil,
+		uuid.New(), map[string]any{"model": "teepin/fast", "messages": []any{map[string]string{"role": "user", "content": "hi"}}},
+		map[string]string{"X-Teepin-Session": "not-a-uuid"})
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 (malformed session id)", w.Code)
+	}
+}
+
+func TestKumbhaChatCompletions_MissingModelIs400(t *testing.T) {
+	server := newTestServerWithKumbha(t, allowGate{}, kumbha.NewRouter(nil))
+	w := kumbhaRequest(server.KumbhaChatCompletions, http.MethodPost, "/v1/kumbha/chat/completions", nil,
+		uuid.New(), map[string]any{"messages": []any{map[string]string{"role": "user", "content": "hi"}}},
+		map[string]string{"X-Teepin-Session": uuid.New().String()})
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 (missing model)", w.Code)
+	}
+}
+
+func TestKumbhaChatCompletions_EmptyMessagesIs400(t *testing.T) {
+	server := newTestServerWithKumbha(t, allowGate{}, kumbha.NewRouter(nil))
+	w := kumbhaRequest(server.KumbhaChatCompletions, http.MethodPost, "/v1/kumbha/chat/completions", nil,
+		uuid.New(), map[string]any{"model": "teepin/fast", "messages": []any{}},
+		map[string]string{"X-Teepin-Session": uuid.New().String()})
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 (empty messages)", w.Code)
+	}
+}
+
+func TestKumbhaChatCompletions_StreamingRefusedExplicitly(t *testing.T) {
+	server := newTestServerWithKumbha(t, allowGate{}, kumbha.NewRouter(nil))
+	w := kumbhaRequest(server.KumbhaChatCompletions, http.MethodPost, "/v1/kumbha/chat/completions", nil,
+		uuid.New(), map[string]any{"model": "teepin/fast", "stream": true,
+			"messages": []any{map[string]string{"role": "user", "content": "hi"}}},
+		map[string]string{"X-Teepin-Session": uuid.New().String()})
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 (streaming not yet available)", w.Code)
+	}
+}
+
+func TestKumbhaChatCompletions_SessionNotFoundIs404(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{in: 1, out: 1}, noopUsageRecorder{})
+	server := (&Server{store: cStore}).WithKumbha(gw)
+
+	sessionID := uuid.New()
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnError(sqlNoRows())
+
+	w := kumbhaRequest(server.KumbhaChatCompletions, http.MethodPost, "/v1/kumbha/chat/completions", nil,
+		uuid.New(), map[string]any{"model": "teepin/fast", "messages": []any{map[string]string{"role": "user", "content": "hi"}}},
+		map[string]string{"X-Teepin-Session": sessionID.String()})
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+func TestKumbhaChatCompletions_Success(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+
+	provider := &stubProvider{body: []byte(`{"model":"qwen3-coder-30b","choices":[{"message":{"content":"hi"}}]}`),
+		usage: inference.Usage{InputTokens: 100, OutputTokens: 20}}
+	router := kumbha.NewRouter(map[string]kumbha.Route{"teepin/fast": {Provider: provider, ProviderName: "vllm"}})
+	gw := kumbha.NewGateway(kStore, router, allowGate{}, &fakeKPricing{in: 2, out: 8}, noopUsageRecorder{})
+	server := (&Server{store: cStore}).WithKumbha(gw)
+
+	sessionID := uuid.New()
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "account_id", "project_id", "budget", "spent", "status", "label",
+			"agent_instance_id", "deploy_approved", "started_at", "ended_at",
+		}).AddRow(sessionID, testAccountID, uuid.New(), 5.0, 0.0, "open", nil, nil, false, nowStub(), nil))
+
+	wantCost := 100.0/1e6*2.0 + 20.0/1e6*8.0
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT status, budget, spent FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnRows(sqlmock.NewRows([]string{"status", "budget", "spent"}).AddRow("open", 5.0, 0.0))
+	mock.ExpectExec(`UPDATE billing\.inference_sessions SET spent`).
+		WithArgs(sessionID, wantCost).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`INSERT INTO billing\.inference_session_usage`).
+		WithArgs(sessionID, "teepin/fast", "vllm", 100, 20).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	w := kumbhaRequest(server.KumbhaChatCompletions, http.MethodPost, "/v1/kumbha/chat/completions", nil,
+		uuid.New(), map[string]any{"model": "teepin/fast", "messages": []any{map[string]string{"role": "user", "content": "hi"}}},
+		map[string]string{"X-Teepin-Session": sessionID.String()})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	if w.Header().Get("X-Teepin-Cost") == "" {
+		t.Error("X-Teepin-Cost header missing")
+	}
+	if w.Header().Get("X-Teepin-Session-Spent") == "" {
+		t.Error("X-Teepin-Session-Spent header missing")
+	}
+	// The backend model name must never reach the response the customer
+	// sees to originate from — the body is passed through verbatim (it IS
+	// OpenAI-shaped already), but nothing about model/provider is added by
+	// the gateway on top of it.
+	if !bytes.Contains(w.Body.Bytes(), []byte("qwen3-coder-30b")) {
+		t.Error("upstream body was not passed through verbatim")
+	}
+}
+
+func TestParseCompletionRequest_PreservesUnknownFieldsAsExtra(t *testing.T) {
+	body := []byte(`{"model":"teepin/fast","messages":[{"role":"user","content":"hi"}],"temperature":0.7,"tools":[{"type":"function"}]}`)
+	req, err := parseCompletionRequest(body)
+	if err != nil {
+		t.Fatalf("parseCompletionRequest: %v", err)
+	}
+	if req.Model != "teepin/fast" {
+		t.Errorf("Model = %q", req.Model)
+	}
+	if len(req.Messages) != 1 {
+		t.Fatalf("got %d messages, want 1", len(req.Messages))
+	}
+	if _, ok := req.Extra["temperature"]; !ok {
+		t.Error("temperature was dropped instead of preserved in Extra")
+	}
+	if _, ok := req.Extra["tools"]; !ok {
+		t.Error("tools was dropped instead of preserved in Extra")
+	}
+	if _, ok := req.Extra["model"]; ok {
+		t.Error("model leaked into Extra — must be excluded, it is a typed field")
+	}
+	if _, ok := req.Extra["messages"]; ok {
+		t.Error("messages leaked into Extra — must be excluded, it is a typed field")
+	}
+}
+
+func TestParseCompletionRequest_RejectsInvalidJSON(t *testing.T) {
+	_, err := parseCompletionRequest([]byte(`not json`))
+	if err == nil {
+		t.Error("expected an error for invalid JSON")
+	}
+}

@@ -431,3 +431,55 @@ func TestArchivabilityDrill023(t *testing.T) {
 	}
 	t.Log("archivability drill passed: 023 applies, reverts cleanly, and re-applies")
 }
+
+// TestArchivabilityDrill024 proves the usage-ledger generalisation (024 —
+// polymorphic subject_type/subject_id, cost_basis/provider, widened
+// decimals, billing.inference_sessions) is reversible: the new table and
+// columns exist after up, are gone after reverting one step, and 023's
+// storage columns survive that revert untouched.
+func TestArchivabilityDrill024(t *testing.T) {
+	dsn := os.Getenv("TEEPIN_DRILL_DSN")
+	if dsn == "" {
+		t.Skip("set TEEPIN_DRILL_DSN to run the migration drill")
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("initial up: %v", err)
+	}
+	if !tableExists(t, db, "billing", "inference_sessions") {
+		t.Fatal("after up: billing.inference_sessions missing")
+	}
+	if !columnExists(t, db, "billing", "usage_records", "subject_type") {
+		t.Fatal("after up: billing.usage_records.subject_type missing")
+	}
+	if !columnExists(t, db, "billing", "pricing", "llm_price_per_million_input") {
+		t.Fatal("after up: billing.pricing.llm_price_per_million_input missing")
+	}
+
+	// Revert to version 23 (state after 023, before 024), absolute.
+	if err := migrator(t, db).Migrate(23); err != nil {
+		t.Fatalf("migrate down to 023: %v", err)
+	}
+	if tableExists(t, db, "billing", "inference_sessions") {
+		t.Error("after down: inference_sessions still present")
+	}
+	if columnExists(t, db, "billing", "usage_records", "subject_type") {
+		t.Error("after down: subject_type still present")
+	}
+	if columnExists(t, db, "billing", "pricing", "llm_price_per_million_input") {
+		t.Error("after down: llm_price_per_million_input still present")
+	}
+	if !columnExists(t, db, "compute", "instances", "storage_gb") {
+		t.Error("after down: storage_gb (023) was wrongly removed")
+	}
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("re-up: %v", err)
+	}
+	t.Log("archivability drill passed: 024 applies, reverts cleanly, and re-applies")
+}

@@ -28,6 +28,24 @@ func NewBillingHandler(billingService *billing.Service, authService *auth.Servic
 	}
 }
 
+// GetPricing returns the platform's current per-resource rates. Public
+// (any authenticated caller, not admin-only) — a customer can already see
+// what they're paying on every invoice, so exposing the live rate table
+// is transparency, not a leak. This is what the Kumbha MCP tool server's
+// present_deployment_plan verb reads to build the itemized cost table a
+// customer approves before real infrastructure is provisioned
+// (KUMBHA-DESIGN.md's pre-deploy cost approval gate) — the same numbers
+// GET /v1/admin/pricing shows an operator, never a separate estimate.
+// GET /v1/billing/pricing
+func (h *BillingHandler) GetPricing(c *gin.Context) {
+	info, err := h.billingService.GetPricing(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, info)
+}
+
 // resolveProjectID resolves the project ID from context, query param, or user's first project
 func (h *BillingHandler) resolveProjectID(c *gin.Context) (uuid.UUID, error) {
 	// Try to get project from context (set by API key middleware)

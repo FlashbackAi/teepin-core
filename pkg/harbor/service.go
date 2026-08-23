@@ -17,6 +17,8 @@ import (
 
 	"github.com/google/uuid"
 	"k8s.io/client-go/kubernetes"
+
+	"github.com/FlashbackAi/teepin-core/pkg/cluster"
 )
 
 // Service handles Harbor operations for TEEPIN
@@ -37,6 +39,17 @@ type RegistryAccess struct {
 	ImagePrefix       string    `json:"image_prefix"`
 	DockerLoginCmd    string    `json:"docker_login_command"`
 	CreatedAt         time.Time `json:"created_at"`
+}
+
+// RegistrySecretName returns the Kubernetes ImagePullSecret name for a
+// Harbor-provisioned project — the single source of truth for this
+// convention, exported so callers outside this package (pkg/build,
+// mounting the same credentials into a Kaniko pod to push what it builds)
+// derive it identically rather than duplicating the "-registry" suffix a
+// second time where it could drift out of step with what
+// ProvisionProjectRegistry actually created.
+func RegistrySecretName(harborProjectName string) string {
+	return harborProjectName + "-registry"
 }
 
 // NewService creates a new Harbor service
@@ -86,12 +99,26 @@ func (s *Service) ProvisionProjectRegistry(ctx context.Context, projectID uuid.U
 		return nil, fmt.Errorf("failed to create robot account: %w", err)
 	}
 
-	// 3. Create Kubernetes ImagePullSecret
-	secretName := fmt.Sprintf("%s-registry", strings.ToLower(projectName))
+	// 3. Create Kubernetes ImagePullSecret — MUST be in the same namespace
+	// as the pods that reference it (cluster.WorkloadNamespace, "default"),
+	// not a separate "teepin" namespace nothing actually runs in: a
+	// Secret is namespace-scoped, and a pod spec can only mount one that
+	// lives alongside it. This is also what Kaniko mounts to push a build
+	// (pkg/build), reusing the exact credentials created here rather than
+	// a second, separate registry-auth mechanism.
+	//
+	// Named from harborProjectName (already sanitized: lowercase,
+	// hyphenated, RFC-1123-safe), NOT the raw customer-supplied
+	// projectName — a name like "My Cool App!" is a valid project name
+	// but not a valid Kubernetes object name, and harborProjectName is
+	// also the one value RevokeRegistryAccess can actually look back up
+	// later (it reads harbor_project_name from the DB, never the original
+	// projectName, which is not persisted at all).
+	secretName := RegistrySecretName(harborProjectName)
 	err = CreateImagePullSecret(
 		ctx,
 		s.k8sClient,
-		"teepin", // namespace
+		cluster.WorkloadNamespace,
 		secretName,
 		project.RegistryURL,
 		robot.Name,
@@ -210,8 +237,8 @@ func (s *Service) RevokeRegistryAccess(ctx context.Context, projectID uuid.UUID)
 	_ = s.client.DeleteRobotAccount(ctx, robotID) // Best effort
 
 	// Delete ImagePullSecret from Kubernetes
-	secretName := fmt.Sprintf("%s-registry", strings.ToLower(harborProjectName))
-	_ = DeleteImagePullSecret(ctx, s.k8sClient, "teepin", secretName) // Best effort
+	secretName := RegistrySecretName(harborProjectName)
+	_ = DeleteImagePullSecret(ctx, s.k8sClient, cluster.WorkloadNamespace, secretName) // Best effort
 
 	// Mark as revoked in database
 	updateQuery := `

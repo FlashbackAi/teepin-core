@@ -1089,8 +1089,15 @@ func (c *DirectClient) buildPod(spec InstanceSpec) (*corev1.Pod, error) {
 // pvcName and networkPolicyName are deterministic from the instance ID so
 // create/delete never need to look anything up first — they just name the
 // object and act.
-func pvcName(instanceID string) string           { return "pvc-" + instanceID }
+func pvcName(instanceID string) string           { return PVCName(instanceID) }
 func networkPolicyName(instanceID string) string { return "netpol-" + instanceID }
+
+// PVCName is pvcName exported: callers outside this package that know an
+// instance ID (e.g. pkg/build, mounting a Kumbha agent's workspace volume
+// into a Kaniko pod) need to derive the same PVC name buildPod already
+// mounts, without duplicating the "pvc-" convention a second time where
+// it could silently drift from this one.
+func PVCName(instanceID string) string { return "pvc-" + instanceID }
 
 // buildPVC builds the PersistentVolumeClaim for an instance's /data mount
 // (see buildPod). StorageClassName is left nil so it resolves to the
