@@ -56,15 +56,18 @@ type AgentConfig struct {
 	// project/robot account/secret behind this name is operator-provisioned
 	// once, out of band, directly against whichever cluster runs the pods.
 	ImagePullSecret string
-	// VisionCapable gates whether the agent's browser_screenshot tool
-	// attaches the actual screenshot for the model to look at, versus
-	// text-only console/network/page signals (see deploy/kumbha-agent/
-	// browser_tool.py's module docstring). Operator-set, not
-	// auto-detected: sending an image content block to a route whose
-	// model cannot handle multimodal input is a real risk (a
-	// malformed/rejected request breaks the whole next model turn, not
-	// just the screenshot itself), so this defaults to false (safe) until
-	// an operator has actually confirmed the hosted model supports
+	// VisionCapable tells the agent, via a plain-text note prepended to
+	// its initial prompt (see run.py's main()), whether it is safe to set
+	// include_screenshot=True on the official browser_get_state tool
+	// (openhands.tools.browser_use.BrowserToolSet) — that tool has no
+	// operator-side gate of its own; the MODEL decides per call whether
+	// to request an image. Operator-set, not auto-detected: sending an
+	// image content block to a route whose model cannot handle
+	// multimodal input is a real risk (a malformed/rejected request
+	// breaks that whole turn, not just the screenshot itself — bounded
+	// and recoverable, since the SDK already retries failed completions,
+	// but still worth avoiding by default), so this defaults to false
+	// until an operator has actually confirmed the hosted model supports
 	// vision.
 	VisionCapable bool
 }

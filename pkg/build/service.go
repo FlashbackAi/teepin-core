@@ -39,8 +39,25 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/FlashbackAi/teepin-core/pkg/cluster"
-	"github.com/FlashbackAi/teepin-core/pkg/harbor"
 )
+
+// RegistryProvider is whatever pkg/build pushes Kaniko's output to —
+// Harbor (*harbor.Service) or ECR (*ecrregistry.Service), abstracted so
+// this package does not care which is configured on a given deployment.
+// Both concrete types satisfy this structurally (Go interfaces, no import
+// needed in either direction) — see each's own DockerConfigJSONForBuild
+// doc comment for why the credential travels as a docker-config string
+// rather than a mounted Secret.
+type RegistryProvider interface {
+	// ImagePrefix returns (provisioning the underlying repository/project
+	// if needed) the pushable image prefix for a project, e.g.
+	// "123456789012.dkr.ecr.us-east-1.amazonaws.com/teepin/kumbha-builds-dev"
+	// or "registry.teepin.cloud/teepin-myapp-abc123".
+	ImagePrefix(ctx context.Context, projectID uuid.UUID, projectName string) (string, error)
+	// DockerConfigJSONForBuild returns a marshaled .dockerconfigjson
+	// granting push access to that same prefix.
+	DockerConfigJSONForBuild(ctx context.Context, projectID uuid.UUID) (string, error)
+}
 
 // Config is the operator-fixed policy every build runs under — not
 // customer-selectable, matching the Kumbha agent's own AgentConfig.
@@ -86,12 +103,12 @@ func DefaultConfig() Config {
 // works identically whether the control plane is in direct or agent
 // cluster mode.
 type Service struct {
-	cluster cluster.Client
-	harbor  *harbor.Service
-	cfg     Config
+	cluster  cluster.Client
+	registry RegistryProvider
+	cfg      Config
 }
 
-func NewService(clusterClient cluster.Client, harborService *harbor.Service, cfg Config) *Service {
+func NewService(clusterClient cluster.Client, registry RegistryProvider, cfg Config) *Service {
 	if cfg.KanikoImage == "" {
 		d := DefaultConfig()
 		if cfg.CPUUnits == 0 {
@@ -108,7 +125,7 @@ func NewService(clusterClient cluster.Client, harborService *harbor.Service, cfg
 		}
 		cfg.KanikoImage = d.KanikoImage
 	}
-	return &Service{cluster: clusterClient, harbor: harborService, cfg: cfg}
+	return &Service{cluster: clusterClient, registry: registry, cfg: cfg}
 }
 
 // Result is what a completed build produced.
@@ -160,16 +177,16 @@ func buildInstanceID(tag string) string {
 // customer-inspectable after the fact beyond what OnLogLine already
 // streamed live.
 func (s *Service) Build(ctx context.Context, req Request, onLogLine OnLogLine) (*Result, error) {
-	access, err := s.harbor.ProvisionProjectRegistry(ctx, req.ProjectID, req.ProjectName)
+	imagePrefix, err := s.registry.ImagePrefix(ctx, req.ProjectID, req.ProjectName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to provision registry: %w", err)
 	}
-	dockerConfigJSON, err := s.harbor.DockerConfigJSONForBuild(ctx, req.ProjectID)
+	dockerConfigJSON, err := s.registry.DockerConfigJSONForBuild(ctx, req.ProjectID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load registry credentials: %w", err)
 	}
 
-	imageRef := fmt.Sprintf("%s:%s", access.ImagePrefix, req.Tag)
+	imageRef := fmt.Sprintf("%s:%s", imagePrefix, req.Tag)
 	instanceID := buildInstanceID(req.Tag)
 	scope := cluster.ProjectScope(req.ProjectID.String())
 

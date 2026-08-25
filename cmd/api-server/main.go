@@ -36,6 +36,7 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/cluster"
 	"github.com/FlashbackAi/teepin-core/pkg/compute"
 	"github.com/FlashbackAi/teepin-core/pkg/database"
+	"github.com/FlashbackAi/teepin-core/pkg/ecrregistry"
 	"github.com/FlashbackAi/teepin-core/pkg/gpu"
 	"github.com/FlashbackAi/teepin-core/pkg/harbor"
 	"github.com/FlashbackAi/teepin-core/pkg/inference"
@@ -606,21 +607,39 @@ func main() {
 				go kumbhaEventTickets.Reap(context.Background())
 				apiServer = apiServer.WithKumbhaEventTickets(kumbhaEventTickets)
 
-				// The "deploy" MCP verb's build step (Kaniko) — needs only
-				// Harbor (a registry to push to). pkg/build goes through
+				// The "deploy" MCP verb's build step (Kaniko) — needs a
+				// registry to push to, Harbor or ECR (pkg/build.RegistryProvider
+				// abstracts over either). pkg/build itself goes through
 				// cluster.Client (the same abstraction LaunchAgent/
-				// CreateInstance/DeleteInstance already use), so it works
-				// in EITHER cluster mode, not only when the control plane
-				// happens to hold direct Kubernetes credentials — see
-				// pkg/build's own package doc comment. Absent Harbor, the
+				// CreateInstance/DeleteInstance already use), so it works in
+				// EITHER cluster mode regardless of which registry backs it.
+				// Harbor takes priority when configured (existing behaviour,
+				// unchanged); TEEPIN_ECR_BUILD_REPOSITORY is the fallback for
+				// a deployment with no Harbor server at all — reusing ECR,
+				// already live for the control-plane and kumbha-agent images
+				// themselves, rather than standing up a second registry (see
+				// ROADMAP.md's 2026-08-25 (night) decision). Absent both, the
 				// verb stays an honest stub (teepin-mcp-server's own
 				// fallback message), not a broken endpoint.
-				if harborService != nil {
-					kumbhaBuildService := build.NewService(clusterClient, harborService, build.DefaultConfig())
+				var kumbhaRegistry build.RegistryProvider
+				switch {
+				case harborService != nil:
+					kumbhaRegistry = harborService
+				case getEnv("TEEPIN_ECR_BUILD_REPOSITORY", "") != "":
+					ecrRepo := getEnv("TEEPIN_ECR_BUILD_REPOSITORY", "")
+					ecrSvc, err := ecrregistry.NewService(context.Background(), ecrRepo)
+					if err != nil {
+						log.Printf("⚠️  ECR build registry initialization failed: %v", err)
+					} else {
+						kumbhaRegistry = ecrSvc
+					}
+				}
+				if kumbhaRegistry != nil {
+					kumbhaBuildService := build.NewService(clusterClient, kumbhaRegistry, build.DefaultConfig())
 					apiServer = apiServer.WithKumbhaBuild(kumbhaBuildService)
-					log.Println("✅ Kumbha build pipeline enabled (Kaniko -> Harbor)")
+					log.Println("✅ Kumbha build pipeline enabled (Kaniko -> registry)")
 				} else {
-					log.Println("Kumbha build pipeline not configured (Harbor is unavailable) — the deploy MCP verb stays a stub")
+					log.Println("Kumbha build pipeline not configured (no registry available — set HARBOR_ADMIN_PASSWORD or TEEPIN_ECR_BUILD_REPOSITORY) — the deploy MCP verb stays a stub")
 				}
 
 				log.Printf("✅ Kumbha Gateway enabled (teepin/fast -> vLLM at %s)", vllmBaseURL)

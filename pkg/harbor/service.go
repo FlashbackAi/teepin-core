@@ -74,6 +74,20 @@ func NewService(harborClient *Client, k8sClient kubernetes.Interface, db *sql.DB
 	}
 }
 
+// ImagePrefix is the thin adapter that makes *Service satisfy
+// pkg/build.RegistryProvider (structurally — this package does not, and
+// should not, import pkg/build just to declare that): calls
+// ProvisionProjectRegistry and returns only the pushable prefix, since
+// that is all a build pipeline needs regardless of which registry backs
+// it (Harbor here, or pkg/ecrregistry.Service elsewhere).
+func (s *Service) ImagePrefix(ctx context.Context, projectID uuid.UUID, projectName string) (string, error) {
+	access, err := s.ProvisionProjectRegistry(ctx, projectID, projectName)
+	if err != nil {
+		return "", err
+	}
+	return access.ImagePrefix, nil
+}
+
 // ProvisionProjectRegistry creates Harbor project, robot account, and ImagePullSecret
 func (s *Service) ProvisionProjectRegistry(ctx context.Context, projectID uuid.UUID, projectName string) (*RegistryAccess, error) {
 	// Check if already provisioned
