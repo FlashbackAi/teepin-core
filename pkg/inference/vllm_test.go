@@ -325,3 +325,63 @@ func TestVLLM_Capabilities_ReportsOwnCostClass(t *testing.T) {
 		t.Errorf("CostClass = %q, want %q — the admin margin view keys off this", got, CostClassOwn)
 	}
 }
+
+func TestDiscoverContextWindow_ReturnsMaxModelLenForTheConfiguredModel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			t.Errorf("requested path %q, want /v1/models", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"Qwen/Qwen3.8-27B","object":"model","max_model_len":1010000}]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	got, err := DiscoverContextWindow(context.Background(), srv.URL, "Qwen/Qwen3.8-27B", "")
+	if err != nil {
+		t.Fatalf("DiscoverContextWindow: %v", err)
+	}
+	if got != 1010000 {
+		t.Errorf("got %d, want 1010000", got)
+	}
+}
+
+func TestDiscoverContextWindow_SendsBearerTokenWhenAPIKeySet(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer secret-key" {
+			t.Errorf("Authorization header = %q, want a bearer token", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"m","max_model_len":8192}]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	if _, err := DiscoverContextWindow(context.Background(), srv.URL, "m", "secret-key"); err != nil {
+		t.Fatalf("DiscoverContextWindow: %v", err)
+	}
+}
+
+func TestDiscoverContextWindow_ErrorsWhenModelNotListed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"a-different-model","max_model_len":8192}]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	if _, err := DiscoverContextWindow(context.Background(), srv.URL, "the-configured-model", ""); err == nil {
+		t.Error("expected an error when the configured model is not in the /v1/models response")
+	}
+}
+
+func TestDiscoverContextWindow_ErrorsOnServerFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	// Callers must fall back to a configured/default value on error, not
+	// treat this as fatal — a vLLM server that is briefly unreachable must
+	// not stop the control plane from starting.
+	if _, err := DiscoverContextWindow(context.Background(), srv.URL, "m", ""); err == nil {
+		t.Error("expected an error on a 500 response")
+	}
+}

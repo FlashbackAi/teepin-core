@@ -370,3 +370,56 @@ func trimTrailingSlash(s string) string {
 	}
 	return s
 }
+
+// DiscoverContextWindow queries vLLM's own OpenAI-compatible /v1/models
+// endpoint for the served model's real max_model_len, rather than making
+// an operator hardcode a guess that silently goes stale the moment the
+// underlying model changes. Found live 2026-08-25: TEEPIN_VLLM_CONTEXT_WINDOW
+// defaulted to a guessed 32768, which rejected (client-side, via
+// FitsContext, before the request ever reached vLLM) a genuinely large but
+// entirely servable build request — the actual deployed model reported
+// max_model_len: 1010000. Callers should treat a non-nil error as "fall
+// back to a configured/default value", not a fatal startup condition: a
+// vLLM server that is briefly unreachable, or one whose /v1/models response
+// shape differs, must not stop the control plane from starting.
+func DiscoverContextWindow(ctx context.Context, baseURL, model, apiKey string) (int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, trimTrailingSlash(baseURL)+"/v1/models", nil)
+	if err != nil {
+		return 0, fmt.Errorf("build /v1/models request: %w", err)
+	}
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("query %s/v1/models: %w", baseURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("query %s/v1/models: status %d", baseURL, resp.StatusCode)
+	}
+
+	var body struct {
+		Data []struct {
+			ID          string `json:"id"`
+			MaxModelLen int    `json:"max_model_len"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return 0, fmt.Errorf("decode %s/v1/models response: %w", baseURL, err)
+	}
+
+	for _, m := range body.Data {
+		if m.ID != model {
+			continue
+		}
+		if m.MaxModelLen <= 0 {
+			return 0, fmt.Errorf("model %q reported max_model_len %d", model, m.MaxModelLen)
+		}
+		return m.MaxModelLen, nil
+	}
+	return 0, fmt.Errorf("model %q not present in %s/v1/models response", model, baseURL)
+}

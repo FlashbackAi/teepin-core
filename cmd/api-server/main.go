@@ -495,11 +495,36 @@ func main() {
 			if vllmModel == "" {
 				log.Println("WARN: TEEPIN_VLLM_BASE_URL is set but TEEPIN_VLLM_MODEL is not — Kumbha Gateway disabled")
 			} else {
+				vllmAPIKey := os.Getenv("TEEPIN_VLLM_API_KEY")
+
+				// TEEPIN_VLLM_CONTEXT_WINDOW is an explicit override, not the
+				// primary source of truth — 0 (unset) means "ask vLLM itself
+				// via /v1/models" rather than falling back straight to a
+				// hardcoded guess. This is what actually stops the guess from
+				// going stale every time the underlying model changes; see
+				// DiscoverContextWindow's own doc comment for the live
+				// incident (a hardcoded 32768 rejecting requests a
+				// 1,010,000-token model could handle easily) that this
+				// exists to prevent for good, not just once.
+				contextWindow := getEnvInt("TEEPIN_VLLM_CONTEXT_WINDOW", 0)
+				if contextWindow == 0 {
+					discoverCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					discovered, err := inference.DiscoverContextWindow(discoverCtx, vllmBaseURL, vllmModel, vllmAPIKey)
+					cancel()
+					if err != nil {
+						log.Printf("WARN: could not auto-discover vLLM context window (%v) — falling back to 32768", err)
+						contextWindow = 32768
+					} else {
+						contextWindow = discovered
+						log.Printf("Kumbha Gateway: discovered context window %d tokens for model %s at %s", contextWindow, vllmModel, vllmBaseURL)
+					}
+				}
+
 				vllmProvider := inference.NewVLLM(inference.VLLMConfig{
 					BaseURL:       vllmBaseURL,
 					Model:         vllmModel,
-					APIKey:        os.Getenv("TEEPIN_VLLM_API_KEY"),
-					ContextWindow: getEnvInt("TEEPIN_VLLM_CONTEXT_WINDOW", 32768),
+					APIKey:        vllmAPIKey,
+					ContextWindow: contextWindow,
 					SupportsTools: getEnv("TEEPIN_VLLM_SUPPORTS_TOOLS", "true") == "true",
 				})
 				routes := map[string]kumbha.Route{
