@@ -557,6 +557,12 @@ func main() {
 						EphemeralStorageGB: getEnvInt("TEEPIN_KUMBHA_AGENT_EPHEMERAL_STORAGE_GB", 10),
 						SessionTokenTTL:    time.Duration(getEnvInt("TEEPIN_KUMBHA_AGENT_TOKEN_TTL_MINUTES", 120)) * time.Minute,
 						APIBaseURL:         getEnv("TEEPIN_KUMBHA_AGENT_API_BASE_URL", ""),
+						// Set once a Harbor project + robot account for the
+						// agent image itself has been provisioned directly
+						// against the target cluster (see AgentConfig's own
+						// doc comment) — empty leaves Image expected to be
+						// publicly pullable, same as before this existed.
+						ImagePullSecret: getEnv("TEEPIN_KUMBHA_AGENT_IMAGE_PULL_SECRET", ""),
 					})
 					log.Printf("✅ Kumbha agent pod orchestration enabled (image %s)", agentImage)
 				} else {
@@ -966,6 +972,7 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 				// account alias + username, since the same email may
 				// exist in several accounts.
 				authRoutes.POST("/login", authHandler.Login)
+				authRoutes.POST("/refresh", authHandler.Refresh)
 				authRoutes.GET("/me", authMiddleware.RequireAuth(), authHandler.GetCurrentUser)
 				if accountHandler != nil {
 					authRoutes.POST("/login/sub-user", accountHandler.LoginSubUser)
@@ -1053,6 +1060,7 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 		}
 		{
 			kumbhaGroup.POST("/sessions", apiServer.CreateKumbhaSession)
+			kumbhaGroup.GET("/sessions", apiServer.ListKumbhaSessions)
 			kumbhaGroup.GET("/sessions/:id", apiServer.GetKumbhaSession)
 			kumbhaGroup.POST("/sessions/:id/close", apiServer.CloseKumbhaSession)
 			kumbhaGroup.POST("/sessions/:id/approve-deploy", apiServer.ApproveKumbhaDeploy)
@@ -1102,6 +1110,7 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 				admin.PUT("/pricing", adminHandler.UpdatePricing)
 				admin.PUT("/pricing/cpu", adminHandler.UpdateCPUPricing)
 				admin.PUT("/pricing/storage", adminHandler.UpdateStoragePricing)
+				admin.PUT("/pricing/llm", adminHandler.UpdateLLMPricing)
 
 				// Manual invoicing for the operator control centre.
 				admin.GET("/accounts", adminHandler.ListAccounts)

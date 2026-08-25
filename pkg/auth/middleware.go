@@ -123,6 +123,15 @@ func (m *Middleware) authenticate(c *gin.Context) *Principal {
 		return nil
 	}
 
+	// A refresh token is structurally a valid JWT with the same claims as
+	// an access token, differing only in ExpiresAt — without this check
+	// it authenticated ordinary API calls perfectly well, silently
+	// defeating the whole point of a 15-minute access token (found live
+	// 2026-08-23). Only /v1/auth/refresh accepts one.
+	if claims.TokenType == "refresh" {
+		return nil
+	}
+
 	// A session-scoped credential (MintSessionToken) is only valid while
 	// its session is open — checked on EVERY request, not just at mint
 	// time, which is what makes closing the session revoke the credential

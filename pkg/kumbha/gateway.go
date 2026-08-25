@@ -103,6 +103,12 @@ func (g *Gateway) GetSession(ctx context.Context, id, accountID uuid.UUID) (*Ses
 	return g.store.Get(ctx, id, accountID)
 }
 
+// ListSessions returns a project's Kumbha build history, most recent
+// first.
+func (g *Gateway) ListSessions(ctx context.Context, accountID, projectID uuid.UUID) ([]*Session, error) {
+	return g.store.ListByProject(ctx, accountID, projectID)
+}
+
 // ApproveDeploy flips a session's pre-deploy cost-approval gate — see
 // KUMBHA-DESIGN.md's "Pre-deploy cost approval" section. Called by the
 // console when the customer approves the itemised Deployment Plan; the

@@ -252,6 +252,30 @@ func TestAuthenticate_OrdinaryJWTNeverConsultsSessionChecker(t *testing.T) {
 	_ = mock
 }
 
+// A refresh token is structurally a valid JWT with the same claims as an
+// access token — before TokenType existed, it authenticated ordinary API
+// calls perfectly well for its full 7-day life, silently defeating the
+// point of a 15-minute access token (found live 2026-08-23). Only
+// /v1/auth/refresh may accept one.
+func TestAuthenticate_RefreshTokenRejectedAsAccessToken(t *testing.T) {
+	svc, mock := newMockService(t)
+	m := NewMiddleware(svc, "test-secret")
+
+	user := &User{ID: uuid.New(), AccountID: uuid.New(), Email: "a@b.com", Role: RoleOwner}
+	_, refresh, err := GenerateJWT(user, "acme", "test-secret")
+	if err != nil {
+		t.Fatalf("GenerateJWT: %v", err)
+	}
+
+	c := newTestContext(t)
+	c.Request.Header.Set("Authorization", "Bearer "+refresh)
+
+	if p := m.authenticate(c); p != nil {
+		t.Error("authenticate accepted a refresh token as a bearer credential")
+	}
+	_ = mock
+}
+
 // fakeSessionCheckerFunc lets TestAuthenticate_OrdinaryJWTNeverConsultsSessionChecker
 // observe whether IsSessionOpen was ever called, without needing a second
 // struct type.

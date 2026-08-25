@@ -4,12 +4,16 @@
 package kumbha
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/FlashbackAi/teepin-core/pkg/cluster"
 )
 
 func TestSanitizeEventLine_PassesThroughAllowlistedFields(t *testing.T) {
@@ -177,5 +181,170 @@ func TestEventTicketStore_RedeemRejectsExpiredTicket(t *testing.T) {
 
 	if _, err := store.Redeem(id, secret); !errors.Is(err, ErrEventTicketNotFound) {
 		t.Errorf("got %v, want ErrEventTicketNotFound for an expired ticket", err)
+	}
+}
+
+// scriptedStreamCall is one entry in streamRetryCluster's scripted
+// StreamLogs behaviour: optionally write some bytes (simulating real
+// output), then return err.
+type scriptedStreamCall struct {
+	write []byte
+	err   error
+}
+
+// streamRetryCluster is a minimal cluster.Client for
+// streamLogsWithRetry tests: StreamLogs plays back a scripted sequence of
+// calls. GetInstanceStatus reports instanceStat/statusErr until the
+// script is exhausted (streamCalls >= len(calls)), then reports the pod
+// as "terminated" — this is what lets a test script naturally terminate
+// the retry loop after its last scripted call instead of retrying
+// forever, without needing extra unused script entries.
+type streamRetryCluster struct {
+	calls        []scriptedStreamCall
+	streamCalls  int
+	instanceStat *cluster.InstanceStatus
+	statusErr    error
+}
+
+func (f *streamRetryCluster) StreamLogs(_ context.Context, _ cluster.Scope, _ string, _ cluster.LogOptions, w io.Writer) error {
+	i := f.streamCalls
+	f.streamCalls++
+	if i >= len(f.calls) {
+		// Ran past the script — block-free "never returns real data,
+		// never errors" would hang the test, so fail loudly instead.
+		return errors.New("streamRetryCluster: StreamLogs called more times than scripted")
+	}
+	call := f.calls[i]
+	if len(call.write) > 0 {
+		w.Write(call.write)
+	}
+	return call.err
+}
+
+func (f *streamRetryCluster) GetInstanceStatus(context.Context, cluster.Scope, string) (*cluster.InstanceStatus, error) {
+	if f.statusErr != nil {
+		return nil, f.statusErr
+	}
+	if f.streamCalls >= len(f.calls) {
+		return &cluster.InstanceStatus{Status: "terminated"}, nil
+	}
+	return f.instanceStat, nil
+}
+
+func (f *streamRetryCluster) CreateInstance(context.Context, cluster.InstanceSpec) (*cluster.InstanceResult, error) {
+	return nil, errors.New("not implemented")
+}
+func (f *streamRetryCluster) DeleteInstance(context.Context, cluster.Scope, string) error {
+	return errors.New("not implemented")
+}
+func (f *streamRetryCluster) ListInstanceStatuses(context.Context, cluster.Scope) ([]cluster.InstanceStatus, error) {
+	return nil, nil
+}
+func (f *streamRetryCluster) Inventory(context.Context) ([]cluster.NodeInventory, error) {
+	return nil, nil
+}
+func (f *streamRetryCluster) Healthy(context.Context) bool { return true }
+func (f *streamRetryCluster) ResolveInstanceAddress(context.Context, string, int32) (string, error) {
+	return "", cluster.ErrNotFound
+}
+
+func newTestEventsHandler(fc *streamRetryCluster) *EventsHandler {
+	h := NewEventsHandler(fc, NewEventTicketStore(), nil)
+	// Fast retry interval so these tests run in milliseconds, not minutes.
+	h.streamRetryInterval = time.Millisecond
+	h.streamRetryBudget = 50 * time.Millisecond
+	return h
+}
+
+// The cold-start case, unchanged by the fix: StreamLogs fails outright
+// (no bytes ever written) every time until the pod becomes reachable —
+// must keep retrying rather than giving up on the first failure.
+func TestStreamLogsWithRetry_ColdStartRetriesUntilPodReachable(t *testing.T) {
+	fc := &streamRetryCluster{
+		calls: []scriptedStreamCall{
+			{err: errors.New("container is waiting to start")},
+			{err: errors.New("container is waiting to start")},
+			{write: []byte("{\"type\":\"action\",\"summary\":\"hi\"}\n"), err: nil},
+		},
+		instanceStat: &cluster.InstanceStatus{Status: "running"},
+	}
+	h := newTestEventsHandler(fc)
+	events := make(chan json.RawMessage, 10)
+
+	err := h.streamLogsWithRetry(context.Background(), cluster.Scope{}, "kumbha-agent-x", events)
+	if err != nil {
+		t.Fatalf("streamLogsWithRetry: %v", err)
+	}
+	if fc.streamCalls != 3 {
+		t.Errorf("StreamLogs called %d times, want 3 (2 cold-start failures + 1 success)", fc.streamCalls)
+	}
+}
+
+// The core of this fix: once real output has been seen, a StreamLogs
+// return must NOT be treated as terminal while the pod is still actually
+// running — it must retry, not give up (found live 2026-08-24: a WS
+// closed ~9s into a session while the agent kept working for minutes
+// afterward, and nothing ever reconnected the event relay).
+func TestStreamLogsWithRetry_RetriesAfterDataSeenIfPodStillRunning(t *testing.T) {
+	fc := &streamRetryCluster{
+		calls: []scriptedStreamCall{
+			{write: []byte("{\"type\":\"action\",\"summary\":\"first\"}\n"), err: nil}, // stream drops after real data
+			{write: []byte("{\"type\":\"action\",\"summary\":\"second\"}\n"), err: nil},
+		},
+		instanceStat: &cluster.InstanceStatus{Status: "running"},
+	}
+	h := newTestEventsHandler(fc)
+	events := make(chan json.RawMessage, 10)
+
+	err := h.streamLogsWithRetry(context.Background(), cluster.Scope{}, "kumbha-agent-x", events)
+	if err != nil {
+		t.Fatalf("streamLogsWithRetry: %v", err)
+	}
+	if fc.streamCalls != 2 {
+		t.Errorf("StreamLogs called %d times, want 2 — the first drop should have been retried since the pod was still running", fc.streamCalls)
+	}
+}
+
+// The other half of the same fix: once the pod is confirmed gone, do NOT
+// retry — this is the legitimate "the agent finished" / "it really
+// failed" case, and must return promptly so the browser gets its
+// terminal "closed"/"error" frame.
+func TestStreamLogsWithRetry_StopsWhenPodConfirmedGone(t *testing.T) {
+	fc := &streamRetryCluster{
+		calls: []scriptedStreamCall{
+			{write: []byte("{\"type\":\"action\",\"summary\":\"first\"}\n"), err: nil},
+		},
+		instanceStat: &cluster.InstanceStatus{Status: "terminated"},
+	}
+	h := newTestEventsHandler(fc)
+	events := make(chan json.RawMessage, 10)
+
+	err := h.streamLogsWithRetry(context.Background(), cluster.Scope{}, "kumbha-agent-x", events)
+	if err != nil {
+		t.Fatalf("streamLogsWithRetry: %v", err)
+	}
+	if fc.streamCalls != 1 {
+		t.Errorf("StreamLogs called %d times, want 1 — a terminated pod must not be retried", fc.streamCalls)
+	}
+}
+
+// If the pod's status can no longer even be read (e.g. it was deleted
+// outright), that must also be treated as terminal, not retried forever.
+func TestStreamLogsWithRetry_StopsWhenStatusUnreadable(t *testing.T) {
+	fc := &streamRetryCluster{
+		calls: []scriptedStreamCall{
+			{write: []byte("{\"type\":\"action\",\"summary\":\"first\"}\n"), err: nil},
+		},
+		statusErr: cluster.ErrNotFound,
+	}
+	h := newTestEventsHandler(fc)
+	events := make(chan json.RawMessage, 10)
+
+	err := h.streamLogsWithRetry(context.Background(), cluster.Scope{}, "kumbha-agent-x", events)
+	if err != nil {
+		t.Fatalf("streamLogsWithRetry: %v", err)
+	}
+	if fc.streamCalls != 1 {
+		t.Errorf("StreamLogs called %d times, want 1 — an unreadable status must not be retried", fc.streamCalls)
 	}
 }

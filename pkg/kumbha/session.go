@@ -300,6 +300,46 @@ func (s *Store) Close(ctx context.Context, id, accountID uuid.UUID, reason strin
 	return &sess, nil
 }
 
+// ListByProject returns a project's Kumbha sessions, most recent first —
+// the history view (KUMBHA-DESIGN.md has no console page of its own for
+// Kumbha; this is what lets a customer find a build they started earlier
+// instead of only ever reaching one via a URL they happened to keep).
+// Read-only: this is a list of past/current sessions, not a way to
+// resume one — see build/[id]/page.tsx's own doc comment on why
+// continuing a finished session's conversation is separate, unbuilt work.
+func (s *Store) ListByProject(ctx context.Context, accountID, projectID uuid.UUID) ([]*Session, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, account_id, project_id, budget, spent, status, label,
+		       agent_instance_id, deploy_approved, started_at, ended_at
+		FROM billing.inference_sessions
+		WHERE account_id = $1 AND project_id = $2
+		ORDER BY started_at DESC
+	`, accountID, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list sessions: %w", err)
+	}
+	defer rows.Close()
+
+	var sessions []*Session
+	for rows.Next() {
+		var sess Session
+		var label, agentInstanceID sql.NullString
+		var endedAt sql.NullTime
+		if err := rows.Scan(&sess.ID, &sess.AccountID, &sess.ProjectID, &sess.Budget,
+			&sess.Spent, &sess.Status, &label, &agentInstanceID, &sess.DeployApproved,
+			&sess.StartedAt, &endedAt); err != nil {
+			return nil, fmt.Errorf("failed to scan session: %w", err)
+		}
+		sess.Label = label.String
+		sess.AgentInstanceID = agentInstanceID.String
+		if endedAt.Valid {
+			sess.EndedAt = &endedAt.Time
+		}
+		sessions = append(sessions, &sess)
+	}
+	return sessions, rows.Err()
+}
+
 func nullIfEmpty(s string) any {
 	if s == "" {
 		return nil

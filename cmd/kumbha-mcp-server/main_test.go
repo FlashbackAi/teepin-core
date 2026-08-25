@@ -110,6 +110,55 @@ func TestPresentDeploymentPlan_RejectsEmptyResources(t *testing.T) {
 	}
 }
 
+// A malformed resource (all zero — the shape a wrong-field-name call
+// silently collapses to, since json.Unmarshal never rejects an unknown or
+// missing field) must be rejected with an actionable message, not priced
+// at $0.00 and reported as a success. Found live 2026-08-24: an agent sent
+// resources shaped like {"resource":"Compute instance","spec":"...",
+// "cost_per_hour":"$0.015"} — none of those keys exist on resourceRequest,
+// so every resource silently priced at $0 and "succeeded" six times in a
+// row before the agent gave up trying different shapes.
+func TestPresentDeploymentPlan_RejectsAllZeroResource(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/billing/pricing", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"cpu_price_per_core_hour":1,"memory_price_per_gb_hour":1,"storage_price_per_gb_month":1}`))
+	})
+	c := newTestClient(t, mux)
+
+	result, _, err := c.presentDeploymentPlan(context.Background(), &mcp.CallToolRequest{}, presentDeploymentPlanArgs{
+		Resources: []resourceRequest{{Name: "pomodoro-instance"}},
+	})
+	if err != nil {
+		t.Fatalf("presentDeploymentPlan: %v", err)
+	}
+	text := result.Content[0].(*mcp.TextContent).Text
+	if !strings.Contains(text, "pomodoro-instance") || !strings.Contains(text, "cpu_units") {
+		t.Errorf("got %q, want a rejection naming the resource and the required fields", text)
+	}
+}
+
+// A storage-only resource (no CPU/memory — a legitimate line item, e.g. a
+// standalone volume) must NOT be rejected by the all-zero check above: it
+// has a real, non-zero storage_gb, just zero compute.
+func TestPresentDeploymentPlan_AllowsStorageOnlyResource(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/billing/pricing", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"cpu_price_per_core_hour":1,"memory_price_per_gb_hour":1,"storage_price_per_gb_month":1}`))
+	})
+	c := newTestClient(t, mux)
+
+	result, _, err := c.presentDeploymentPlan(context.Background(), &mcp.CallToolRequest{}, presentDeploymentPlanArgs{
+		Resources: []resourceRequest{{Name: "db", StorageGB: 10}},
+	})
+	if err != nil {
+		t.Fatalf("presentDeploymentPlan: %v", err)
+	}
+	text := result.Content[0].(*mcp.TextContent).Text
+	if strings.Contains(text, "must specify") {
+		t.Errorf("storage-only resource was rejected: %s", text)
+	}
+}
+
 func TestCreateInstance_BlockedBeforeApproval(t *testing.T) {
 	mux := http.NewServeMux()
 	called := false

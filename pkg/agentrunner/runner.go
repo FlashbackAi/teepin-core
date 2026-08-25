@@ -308,6 +308,8 @@ func (r *Runner) handleCreate(ctx context.Context, s stream, requestID string, c
 		ImagePullSecret:    cmd.ImagePullSecret,
 		StorageGB:          int(cmd.StorageGb),
 		EphemeralStorageGB: int(cmd.EphemeralStorageGb),
+		AlwaysPullImage:    cmd.AlwaysPullImage,
+		NeverRestart:       cmd.NeverRestart,
 	}
 
 	// Idempotency: a command redelivered after a reconnect must not

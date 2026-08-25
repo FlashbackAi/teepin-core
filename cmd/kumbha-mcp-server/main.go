@@ -193,6 +193,31 @@ func (c *teepinClient) presentDeploymentPlan(ctx context.Context, req *mcp.CallT
 	if len(args.Resources) == 0 {
 		return textResult("at least one resource is required")
 	}
+	// Go's json.Unmarshal never rejects a missing or wrong-named field — it
+	// just leaves the zero value in place. Left unchecked, a call using the
+	// wrong argument shape (e.g. "resource"/"spec" strings instead of
+	// cpu_units/memory_gb) silently produces a "successful" plan priced at
+	// $0.00 for that resource: a customer could approve what looks like a
+	// free deployment and then be charged the real rate once it's actually
+	// provisioned. Reject explicitly instead, with the exact field names
+	// the schema expects, so the agent gets a fixable error on THIS call
+	// rather than a bogus "success" it has no reason to doubt (found live
+	// 2026-08-24: the agent retried this tool 6 times with 6 different
+	// wrong shapes because every one of them "succeeded").
+	for _, r := range args.Resources {
+		if strings.TrimSpace(r.Name) == "" {
+			return textResult("every resource requires a non-empty \"name\"")
+		}
+		if r.CPUUnits <= 0 && r.MemoryGB <= 0 && r.StorageGB <= 0 {
+			return textResult(
+				"resource %q has cpu_units=0, memory_gb=0, and storage_gb=0 — it must specify "+
+					"a positive integer for at least one of \"cpu_units\", \"memory_gb\", or "+
+					"\"storage_gb\" (not, e.g., a \"resource\"/\"spec\" text description; those field "+
+					"names are not part of the schema and are silently dropped).",
+				r.Name,
+			)
+		}
+	}
 
 	// The real, live admin-configured rates — GET /v1/billing/pricing is
 	// the same numbers a human sees on their invoice, never a separate

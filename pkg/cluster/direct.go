@@ -66,6 +66,20 @@ const (
 	labelProjectID = "teepin.io/project-id"
 	labelAccountID = "teepin.io/account-id"
 
+	// MUST match pkg/kumbha's agentLabel exactly. Kumbha's own agent pod
+	// carries the same account/project tenancy labels as any customer
+	// instance (correctly, for billing/scoping) and is otherwise
+	// indistinguishable from one at this layer — the "never appears in
+	// the customer's Compute list" guarantee (pkg/kumbha/agent.go's own
+	// doc comment) was never actually true: ListInstances is cluster-
+	// authoritative (server.go's ListInstances queries the live cluster,
+	// merging in compute.instances only for extra metadata), not
+	// database-authoritative, and nothing excluded this label from that
+	// query until it was excluded here. Found live 2026-08-23: a
+	// customer's CPU compute list showed "kumbha-agent-<id>" with a
+	// working Delete button.
+	labelKumbhaAgent = "teepin.io/kumbha-agent"
+
 	// Consumed by the networking Service selector.
 	labelInstanceShort = "teepin.io/instance"
 	labelInstanceUUID  = "teepin.io/instance-uuid"
@@ -342,9 +356,14 @@ func instanceSelector(scope Scope, instanceID string) string {
 	return appendScope(selector, scope)
 }
 
-// managedSelector matches every TEEPIN-managed instance in a scope.
+// managedSelector matches every TEEPIN-managed instance in a scope, for
+// LISTING — excludes Kumbha's own agent pods (see labelKumbhaAgent),
+// unlike instanceSelector: a caller that already knows a pod's exact
+// instance ID (CloseSession's teardown, the event relay's StreamLogs)
+// must still find it. Only the customer-facing list must not.
 func managedSelector(scope Scope) string {
-	return appendScope(fmt.Sprintf("%s=true", labelManaged), scope)
+	selector := fmt.Sprintf("%s=true,%s!=true", labelManaged, labelKumbhaAgent)
+	return appendScope(selector, scope)
 }
 
 func appendScope(selector string, scope Scope) string {
@@ -942,6 +961,19 @@ func (c *DirectClient) buildPod(spec InstanceSpec) (*corev1.Pod, error) {
 			SecurityContext: &corev1.PodSecurityContext{
 				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			},
+			// A bare Pod defaults to RestartPolicy: Always when left
+			// unset — correct for a customer's persistent compute
+			// instance, catastrophic for a one-shot workload (see
+			// InstanceSpec.NeverRestart's own doc comment for the live
+			// incident this guards against: Kumbha's agent pod silently
+			// restarting mid-build and re-running the whole thing from
+			// scratch against the same prompt, on repeat).
+			RestartPolicy: func() corev1.RestartPolicy {
+				if spec.NeverRestart {
+					return corev1.RestartPolicyNever
+				}
+				return corev1.RestartPolicyAlways
+			}(),
 			Containers: []corev1.Container{
 				{
 					Name: "app",
@@ -951,6 +983,12 @@ func (c *DirectClient) buildPod(spec InstanceSpec) (*corev1.Pod, error) {
 					Command: spec.Command,
 					Args:    spec.Args,
 					Image:   spec.Image,
+					ImagePullPolicy: func() corev1.PullPolicy {
+						if spec.AlwaysPullImage {
+							return corev1.PullAlways
+						}
+						return "" // API server defaults this by tag, as before
+					}(),
 					SecurityContext: &corev1.SecurityContext{
 						AllowPrivilegeEscalation: boolPtr(false),
 						Capabilities: &corev1.Capabilities{

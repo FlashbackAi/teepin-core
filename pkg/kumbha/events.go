@@ -173,9 +173,17 @@ func sanitizeEventLine(line []byte) (json.RawMessage, bool) {
 type logLineWriter struct {
 	buf    []byte
 	events chan<- json.RawMessage
+	// sawData marks whether StreamLogs ever delivered a single byte —
+	// the signal ServeSession's retry loop uses to tell "the pod was
+	// never reachable yet" (retry) apart from "it streamed real output,
+	// then legitimately ended" (stop, same as before this existed).
+	sawData bool
 }
 
 func (w *logLineWriter) Write(p []byte) (int, error) {
+	if len(p) > 0 {
+		w.sawData = true
+	}
 	w.buf = append(w.buf, p...)
 	for {
 		i := bytes.IndexByte(w.buf, '\n')
@@ -220,7 +228,17 @@ type EventsHandler struct {
 	cluster  cluster.Client
 	tickets  *EventTicketStore
 	upgrader websocket.Upgrader
+
+	// Overridable so tests can exercise the retry loop without real
+	// sleeps; NewEventsHandler sets the real production values.
+	streamRetryInterval time.Duration
+	streamRetryBudget   time.Duration
 }
+
+const (
+	defaultStreamRetryInterval = 3 * time.Second
+	defaultStreamRetryBudget   = 5 * time.Minute
+)
 
 func NewEventsHandler(client cluster.Client, tickets *EventTicketStore, checkOrigin func(*http.Request) bool) *EventsHandler {
 	return &EventsHandler{
@@ -230,6 +248,8 @@ func NewEventsHandler(client cluster.Client, tickets *EventTicketStore, checkOri
 			CheckOrigin:       checkOrigin,
 			EnableCompression: false,
 		},
+		streamRetryInterval: defaultStreamRetryInterval,
+		streamRetryBudget:   defaultStreamRetryBudget,
 	}
 }
 
@@ -248,6 +268,73 @@ type wsServerFrame struct {
 	Message string `json:"message,omitempty"`
 }
 
+// streamLogsWithRetry tails the agent pod's stdout via cluster.Client's
+// StreamLogs, pushing sanitized lines onto events, and retries across two
+// distinct failure classes rather than treating any return from StreamLogs
+// as terminal:
+//
+//  1. Cold start — the pod was never reached at all yet (still pulling its
+//     image / ContainerCreating, the same "container is waiting to start"
+//     error a plain `kubectl logs` on a Pending pod returns). Bounded
+//     retry, budget h.streamRetryBudget: a single attempt here closed the
+//     WS moments after every session was created, well before the agent
+//     had any chance to run.
+//  2. A transient transport drop AFTER real output was already seen — the
+//     pod was genuinely reached, but StreamLogs returning does not by
+//     itself mean the agent's own process ended; a hiccup on the
+//     agent-mode gRPC tunnel between the control plane and the
+//     home/datacenter node looks identical from this call alone. Found
+//     live 2026-08-24: a session's activity feed went silent for the rest
+//     of a build (WS closed after ~9s, no reconnect — correct per the
+//     frontend's own contract, since a "closed" frame is a genuine
+//     terminal state it must not retry) while chat/completions kept
+//     succeeding for minutes afterward, proving the agent was still very
+//     much alive. This case checks the pod's actual status via
+//     GetInstanceStatus before deciding the stream has genuinely ended,
+//     and retries indefinitely (not the cold-start budget, which exists
+//     only to bound the one-time image-pull wait) as long as the pod is
+//     still "running" — bounded naturally by ctx being cancelled when the
+//     browser disconnects or the session ends.
+//
+// Only once the pod is confirmed gone (or its status can no longer be
+// read) is this treated as a legitimate end and the error returned.
+func (h *EventsHandler) streamLogsWithRetry(ctx context.Context, scope cluster.Scope, instanceID string, events chan<- json.RawMessage) error {
+	coldStartDeadline := time.Now().Add(h.streamRetryBudget)
+
+	for {
+		writer := &logLineWriter{events: events}
+		err := h.cluster.StreamLogs(ctx, scope, instanceID, cluster.LogOptions{Follow: true}, writer)
+
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		if !writer.sawData {
+			if time.Now().After(coldStartDeadline) {
+				return err
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(h.streamRetryInterval):
+				continue
+			}
+		}
+
+		status, statusErr := h.cluster.GetInstanceStatus(ctx, scope, instanceID)
+		if statusErr == nil && status.Status == "running" {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(h.streamRetryInterval):
+				continue
+			}
+		}
+
+		return err
+	}
+}
+
 // ServeSession upgrades to a WebSocket and streams one session's agent
 // activity to it. sessionID is the bare session ID — the caller (routing
 // in cmd/api-server) has already resolved it from the URL path.
@@ -258,7 +345,17 @@ func (h *EventsHandler) ServeSession(w http.ResponseWriter, r *http.Request, ses
 	}
 	defer conn.Close()
 
-	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	// 5s was too tight for real conditions — found live 2026-08-24: the
+	// event WS was reconnecting roughly every 15s (my own retry backoff
+	// masked it as "Watching live" the whole time in the console, but
+	// underneath it was dropping and re-establishing constantly, wiping
+	// and replaying the whole event list on every cycle). A fresh
+	// WS handshake plus one client-side JSON send, over a real network
+	// path (browser -> ALB -> ECS task), can reasonably take longer than
+	// 5s under real-world latency — this isn't catching a broken client,
+	// it was catching an ordinary one. Same class of bug as the vLLM
+	// ResponseHeaderTimeout fix.
+	_ = conn.SetReadDeadline(time.Now().Add(20 * time.Second))
 	_, authMsg, err := conn.ReadMessage()
 	if err != nil {
 		closeWithError(conn, wsCloseAuthFailed, "expired", "no ticket presented in time")
@@ -279,6 +376,20 @@ func (h *EventsHandler) ServeSession(w http.ResponseWriter, r *http.Request, ses
 		return
 	}
 
+	// THE actual bug behind every "activity stream keeps disconnecting"
+	// symptom this session (found live 2026-08-24, via a WebSocket spy
+	// proving auth succeeded instantly and real events flowed fine before
+	// an abrupt code-1006 close at exactly the deadline): SetReadDeadline
+	// above was never cleared after the auth read succeeded. The reader
+	// goroutine below calls ReadMessage() in a loop for the rest of this
+	// connection's life (purely to detect the client going away — this is
+	// a read-only relay, the client never sends anything else), and
+	// inherited that same stale deadline — so every connection was
+	// silently capped at the auth-read deadline's duration, not by
+	// anything about the client or network. Widening 5s to 20s earlier
+	// today only delayed hitting this, it never fixed it.
+	_ = conn.SetReadDeadline(time.Time{})
+
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
@@ -298,12 +409,10 @@ func (h *EventsHandler) ServeSession(w http.ResponseWriter, r *http.Request, ses
 
 	events := make(chan json.RawMessage, eventsChannelSize)
 	streamErr := make(chan error, 1)
+	scope := cluster.ProjectScope(ticket.ProjectID.String())
 	go func() {
-		scope := cluster.ProjectScope(ticket.ProjectID.String())
-		err := h.cluster.StreamLogs(ctx, scope, ticket.AgentInstanceID,
-			cluster.LogOptions{Follow: true}, &logLineWriter{events: events})
-		streamErr <- err
-		close(events)
+		defer close(events)
+		streamErr <- h.streamLogsWithRetry(ctx, scope, ticket.AgentInstanceID, events)
 	}()
 
 	pingTicker := time.NewTicker(eventsPingInterval)

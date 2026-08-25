@@ -24,35 +24,56 @@ type Claims struct {
 	// open/closed status on every request, so the credential is revoked
 	// the instant the session ends without needing a token blocklist.
 	SessionID uuid.UUID `json:"session_id,omitempty"`
+	// TokenType distinguishes a login access token from its refresh
+	// token — added 2026-08-23 after finding both were structurally
+	// identical (same claims, only ExpiresAt differed), so a 7-day
+	// refresh token worked as a bearer credential on every ordinary API
+	// call, silently defeating the whole point of a 15-minute access
+	// token. Middleware.authenticate rejects "refresh" outright; only
+	// the /v1/auth/refresh endpoint accepts one. Empty/absent (older
+	// already-issued tokens, and Kumbha's own MintSessionToken credential)
+	// is treated as "access" — those are distinguished by SessionID
+	// instead and this field does not apply to them.
+	TokenType string `json:"token_type,omitempty"`
 	jwt.RegisteredClaims
 }
 
 // GenerateJWT creates an access token (15 minutes) and refresh token
 // (7 days) for a user, carrying their account and role.
 func GenerateJWT(user *User, accountAlias, secret string) (accessToken, refreshToken string, err error) {
-	newClaims := func(ttl time.Duration) Claims {
+	newClaims := func(ttl time.Duration, tokenType string) Claims {
 		return Claims{
 			UserID:       user.ID,
 			Email:        user.Email,
 			AccountID:    user.AccountID,
 			AccountAlias: accountAlias,
 			Role:         user.Role,
+			TokenType:    tokenType,
 			RegisteredClaims: jwt.RegisteredClaims{
 				ExpiresAt: jwt.NewNumericDate(time.Now().Add(ttl)),
 				IssuedAt:  jwt.NewNumericDate(time.Now()),
 				Issuer:    "teepin-api",
 				Subject:   user.ID.String(),
+				// ID (jti): RegisteredClaims' NumericDate fields truncate
+				// to whole seconds, so two tokens minted for the same
+				// user within the same second would otherwise be
+				// byte-identical (HMAC signing is deterministic) — found
+				// via a refresh-rotation test that could mint both the
+				// original and the "rotated" token in the same second.
+				// A random ID guarantees every mint is distinct
+				// regardless of timing, independent of anything else.
+				ID: uuid.NewString(),
 			},
 		}
 	}
 
-	accessToken, err = jwt.NewWithClaims(jwt.SigningMethodHS256, newClaims(15*time.Minute)).
+	accessToken, err = jwt.NewWithClaims(jwt.SigningMethodHS256, newClaims(15*time.Minute, "access")).
 		SignedString([]byte(secret))
 	if err != nil {
 		return "", "", err
 	}
 
-	refreshToken, err = jwt.NewWithClaims(jwt.SigningMethodHS256, newClaims(7*24*time.Hour)).
+	refreshToken, err = jwt.NewWithClaims(jwt.SigningMethodHS256, newClaims(7*24*time.Hour, "refresh")).
 		SignedString([]byte(secret))
 	if err != nil {
 		return "", "", err

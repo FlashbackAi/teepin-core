@@ -111,6 +111,51 @@ func (s *Service) issueTokens(ctx context.Context, user *User) (accessToken, ref
 	return accessToken, refreshToken, nil
 }
 
+// Refresh exchanges a valid, non-expired refresh token for a brand new
+// access/refresh pair — the piece that was missing entirely until
+// 2026-08-23: a refresh token was minted and stored client-side at login,
+// but nothing ever redeemed it, so an access token expiring after 15
+// minutes meant a hard sign-out every 15 minutes instead of a silent
+// refresh.
+//
+// Rotates the refresh token too (returns a new one, does not just re-mint
+// an access token against the old refresh token indefinitely) — standard
+// practice that bounds how long a leaked refresh token stays useful.
+//
+// Re-fetches the user from the database rather than trusting the embedded
+// claims for another cycle: an account disabled since the refresh token
+// was issued must stop minting new access tokens immediately, the same
+// check Login itself makes.
+func (s *Service) Refresh(ctx context.Context, refreshToken string) (accessToken, newRefreshToken string, err error) {
+	claims, err := VerifyJWT(refreshToken, s.jwtSecret)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid or expired refresh token")
+	}
+	if claims.TokenType != "refresh" {
+		return "", "", fmt.Errorf("not a refresh token")
+	}
+
+	var user User
+	query := `
+		SELECT id, account_id, email, COALESCE(username,''), role, status,
+		       password_hash, COALESCE(full_name,''), email_verified, created_at, updated_at
+		FROM auth.users
+		WHERE id = $1 AND deleted_at IS NULL
+	`
+	if err := s.db.QueryRowContext(ctx, query, claims.UserID).Scan(
+		&user.ID, &user.AccountID, &user.Email, &user.Username, &user.Role, &user.Status,
+		&user.PasswordHash, &user.FullName, &user.EmailVerified,
+		&user.CreatedAt, &user.UpdatedAt,
+	); err != nil {
+		return "", "", fmt.Errorf("user not found")
+	}
+	if user.Status == "disabled" {
+		return "", "", fmt.Errorf("this login has been disabled")
+	}
+
+	return s.issueTokens(ctx, &user)
+}
+
 // GetUserByID retrieves a user by ID
 func (s *Service) GetUserByID(ctx context.Context, userID uuid.UUID) (*User, error) {
 	var user User

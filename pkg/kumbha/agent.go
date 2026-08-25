@@ -41,6 +41,18 @@ type AgentConfig struct {
 	// "http://teepin-api.default.svc.cluster.local:8080"), never a
 	// customer-facing URL.
 	APIBaseURL string
+	// ImagePullSecret is the name of a Kubernetes docker-registry Secret,
+	// already present in cluster.WorkloadNamespace on whichever cluster
+	// LaunchAgent's pods land on, granting pull access to Image. Empty
+	// means Image must be publicly pullable — the same "ships on, does
+	// nothing until configured" contract as the rest of AgentConfig; there
+	// is deliberately no provisioning path for this secret here (unlike a
+	// customer's own registry via pkg/harbor.Service.ProvisionProjectRegistry,
+	// which is keyed to a real auth.projects row) — Kumbha's own agent
+	// image is a platform resource, not a per-customer one, so the Harbor
+	// project/robot account/secret behind this name is operator-provisioned
+	// once, out of band, directly against whichever cluster runs the pods.
+	ImagePullSecret string
 }
 
 // TokenMinter mints the agent's own short-lived, session-scoped
@@ -118,6 +130,24 @@ func (g *Gateway) LaunchAgent(ctx context.Context, sess *Session, prompt string)
 		MemoryGB:           g.agentConfig.MemoryGB,
 		StorageGB:          g.agentConfig.StorageGB,
 		EphemeralStorageGB: g.agentConfig.EphemeralStorageGB,
+		ImagePullSecret:    g.agentConfig.ImagePullSecret,
+		// The agent image's tag is not a genuinely immutable identifier
+		// today (see the proto field's own doc comment) — force a fresh
+		// pull every launch rather than risk a node silently reusing a
+		// stale cached image under the same tag.
+		AlwaysPullImage: true,
+		// A bare Pod's default RestartPolicy (Always) is correct for a
+		// customer's persistent compute instance and wrong for this one:
+		// the agent is a one-shot process that is SUPPOSED to exit when
+		// it finishes (or after wait_for_deploy_approval's bounded wait) —
+		// left at the default, a Kubernetes restart would silently
+		// re-run the entire build from scratch against the same original
+		// prompt, on repeat, burning the customer's session budget on
+		// duplicate work (found live 2026-08-24: a build session's
+		// activity feed showed re-generated, differently-worded text for
+		// actions already completed — the tell that this had already
+		// happened before this fix).
+		NeverRestart: true,
 	}
 
 	if _, err := g.cluster.CreateInstance(ctx, spec); err != nil {

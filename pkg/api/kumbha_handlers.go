@@ -115,6 +115,35 @@ func (s *Server) CreateKumbhaSession(c *gin.Context) {
 	c.JSON(http.StatusCreated, kumbhaSessionResponse(sess))
 }
 
+// ListKumbhaSessions returns the active project's Kumbha build history,
+// most recent first — the history view Kumbha has no console page of its
+// own for otherwise (KUMBHA-DESIGN.md). Read-only: a way to find and
+// revisit a past build, not to resume its conversation.
+// GET /v1/kumbha/sessions
+func (s *Server) ListKumbhaSessions(c *gin.Context) {
+	if s.kumbha == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha Gateway is not available on this deployment"})
+		return
+	}
+
+	projectID, accountID, ok := s.requireScope(c)
+	if !ok {
+		return
+	}
+
+	sessions, err := s.kumbha.ListSessions(c.Request.Context(), accountID, projectID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	out := make([]gin.H, len(sessions))
+	for i, sess := range sessions {
+		out[i] = kumbhaSessionResponse(sess)
+	}
+	c.JSON(http.StatusOK, gin.H{"sessions": out, "count": len(out)})
+}
+
 // CloseKumbhaSession explicitly ends a session and settles its ledger —
 // one usage_records line per (route, direction) the session touched,
 // drawn against the account's credits.

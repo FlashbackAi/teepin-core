@@ -107,6 +107,30 @@ message CreateInstanceCommand {
   // regenerated 2026-08-22, no renumbering.
   int32 storage_gb           = 20;
   int32 ephemeral_storage_gb = 21;
+
+  // Forces a fresh pull even if the node's containerd already has an
+  // image cached under this exact tag. Needed for images whose tag is
+  // NOT a genuinely immutable identifier (e.g. Kumbha's agent image
+  // today — "sha-nogit-dirty" until the repo is a real git checkout,
+  // see ROADMAP.md 2026-08-23) — without it, kubelet's default
+  // IfNotPresent policy silently reuses a stale cached image and a
+  // rebuilt-but-same-tag push never reaches already-visited nodes.
+  // False preserves prior behaviour for every other caller.
+  bool always_pull_image = 22;
+
+  // corev1.PodSpec.RestartPolicy defaults to Always when left unset —
+  // correct for a customer's persistent compute instance (a crashed web
+  // server should come back), catastrophic for a one-shot workload like
+  // Kumbha's agent: found live 2026-08-24, a build session's activity
+  // feed reset mid-test with re-generated (differently-worded) text for
+  // actions already completed — the pod had silently been restarted by
+  // Kubernetes and was re-running the ENTIRE build from scratch against
+  // the same original prompt, on repeat, burning the customer's session
+  // budget on duplicate work with no way to ever stably reach the
+  // deploy-approval wait. True sets RestartPolicy: Never on this pod;
+  // false (default) preserves prior Always behaviour for every other
+  // caller.
+  bool never_restart = 23;
 }
 
 message PortMapping {

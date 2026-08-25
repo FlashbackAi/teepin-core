@@ -72,6 +72,18 @@ type VLLMConfig struct {
 // short-prompt request a short deadline and a long agentic step a long one.
 // The transport-level timeouts below still bound connection setup and the
 // wait for response HEADERS, which is what actually catches a dead backend.
+//
+// ResponseHeaderTimeout specifically was 60s until this was found live
+// (2026-08-23): for a NON-streaming completion (Kumbha does not support
+// streaming yet — see the "streaming is not yet available" 400 in
+// kumbha_handlers.go), vLLM sends nothing at all, headers included, until
+// the entire response has finished generating. A high-reasoning-effort
+// agentic turn on a single home-hosted GPU legitimately took longer than
+// that, so every retry hit the exact same 60s wall and the agent looked
+// permanently stuck — this setting was quietly doing precisely what the
+// paragraph above says it deliberately does not do. Raised generously
+// rather than removed outright, so a genuinely dead backend is still
+// caught eventually rather than hanging forever.
 func NewVLLM(cfg VLLMConfig) *VLLMProvider {
 	client := cfg.HTTPClient
 	if client == nil {
@@ -89,7 +101,7 @@ func NewVLLM(cfg VLLMConfig) *VLLMProvider {
 				MaxIdleConnsPerHost:   100,
 				IdleConnTimeout:       90 * time.Second,
 				TLSHandshakeTimeout:   5 * time.Second,
-				ResponseHeaderTimeout: 60 * time.Second,
+				ResponseHeaderTimeout: 10 * time.Minute,
 				ExpectContinueTimeout: 1 * time.Second,
 			},
 		}

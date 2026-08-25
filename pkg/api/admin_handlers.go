@@ -143,6 +143,38 @@ func (h *AdminHandler) UpdateStoragePricing(c *gin.Context) {
 	c.JSON(http.StatusOK, info)
 }
 
+// UpdateLLMPricing sets the Kumbha Gateway's per-million-token input/output
+// rates. Zero is valid ("do not charge"), same contract as CPU/storage.
+//
+// service.SetLLMPricing has existed since Kumbha's Gateway shipped, but
+// this handler and its route did not — found live 2026-08-24 when every
+// Kumbha session's "spent" stayed $0.00 regardless of real token usage.
+// That was not a calculation bug (Gateway.cost's math was always correct);
+// the configured rate was genuinely $0 because there was no way to set it
+// to anything else short of raw SQL against billing.pricing.
+// PUT /v1/admin/pricing/llm
+func (h *AdminHandler) UpdateLLMPricing(c *gin.Context) {
+	var req struct {
+		LLMPricePerMillionInput  float64 `json:"llm_price_per_million_input"`
+		LLMPricePerMillionOutput float64 `json:"llm_price_per_million_output"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := h.billingService.SetLLMPricing(c.Request.Context(),
+		req.LLMPricePerMillionInput, req.LLMPricePerMillionOutput, "admin-api"); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	info, err := h.billingService.GetPricing(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, info)
+}
+
 // ---------------------------------------------------------------------
 // Manual invoicing
 //

@@ -102,6 +102,13 @@ func TestGateway_LaunchAgent_Success(t *testing.T) {
 	if spec.AccountID != accountID.String() || spec.ProjectID != projectID.String() {
 		t.Errorf("agent pod not scoped to the session's account/project: %+v", spec)
 	}
+	// A restarted agent pod silently re-runs the entire build from
+	// scratch against the same original prompt (found live 2026-08-24) —
+	// this must never be left at Kubernetes' default RestartPolicy:
+	// Always, unlike a normal customer compute instance.
+	if !spec.NeverRestart {
+		t.Error("agent pod spec did not set NeverRestart — a Kubernetes restart would silently re-run the whole build")
+	}
 	if sess.AgentInstanceID == "" {
 		t.Error("session's AgentInstanceID was not updated in memory")
 	}

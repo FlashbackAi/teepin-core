@@ -128,6 +128,57 @@ func TestCreateInstance_NoServiceAccountToken(t *testing.T) {
 	}
 }
 
+// A bare Pod defaults to RestartPolicy: Always when left unset — correct
+// for a customer's persistent compute instance (this test's baseline
+// case), catastrophic for a one-shot workload like Kumbha's agent (see
+// TestCreateInstance_NeverRestartSetsPodRestartPolicyNever). Found live
+// 2026-08-24: an agent pod silently restarted mid-build and re-ran the
+// entire build from scratch against the same original prompt.
+func TestCreateInstance_DefaultsToRestartPolicyAlways(t *testing.T) {
+	c := newTestClient()
+
+	_, err := c.CreateInstance(context.Background(), InstanceSpec{
+		InstanceID: "inst-tenant1",
+		Image:      "customer/workload:v1",
+		CPUUnits:   1,
+		MemoryGB:   2,
+	})
+	if err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	pods, _ := c.k8s.CoreV1().Pods(workloadNamespace).List(
+		context.Background(), metav1.ListOptions{})
+	pod := pods.Items[0]
+
+	if pod.Spec.RestartPolicy != corev1.RestartPolicyAlways {
+		t.Errorf("RestartPolicy = %q, want Always for a normal compute instance", pod.Spec.RestartPolicy)
+	}
+}
+
+func TestCreateInstance_NeverRestartSetsPodRestartPolicyNever(t *testing.T) {
+	c := newTestClient()
+
+	_, err := c.CreateInstance(context.Background(), InstanceSpec{
+		InstanceID:   "kumbha-agent-abc123",
+		Image:        "teepin/kumbha-agent:latest",
+		CPUUnits:     2,
+		MemoryGB:     4,
+		NeverRestart: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	pods, _ := c.k8s.CoreV1().Pods(workloadNamespace).List(
+		context.Background(), metav1.ListOptions{})
+	pod := pods.Items[0]
+
+	if pod.Spec.RestartPolicy != corev1.RestartPolicyNever {
+		t.Errorf("RestartPolicy = %q, want Never — a restarted agent pod silently re-runs the whole build", pod.Spec.RestartPolicy)
+	}
+}
+
 func TestCreateInstance_CommandAndArgsPreserved(t *testing.T) {
 	c := newTestClient()
 

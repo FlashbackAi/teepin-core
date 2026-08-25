@@ -199,6 +199,8 @@ func (c *AgentClient) CreateInstance(ctx context.Context, spec InstanceSpec) (*I
 		ImagePullSecret:    spec.ImagePullSecret,
 		StorageGb:          int32(spec.StorageGB),
 		EphemeralStorageGb: int32(spec.EphemeralStorageGB),
+		AlwaysPullImage:    spec.AlwaysPullImage,
+		NeverRestart:       spec.NeverRestart,
 	}
 
 	// The instance ID is the idempotency key: a command redelivered after

@@ -108,6 +108,20 @@ type InstanceSpec struct {
 	EnableTLS       bool
 	TLSIssuer       string
 	ImagePullSecret string
+
+	// AlwaysPullImage forces a fresh pull even if the node's containerd
+	// already has this exact tag cached — for callers whose tag is not a
+	// genuinely immutable identifier (see the proto field's own doc
+	// comment). False (the default) preserves kubelet's normal
+	// IfNotPresent behaviour for every other caller.
+	AlwaysPullImage bool
+
+	// NeverRestart sets the pod's RestartPolicy to Never instead of the
+	// Kubernetes default (Always) — see the proto field's own doc comment
+	// for the live incident this exists to prevent. False (the default)
+	// preserves Always for every other caller, which IS the correct
+	// behaviour for a customer's persistent compute instance.
+	NeverRestart bool
 }
 
 type PortMapping struct {

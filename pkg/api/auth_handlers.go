@@ -67,6 +67,35 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	})
 }
 
+// Refresh exchanges a valid refresh token for a new access/refresh pair —
+// what the console calls automatically when a request 401s, instead of
+// signing the customer out every 15 minutes (the access token's TTL).
+// Anonymous like Login: the whole point is to get new tokens without a
+// currently-valid access token.
+// POST /v1/auth/refresh
+func (h *AuthHandler) Refresh(c *gin.Context) {
+	var req struct {
+		RefreshToken string `json:"refresh_token" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	accessToken, refreshToken, err := h.authService.Refresh(c.Request.Context(), req.RefreshToken)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired refresh token"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"access_token":  accessToken,
+		"refresh_token": refreshToken,
+		"token_type":    "Bearer",
+		"expires_in":    900,
+	})
+}
+
 // GetCurrentUser returns the currently authenticated user
 // GET /v1/auth/me
 func (h *AuthHandler) GetCurrentUser(c *gin.Context) {
