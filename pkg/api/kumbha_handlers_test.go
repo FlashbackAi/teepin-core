@@ -16,7 +16,6 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/FlashbackAi/teepin-core/pkg/auth"
 	"github.com/FlashbackAi/teepin-core/pkg/billing"
@@ -380,7 +379,11 @@ func TestParseCompletionRequest_RejectsInvalidJSON(t *testing.T) {
 // --- BuildKumbhaSession ---
 
 func newTestBuildService() *build.Service {
-	return build.NewService(fake.NewSimpleClientset(), nil, build.DefaultConfig())
+	// newFakeCluster (server_test.go) already implements cluster.Client in
+	// full — reused here rather than a second fake, since pkg/build now
+	// goes through the same transport-neutral interface every other
+	// cluster-touching handler test in this package already exercises.
+	return build.NewService(newFakeCluster(), nil, build.DefaultConfig())
 }
 
 func TestBuildKumbhaSession_NoBuildServiceIs404(t *testing.T) {

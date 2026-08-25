@@ -10,6 +10,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
@@ -114,21 +115,31 @@ func (s *Service) ProvisionProjectRegistry(ctx context.Context, projectID uuid.U
 	// also the one value RevokeRegistryAccess can actually look back up
 	// later (it reads harbor_project_name from the DB, never the original
 	// projectName, which is not persisted at all).
+	// s.k8sClient is nil in agent-mode topology (the control plane holds
+	// no direct Kubernetes credentials there — see cmd/api-server/main.go's
+	// TEEPIN_CLUSTER_MODE wiring). Skipping the Secret in that case is
+	// correct, not a degraded state: the database row inserted below is
+	// the actual source of truth either way, and pkg/build's Kaniko pod
+	// gets these same credentials through DockerConfigJSONForBuild (an env
+	// var) instead of a mounted Secret when there is no cluster.Client
+	// backing a direct k8s connection to mount one into.
 	secretName := RegistrySecretName(harborProjectName)
-	err = CreateImagePullSecret(
-		ctx,
-		s.k8sClient,
-		cluster.WorkloadNamespace,
-		secretName,
-		project.RegistryURL,
-		robot.Name,
-		robot.Token,
-	)
-	if err != nil {
-		// Cleanup: delete robot and project
-		_ = s.client.DeleteRobotAccount(ctx, robot.ID)
-		_ = s.client.DeleteProject(ctx, harborProjectName)
-		return nil, fmt.Errorf("failed to create image pull secret: %w", err)
+	if s.k8sClient != nil {
+		err = CreateImagePullSecret(
+			ctx,
+			s.k8sClient,
+			cluster.WorkloadNamespace,
+			secretName,
+			project.RegistryURL,
+			robot.Name,
+			robot.Token,
+		)
+		if err != nil {
+			// Cleanup: delete robot and project
+			_ = s.client.DeleteRobotAccount(ctx, robot.ID)
+			_ = s.client.DeleteProject(ctx, harborProjectName)
+			return nil, fmt.Errorf("failed to create image pull secret: %w", err)
+		}
 	}
 
 	// 4. Encrypt and store credentials in database
@@ -152,7 +163,9 @@ func (s *Service) ProvisionProjectRegistry(ctx context.Context, projectID uuid.U
 	)
 	if err != nil {
 		// Cleanup
-		_ = DeleteImagePullSecret(ctx, s.k8sClient, "teepin", secretName)
+		if s.k8sClient != nil {
+			_ = DeleteImagePullSecret(ctx, s.k8sClient, "teepin", secretName)
+		}
 		_ = s.client.DeleteRobotAccount(ctx, robot.ID)
 		_ = s.client.DeleteProject(ctx, harborProjectName)
 		return nil, fmt.Errorf("failed to store credentials: %w", err)
@@ -213,6 +226,55 @@ func (s *Service) GetRegistryCredentials(ctx context.Context, projectID uuid.UUI
 	}, nil
 }
 
+// DockerConfigJSONForBuild returns the SAME registry push credential
+// ProvisionProjectRegistry's Kubernetes Secret would hold, as a marshaled
+// .dockerconfigjson string instead — for a build pipeline that has no
+// direct Kubernetes access to mount a Secret with (agent-mode topology;
+// see pkg/build, which writes this directly into a Kaniko pod's
+// /kaniko/.docker/config.json via an env var, the "credential lives in
+// env, not argv" convention already established for the workspace-fetch
+// token). Decrypts the robot account's token, which GetRegistryCredentials
+// deliberately never does ("Don't return password for security") —
+// this method exists specifically for that one internal, non-HTTP-exposed
+// caller, never returned from a customer-facing endpoint.
+func (s *Service) DockerConfigJSONForBuild(ctx context.Context, projectID uuid.UUID) (string, error) {
+	query := `
+		SELECT harbor_project_name, robot_account_name, docker_config_json
+		FROM auth.registry_credentials
+		WHERE project_id = $1 AND revoked_at IS NULL
+	`
+	var harborProjectName, robotName, encryptedToken string
+	err := s.db.QueryRowContext(ctx, query, projectID).Scan(&harborProjectName, &robotName, &encryptedToken)
+	if err == sql.ErrNoRows {
+		return "", fmt.Errorf("registry not provisioned for project")
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to get credentials: %w", err)
+	}
+
+	token, err := s.decrypt(encryptedToken)
+	if err != nil {
+		return "", fmt.Errorf("failed to decrypt registry credential: %w", err)
+	}
+
+	project, err := s.client.GetProject(ctx, harborProjectName)
+	if err != nil {
+		return "", fmt.Errorf("failed to get Harbor project: %w", err)
+	}
+
+	authString := base64.StdEncoding.EncodeToString([]byte(robotName + ":" + token))
+	dockerConfig := DockerConfigJSON{
+		Auths: map[string]DockerAuth{
+			project.RegistryURL: {Username: robotName, Password: token, Auth: authString},
+		},
+	}
+	raw, err := json.Marshal(dockerConfig)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode docker config: %w", err)
+	}
+	return string(raw), nil
+}
+
 // RevokeRegistryAccess deletes robot account, ImagePullSecret, and marks as revoked
 func (s *Service) RevokeRegistryAccess(ctx context.Context, projectID uuid.UUID) error {
 	// Get credentials
@@ -236,9 +298,13 @@ func (s *Service) RevokeRegistryAccess(ctx context.Context, projectID uuid.UUID)
 	fmt.Sscanf(robotAccountID, "%d", &robotID)
 	_ = s.client.DeleteRobotAccount(ctx, robotID) // Best effort
 
-	// Delete ImagePullSecret from Kubernetes
-	secretName := RegistrySecretName(harborProjectName)
-	_ = DeleteImagePullSecret(ctx, s.k8sClient, cluster.WorkloadNamespace, secretName) // Best effort
+	// Delete ImagePullSecret from Kubernetes — nothing to delete in
+	// agent-mode topology (see ProvisionProjectRegistry's own note; no
+	// Secret was ever created there).
+	if s.k8sClient != nil {
+		secretName := RegistrySecretName(harborProjectName)
+		_ = DeleteImagePullSecret(ctx, s.k8sClient, cluster.WorkloadNamespace, secretName) // Best effort
+	}
 
 	// Mark as revoked in database
 	updateQuery := `

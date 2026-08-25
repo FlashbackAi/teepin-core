@@ -606,19 +606,21 @@ func main() {
 				go kumbhaEventTickets.Reap(context.Background())
 				apiServer = apiServer.WithKumbhaEventTickets(kumbhaEventTickets)
 
-				// The "deploy" MCP verb's build step (Kaniko) — needs both
-				// Harbor (a registry to push to) and a local Kubernetes
-				// client (pkg/build follows pkg/harbor's own established
-				// exception to the "no k8s client above pkg/cluster" rule;
-				// see pkg/build's package doc comment). Absent either, the
+				// The "deploy" MCP verb's build step (Kaniko) — needs only
+				// Harbor (a registry to push to). pkg/build goes through
+				// cluster.Client (the same abstraction LaunchAgent/
+				// CreateInstance/DeleteInstance already use), so it works
+				// in EITHER cluster mode, not only when the control plane
+				// happens to hold direct Kubernetes credentials — see
+				// pkg/build's own package doc comment. Absent Harbor, the
 				// verb stays an honest stub (teepin-mcp-server's own
 				// fallback message), not a broken endpoint.
-				if harborService != nil && k8sClient != nil {
-					kumbhaBuildService := build.NewService(k8sClient, harborService, build.DefaultConfig())
+				if harborService != nil {
+					kumbhaBuildService := build.NewService(clusterClient, harborService, build.DefaultConfig())
 					apiServer = apiServer.WithKumbhaBuild(kumbhaBuildService)
 					log.Println("✅ Kumbha build pipeline enabled (Kaniko -> Harbor)")
 				} else {
-					log.Println("Kumbha build pipeline not configured (Harbor or a local Kubernetes client is unavailable) — the deploy MCP verb stays a stub")
+					log.Println("Kumbha build pipeline not configured (Harbor is unavailable) — the deploy MCP verb stays a stub")
 				}
 
 				log.Printf("✅ Kumbha Gateway enabled (teepin/fast -> vLLM at %s)", vllmBaseURL)

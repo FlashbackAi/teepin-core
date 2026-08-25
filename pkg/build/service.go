@@ -1,24 +1,32 @@
 // Copyright 2026 TEEPIN Project
 // Licensed under the Apache License, Version 2.0
 
-// Package build turns an agent session's workspace into a pushed
-// container image — the piece the Kumbha plan's M4 exists for, and what
-// finally lets the "deploy" MCP verb stop being an honest stub.
+// Package build turns a Kumbha session's current workspace version into a
+// pushed container image — the piece that lets the `deploy` MCP verb and
+// the console IDE's Deploy button actually deploy something.
 //
 // Uses Kaniko (github.com/GoogleContainerTools/kaniko, now maintained by
 // Chainguard), not Docker-in-Docker or BuildKit: Kaniko needs no
-// privileged access and no relaxed seccomp/AppArmor, so a build pod gets
-// the exact same restrictive SecurityContext every other Teepin workload
-// already runs under (see pkg/cluster/direct.go's buildPod) — no carve-out
-// for this one workload type.
+// privileged access, so a build pod gets the exact same restrictive
+// SecurityContext every other Teepin workload already runs under.
 //
-// This package holds a direct kubernetes.Interface, the same accepted
-// exception pkg/harbor already established (main.go gates both on
-// k8sClient != nil): registry/build provisioning is control-plane-local
-// infrastructure, unlike customer compute, which must also work when the
-// control plane runs on AWS with zero Kubernetes credentials at all
-// (pkg/cluster's whole reason for existing). Build support in "agent"
-// cluster mode is future work, not a regression introduced here.
+// Expressed as a SINGLE cluster.InstanceSpec-based instance — the same
+// abstraction LaunchAgent, CreateInstance, and DeleteInstance already use
+// — rather than a hand-built Kubernetes Pod via a direct client. This is
+// deliberate, not incidental: InstanceSpec has no concept of a second
+// (init) container or a mounted Secret volume (confirmed by reading
+// pkg/cluster's own client.go/direct.go/agent.go and the agentpb proto —
+// CreateInstanceCommand is a 1:1 wire mirror of InstanceSpec, nothing
+// more), so this package used to require its OWN direct kubernetes.Interface
+// specifically to express a two-container (fetch + kaniko) pod with a
+// Secret mount — which meant it only ever worked when the control plane
+// itself had direct Kubernetes credentials (TEEPIN_CLUSTER_MODE=direct),
+// never in the ECS/agent-mode topology this product actually runs in
+// production. Collapsing to one container, with BOTH the workspace fetch
+// and the registry push credential delivered via Env instead of an
+// initContainer/Secret (see buildPod's own comment), means this package
+// now goes through cluster.Client like everything else — same code path,
+// same behaviour, in either cluster mode.
 package build
 
 import (
@@ -27,12 +35,6 @@ import (
 	"fmt"
 	"io"
 	"time"
-
-	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
 
 	"github.com/google/uuid"
 
@@ -43,17 +45,25 @@ import (
 // Config is the operator-fixed policy every build runs under — not
 // customer-selectable, matching the Kumbha agent's own AgentConfig.
 type Config struct {
-	// KanikoImage is pinned, not floating (":latest" would let an
-	// upstream release silently change build behaviour platform-wide).
+	// KanikoImage must be a "debug" (BusyBox-shell) variant — the plain
+	// distroless executor image has no shell, no wget, nothing but the
+	// kaniko binary itself, and this package needs a shell to fetch the
+	// workspace archive and write the registry credential before
+	// exec'ing kaniko in the SAME container. Pinned, not floating (an
+	// unpinned ":debug" would let an upstream release silently change
+	// build behaviour platform-wide).
 	KanikoImage string
-	// FetchImage runs the initContainer that downloads and unpacks the
-	// session's current workspace archive before Kaniko starts — needs
-	// only wget and unzip, both BusyBox applets, so a full distro image
-	// is unnecessary. Pinned for the same reason KanikoImage is.
-	FetchImage string
-	CPUUnits   int
-	MemoryGB   int
-	// Timeout bounds how long a single build pod may run before it is
+	CPUUnits    int
+	MemoryGB    int
+	// EphemeralStorageGB caps the build container's own writable-layer
+	// disk — there is no separate scratch volume (InstanceSpec has none
+	// to offer beyond the billed, StorageGB-backed /data PVC, which this
+	// package deliberately does not use for a few-minutes-lived build).
+	// Kaniko needs room to unpack the base image's layers plus write the
+	// new ones; generous by design since a generated web app's own
+	// source is tiny compared to a base image.
+	EphemeralStorageGB int
+	// Timeout bounds how long a single build may run before it is
 	// killed and reported as failed.
 	Timeout time.Duration
 }
@@ -62,22 +72,26 @@ type Config struct {
 // see NewService.
 func DefaultConfig() Config {
 	return Config{
-		KanikoImage: "gcr.io/kaniko-project/executor:v1.23.2",
-		FetchImage:  "busybox:1.36.1",
-		CPUUnits:    2,
-		MemoryGB:    4,
-		Timeout:     15 * time.Minute,
+		KanikoImage:        "gcr.io/kaniko-project/executor:v1.23.2-debug",
+		CPUUnits:           2,
+		MemoryGB:           4,
+		EphemeralStorageGB: 15,
+		Timeout:            15 * time.Minute,
 	}
 }
 
-// Service runs Kaniko builds against a Kumbha agent's own workspace PVC.
+// Service runs Kaniko builds of a Kumbha session's current workspace
+// version, through cluster.Client — the same transport-neutral interface
+// LaunchAgent/CreateInstance/DeleteInstance already use, so this package
+// works identically whether the control plane is in direct or agent
+// cluster mode.
 type Service struct {
-	k8sClient kubernetes.Interface
-	harbor    *harbor.Service
-	cfg       Config
+	cluster cluster.Client
+	harbor  *harbor.Service
+	cfg     Config
 }
 
-func NewService(k8sClient kubernetes.Interface, harborService *harbor.Service, cfg Config) *Service {
+func NewService(clusterClient cluster.Client, harborService *harbor.Service, cfg Config) *Service {
 	if cfg.KanikoImage == "" {
 		d := DefaultConfig()
 		if cfg.CPUUnits == 0 {
@@ -86,15 +100,15 @@ func NewService(k8sClient kubernetes.Interface, harborService *harbor.Service, c
 		if cfg.MemoryGB == 0 {
 			cfg.MemoryGB = d.MemoryGB
 		}
+		if cfg.EphemeralStorageGB == 0 {
+			cfg.EphemeralStorageGB = d.EphemeralStorageGB
+		}
 		if cfg.Timeout == 0 {
 			cfg.Timeout = d.Timeout
 		}
-		if cfg.FetchImage == "" {
-			cfg.FetchImage = d.FetchImage
-		}
 		cfg.KanikoImage = d.KanikoImage
 	}
-	return &Service{k8sClient: k8sClient, harbor: harborService, cfg: cfg}
+	return &Service{cluster: clusterClient, harbor: harborService, cfg: cfg}
 }
 
 // Result is what a completed build produced.
@@ -108,13 +122,12 @@ type Request struct {
 	ProjectName string
 	// WorkspaceArchiveURL and WorkspaceToken locate and authorise a GET of
 	// the session's CURRENT workspace version (pkg/kumbha/gateway.go's
-	// MintWorkspaceFetchToken) — an initContainer downloads and unpacks
-	// this as the build context, rather than mounting the agent pod's own
-	// live PVC. This is what makes a customer's IDE edit or a version
-	// rollback actually reach the image: both only ever change what
-	// pkg/kumbha/workspace.go considers "current", never the agent pod's
-	// own on-disk copy, so building from anything else would silently
-	// ignore them.
+	// MintWorkspaceFetchToken) — fetched and unpacked by the build
+	// container's own entrypoint script before it invokes kaniko, so a
+	// customer's IDE edit or a version rollback (both of which only ever
+	// change what pkg/kumbha/workspace.go considers "current", never
+	// anything a Kubernetes volume could already hold) is what actually
+	// gets built.
 	WorkspaceArchiveURL string
 	WorkspaceToken      string
 	// DockerfilePath is relative to the workspace root.
@@ -125,15 +138,24 @@ type Request struct {
 	Tag string
 }
 
-// OnLogLine, when non-nil, is called once per line of the Kaniko build's
-// own output as it happens — this is what lets a "building your image"
+// OnLogLine, when non-nil, is called once per line of the build's own
+// output as it happens — this is what lets a "building your image"
 // observation reach the console's activity feed in real time rather than
 // only after the build finishes.
 type OnLogLine func(line string)
 
-// Build provisions the project's Harbor registry if needed, runs a Kaniko
-// pod against the session's workspace PVC, and returns the pushed image
-// reference. The build pod is deleted before returning, success or
+// buildInstanceID names the build instance, deterministic from the
+// requested tag so a retried/duplicate build call for the same tag
+// collides (fails fast on a still-running duplicate) rather than
+// silently launching two builds pushing the same destination
+// concurrently.
+func buildInstanceID(tag string) string {
+	return "kaniko-build-" + tag
+}
+
+// Build provisions the project's registry, launches one build instance
+// through cluster.Client, waits for it to finish, and returns the pushed
+// image reference. The instance is deleted before returning, success or
 // failure — nothing about the build's own execution is meant to be
 // customer-inspectable after the fact beyond what OnLogLine already
 // streamed live.
@@ -142,95 +164,102 @@ func (s *Service) Build(ctx context.Context, req Request, onLogLine OnLogLine) (
 	if err != nil {
 		return nil, fmt.Errorf("failed to provision registry: %w", err)
 	}
+	dockerConfigJSON, err := s.harbor.DockerConfigJSONForBuild(ctx, req.ProjectID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load registry credentials: %w", err)
+	}
 
 	imageRef := fmt.Sprintf("%s:%s", access.ImagePrefix, req.Tag)
-	podName := "kaniko-build-" + req.Tag
+	instanceID := buildInstanceID(req.Tag)
+	scope := cluster.ProjectScope(req.ProjectID.String())
 
 	ctx, cancel := context.WithTimeout(ctx, s.cfg.Timeout)
 	defer cancel()
 
-	pod := s.buildPod(podName, req, access.HarborProjectName, imageRef)
-	if _, err := s.k8sClient.CoreV1().Pods(cluster.WorkloadNamespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
-		return nil, fmt.Errorf("failed to create build pod: %w", err)
+	spec := s.buildInstanceSpec(instanceID, req, dockerConfigJSON, imageRef)
+	if _, err := s.cluster.CreateInstance(ctx, spec); err != nil {
+		return nil, fmt.Errorf("failed to create build instance: %w", err)
 	}
 	defer func() {
 		// Best-effort cleanup with a fresh, short-lived context: the
 		// caller's ctx may already be the one that just timed out or was
-		// cancelled, which would make a cleanup Delete fail too and leak
-		// the pod.
+		// cancelled, which would make a cleanup delete fail too and leak
+		// the instance.
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cleanupCancel()
-		_ = s.k8sClient.CoreV1().Pods(cluster.WorkloadNamespace).Delete(cleanupCtx, podName, metav1.DeleteOptions{})
+		_ = s.cluster.DeleteInstance(cleanupCtx, scope, instanceID)
 	}()
 
 	if onLogLine != nil {
-		go s.streamLogs(ctx, podName, onLogLine)
+		go s.streamLogs(ctx, scope, instanceID, onLogLine)
 	}
 
-	phase, message, err := s.waitForCompletion(ctx, podName)
+	status, err := s.waitForCompletion(ctx, scope, instanceID)
 	if err != nil {
 		return nil, err
 	}
-	if phase != corev1.PodSucceeded {
-		return nil, fmt.Errorf("build failed: %s", message)
+	if status.Status != "terminated" {
+		msg := status.Message
+		if msg == "" {
+			msg = status.Status
+		}
+		return nil, fmt.Errorf("build failed: %s", msg)
 	}
 
 	return &Result{ImageRef: imageRef}, nil
 }
 
-// waitForCompletion polls the build pod's phase. Polling rather than
-// watching: a one-off build pod's lifetime is short and this keeps the
+// waitForCompletion polls the build instance's status. Polling rather
+// than watching: a one-off build's lifetime is short and this keeps the
 // implementation to a plain loop instead of a watch client — acceptable
 // for something that runs for minutes, not something latency-sensitive.
-func (s *Service) waitForCompletion(ctx context.Context, podName string) (corev1.PodPhase, string, error) {
+// "terminated" is cluster.Client's status string for a successful exit
+// (PodSucceeded in direct mode — see cluster.podStatus); "failed" covers
+// both a nonzero exit AND unrecoverable pull/crash states the underlying
+// client already detects (ImagePullBackOff, CrashLoopBackOff), which is a
+// strict improvement over this package's own previous phase-only check.
+func (s *Service) waitForCompletion(ctx context.Context, scope cluster.Scope, instanceID string) (*cluster.InstanceStatus, error) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return "", "", fmt.Errorf("build timed out or was cancelled: %w", ctx.Err())
+			return nil, fmt.Errorf("build timed out or was cancelled: %w", ctx.Err())
 		case <-ticker.C:
-			pod, err := s.k8sClient.CoreV1().Pods(cluster.WorkloadNamespace).Get(ctx, podName, metav1.GetOptions{})
+			status, err := s.cluster.GetInstanceStatus(ctx, scope, instanceID)
 			if err != nil {
-				if apierrors.IsNotFound(err) {
+				if err == cluster.ErrNotFound {
 					continue // creation may not have propagated to this read yet
 				}
-				return "", "", fmt.Errorf("failed to check build status: %w", err)
+				return nil, fmt.Errorf("failed to check build status: %w", err)
 			}
-			switch pod.Status.Phase {
-			case corev1.PodSucceeded:
-				return corev1.PodSucceeded, "", nil
-			case corev1.PodFailed:
-				return corev1.PodFailed, podFailureMessage(pod), nil
+			if status.Status == "terminated" || status.Status == "failed" {
+				return status, nil
 			}
 		}
 	}
 }
 
-func podFailureMessage(pod *corev1.Pod) string {
-	for _, cs := range pod.Status.ContainerStatuses {
-		if cs.State.Terminated != nil && cs.State.Terminated.ExitCode != 0 {
-			return fmt.Sprintf("exit code %d: %s", cs.State.Terminated.ExitCode, cs.State.Terminated.Reason)
+// streamLogs follows the build instance's own output and calls
+// onLogLine per line — best-effort: a log-streaming failure (instance
+// not ready yet, stream hiccup) is not itself a build failure, so errors
+// here are swallowed rather than propagated. Retries a few times before
+// giving up, since the instance may not be schedulable/running yet when
+// this goroutine starts.
+func (s *Service) streamLogs(ctx context.Context, scope cluster.Scope, instanceID string, onLogLine OnLogLine) {
+	pr, pw := io.Pipe()
+	go func() {
+		scanner := bufio.NewScanner(pr)
+		for scanner.Scan() {
+			onLogLine(scanner.Text())
 		}
-	}
-	return pod.Status.Message
-}
+	}()
+	defer pw.Close()
 
-// streamLogs follows the build pod's own output and calls onLogLine per
-// line — best-effort: a log-streaming failure (pod not ready yet, stream
-// hiccup) is not itself a build failure, so errors here are swallowed
-// rather than propagated.
-func (s *Service) streamLogs(ctx context.Context, podName string, onLogLine OnLogLine) {
-	// The pod may not be Running yet when this goroutine starts; retry the
-	// log stream a few times rather than giving up on the very first
-	// "container not created" error.
-	var stream io.ReadCloser
 	for attempt := 0; attempt < 30; attempt++ {
-		s, err := s.k8sClient.CoreV1().Pods(cluster.WorkloadNamespace).
-			GetLogs(podName, &corev1.PodLogOptions{Follow: true}).Stream(ctx)
+		err := s.cluster.StreamLogs(ctx, scope, instanceID, cluster.LogOptions{Follow: true}, pw)
 		if err == nil {
-			stream = s
-			break
+			return
 		}
 		select {
 		case <-ctx.Done():
@@ -238,112 +267,72 @@ func (s *Service) streamLogs(ctx context.Context, podName string, onLogLine OnLo
 		case <-time.After(time.Second):
 		}
 	}
-	if stream == nil {
-		return
-	}
-	defer stream.Close()
-
-	scanner := bufio.NewScanner(stream)
-	for scanner.Scan() {
-		onLogLine(scanner.Text())
-	}
 }
 
-// buildPod constructs the build pod spec — an initContainer that fetches
-// and unpacks the session's current workspace archive into a shared
-// emptyDir, then Kaniko building from it. SecurityContext matches
-// buildPod's own restrictive posture in pkg/cluster/direct.go exactly
-// (drop ALL capabilities, no privilege escalation, RuntimeDefault
-// seccomp) on BOTH containers, since a build workload gets no special
-// exemption from the isolation model the rest of the platform runs under.
-func (s *Service) buildPod(podName string, req Request, harborProjectName, imageRef string) *corev1.Pod {
-	cpu := resource.MustParse(fmt.Sprintf("%dm", s.cfg.CPUUnits*1000))
-	memory := resource.MustParse(fmt.Sprintf("%dGi", s.cfg.MemoryGB))
-	fetchCPU := resource.MustParse("200m")
-	fetchMemory := resource.MustParse("256Mi")
+// buildInstanceSpec constructs the single-container build instance —
+// SecurityContext is entirely the underlying cluster.Client
+// implementation's own concern (buildPod in direct.go applies the same
+// restrictive posture, drop ALL capabilities/no privilege escalation/
+// RuntimeDefault seccomp, to every instance uniformly; there is no
+// per-request override to opt out of it, so this package need not — and
+// cannot — ask for one).
+//
+// The container's own entrypoint is overridden to a shell script (Command:
+// the debug image's own busybox shell, Args: the script) that:
+//  1. Fetches the session's current workspace archive over HTTP with the
+//     short-lived fetch token (same mechanism the console's own download
+//     button uses), and unpacks it.
+//  2. Writes the registry push credential to /kaniko/.docker/config.json
+//     — DockerConfigJSONForBuild's own doc comment covers why this
+//     travels via Env rather than a mounted Secret (InstanceSpec has no
+//     Secret-volume concept), the "credential lives in env, not argv"
+//     convention already established for the fetch token itself, and a
+//     REAL, explicitly acknowledged tradeoff: this credential is visible
+//     via `kubectl describe pod`/the container's own environment for the
+//     build's lifetime, not filesystem-mounted-and-nothing-else the way a
+//     Secret volume would be. It remains a narrowly-scoped, revocable
+//     per-project robot account (push/pull/delete on ONE Harbor project),
+//     not a platform-wide credential — the same class of exposure this
+//     codebase already accepts for TEEPIN_SESSION_TOKEN.
+//  3. execs the kaniko binary itself.
+//
+// Every value that could plausibly contain shell metacharacters
+// (DockerfilePath is customer-supplied) is passed via Env and referenced
+// as a quoted "$VAR" inside the script, never string-formatted into the
+// script's own text — quoted env-var expansion does not re-parse for
+// shell metacharacters, so this is not shell-injectable the way building
+// the script text via fmt.Sprintf(dockerfilePath) would be.
+func (s *Service) buildInstanceSpec(instanceID string, req Request, dockerConfigJSON, imageRef string) cluster.InstanceSpec {
+	const script = `set -e
+wget -q --header="Authorization: Bearer $TEEPIN_TOKEN" -O /tmp/workspace.zip "$TEEPIN_ARCHIVE_URL"
+unzip -o -q /tmp/workspace.zip -d /workspace
+rm -f /tmp/workspace.zip
+mkdir -p /kaniko/.docker
+printf '%s' "$TEEPIN_DOCKER_CONFIG" > /kaniko/.docker/config.json
+exec /kaniko/executor --dockerfile="$TEEPIN_DOCKERFILE_PATH" --context=dir:///workspace --destination="$TEEPIN_DESTINATION"
+`
 
-	restrictedSecurityContext := &corev1.SecurityContext{
-		AllowPrivilegeEscalation: boolPtr(false),
-		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
-	}
-
-	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      podName,
-			Namespace: cluster.WorkloadNamespace,
-			Labels: map[string]string{
-				"teepin.io/kumbha-build": "true",
-			},
+	return cluster.InstanceSpec{
+		InstanceID: instanceID,
+		ProjectID:  req.ProjectID.String(),
+		Image:      s.cfg.KanikoImage,
+		Command:    []string{"/busybox/sh", "-c"},
+		Args:       []string{script},
+		Env: map[string]string{
+			"TEEPIN_TOKEN":           req.WorkspaceToken,
+			"TEEPIN_ARCHIVE_URL":     req.WorkspaceArchiveURL,
+			"TEEPIN_DOCKER_CONFIG":   dockerConfigJSON,
+			"TEEPIN_DOCKERFILE_PATH": req.DockerfilePath,
+			"TEEPIN_DESTINATION":     imageRef,
 		},
-		Spec: corev1.PodSpec{
-			RestartPolicy: corev1.RestartPolicyNever,
-			SecurityContext: &corev1.PodSecurityContext{
-				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
-			},
-			InitContainers: []corev1.Container{{
-				Name:  "fetch-workspace",
-				Image: s.cfg.FetchImage,
-				// A short-lived, session-scoped token (see
-				// MintWorkspaceFetchToken) — referenced via env expansion
-				// rather than baked into the command string, the same
-				// "credential lives in env, not argv" convention
-				// LaunchAgent's own TEEPIN_SESSION_TOKEN already uses.
-				Command: []string{"sh", "-c",
-					`set -e; wget -q --header="Authorization: Bearer $TEEPIN_TOKEN" -O /tmp/workspace.zip "$TEEPIN_ARCHIVE_URL"; unzip -o -q /tmp/workspace.zip -d /workspace; rm -f /tmp/workspace.zip`,
-				},
-				Env: []corev1.EnvVar{
-					{Name: "TEEPIN_TOKEN", Value: req.WorkspaceToken},
-					{Name: "TEEPIN_ARCHIVE_URL", Value: req.WorkspaceArchiveURL},
-				},
-				VolumeMounts: []corev1.VolumeMount{
-					{Name: "workspace", MountPath: "/workspace"},
-				},
-				Resources: corev1.ResourceRequirements{
-					Requests: corev1.ResourceList{corev1.ResourceCPU: fetchCPU, corev1.ResourceMemory: fetchMemory},
-					Limits:   corev1.ResourceList{corev1.ResourceCPU: fetchCPU, corev1.ResourceMemory: fetchMemory},
-				},
-				SecurityContext: restrictedSecurityContext,
-			}},
-			Containers: []corev1.Container{{
-				Name:  "kaniko",
-				Image: s.cfg.KanikoImage,
-				Args: []string{
-					"--dockerfile=" + req.DockerfilePath,
-					"--context=dir:///workspace",
-					"--destination=" + imageRef,
-				},
-				VolumeMounts: []corev1.VolumeMount{
-					{Name: "workspace", MountPath: "/workspace", ReadOnly: true},
-					{Name: "docker-config", MountPath: "/kaniko/.docker"},
-				},
-				Resources: corev1.ResourceRequirements{
-					Requests: corev1.ResourceList{corev1.ResourceCPU: cpu, corev1.ResourceMemory: memory},
-					Limits:   corev1.ResourceList{corev1.ResourceCPU: cpu, corev1.ResourceMemory: memory},
-				},
-				SecurityContext: restrictedSecurityContext,
-			}},
-			Volumes: []corev1.Volume{
-				{
-					// Populated by the fetch-workspace initContainer above,
-					// not a PVC — see Request.WorkspaceArchiveURL's own doc
-					// comment on why this replaced mounting the agent's PVC.
-					Name:         "workspace",
-					VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
-				},
-				{
-					Name: "docker-config",
-					VolumeSource: corev1.VolumeSource{
-						Secret: &corev1.SecretVolumeSource{
-							SecretName: harbor.RegistrySecretName(harborProjectName),
-							Items: []corev1.KeyToPath{
-								{Key: ".dockerconfigjson", Path: "config.json"},
-							},
-						},
-					},
-				},
-			},
-		},
+		CPUUnits:           s.cfg.CPUUnits,
+		MemoryGB:           s.cfg.MemoryGB,
+		EphemeralStorageGB: s.cfg.EphemeralStorageGB,
+		// A bare instance's default RestartPolicy (Always) would silently
+		// re-run the entire build from scratch on any exit, success or
+		// failure alike — the exact "silently re-ran the whole build"
+		// class of incident InstanceSpec.NeverRestart's own doc comment
+		// already documents from the Kumbha agent pod's history.
+		NeverRestart: true,
 	}
 }
-
-func boolPtr(b bool) *bool { return &b }
