@@ -5,6 +5,7 @@ package build
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -43,34 +44,85 @@ func TestNewService_PreservesExplicitConfig(t *testing.T) {
 	}
 }
 
-func TestBuildPod_UsesTheSessionsWorkspacePVCReadOnly(t *testing.T) {
+func TestBuildPod_FetchesWorkspaceViaInitContainerIntoEmptyDir(t *testing.T) {
 	s := newTestService(t)
-	req := Request{AgentInstanceID: "kumbha-agent-abc123", DockerfilePath: "Dockerfile", Tag: "sess1"}
+	req := Request{
+		WorkspaceArchiveURL: "http://teepin-api.default.svc.cluster.local:8080/v1/kumbha/sessions/sess1/workspace/archive",
+		WorkspaceToken:      "test-fetch-token",
+		DockerfilePath:      "Dockerfile",
+		Tag:                 "sess1",
+	}
 
 	pod := s.buildPod("kaniko-build-sess1", req, "teepin-myapp-a1b2c3d4", "registry.teepin.cloud/teepin-myapp-a1b2c3d4:sess1")
 
-	var pvcVol *corev1.Volume
+	var workspaceVol *corev1.Volume
 	for i := range pod.Spec.Volumes {
 		if pod.Spec.Volumes[i].Name == "workspace" {
-			pvcVol = &pod.Spec.Volumes[i]
+			workspaceVol = &pod.Spec.Volumes[i]
 		}
 	}
-	if pvcVol == nil || pvcVol.PersistentVolumeClaim == nil {
-		t.Fatal("workspace volume is missing or not a PVC source")
+	if workspaceVol == nil || workspaceVol.EmptyDir == nil {
+		t.Fatal("workspace volume is missing or not an EmptyDir source — nothing PVC-based should remain")
 	}
-	wantPVC := cluster.PVCName(req.AgentInstanceID)
-	if pvcVol.PersistentVolumeClaim.ClaimName != wantPVC {
-		t.Errorf("PVC claim name = %q, want %q (cluster.PVCName must match what LaunchAgent provisioned)",
-			pvcVol.PersistentVolumeClaim.ClaimName, wantPVC)
+
+	if len(pod.Spec.InitContainers) != 1 {
+		t.Fatalf("got %d init containers, want exactly 1 (fetch-workspace)", len(pod.Spec.InitContainers))
 	}
-	if !pvcVol.PersistentVolumeClaim.ReadOnly {
-		t.Error("workspace PVC must be mounted read-only — a build must never corrupt the agent's own live workspace")
+	fetch := pod.Spec.InitContainers[0]
+	if fetch.Name != "fetch-workspace" {
+		t.Errorf("init container name = %q, want fetch-workspace", fetch.Name)
+	}
+	var gotURL, gotToken string
+	for _, e := range fetch.Env {
+		switch e.Name {
+		case "TEEPIN_ARCHIVE_URL":
+			gotURL = e.Value
+		case "TEEPIN_TOKEN":
+			gotToken = e.Value
+		}
+	}
+	if gotURL != req.WorkspaceArchiveURL {
+		t.Errorf("TEEPIN_ARCHIVE_URL = %q, want %q", gotURL, req.WorkspaceArchiveURL)
+	}
+	if gotToken != req.WorkspaceToken {
+		t.Errorf("TEEPIN_TOKEN = %q, want %q", gotToken, req.WorkspaceToken)
+	}
+	// The token must never appear directly in the command string — it
+	// belongs in env only (referenced via shell expansion), matching
+	// LaunchAgent's own "credential lives in env, not argv" convention.
+	for _, arg := range fetch.Command {
+		if strings.Contains(arg, req.WorkspaceToken) {
+			t.Errorf("fetch token leaked directly into the container command: %q", arg)
+		}
+	}
+
+	var fetchMount *corev1.VolumeMount
+	for i := range fetch.VolumeMounts {
+		if fetch.VolumeMounts[i].Name == "workspace" {
+			fetchMount = &fetch.VolumeMounts[i]
+		}
+	}
+	if fetchMount == nil {
+		t.Fatal("fetch-workspace does not mount the workspace volume")
+	}
+	if fetchMount.ReadOnly {
+		t.Error("fetch-workspace must be able to WRITE into the workspace volume to unpack the archive")
+	}
+
+	var kanikoMount *corev1.VolumeMount
+	for i := range pod.Spec.Containers[0].VolumeMounts {
+		if pod.Spec.Containers[0].VolumeMounts[i].Name == "workspace" {
+			kanikoMount = &pod.Spec.Containers[0].VolumeMounts[i]
+		}
+	}
+	if kanikoMount == nil || !kanikoMount.ReadOnly {
+		t.Error("kaniko must mount the workspace volume read-only — a build must never modify its own fetched source")
 	}
 }
 
 func TestBuildPod_MountsTheProjectsRegistrySecretForPush(t *testing.T) {
 	s := newTestService(t)
-	req := Request{AgentInstanceID: "kumbha-agent-abc123", DockerfilePath: "Dockerfile", Tag: "sess1"}
+	req := Request{DockerfilePath: "Dockerfile", Tag: "sess1"}
 
 	pod := s.buildPod("kaniko-build-sess1", req, "teepin-myapp-a1b2c3d4", "ref:sess1")
 
@@ -92,19 +144,23 @@ func TestBuildPod_MountsTheProjectsRegistrySecretForPush(t *testing.T) {
 
 func TestBuildPod_SecurityContextMatchesPlatformIsolationPosture(t *testing.T) {
 	s := newTestService(t)
-	pod := s.buildPod("kaniko-build-x", Request{AgentInstanceID: "a", DockerfilePath: "Dockerfile", Tag: "x"}, "proj", "ref")
+	pod := s.buildPod("kaniko-build-x", Request{DockerfilePath: "Dockerfile", Tag: "x"}, "proj", "ref")
 
 	if pod.Spec.SecurityContext == nil || pod.Spec.SecurityContext.SeccompProfile == nil ||
 		pod.Spec.SecurityContext.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
 		t.Error("pod SecurityContext must set RuntimeDefault seccomp — same posture as every other Teepin workload")
 	}
-	c := pod.Spec.Containers[0]
-	if c.SecurityContext == nil || c.SecurityContext.AllowPrivilegeEscalation == nil || *c.SecurityContext.AllowPrivilegeEscalation {
-		t.Error("container must set AllowPrivilegeEscalation: false")
+	assertRestricted := func(name string, sc *corev1.SecurityContext) {
+		t.Helper()
+		if sc == nil || sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation {
+			t.Errorf("%s must set AllowPrivilegeEscalation: false", name)
+		}
+		if sc.Capabilities == nil || len(sc.Capabilities.Drop) != 1 || sc.Capabilities.Drop[0] != "ALL" {
+			t.Errorf("%s must drop ALL capabilities, got %+v", name, sc.Capabilities)
+		}
 	}
-	if c.SecurityContext.Capabilities == nil || len(c.SecurityContext.Capabilities.Drop) != 1 || c.SecurityContext.Capabilities.Drop[0] != "ALL" {
-		t.Errorf("container must drop ALL capabilities, got %+v", c.SecurityContext.Capabilities)
-	}
+	assertRestricted("kaniko container", pod.Spec.Containers[0].SecurityContext)
+	assertRestricted("fetch-workspace init container", pod.Spec.InitContainers[0].SecurityContext)
 }
 
 func TestBuildPod_PassesDockerfileContextAndDestinationToKaniko(t *testing.T) {

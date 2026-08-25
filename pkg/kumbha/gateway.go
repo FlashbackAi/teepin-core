@@ -109,6 +109,61 @@ func (g *Gateway) ListSessions(ctx context.Context, accountID, projectID uuid.UU
 	return g.store.ListByProject(ctx, accountID, projectID)
 }
 
+// SaveWorkspaceVersion appends a new workspace version for a session and
+// moves the current-version pointer to it. createdBy distinguishes an
+// agent's automatic save (after a file_editor call) from a customer's
+// explicit edit-and-save in the console IDE — both go through this one
+// path, since both are just "a new version," differing only in who made
+// it. Returns the new version number.
+func (g *Gateway) SaveWorkspaceVersion(ctx context.Context, sessionID uuid.UUID, files []WorkspaceFile, skipped []SkippedFile, createdBy CreatedBy) (int, error) {
+	return g.store.SaveVersion(ctx, sessionID, files, skipped, createdBy)
+}
+
+// CurrentWorkspace returns whatever version is currently live for a
+// session, scoped to the owning account — what the file browser and ZIP
+// download show by default.
+func (g *Gateway) CurrentWorkspace(ctx context.Context, sessionID, accountID uuid.UUID) (*Snapshot, error) {
+	return g.store.GetCurrentVersion(ctx, sessionID, accountID)
+}
+
+// WorkspaceVersion returns one specific version, scoped to the owning
+// account — used to view or download an older version before deciding
+// whether to roll back to it.
+func (g *Gateway) WorkspaceVersion(ctx context.Context, sessionID, accountID uuid.UUID, version int) (*Snapshot, error) {
+	return g.store.GetVersion(ctx, sessionID, accountID, version)
+}
+
+// WorkspaceHistory returns every version's metadata (no file content),
+// newest first, scoped to the owning account — the console's version
+// history list.
+func (g *Gateway) WorkspaceHistory(ctx context.Context, sessionID, accountID uuid.UUID) ([]VersionInfo, error) {
+	return g.store.ListVersions(ctx, sessionID, accountID)
+}
+
+// PollMessages returns and marks-delivered every undelivered follow-up
+// message for a session — called by the agent pod's own poll loop
+// (run.py's wait_for_next_instruction), authenticated with its
+// session-scoped credential, not a customer JWT.
+func (g *Gateway) PollMessages(ctx context.Context, sessionID uuid.UUID) ([]Message, error) {
+	return g.store.PollMessages(ctx, sessionID)
+}
+
+// SetAppInstanceID records the compute instance a session's Deploy most
+// recently created — see migration 026 and Session.AppInstanceID's own
+// doc comment.
+func (g *Gateway) SetAppInstanceID(ctx context.Context, sessionID uuid.UUID, instanceID string) error {
+	return g.store.SetAppInstanceID(ctx, sessionID, instanceID)
+}
+
+// RollbackWorkspace moves the current-version pointer to an existing,
+// older (or newer) version — the undo for a customer edit or an agent
+// step that broke something. Does not delete or overwrite anything: the
+// version being rolled back FROM is still there, so a rollback can itself
+// be undone by rolling forward again.
+func (g *Gateway) RollbackWorkspace(ctx context.Context, sessionID, accountID uuid.UUID, version int) error {
+	return g.store.SetCurrentVersion(ctx, sessionID, accountID, version)
+}
+
 // ApproveDeploy flips a session's pre-deploy cost-approval gate — see
 // KUMBHA-DESIGN.md's "Pre-deploy cost approval" section. Called by the
 // console when the customer approves the itemised Deployment Plan; the

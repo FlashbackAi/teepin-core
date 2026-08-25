@@ -235,9 +235,15 @@ func TestDeploy_HonestStubStillChecksApproval(t *testing.T) {
 
 // When the control plane has no build pipeline configured, POST .../build
 // 404s (see BuildKumbhaSession's own s.kumbhaBuild == nil check) — deploy
-// must translate that into an honest "not available" message, not a raw
-// HTTP error.
-func TestDeploy_Approved_NoBuildPipelineConfiguredIsHonestMessage(t *testing.T) {
+// must translate that into an honest message, not a raw HTTP error.
+//
+// The message must also read as a DEAD END rather than a hint, because an
+// agent treats a suggested alternative as something to go hunt for: found
+// live 2026-08-25, the earlier "...use create_instance with that image
+// instead" phrasing sent one build into a dozen-turn, thousands-of-tokens
+// search for a workaround that does not exist. These assertions pin the
+// properties that actually stop that search, not the exact prose.
+func TestDeploy_Approved_NoBuildPipelineConfiguredIsADeadEndNotAHint(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/kumbha/sessions/sess-test", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"deploy_approved":true}`))
@@ -251,33 +257,42 @@ func TestDeploy_Approved_NoBuildPipelineConfiguredIsHonestMessage(t *testing.T) 
 		t.Fatalf("deploy: %v", err)
 	}
 	text := result.Content[0].(*mcp.TextContent).Text
-	if !strings.Contains(text, "not available") {
-		t.Errorf("got %q, want an honest not-available message", text)
+
+	if !strings.Contains(text, "NOT POSSIBLE") {
+		t.Errorf("got %q, want an unambiguous statement that deployment cannot happen here", text)
+	}
+	// The specific instruction that ends the loop rather than inviting one.
+	if !strings.Contains(text, "Do NOT try to work around this") {
+		t.Errorf("got %q, want an explicit instruction not to search for a workaround", text)
+	}
+	if !strings.Contains(text, "Tell the customer") {
+		t.Errorf("got %q, want the agent told what to do instead (report back, not retry)", text)
 	}
 }
 
+// TestDeploy_Approved_BuildsAndCreatesInstance covers the unified path:
+// deploy now calls the SAME /v1/kumbha/sessions/:id/deploy endpoint the
+// console IDE's own Deploy button calls (build + create in one control-
+// plane round trip), not a separate build-then-create-instance sequence
+// of its own — see deploy's own doc comment on why that convergence is
+// what makes app_instance_id tracking (migration 026) actually hold
+// regardless of which side triggered the deploy.
 func TestDeploy_Approved_BuildsAndCreatesInstance(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/kumbha/sessions/sess-test", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"deploy_approved":true}`))
 	})
-	mux.HandleFunc("/v1/kumbha/sessions/sess-test/build", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/kumbha/sessions/sess-test/deploy", func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
 		json.NewDecoder(r.Body).Decode(&body)
 		if body["dockerfile_path"] != "Dockerfile" {
 			t.Errorf("dockerfile_path = %v, want the default Dockerfile", body["dockerfile_path"])
 		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"image_ref":"registry.teepin.cloud/teepin-app-abc123:sess-tes"}`))
-	})
-	mux.HandleFunc("/v1/compute/instances", func(w http.ResponseWriter, r *http.Request) {
-		var body map[string]any
-		json.NewDecoder(r.Body).Decode(&body)
-		if body["image"] != "registry.teepin.cloud/teepin-app-abc123:sess-tes" {
-			t.Errorf("image = %v, want the image deploy just built", body["image"])
+		if body["name"] != "app" {
+			t.Errorf("name = %v, want app", body["name"])
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"id":"inst-xyz789","status":"running","endpoint":"https://inst-xyz789.teepin.com","price_per_hour":0.20}`))
+		w.Write([]byte(`{"image_ref":"registry.teepin.cloud/teepin-app-abc123:sess-tes","instance_id":"inst-xyz789","status":"running","endpoint":"https://inst-xyz789.teepin.com","price_per_hour":0.20}`))
 	})
 	c := newTestClient(t, mux)
 
@@ -296,7 +311,7 @@ func TestDeploy_Approved_BuildFailureIsReportedNotSwallowed(t *testing.T) {
 	mux.HandleFunc("/v1/kumbha/sessions/sess-test", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"deploy_approved":true}`))
 	})
-	mux.HandleFunc("/v1/kumbha/sessions/sess-test/build", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/kumbha/sessions/sess-test/deploy", func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"build failed: exit code 1: Error","log":"COPY failed: file not found"}`, http.StatusUnprocessableEntity)
 	})
 	c := newTestClient(t, mux)

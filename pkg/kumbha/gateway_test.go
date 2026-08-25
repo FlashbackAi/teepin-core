@@ -193,8 +193,8 @@ func TestGateway_CloseSession_SettlesEachRouteLineAndConsumesCredit(t *testing.T
 		WithArgs(sessID, accountID, "closed").
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "account_id", "project_id", "budget", "spent", "status", "label",
-			"agent_instance_id", "deploy_approved", "started_at", "ended_at",
-		}).AddRow(sessID, accountID, projectID, 5.0, 1.25, "closed", nil, nil, false, startedAt, startedAt))
+			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
+		}).AddRow(sessID, accountID, projectID, 5.0, 1.25, "closed", nil, nil, nil, false, startedAt, startedAt))
 
 	mock.ExpectQuery(`SELECT route, provider, input_tokens, output_tokens`).
 		WithArgs(sessID).

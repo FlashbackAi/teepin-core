@@ -4,19 +4,25 @@
 package api
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/http/httptest"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
+	"github.com/FlashbackAi/teepin-core/pkg/auth"
 	"github.com/FlashbackAi/teepin-core/pkg/build"
 	"github.com/FlashbackAi/teepin-core/pkg/inference"
 	"github.com/FlashbackAi/teepin-core/pkg/kumbha"
+	"github.com/FlashbackAi/teepin-core/pkg/models"
 )
 
 // createKumbhaSessionRequest pre-authorises a build session's spend.
@@ -199,6 +205,14 @@ type buildKumbhaSessionRequest struct {
 // not an unbounded dump.
 const buildLogTailLimit = 4000
 
+// workspaceFetchTokenTTL bounds the lifetime of the credential minted for
+// the build pod's fetch-workspace initContainer — comfortably past
+// build.DefaultConfig's own 15-minute build timeout, so the server (the
+// build timing out) governs a stuck build rather than the fetch token
+// itself expiring mid-build and turning into a confusing 401 instead of a
+// clear timeout.
+const workspaceFetchTokenTTL = 20 * time.Minute
+
 // BuildKumbhaSession runs a Kaniko build of the session's agent workspace
 // and pushes the result to the project's Harbor registry — what the
 // "deploy" MCP verb calls once the customer has approved the deployment
@@ -246,9 +260,45 @@ func (s *Server) BuildKumbhaSession(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "the customer has not approved the deployment plan yet", "code": "not_approved"})
 		return
 	}
-	if sess.AgentInstanceID == "" {
-		c.JSON(http.StatusConflict, gin.H{"error": "this session has no agent running yet"})
+
+	imageRef, status, body := s.buildKumbhaImage(c.Request.Context(), sess, accountID, req.DockerfilePath)
+	if status != 0 {
+		c.JSON(status, body)
 		return
+	}
+	c.JSON(http.StatusOK, gin.H{"image_ref": imageRef})
+}
+
+// buildKumbhaImage is the shared build step behind BuildKumbhaSession
+// (image only) and DeployKumbhaSession (image + real running instance):
+// confirms a workspace exists, mints the fetch-workspace credential, and
+// runs the Kaniko build. Returns status == 0 on success; otherwise status
+// and body are exactly what the caller should write via c.JSON and
+// return — kept here once so both callers give the customer an identically
+// worded explanation for the same underlying failure.
+func (s *Server) buildKumbhaImage(ctx context.Context, sess *kumbha.Session, accountID uuid.UUID, dockerfilePath string) (imageRef string, status int, body gin.H) {
+	// Confirms there is something to build BEFORE minting a fetch token or
+	// touching Harbor/Kaniko — a session with no saved version yet (the
+	// agent hasn't written anything, or a build was triggered too early)
+	// gets a clear, cheap 409 instead of a Kaniko pod that fails to unzip
+	// an empty/missing archive.
+	if _, err := s.kumbha.CurrentWorkspace(ctx, sess.ID, accountID); err != nil {
+		if errors.Is(err, kumbha.ErrNoWorkspace) {
+			return "", http.StatusConflict, gin.H{"error": "nothing has been saved for this build yet"}
+		}
+		return "", http.StatusInternalServerError, gin.H{"error": err.Error()}
+	}
+
+	// The build pod fetches the CURRENT workspace version over HTTP
+	// (fetch-workspace initContainer) rather than mounting the agent's own
+	// PVC — see MintWorkspaceFetchToken's doc comment for why: it's what
+	// makes a customer's IDE edit or a rollback actually reach the image.
+	fetchToken, archiveURL, err := s.kumbha.MintWorkspaceFetchToken(sess, workspaceFetchTokenTTL)
+	if err != nil {
+		if errors.Is(err, kumbha.ErrAgentNotConfigured) {
+			return "", http.StatusNotFound, gin.H{"error": "the Kumbha build pipeline is not available on this deployment"}
+		}
+		return "", http.StatusInternalServerError, gin.H{"error": err.Error()}
 	}
 
 	var logTail []string
@@ -259,28 +309,204 @@ func (s *Server) BuildKumbhaSession(c *gin.Context) {
 		}
 	}
 
-	result, err := s.kumbhaBuild.Build(c.Request.Context(), build.Request{
+	result, err := s.kumbhaBuild.Build(ctx, build.Request{
 		ProjectID: sess.ProjectID,
 		// A synthetic, stable name rather than the account's real project
 		// name: this handler has no project-name lookup wired, and Harbor
 		// project uniqueness already comes from the project ID suffix
 		// generateHarborProjectName appends, not from this label — it is
 		// purely a Harbor-UI display convenience.
-		ProjectName:     "project-" + sess.ProjectID.String()[:8],
-		AgentInstanceID: sess.AgentInstanceID,
-		DockerfilePath:  req.DockerfilePath,
-		Tag:             sessionID.String()[:8],
+		ProjectName:         "project-" + sess.ProjectID.String()[:8],
+		WorkspaceArchiveURL: archiveURL,
+		WorkspaceToken:      fetchToken,
+		DockerfilePath:      dockerfilePath,
+		Tag:                 sess.ID.String()[:8],
 	}, onLogLine)
 	if err != nil {
 		tail := joinTail(logTail, buildLogTailLimit)
-		c.JSON(http.StatusUnprocessableEntity, gin.H{
-			"error": err.Error(),
-			"log":   tail,
-		})
+		return "", http.StatusUnprocessableEntity, gin.H{"error": err.Error(), "log": tail}
+	}
+	return result.ImageRef, 0, nil
+}
+
+// deployKumbhaSessionRequest is what the console IDE's Deploy button
+// sends. DockerfilePath aside, this is deliberately the same shape
+// POST /v1/compute/instances itself accepts (Name/CPUUnits/MemoryGB/
+// StorageGB/Ports/Env) — sizing the resulting app is the customer's own
+// choice, not something Kumbha decides on their behalf.
+type deployKumbhaSessionRequest struct {
+	DockerfilePath string               `json:"dockerfile_path,omitempty"`
+	Name           string               `json:"name,omitempty"`
+	CPUUnits       int                  `json:"cpu_units,omitempty"`
+	MemoryGB       int                  `json:"memory_gb,omitempty"`
+	StorageGB      int                  `json:"storage_gb,omitempty"`
+	Ports          []models.PortMapping `json:"ports,omitempty"`
+	Env            map[string]string    `json:"env,omitempty"`
+}
+
+// DeployKumbhaSession builds the session's current workspace and deploys
+// it as a real, customer-facing compute instance — the console IDE's
+// Deploy button, and the thing that finally makes an IDE edit or a
+// version rollback actually reachable at a URL, not just buildable.
+//
+// Reuses CreateInstance/DeleteInstance UNCHANGED via invokeInternally
+// (see its own doc comment) rather than re-implementing GPU/home
+// placement, the payment gate, endpoint provisioning, or the
+// compute.instances billing row a second time — the resulting instance
+// must be indistinguishable from one the customer created by hand, and
+// duplicated logic is one drifted line away from silently not being that.
+//
+// Each call creates a NEW instance — the compute layer has no in-place
+// "swap the image on a running instance" capability yet (see migration
+// 026's own note) — and tears down whatever instance THIS session's
+// previous deploy created, so redeploying does not leak one orphaned
+// instance per click. The resulting endpoint hostname changes on every
+// deploy as a consequence; that is the same behaviour the agent's own
+// `deploy` MCP verb already has today, not a new limitation introduced
+// here.
+// POST /v1/kumbha/sessions/:id/deploy
+func (s *Server) DeployKumbhaSession(c *gin.Context) {
+	if s.kumbha == nil || s.kumbhaBuild == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha build pipeline is not available on this deployment"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"image_ref": result.ImageRef})
+	sessionID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid session id"})
+		return
+	}
+
+	var req deployKumbhaSessionRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.DockerfilePath == "" {
+		req.DockerfilePath = "Dockerfile"
+	}
+	if req.CPUUnits <= 0 {
+		req.CPUUnits = 1
+	}
+	if req.MemoryGB <= 0 {
+		req.MemoryGB = 1
+	}
+	if req.Name == "" {
+		req.Name = "kumbha-" + sessionID.String()[:8]
+	}
+
+	projectID, accountID, ok := s.requireScope(c)
+	if !ok {
+		return
+	}
+	userID, _ := auth.GetUserID(c)
+
+	sess, err := s.kumbha.GetSession(c.Request.Context(), sessionID, accountID)
+	if err != nil {
+		if errors.Is(err, kumbha.ErrSessionNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if !sess.DeployApproved {
+		c.JSON(http.StatusForbidden, gin.H{"error": "the customer has not approved the deployment plan yet", "code": "not_approved"})
+		return
+	}
+
+	imageRef, status, body := s.buildKumbhaImage(c.Request.Context(), sess, accountID, req.DockerfilePath)
+	if status != 0 {
+		c.JSON(status, body)
+		return
+	}
+
+	createReq := models.CreateInstanceRequest{
+		Name:      req.Name,
+		Image:     imageRef,
+		CPUUnits:  req.CPUUnits,
+		Memory:    fmt.Sprintf("%dGB", req.MemoryGB),
+		StorageGB: req.StorageGB,
+		Ports:     req.Ports,
+		Env:       req.Env,
+	}
+	createStatus, createBody := s.invokeInternally(s.CreateInstance, http.MethodPost, "/v1/compute/instances", nil, accountID, projectID, userID, createReq)
+	if createStatus != http.StatusCreated {
+		// CreateInstance's own error already explains a payment gate,
+		// invalid ports, or GPU/home capacity far better than a generic
+		// message here would — surfaced verbatim rather than re-worded.
+		c.Data(createStatus, "application/json", createBody)
+		return
+	}
+
+	var created models.Instance
+	if err := json.Unmarshal(createBody, &created); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "instance was created but its response could not be read"})
+		return
+	}
+
+	previousInstanceID := sess.AppInstanceID
+	if err := s.kumbha.SetAppInstanceID(c.Request.Context(), sessionID, created.ID); err != nil {
+		// The instance is real and running; only OUR bookkeeping of which
+		// one belongs to this session failed. Not worth failing the
+		// customer's deploy over — logged so an operator can reconcile —
+		// the worst outcome is the NEXT deploy failing to clean this one
+		// up, not the customer losing the app they just got.
+		log.Printf("WARN: deployed instance %s for Kumbha session %s but failed to record it: %v", created.ID, sessionID, err)
+	}
+
+	if previousInstanceID != "" && previousInstanceID != created.ID {
+		delStatus, delBody := s.invokeInternally(s.DeleteInstance, http.MethodDelete, "/v1/compute/instances/"+previousInstanceID,
+			gin.Params{{Key: "id", Value: previousInstanceID}}, accountID, projectID, userID, nil)
+		if delStatus != http.StatusOK {
+			log.Printf("WARN: Kumbha session %s redeployed but failed to tear down its previous instance %s (status %d): %s",
+				sessionID, previousInstanceID, delStatus, string(delBody))
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"image_ref":      imageRef,
+		"instance_id":    created.ID,
+		"endpoint":       created.Endpoint,
+		"status":         created.Status,
+		"price_per_hour": created.PricePerHour,
+	})
+}
+
+// invokeInternally calls a gin.HandlerFunc directly, as if it had received
+// a real HTTP request, using a synthetic context carrying the given
+// identity — the exact technique this package's own tests already use to
+// drive a handler without a live server. Used ONLY so DeployKumbhaSession
+// can reuse CreateInstance/DeleteInstance's real logic (GPU/home
+// placement, the payment gate, endpoint provisioning, the billing row)
+// rather than re-implementing any of it: an app instance a Kumbha deploy
+// creates must be indistinguishable from one the customer created by hand,
+// and a second copy of that logic is one drifted line away from silently
+// not being that. userID is optional (zero value omitted) — CreateInstance
+// itself treats a missing one as "no attribution", the same as a normal
+// request whose JWT happens to carry none.
+func (s *Server) invokeInternally(handler gin.HandlerFunc, method, path string, params gin.Params, accountID, projectID, userID uuid.UUID, body any) (status int, respBody []byte) {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+
+	var bodyReader *bytes.Reader
+	if body != nil {
+		b, _ := json.Marshal(body)
+		bodyReader = bytes.NewReader(b)
+	} else {
+		bodyReader = bytes.NewReader(nil)
+	}
+	c.Request = httptest.NewRequest(method, path, bodyReader)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Params = params
+	c.Set(string(auth.AccountIDKey), accountID)
+	c.Set(string(auth.ProjectIDKey), projectID)
+	if userID != uuid.Nil {
+		c.Set(string(auth.UserIDKey), userID)
+	}
+
+	handler(c)
+	return w.Code, w.Body.Bytes()
 }
 
 // joinTail joins log lines with newlines, trimmed from the FRONT to at
@@ -577,4 +803,113 @@ func (s *Server) KumbhaChatCompletions(c *gin.Context) {
 	c.Header("X-Teepin-Cost", fmt.Sprintf("%.6f", result.Cost))
 	c.Header("X-Teepin-Session-Spent", fmt.Sprintf("%.6f", result.Spent))
 	c.Data(http.StatusOK, "application/json", result.Response.Body)
+}
+
+// sendKumbhaMessageRequest is the console chat input's body.
+type sendKumbhaMessageRequest struct {
+	Content string `json:"content"`
+}
+
+// SendKumbhaMessage is "chat + resume" from the customer's side — the
+// console's chat input, sending a follow-up instruction after the
+// session's initial prompt. Gateway.DeliverMessage decides whether that
+// reaches the SAME still-running agent process (queued for its own poll
+// loop, full conversation memory intact) or launches a fresh one (the
+// previous pod already exited) — see its own doc comment for why the
+// latter is an honest, bounded degradation rather than real persistence.
+// POST /v1/kumbha/sessions/:id/messages
+func (s *Server) SendKumbhaMessage(c *gin.Context) {
+	if s.kumbha == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha Gateway is not available on this deployment"})
+		return
+	}
+
+	sessionID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid session id"})
+		return
+	}
+
+	var req sendKumbhaMessageRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	_, accountID, ok := s.requireScope(c)
+	if !ok {
+		return
+	}
+
+	sess, err := s.kumbha.GetSession(c.Request.Context(), sessionID, accountID)
+	if err != nil {
+		if errors.Is(err, kumbha.ErrSessionNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if sess.Status != "open" {
+		c.JSON(http.StatusConflict, gin.H{"error": "session is closed", "code": "session_closed"})
+		return
+	}
+
+	relaunched, err := s.kumbha.DeliverMessage(c.Request.Context(), sess, req.Content)
+	if err != nil {
+		switch {
+		case errors.Is(err, kumbha.ErrEmptyMessage), errors.Is(err, kumbha.ErrMessageTooLong):
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		case errors.Is(err, kumbha.ErrAgentNotConfigured):
+			c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha agent is not available on this deployment"})
+		case errors.Is(err, kumbha.ErrSessionClosed):
+			c.JSON(http.StatusConflict, gin.H{"error": "session is closed", "code": "session_closed"})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"delivered": true, "relaunched": relaunched})
+}
+
+// PollKumbhaMessages is the agent's own side of "chat + resume" —
+// run.py's wait_for_next_instruction poll loop. Session-scoped credential
+// only (auth.GetSessionID), matching UploadKumbhaWorkspace's own auth
+// shape: the agent may only ever poll its OWN session, never argue its way
+// into another one via the path parameter.
+// GET /v1/kumbha/sessions/:id/messages/poll
+func (s *Server) PollKumbhaMessages(c *gin.Context) {
+	if s.kumbha == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha Gateway is not available on this deployment"})
+		return
+	}
+
+	sessionID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid session id"})
+		return
+	}
+
+	callerSession, ok := auth.GetSessionID(c)
+	if !ok {
+		c.JSON(http.StatusForbidden, gin.H{"error": "this endpoint requires a Kumbha session credential"})
+		return
+	}
+	if callerSession != sessionID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "this credential does not belong to that session"})
+		return
+	}
+
+	messages, err := s.kumbha.PollMessages(c.Request.Context(), sessionID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	out := make([]gin.H, len(messages))
+	for i, m := range messages {
+		out[i] = gin.H{"id": m.ID, "content": m.Content, "created_at": m.CreatedAt}
+	}
+	c.JSON(http.StatusOK, gin.H{"messages": out})
 }

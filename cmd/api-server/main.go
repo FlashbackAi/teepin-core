@@ -588,6 +588,12 @@ func main() {
 						// doc comment) — empty leaves Image expected to be
 						// publicly pullable, same as before this existed.
 						ImagePullSecret: getEnv("TEEPIN_KUMBHA_AGENT_IMAGE_PULL_SECRET", ""),
+						// Off by default — see AgentConfig.VisionCapable's own
+						// doc comment on why this is operator-confirmed, not
+						// auto-detected. Set TEEPIN_KUMBHA_VISION_CAPABLE=true
+						// only once the hosted route's model is confirmed to
+						// accept multimodal (image) input.
+						VisionCapable: getEnvBool("TEEPIN_KUMBHA_VISION_CAPABLE", false),
 					})
 					log.Printf("✅ Kumbha agent pod orchestration enabled (image %s)", agentImage)
 				} else {
@@ -874,6 +880,22 @@ func getEnvInt(key string, defaultValue int) int {
 	return defaultValue
 }
 
+// getEnvBool reads a boolean environment variable ("true"/"1", case
+// insensitive, counts as true), falling back to defaultValue when unset
+// or unrecognised — same "malformed input should not crash startup"
+// reasoning as getEnvInt.
+func getEnvBool(key string, defaultValue bool) bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	switch value {
+	case "true", "1":
+		return true
+	case "false", "0":
+		return false
+	default:
+		return defaultValue
+	}
+}
+
 func initRateLimiting() *ratelimit.Config {
 	// Try to load from config file
 	configPath := getEnv("RATELIMIT_CONFIG", "config/ratelimit.yaml")
@@ -1091,7 +1113,35 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 			kumbhaGroup.POST("/sessions/:id/approve-deploy", apiServer.ApproveKumbhaDeploy)
 			kumbhaGroup.POST("/sessions/:id/events", apiServer.CreateKumbhaEventTicket)
 			kumbhaGroup.POST("/sessions/:id/build", apiServer.BuildKumbhaSession)
+			// Deploy: build + create (or replace) a real, customer-facing
+			// compute instance — the console IDE's Deploy button. See
+			// DeployKumbhaSession's own doc comment for why each call
+			// creates a fresh instance and tears down the session's
+			// previous one, rather than updating in place.
+			kumbhaGroup.POST("/sessions/:id/deploy", apiServer.DeployKumbhaSession)
+			// Chat + resume: the customer POSTs a follow-up (ordinary JWT);
+			// the agent's own poll loop (run.py's wait_for_next_instruction)
+			// GETs it with its session-scoped credential — same auth split
+			// as the workspace endpoints just below, and for the same
+			// reason (the agent may only ever touch its OWN session).
+			kumbhaGroup.POST("/sessions/:id/messages", apiServer.SendKumbhaMessage)
+			kumbhaGroup.GET("/sessions/:id/messages/poll", apiServer.PollKumbhaMessages)
 			kumbhaGroup.POST("/chat/completions", apiServer.KumbhaChatCompletions)
+			// Workspace: versioned, not overwrite-in-place — every save (agent
+			// or customer) creates a new version and moves the "current"
+			// pointer, so an editable IDE with a Deploy button that can break
+			// a working app always has a way back. The agent PUTs
+			// (session-scoped credential, may only write its own session,
+			// recorded as created_by=agent); the customer POSTs its own edits
+			// (ordinary JWT, account-scoped, created_by=customer) via the
+			// console IDE's Save button. See kumbha_workspace_handlers.go's
+			// own note on why the auth differs between them.
+			kumbhaGroup.PUT("/sessions/:id/workspace", apiServer.UploadKumbhaWorkspace)
+			kumbhaGroup.POST("/sessions/:id/workspace", apiServer.SaveKumbhaWorkspace)
+			kumbhaGroup.GET("/sessions/:id/workspace", apiServer.GetKumbhaWorkspace)
+			kumbhaGroup.GET("/sessions/:id/workspace/versions", apiServer.ListKumbhaWorkspaceVersions)
+			kumbhaGroup.POST("/sessions/:id/workspace/rollback", apiServer.RollbackKumbhaWorkspace)
+			kumbhaGroup.GET("/sessions/:id/workspace/archive", apiServer.DownloadKumbhaWorkspace)
 		}
 
 		// Compute endpoints require auth — requireScope (server.go) rejects

@@ -7,6 +7,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,6 +23,12 @@ import (
 type fakeCluster struct {
 	createErr error
 	deleteErr error
+	// statusResult/statusErr let DeliverMessage/isAgentRunning tests
+	// control what GetInstanceStatus reports; unset (both nil) preserves
+	// the original default every other test in this file already relies
+	// on — "no such pod".
+	statusResult *cluster.InstanceStatus
+	statusErr    error
 
 	created []cluster.InstanceSpec
 	deleted []string
@@ -43,6 +51,9 @@ func (f *fakeCluster) DeleteInstance(_ context.Context, _ cluster.Scope, instanc
 }
 
 func (f *fakeCluster) GetInstanceStatus(context.Context, cluster.Scope, string) (*cluster.InstanceStatus, error) {
+	if f.statusResult != nil || f.statusErr != nil {
+		return f.statusResult, f.statusErr
+	}
 	return nil, cluster.ErrNotFound
 }
 func (f *fakeCluster) ListInstanceStatuses(context.Context, cluster.Scope) ([]cluster.InstanceStatus, error) {
@@ -69,6 +80,44 @@ func TestGateway_LaunchAgent_NotConfiguredWithoutWithAgent(t *testing.T) {
 	err := gw.LaunchAgent(context.Background(), sess, "build me a booking app")
 	if !errors.Is(err, ErrAgentNotConfigured) {
 		t.Errorf("got %v, want ErrAgentNotConfigured", err)
+	}
+}
+
+func TestGateway_MintWorkspaceFetchToken_NotConfiguredWithoutWithAgent(t *testing.T) {
+	store, _ := newMockStore(t)
+	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{})
+
+	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), ProjectID: uuid.New()}
+	_, _, err := gw.MintWorkspaceFetchToken(sess, time.Minute)
+	if !errors.Is(err, ErrAgentNotConfigured) {
+		t.Errorf("got %v, want ErrAgentNotConfigured", err)
+	}
+}
+
+// The build pod's fetch-workspace initContainer needs a URL it can reach
+// from wherever build pods run — the SAME APIBaseURL already configured
+// for the agent pod itself (WithAgent), not a separate setting to keep in
+// sync.
+func TestGateway_MintWorkspaceFetchToken_ReturnsTokenAndArchiveURL(t *testing.T) {
+	store, _ := newMockStore(t)
+	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+		WithAgent(&fakeCluster{}, fakeMintToken, AgentConfig{
+			Image:      "kumbha-agent:latest",
+			APIBaseURL: "http://teepin-api.default.svc.cluster.local:8080/",
+		})
+
+	sessID := uuid.New()
+	sess := &Session{ID: sessID, AccountID: uuid.New(), ProjectID: uuid.New()}
+	token, archiveURL, err := gw.MintWorkspaceFetchToken(sess, time.Minute)
+	if err != nil {
+		t.Fatalf("MintWorkspaceFetchToken: %v", err)
+	}
+	if token != "fake-agent-token" {
+		t.Errorf("token = %q, want the value fakeMintToken returns", token)
+	}
+	want := "http://teepin-api.default.svc.cluster.local:8080/v1/kumbha/sessions/" + sessID.String() + "/workspace/archive"
+	if archiveURL != want {
+		t.Errorf("archiveURL = %q, want %q", archiveURL, want)
 	}
 }
 
@@ -117,6 +166,38 @@ func TestGateway_LaunchAgent_Success(t *testing.T) {
 	}
 }
 
+// TestGateway_LaunchAgent_PropagatesVisionCapableFlag covers AgentConfig.
+// VisionCapable reaching the pod as TEEPIN_VISION_CAPABLE — what
+// browser_tool.py's get_shared_browser() reads to decide whether
+// browser_screenshot attaches an actual image or stays text-only. Both
+// values are asserted (not just the non-default one) since the SAFE
+// default (false) not silently flipping to true is the more
+// safety-critical direction to catch a regression in.
+func TestGateway_LaunchAgent_PropagatesVisionCapableFlag(t *testing.T) {
+	for _, visionCapable := range []bool{false, true} {
+		store, mock := newMockStore(t)
+		fc := &fakeCluster{}
+		gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+			WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest", VisionCapable: visionCapable})
+
+		sessID := uuid.New()
+		sess := &Session{ID: sessID, AccountID: uuid.New(), ProjectID: uuid.New()}
+
+		mock.ExpectExec(`UPDATE billing\.inference_sessions SET agent_instance_id`).
+			WithArgs(sessID, "kumbha-agent-"+sessID.String()[:8]).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		if err := gw.LaunchAgent(context.Background(), sess, "build me a booking app"); err != nil {
+			t.Fatalf("LaunchAgent: %v", err)
+		}
+
+		want := strconv.FormatBool(visionCapable)
+		if got := fc.created[0].Env["TEEPIN_VISION_CAPABLE"]; got != want {
+			t.Errorf("VisionCapable=%v: TEEPIN_VISION_CAPABLE = %q, want %q", visionCapable, got, want)
+		}
+	}
+}
+
 func TestGateway_LaunchAgent_RecordingFailureCleansUpThePod(t *testing.T) {
 	store, mock := newMockStore(t)
 	fc := &fakeCluster{}
@@ -151,8 +232,8 @@ func TestGateway_CloseSession_TearsDownAgentPod(t *testing.T) {
 		WithArgs(sessID, accountID, "closed").
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "account_id", "project_id", "budget", "spent", "status", "label",
-			"agent_instance_id", "deploy_approved", "started_at", "ended_at",
-		}).AddRow(sessID, accountID, projectID, 5.0, 0.0, "closed", nil, agentPodID, false, startedAt, startedAt))
+			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
+		}).AddRow(sessID, accountID, projectID, 5.0, 0.0, "closed", nil, agentPodID, nil, false, startedAt, startedAt))
 
 	mock.ExpectQuery(`SELECT route, provider, input_tokens, output_tokens`).
 		WithArgs(sessID).
@@ -182,8 +263,8 @@ func TestGateway_CloseSession_NoAgentPodMeansNoDeleteCall(t *testing.T) {
 		WithArgs(sessID, accountID, "closed").
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "account_id", "project_id", "budget", "spent", "status", "label",
-			"agent_instance_id", "deploy_approved", "started_at", "ended_at",
-		}).AddRow(sessID, accountID, projectID, 5.0, 0.0, "closed", nil, nil, false, startedAt, startedAt))
+			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
+		}).AddRow(sessID, accountID, projectID, 5.0, 0.0, "closed", nil, nil, nil, false, startedAt, startedAt))
 
 	mock.ExpectQuery(`SELECT route, provider, input_tokens, output_tokens`).
 		WithArgs(sessID).
@@ -198,5 +279,180 @@ func TestGateway_CloseSession_NoAgentPodMeansNoDeleteCall(t *testing.T) {
 	}
 	if len(fc.deleted) != 0 {
 		t.Errorf("DeleteInstance was called with no agent pod on the session: %v", fc.deleted)
+	}
+}
+
+// --- isAgentRunning / DeliverMessage ---
+
+func TestIsAgentRunning_NoClusterConfiguredIsFalse(t *testing.T) {
+	store, _ := newMockStore(t)
+	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{})
+	sess := &Session{ID: uuid.New(), ProjectID: uuid.New(), AgentInstanceID: "kumbha-agent-abc"}
+
+	running, err := gw.isAgentRunning(context.Background(), sess)
+	if err != nil {
+		t.Fatalf("isAgentRunning: %v", err)
+	}
+	if running {
+		t.Error("got running=true with no cluster configured, want false")
+	}
+}
+
+func TestIsAgentRunning_NoAgentInstanceIDIsFalse(t *testing.T) {
+	store, _ := newMockStore(t)
+	fc := &fakeCluster{statusResult: &cluster.InstanceStatus{Status: "running"}}
+	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+		WithAgent(fc, fakeMintToken, AgentConfig{})
+	sess := &Session{ID: uuid.New(), ProjectID: uuid.New()} // AgentInstanceID empty
+
+	running, err := gw.isAgentRunning(context.Background(), sess)
+	if err != nil {
+		t.Fatalf("isAgentRunning: %v", err)
+	}
+	if running {
+		t.Error("got running=true with no agent ever launched, want false")
+	}
+}
+
+func TestIsAgentRunning_RunningOrPendingStatusIsTrue(t *testing.T) {
+	for _, status := range []string{"running", "pending"} {
+		store, _ := newMockStore(t)
+		fc := &fakeCluster{statusResult: &cluster.InstanceStatus{Status: status}}
+		gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+			WithAgent(fc, fakeMintToken, AgentConfig{})
+		sess := &Session{ID: uuid.New(), ProjectID: uuid.New(), AgentInstanceID: "kumbha-agent-abc"}
+
+		running, err := gw.isAgentRunning(context.Background(), sess)
+		if err != nil {
+			t.Fatalf("isAgentRunning(%s): %v", status, err)
+		}
+		if !running {
+			t.Errorf("status %q: got running=false, want true", status)
+		}
+	}
+}
+
+func TestIsAgentRunning_TerminatedOrFailedStatusIsFalse(t *testing.T) {
+	for _, status := range []string{"terminated", "failed"} {
+		store, _ := newMockStore(t)
+		fc := &fakeCluster{statusResult: &cluster.InstanceStatus{Status: status}}
+		gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+			WithAgent(fc, fakeMintToken, AgentConfig{})
+		sess := &Session{ID: uuid.New(), ProjectID: uuid.New(), AgentInstanceID: "kumbha-agent-abc"}
+
+		running, err := gw.isAgentRunning(context.Background(), sess)
+		if err != nil {
+			t.Fatalf("isAgentRunning(%s): %v", status, err)
+		}
+		if running {
+			t.Errorf("status %q: got running=true, want false", status)
+		}
+	}
+}
+
+func TestIsAgentRunning_NotFoundIsFalseWithNoError(t *testing.T) {
+	store, _ := newMockStore(t)
+	fc := &fakeCluster{statusErr: cluster.ErrNotFound}
+	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+		WithAgent(fc, fakeMintToken, AgentConfig{})
+	sess := &Session{ID: uuid.New(), ProjectID: uuid.New(), AgentInstanceID: "kumbha-agent-abc"}
+
+	running, err := gw.isAgentRunning(context.Background(), sess)
+	if err != nil {
+		t.Fatalf("isAgentRunning: %v", err)
+	}
+	if running {
+		t.Error("got running=true for a pod cluster.ErrNotFound reported gone, want false")
+	}
+}
+
+func TestIsAgentRunning_AmbiguousErrorPropagates(t *testing.T) {
+	store, _ := newMockStore(t)
+	boom := errors.New("cluster unreachable")
+	fc := &fakeCluster{statusErr: boom}
+	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+		WithAgent(fc, fakeMintToken, AgentConfig{})
+	sess := &Session{ID: uuid.New(), ProjectID: uuid.New(), AgentInstanceID: "kumbha-agent-abc"}
+
+	_, err := gw.isAgentRunning(context.Background(), sess)
+	if err == nil {
+		t.Fatal("got nil error for an ambiguous cluster failure, want it propagated")
+	}
+}
+
+func TestGateway_DeliverMessage_NotConfiguredWithoutWithAgent(t *testing.T) {
+	store, _ := newMockStore(t)
+	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{})
+	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), ProjectID: uuid.New()}
+
+	_, err := gw.DeliverMessage(context.Background(), sess, "hello")
+	if !errors.Is(err, ErrAgentNotConfigured) {
+		t.Errorf("got %v, want ErrAgentNotConfigured", err)
+	}
+}
+
+// The common case: the previous pod is still alive, so the message is
+// just queued for its own poll loop to pick up — no new pod launched.
+func TestGateway_DeliverMessage_QueuesWhenAgentRunning(t *testing.T) {
+	store, mock := newMockStore(t)
+	fc := &fakeCluster{statusResult: &cluster.InstanceStatus{Status: "running"}}
+	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+		WithAgent(fc, fakeMintToken, AgentConfig{})
+
+	sessID := uuid.New()
+	sess := &Session{ID: sessID, AccountID: uuid.New(), ProjectID: uuid.New(), AgentInstanceID: "kumbha-agent-abc"}
+
+	mock.ExpectQuery(`INSERT INTO billing\.kumbha_messages`).
+		WithArgs(sessID, "add a footer").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(1), time.Now()))
+
+	relaunched, err := gw.DeliverMessage(context.Background(), sess, "add a footer")
+	if err != nil {
+		t.Fatalf("DeliverMessage: %v", err)
+	}
+	if relaunched {
+		t.Error("got relaunched=true while the agent pod is still running, want false")
+	}
+	if len(fc.created) != 0 {
+		t.Errorf("CreateInstance was called while the agent pod is still running: %v", fc.created)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+// The relaunch case: the previous pod is gone, so DeliverMessage starts a
+// fresh one with the message folded into a resume-oriented prompt rather
+// than queuing it (queuing would just strand it — nothing would ever
+// poll for it).
+func TestGateway_DeliverMessage_RelaunchesWhenAgentNotRunning(t *testing.T) {
+	store, mock := newMockStore(t)
+	fc := &fakeCluster{statusErr: cluster.ErrNotFound}
+	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+		WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest"})
+
+	sessID := uuid.New()
+	sess := &Session{ID: sessID, AccountID: uuid.New(), ProjectID: uuid.New(), AgentInstanceID: "kumbha-agent-abc"}
+
+	mock.ExpectExec(`UPDATE billing\.inference_sessions SET agent_instance_id`).
+		WithArgs(sessID, "kumbha-agent-"+sessID.String()[:8]).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	relaunched, err := gw.DeliverMessage(context.Background(), sess, "add a footer")
+	if err != nil {
+		t.Fatalf("DeliverMessage: %v", err)
+	}
+	if !relaunched {
+		t.Error("got relaunched=false with no live agent pod, want true")
+	}
+	if len(fc.created) != 1 {
+		t.Fatalf("got %d CreateInstance calls, want 1", len(fc.created))
+	}
+	prompt := fc.created[0].Env["TEEPIN_PROMPT"]
+	if !strings.Contains(prompt, "add a footer") {
+		t.Errorf("relaunch prompt = %q, want it to include the customer's message", prompt)
+	}
+	if !strings.Contains(prompt, "workspace already contains") {
+		t.Errorf("relaunch prompt = %q, want it to tell the agent its previous work still exists", prompt)
 	}
 }

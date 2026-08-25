@@ -483,3 +483,128 @@ func TestArchivabilityDrill024(t *testing.T) {
 	}
 	t.Log("archivability drill passed: 024 applies, reverts cleanly, and re-applies")
 }
+
+// TestArchivabilityDrill025 proves the Kumbha workspace-version table
+// (025) is reversible: it and inference_sessions.current_workspace_version
+// exist after up, are gone after reverting one step, and 024's
+// inference_sessions — which the version table references with ON DELETE
+// CASCADE — survives that revert untouched. The cascade direction is the
+// specific thing worth pinning: dropping workspace versions must never
+// take the sessions (and therefore the billing records keyed to them)
+// with it.
+func TestArchivabilityDrill025(t *testing.T) {
+	dsn := os.Getenv("TEEPIN_DRILL_DSN")
+	if dsn == "" {
+		t.Skip("set TEEPIN_DRILL_DSN to run the migration drill")
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("initial up: %v", err)
+	}
+	if !tableExists(t, db, "billing", "kumbha_workspace_versions") {
+		t.Fatal("after up: billing.kumbha_workspace_versions missing")
+	}
+	if !columnExists(t, db, "billing", "inference_sessions", "current_workspace_version") {
+		t.Fatal("after up: inference_sessions.current_workspace_version missing")
+	}
+
+	// Revert to version 24 (state after 024, before 025), absolute.
+	if err := migrator(t, db).Migrate(24); err != nil {
+		t.Fatalf("migrate down to 024: %v", err)
+	}
+	if tableExists(t, db, "billing", "kumbha_workspace_versions") {
+		t.Error("after down: kumbha_workspace_versions still present")
+	}
+	if columnExists(t, db, "billing", "inference_sessions", "current_workspace_version") {
+		t.Error("after down: current_workspace_version still present")
+	}
+	if !tableExists(t, db, "billing", "inference_sessions") {
+		t.Error("after down: inference_sessions (024) was wrongly removed — the version table's FK must not cascade upwards")
+	}
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("re-up: %v", err)
+	}
+	t.Log("archivability drill passed: 025 applies, reverts cleanly, and re-applies")
+}
+
+// TestArchivabilityDrill026 proves inference_sessions.app_instance_id (026)
+// is reversible — added after up, gone after reverting one step, and
+// inference_sessions itself (untouched by this migration beyond the one
+// column) survives the round trip.
+func TestArchivabilityDrill026(t *testing.T) {
+	dsn := os.Getenv("TEEPIN_DRILL_DSN")
+	if dsn == "" {
+		t.Skip("set TEEPIN_DRILL_DSN to run the migration drill")
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("initial up: %v", err)
+	}
+	if !columnExists(t, db, "billing", "inference_sessions", "app_instance_id") {
+		t.Fatal("after up: inference_sessions.app_instance_id missing")
+	}
+
+	if err := migrator(t, db).Migrate(25); err != nil {
+		t.Fatalf("migrate down to 025: %v", err)
+	}
+	if columnExists(t, db, "billing", "inference_sessions", "app_instance_id") {
+		t.Error("after down: app_instance_id still present")
+	}
+	if !tableExists(t, db, "billing", "inference_sessions") {
+		t.Error("after down: inference_sessions was wrongly removed")
+	}
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("re-up: %v", err)
+	}
+	t.Log("archivability drill passed: 026 applies, reverts cleanly, and re-applies")
+}
+
+// TestArchivabilityDrill027 proves billing.kumbha_messages (027) is
+// reversible, and that inference_sessions survives the round trip
+// untouched — the cascade direction that matters is dropping messages
+// must never take sessions (and their billing records) with it.
+func TestArchivabilityDrill027(t *testing.T) {
+	dsn := os.Getenv("TEEPIN_DRILL_DSN")
+	if dsn == "" {
+		t.Skip("set TEEPIN_DRILL_DSN to run the migration drill")
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("initial up: %v", err)
+	}
+	if !tableExists(t, db, "billing", "kumbha_messages") {
+		t.Fatal("after up: billing.kumbha_messages missing")
+	}
+
+	if err := migrator(t, db).Migrate(26); err != nil {
+		t.Fatalf("migrate down to 026: %v", err)
+	}
+	if tableExists(t, db, "billing", "kumbha_messages") {
+		t.Error("after down: kumbha_messages still present")
+	}
+	if !tableExists(t, db, "billing", "inference_sessions") {
+		t.Error("after down: inference_sessions was wrongly removed — the message table's FK must not cascade upwards")
+	}
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("re-up: %v", err)
+	}
+	t.Log("archivability drill passed: 027 applies, reverts cleanly, and re-applies")
+}

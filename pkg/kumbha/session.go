@@ -52,9 +52,16 @@ type Session struct {
 	Status          string // "open" | "closed" | "budget_exhausted" | "idle_timeout"
 	Label           string
 	AgentInstanceID string
-	DeployApproved  bool
-	StartedAt       time.Time
-	EndedAt         *time.Time
+	// AppInstanceID names the customer-facing app instance this session's
+	// Deploy most recently created (a real compute.instances row, billed
+	// and manageable like any other) — distinct from AgentInstanceID,
+	// which is Kumbha's own never-customer-visible agent pod. See
+	// migration 026's own note on why a redeploy replaces this rather than
+	// updating an instance in place.
+	AppInstanceID  string
+	DeployApproved bool
+	StartedAt      time.Time
+	EndedAt        *time.Time
 }
 
 // RouteUsage is one session's accumulated tokens for one route — the raw
@@ -141,15 +148,15 @@ func (s *Store) SetDeployApproved(ctx context.Context, id, accountID uuid.UUID) 
 // Get loads a session, scoped to the owning account.
 func (s *Store) Get(ctx context.Context, id, accountID uuid.UUID) (*Session, error) {
 	var sess Session
-	var label, agentInstanceID sql.NullString
+	var label, agentInstanceID, appInstanceID sql.NullString
 	var endedAt sql.NullTime
 	err := s.db.QueryRowContext(ctx, `
 		SELECT id, account_id, project_id, budget, spent, status, label,
-		       agent_instance_id, deploy_approved, started_at, ended_at
+		       agent_instance_id, app_instance_id, deploy_approved, started_at, ended_at
 		FROM billing.inference_sessions
 		WHERE id = $1 AND account_id = $2
 	`, id, accountID).Scan(&sess.ID, &sess.AccountID, &sess.ProjectID, &sess.Budget,
-		&sess.Spent, &sess.Status, &label, &agentInstanceID, &sess.DeployApproved,
+		&sess.Spent, &sess.Status, &label, &agentInstanceID, &appInstanceID, &sess.DeployApproved,
 		&sess.StartedAt, &endedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrSessionNotFound
@@ -159,6 +166,7 @@ func (s *Store) Get(ctx context.Context, id, accountID uuid.UUID) (*Session, err
 	}
 	sess.Label = label.String
 	sess.AgentInstanceID = agentInstanceID.String
+	sess.AppInstanceID = appInstanceID.String
 	if endedAt.Valid {
 		sess.EndedAt = &endedAt.Time
 	}
@@ -247,6 +255,25 @@ func (s *Store) SetAgentInstanceID(ctx context.Context, sessionID uuid.UUID, age
 	return nil
 }
 
+// SetAppInstanceID records which compute instance a Deploy most recently
+// created for this session — set right after the create succeeds, so the
+// NEXT deploy knows what to tear down (see migration 026). An empty
+// string clears it (used when the instance is torn down without a
+// replacement, e.g. DeployKumbhaSession's own cleanup-on-partial-failure
+// path).
+func (s *Store) SetAppInstanceID(ctx context.Context, sessionID uuid.UUID, appInstanceID string) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE billing.inference_sessions SET app_instance_id = $2 WHERE id = $1
+	`, sessionID, nullIfEmpty(appInstanceID))
+	if err != nil {
+		return fmt.Errorf("failed to record app instance id: %w", err)
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return ErrSessionNotFound
+	}
+	return nil
+}
+
 func (s *Store) RouteUsage(ctx context.Context, sessionID uuid.UUID) ([]RouteUsage, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT route, provider, input_tokens, output_tokens
@@ -275,16 +302,16 @@ func (s *Store) RouteUsage(ctx context.Context, sessionID uuid.UUID) ([]RouteUsa
 // cross-referencing anything else.
 func (s *Store) Close(ctx context.Context, id, accountID uuid.UUID, reason string) (*Session, error) {
 	var sess Session
-	var label, agentInstanceID sql.NullString
+	var label, agentInstanceID, appInstanceID sql.NullString
 	var endedAt time.Time
 	err := s.db.QueryRowContext(ctx, `
 		UPDATE billing.inference_sessions
 		SET status = $3, ended_at = NOW()
 		WHERE id = $1 AND account_id = $2 AND status = 'open'
 		RETURNING id, account_id, project_id, budget, spent, status, label,
-		          agent_instance_id, deploy_approved, started_at, ended_at
+		          agent_instance_id, app_instance_id, deploy_approved, started_at, ended_at
 	`, id, accountID, reason).Scan(&sess.ID, &sess.AccountID, &sess.ProjectID,
-		&sess.Budget, &sess.Spent, &sess.Status, &label, &agentInstanceID,
+		&sess.Budget, &sess.Spent, &sess.Status, &label, &agentInstanceID, &appInstanceID,
 		&sess.DeployApproved, &sess.StartedAt, &endedAt)
 	if err == sql.ErrNoRows {
 		// Already closed, or does not belong to this account — same
@@ -296,6 +323,7 @@ func (s *Store) Close(ctx context.Context, id, accountID uuid.UUID, reason strin
 	}
 	sess.Label = label.String
 	sess.AgentInstanceID = agentInstanceID.String
+	sess.AppInstanceID = appInstanceID.String
 	sess.EndedAt = &endedAt
 	return &sess, nil
 }
@@ -310,7 +338,7 @@ func (s *Store) Close(ctx context.Context, id, accountID uuid.UUID, reason strin
 func (s *Store) ListByProject(ctx context.Context, accountID, projectID uuid.UUID) ([]*Session, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, account_id, project_id, budget, spent, status, label,
-		       agent_instance_id, deploy_approved, started_at, ended_at
+		       agent_instance_id, app_instance_id, deploy_approved, started_at, ended_at
 		FROM billing.inference_sessions
 		WHERE account_id = $1 AND project_id = $2
 		ORDER BY started_at DESC
@@ -323,15 +351,16 @@ func (s *Store) ListByProject(ctx context.Context, accountID, projectID uuid.UUI
 	var sessions []*Session
 	for rows.Next() {
 		var sess Session
-		var label, agentInstanceID sql.NullString
+		var label, agentInstanceID, appInstanceID sql.NullString
 		var endedAt sql.NullTime
 		if err := rows.Scan(&sess.ID, &sess.AccountID, &sess.ProjectID, &sess.Budget,
-			&sess.Spent, &sess.Status, &label, &agentInstanceID, &sess.DeployApproved,
+			&sess.Spent, &sess.Status, &label, &agentInstanceID, &appInstanceID, &sess.DeployApproved,
 			&sess.StartedAt, &endedAt); err != nil {
 			return nil, fmt.Errorf("failed to scan session: %w", err)
 		}
 		sess.Label = label.String
 		sess.AgentInstanceID = agentInstanceID.String
+		sess.AppInstanceID = appInstanceID.String
 		if endedAt.Valid {
 			sess.EndedAt = &endedAt.Time
 		}

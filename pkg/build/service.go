@@ -46,8 +46,13 @@ type Config struct {
 	// KanikoImage is pinned, not floating (":latest" would let an
 	// upstream release silently change build behaviour platform-wide).
 	KanikoImage string
-	CPUUnits    int
-	MemoryGB    int
+	// FetchImage runs the initContainer that downloads and unpacks the
+	// session's current workspace archive before Kaniko starts — needs
+	// only wget and unzip, both BusyBox applets, so a full distro image
+	// is unnecessary. Pinned for the same reason KanikoImage is.
+	FetchImage string
+	CPUUnits   int
+	MemoryGB   int
 	// Timeout bounds how long a single build pod may run before it is
 	// killed and reported as failed.
 	Timeout time.Duration
@@ -58,6 +63,7 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		KanikoImage: "gcr.io/kaniko-project/executor:v1.23.2",
+		FetchImage:  "busybox:1.36.1",
 		CPUUnits:    2,
 		MemoryGB:    4,
 		Timeout:     15 * time.Minute,
@@ -83,6 +89,9 @@ func NewService(k8sClient kubernetes.Interface, harborService *harbor.Service, c
 		if cfg.Timeout == 0 {
 			cfg.Timeout = d.Timeout
 		}
+		if cfg.FetchImage == "" {
+			cfg.FetchImage = d.FetchImage
+		}
 		cfg.KanikoImage = d.KanikoImage
 	}
 	return &Service{k8sClient: k8sClient, harbor: harborService, cfg: cfg}
@@ -97,12 +106,17 @@ type Result struct {
 type Request struct {
 	ProjectID   uuid.UUID
 	ProjectName string
-	// AgentInstanceID names the Kumbha agent pod whose workspace PVC
-	// (cluster.PVCName(AgentInstanceID)) holds the source to build —
-	// the SAME PVC LaunchAgent already provisioned, mounted read-only
-	// here so a build in progress can never corrupt the agent's own
-	// still-running workspace.
-	AgentInstanceID string
+	// WorkspaceArchiveURL and WorkspaceToken locate and authorise a GET of
+	// the session's CURRENT workspace version (pkg/kumbha/gateway.go's
+	// MintWorkspaceFetchToken) — an initContainer downloads and unpacks
+	// this as the build context, rather than mounting the agent pod's own
+	// live PVC. This is what makes a customer's IDE edit or a version
+	// rollback actually reach the image: both only ever change what
+	// pkg/kumbha/workspace.go considers "current", never the agent pod's
+	// own on-disk copy, so building from anything else would silently
+	// ignore them.
+	WorkspaceArchiveURL string
+	WorkspaceToken      string
 	// DockerfilePath is relative to the workspace root.
 	DockerfilePath string
 	// Tag becomes the pushed image's tag — typically a short session id,
@@ -235,14 +249,23 @@ func (s *Service) streamLogs(ctx context.Context, podName string, onLogLine OnLo
 	}
 }
 
-// buildPod constructs the Kaniko pod spec — SecurityContext matches
+// buildPod constructs the build pod spec — an initContainer that fetches
+// and unpacks the session's current workspace archive into a shared
+// emptyDir, then Kaniko building from it. SecurityContext matches
 // buildPod's own restrictive posture in pkg/cluster/direct.go exactly
 // (drop ALL capabilities, no privilege escalation, RuntimeDefault
-// seccomp), since a build workload gets no special exemption from the
-// isolation model the rest of the platform runs under.
+// seccomp) on BOTH containers, since a build workload gets no special
+// exemption from the isolation model the rest of the platform runs under.
 func (s *Service) buildPod(podName string, req Request, harborProjectName, imageRef string) *corev1.Pod {
 	cpu := resource.MustParse(fmt.Sprintf("%dm", s.cfg.CPUUnits*1000))
 	memory := resource.MustParse(fmt.Sprintf("%dGi", s.cfg.MemoryGB))
+	fetchCPU := resource.MustParse("200m")
+	fetchMemory := resource.MustParse("256Mi")
+
+	restrictedSecurityContext := &corev1.SecurityContext{
+		AllowPrivilegeEscalation: boolPtr(false),
+		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+	}
 
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -257,6 +280,30 @@ func (s *Service) buildPod(podName string, req Request, harborProjectName, image
 			SecurityContext: &corev1.PodSecurityContext{
 				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			},
+			InitContainers: []corev1.Container{{
+				Name:  "fetch-workspace",
+				Image: s.cfg.FetchImage,
+				// A short-lived, session-scoped token (see
+				// MintWorkspaceFetchToken) — referenced via env expansion
+				// rather than baked into the command string, the same
+				// "credential lives in env, not argv" convention
+				// LaunchAgent's own TEEPIN_SESSION_TOKEN already uses.
+				Command: []string{"sh", "-c",
+					`set -e; wget -q --header="Authorization: Bearer $TEEPIN_TOKEN" -O /tmp/workspace.zip "$TEEPIN_ARCHIVE_URL"; unzip -o -q /tmp/workspace.zip -d /workspace; rm -f /tmp/workspace.zip`,
+				},
+				Env: []corev1.EnvVar{
+					{Name: "TEEPIN_TOKEN", Value: req.WorkspaceToken},
+					{Name: "TEEPIN_ARCHIVE_URL", Value: req.WorkspaceArchiveURL},
+				},
+				VolumeMounts: []corev1.VolumeMount{
+					{Name: "workspace", MountPath: "/workspace"},
+				},
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: fetchCPU, corev1.ResourceMemory: fetchMemory},
+					Limits:   corev1.ResourceList{corev1.ResourceCPU: fetchCPU, corev1.ResourceMemory: fetchMemory},
+				},
+				SecurityContext: restrictedSecurityContext,
+			}},
 			Containers: []corev1.Container{{
 				Name:  "kaniko",
 				Image: s.cfg.KanikoImage,
@@ -273,20 +320,15 @@ func (s *Service) buildPod(podName string, req Request, harborProjectName, image
 					Requests: corev1.ResourceList{corev1.ResourceCPU: cpu, corev1.ResourceMemory: memory},
 					Limits:   corev1.ResourceList{corev1.ResourceCPU: cpu, corev1.ResourceMemory: memory},
 				},
-				SecurityContext: &corev1.SecurityContext{
-					AllowPrivilegeEscalation: boolPtr(false),
-					Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
-				},
+				SecurityContext: restrictedSecurityContext,
 			}},
 			Volumes: []corev1.Volume{
 				{
-					Name: "workspace",
-					VolumeSource: corev1.VolumeSource{
-						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-							ClaimName: cluster.PVCName(req.AgentInstanceID),
-							ReadOnly:  true,
-						},
-					},
+					// Populated by the fetch-workspace initContainer above,
+					// not a PVC — see Request.WorkspaceArchiveURL's own doc
+					// comment on why this replaced mounting the agent's PVC.
+					Name:         "workspace",
+					VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
 				},
 				{
 					Name: "docker-config",

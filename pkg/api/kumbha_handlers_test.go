@@ -16,9 +16,11 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/FlashbackAi/teepin-core/pkg/auth"
 	"github.com/FlashbackAi/teepin-core/pkg/billing"
+	"github.com/FlashbackAi/teepin-core/pkg/build"
 	"github.com/FlashbackAi/teepin-core/pkg/compute"
 	"github.com/FlashbackAi/teepin-core/pkg/inference"
 	"github.com/FlashbackAi/teepin-core/pkg/kumbha"
@@ -305,8 +307,8 @@ func TestKumbhaChatCompletions_Success(t *testing.T) {
 		WithArgs(sessionID, testAccountID).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "account_id", "project_id", "budget", "spent", "status", "label",
-			"agent_instance_id", "deploy_approved", "started_at", "ended_at",
-		}).AddRow(sessionID, testAccountID, uuid.New(), 5.0, 0.0, "open", nil, nil, false, nowStub(), nil))
+			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
+		}).AddRow(sessionID, testAccountID, uuid.New(), 5.0, 0.0, "open", nil, nil, nil, false, nowStub(), nil))
 
 	wantCost := 100.0/1e6*2.0 + 20.0/1e6*8.0
 	mock.ExpectBegin()
@@ -372,5 +374,464 @@ func TestParseCompletionRequest_RejectsInvalidJSON(t *testing.T) {
 	_, err := parseCompletionRequest([]byte(`not json`))
 	if err == nil {
 		t.Error("expected an error for invalid JSON")
+	}
+}
+
+// --- BuildKumbhaSession ---
+
+func newTestBuildService() *build.Service {
+	return build.NewService(fake.NewSimpleClientset(), nil, build.DefaultConfig())
+}
+
+func TestBuildKumbhaSession_NoBuildServiceIs404(t *testing.T) {
+	_, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	server := (&Server{store: cStore}).WithKumbha(gw) // no WithKumbhaBuild
+
+	sessionID, projectID := uuid.New(), uuid.New()
+	w := kumbhaRequest(server.BuildKumbhaSession, http.MethodPost, "/v1/kumbha/sessions/"+sessionID.String()+"/build",
+		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, map[string]string{}, nil)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+func TestBuildKumbhaSession_SessionNotFoundIs404(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	server := (&Server{store: cStore}).WithKumbha(gw).WithKumbhaBuild(newTestBuildService())
+
+	sessionID, projectID := uuid.New(), uuid.New()
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnError(sqlNoRows())
+
+	w := kumbhaRequest(server.BuildKumbhaSession, http.MethodPost, "/v1/kumbha/sessions/"+sessionID.String()+"/build",
+		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, map[string]string{}, nil)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+// --- DeployKumbhaSession ---
+//
+// DeployKumbhaSession shares buildKumbhaImage with BuildKumbhaSession, so
+// its guard-path tests mirror BuildKumbhaSession's own (not-configured/
+// not-found/not-approved/no-workspace) — what's new and worth testing
+// SEPARATELY is invokeInternally, the mechanism that lets this handler
+// reuse CreateInstance/DeleteInstance without a second implementation of
+// GPU/home placement, the payment gate, or billing (see its own doc
+// comment). The full build-then-create success path needs a real Kaniko
+// pod transitioning to Succeeded plus a working Harbor client — the same
+// live-infra boundary pkg/build's own tests already stop at (they test
+// buildPod/waitForCompletion in isolation, never Build() end-to-end) —
+// so it is not re-attempted here.
+
+func TestDeployKumbhaSession_NoBuildServiceIs404(t *testing.T) {
+	_, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	server := (&Server{store: cStore}).WithKumbha(gw) // no WithKumbhaBuild
+
+	sessionID, projectID := uuid.New(), uuid.New()
+	w := kumbhaRequest(server.DeployKumbhaSession, http.MethodPost, "/v1/kumbha/sessions/"+sessionID.String()+"/deploy",
+		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, map[string]string{}, nil)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+func TestDeployKumbhaSession_SessionNotFoundIs404(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	server := (&Server{store: cStore}).WithKumbha(gw).WithKumbhaBuild(newTestBuildService())
+
+	sessionID, projectID := uuid.New(), uuid.New()
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnError(sqlNoRows())
+
+	w := kumbhaRequest(server.DeployKumbhaSession, http.MethodPost, "/v1/kumbha/sessions/"+sessionID.String()+"/deploy",
+		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, map[string]string{}, nil)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+func TestDeployKumbhaSession_NotApprovedIs403(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	server := (&Server{store: cStore}).WithKumbha(gw).WithKumbhaBuild(newTestBuildService())
+
+	sessionID, projectID := uuid.New(), uuid.New()
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnRows(sessionRow(sessionID)) // deploy_approved=false
+
+	w := kumbhaRequest(server.DeployKumbhaSession, http.MethodPost, "/v1/kumbha/sessions/"+sessionID.String()+"/deploy",
+		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, map[string]string{}, nil)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+func TestDeployKumbhaSession_NoWorkspaceIs409(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	server := (&Server{store: cStore}).WithKumbha(gw).WithKumbhaBuild(newTestBuildService())
+
+	sessionID, projectID := uuid.New(), uuid.New()
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnRows(deployApprovedSessionRow(sessionID))
+	mock.ExpectQuery(`SELECT current_workspace_version FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnRows(sqlmock.NewRows([]string{"current_workspace_version"}).AddRow(nil))
+
+	w := kumbhaRequest(server.DeployKumbhaSession, http.MethodPost, "/v1/kumbha/sessions/"+sessionID.String()+"/deploy",
+		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, map[string]string{}, nil)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+// echoIdentityHandler is a minimal gin.HandlerFunc that reports back
+// exactly what invokeInternally put into the synthetic context — used to
+// verify the dispatch mechanism itself (identity, params, body) rather
+// than any real business logic.
+func echoIdentityHandler(c *gin.Context) {
+	accountID, _ := auth.GetAccountID(c)
+	projectID, _ := auth.GetProjectID(c)
+	userID, _ := auth.GetUserID(c)
+	var body map[string]any
+	_ = c.ShouldBindJSON(&body)
+	c.JSON(http.StatusTeapot, gin.H{
+		"account_id": accountID.String(),
+		"project_id": projectID.String(),
+		"user_id":    userID.String(),
+		"param_id":   c.Param("id"),
+		"body":       body,
+	})
+}
+
+func TestInvokeInternally_CarriesIdentityParamsAndBodyThrough(t *testing.T) {
+	_, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	server := (&Server{store: cStore}).WithKumbha(gw)
+
+	accountID, projectID, userID := uuid.New(), uuid.New(), uuid.New()
+	status, body := server.invokeInternally(echoIdentityHandler, http.MethodPost, "/v1/internal/echo/abc123",
+		gin.Params{{Key: "id", Value: "abc123"}}, accountID, projectID, userID, map[string]string{"k": "v"})
+
+	if status != http.StatusTeapot {
+		t.Fatalf("status = %d, want %d (body: %s)", status, http.StatusTeapot, body)
+	}
+	var resp struct {
+		AccountID string         `json:"account_id"`
+		ProjectID string         `json:"project_id"`
+		UserID    string         `json:"user_id"`
+		ParamID   string         `json:"param_id"`
+		Body      map[string]any `json:"body"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.AccountID != accountID.String() {
+		t.Errorf("account_id = %q, want %q", resp.AccountID, accountID.String())
+	}
+	if resp.ProjectID != projectID.String() {
+		t.Errorf("project_id = %q, want %q", resp.ProjectID, projectID.String())
+	}
+	if resp.UserID != userID.String() {
+		t.Errorf("user_id = %q, want %q", resp.UserID, userID.String())
+	}
+	if resp.ParamID != "abc123" {
+		t.Errorf("param_id = %q, want abc123", resp.ParamID)
+	}
+	if resp.Body["k"] != "v" {
+		t.Errorf("body = %v, want {k: v} to have round-tripped", resp.Body)
+	}
+}
+
+func TestInvokeInternally_OmitsUserIDFromContextWhenNil(t *testing.T) {
+	_, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	server := (&Server{store: cStore}).WithKumbha(gw)
+
+	_, body := server.invokeInternally(echoIdentityHandler, http.MethodPost, "/v1/internal/echo",
+		nil, uuid.New(), uuid.New(), uuid.Nil, nil)
+
+	var resp struct {
+		UserID string `json:"user_id"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.UserID != uuid.Nil.String() {
+		t.Errorf("user_id = %q, want the zero UUID (no attribution) when userID is uuid.Nil", resp.UserID)
+	}
+}
+
+func TestBuildKumbhaSession_NotApprovedIs403(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	server := (&Server{store: cStore}).WithKumbha(gw).WithKumbhaBuild(newTestBuildService())
+
+	sessionID, projectID := uuid.New(), uuid.New()
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnRows(sessionRow(sessionID)) // deploy_approved=false by default
+
+	w := kumbhaRequest(server.BuildKumbhaSession, http.MethodPost, "/v1/kumbha/sessions/"+sessionID.String()+"/build",
+		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, map[string]string{}, nil)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+// deployApprovedSessionRow is sessionRow with deploy_approved flipped —
+// TestBuildKumbhaSession_NoWorkspaceIs409 and the agent-not-configured
+// test both need a session past the approval gate.
+func deployApprovedSessionRow(sessionID uuid.UUID) *sqlmock.Rows {
+	return sqlmock.NewRows([]string{
+		"id", "account_id", "project_id", "budget", "spent", "status", "label",
+		"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
+	}).AddRow(sessionID, testAccountID, uuid.New(), 5.0, 0.0, "open", nil, nil, nil, true, nowStub(), nil)
+}
+
+func TestBuildKumbhaSession_NoWorkspaceIs409(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	server := (&Server{store: cStore}).WithKumbha(gw).WithKumbhaBuild(newTestBuildService())
+
+	sessionID, projectID := uuid.New(), uuid.New()
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnRows(deployApprovedSessionRow(sessionID))
+	mock.ExpectQuery(`SELECT current_workspace_version FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnRows(sqlmock.NewRows([]string{"current_workspace_version"}).AddRow(nil))
+
+	w := kumbhaRequest(server.BuildKumbhaSession, http.MethodPost, "/v1/kumbha/sessions/"+sessionID.String()+"/build",
+		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, map[string]string{}, nil)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+// --- SendKumbhaMessage / PollKumbhaMessages ---
+
+func fakeMintKumbhaToken(_, _, _ uuid.UUID, _ time.Duration) (string, error) {
+	return "fake-agent-token", nil
+}
+
+// closedSessionRow is sessionRow with status flipped to closed — the
+// customer-side chat handler must refuse a message to a session with
+// nothing left running to ever receive it.
+func closedSessionRow(sessionID uuid.UUID) *sqlmock.Rows {
+	return sqlmock.NewRows([]string{
+		"id", "account_id", "project_id", "budget", "spent", "status", "label",
+		"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
+	}).AddRow(sessionID, testAccountID, uuid.New(), 5.0, 0.0, "closed", nil, nil, nil, false, nowStub(), nowStub())
+}
+
+func TestSendKumbhaMessage_NotAvailableWhenKumbhaNil(t *testing.T) {
+	server := &Server{}
+	sessionID, projectID := uuid.New(), uuid.New()
+	w := kumbhaRequest(server.SendKumbhaMessage, http.MethodPost, "/v1/kumbha/sessions/"+sessionID.String()+"/messages",
+		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, map[string]string{"content": "hi"}, nil)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+func TestSendKumbhaMessage_SessionNotFoundIs404(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	server := (&Server{store: cStore}).WithKumbha(gw)
+
+	sessionID, projectID := uuid.New(), uuid.New()
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnError(sqlNoRows())
+
+	w := kumbhaRequest(server.SendKumbhaMessage, http.MethodPost, "/v1/kumbha/sessions/"+sessionID.String()+"/messages",
+		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, map[string]string{"content": "hi"}, nil)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+func TestSendKumbhaMessage_ClosedSessionIs409(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	server := (&Server{store: cStore}).WithKumbha(gw)
+
+	sessionID, projectID := uuid.New(), uuid.New()
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnRows(closedSessionRow(sessionID))
+
+	w := kumbhaRequest(server.SendKumbhaMessage, http.MethodPost, "/v1/kumbha/sessions/"+sessionID.String()+"/messages",
+		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, map[string]string{"content": "hi"}, nil)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+// The common case: an already-running agent pod, so the message is just
+// queued for its own poll loop — mirrors kumbha's own
+// TestGateway_DeliverMessage_QueuesWhenAgentRunning, exercised here
+// through the actual HTTP handler.
+func TestSendKumbhaMessage_QueuesWhenAgentRunning(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	fc := newFakeCluster()
+	sessionID, projectID := uuid.New(), uuid.New()
+	fc.add("kumbha-agent-abc", projectID.String(), "running")
+
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{}).
+		WithAgent(fc, fakeMintKumbhaToken, kumbha.AgentConfig{})
+	server := (&Server{store: cStore}).WithKumbha(gw)
+
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "account_id", "project_id", "budget", "spent", "status", "label",
+			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
+		}).AddRow(sessionID, testAccountID, projectID, 5.0, 0.0, "open", nil, "kumbha-agent-abc", nil, false, nowStub(), nil))
+	mock.ExpectQuery(`INSERT INTO billing\.kumbha_messages`).
+		WithArgs(sessionID, "add a footer").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(1), nowStub()))
+
+	w := kumbhaRequest(server.SendKumbhaMessage, http.MethodPost, "/v1/kumbha/sessions/"+sessionID.String()+"/messages",
+		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, map[string]string{"content": "add a footer"}, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Delivered  bool `json:"delivered"`
+		Relaunched bool `json:"relaunched"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !resp.Delivered || resp.Relaunched {
+		t.Errorf("got %+v, want delivered=true relaunched=false", resp)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestSendKumbhaMessage_EmptyContentIs400(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	fc := newFakeCluster()
+	sessionID, projectID := uuid.New(), uuid.New()
+	fc.add("kumbha-agent-abc", projectID.String(), "running")
+
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{}).
+		WithAgent(fc, fakeMintKumbhaToken, kumbha.AgentConfig{})
+	server := (&Server{store: cStore}).WithKumbha(gw)
+
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "account_id", "project_id", "budget", "spent", "status", "label",
+			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
+		}).AddRow(sessionID, testAccountID, projectID, 5.0, 0.0, "open", nil, "kumbha-agent-abc", nil, false, nowStub(), nil))
+
+	w := kumbhaRequest(server.SendKumbhaMessage, http.MethodPost, "/v1/kumbha/sessions/"+sessionID.String()+"/messages",
+		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, map[string]string{"content": ""}, nil)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+func TestPollKumbhaMessages_RequiresSessionCredential(t *testing.T) {
+	_, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	server := (&Server{store: cStore}).WithKumbha(gw)
+
+	sessionID := uuid.New()
+	w := kumbhaRequest(server.PollKumbhaMessages, http.MethodGet, "/v1/kumbha/sessions/"+sessionID.String()+"/messages/poll",
+		gin.Params{{Key: "id", Value: sessionID.String()}}, uuid.Nil, nil, nil)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+func TestPollKumbhaMessages_RejectsMismatchedSession(t *testing.T) {
+	_, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	server := (&Server{store: cStore}).WithKumbha(gw)
+
+	credentialSession, pathSession := uuid.New(), uuid.New()
+	w := agentRequest(server.PollKumbhaMessages, http.MethodGet, "/v1/kumbha/sessions/"+pathSession.String()+"/messages/poll",
+		gin.Params{{Key: "id", Value: pathSession.String()}}, credentialSession, nil)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+func TestPollKumbhaMessages_Success(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	server := (&Server{store: cStore}).WithKumbha(gw)
+
+	sessionID := uuid.New()
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT id, content, created_at FROM billing\.kumbha_messages`).
+		WithArgs(sessionID).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "content", "created_at"}).
+			AddRow(int64(1), "add a footer", nowStub()))
+	mock.ExpectExec(`UPDATE billing\.kumbha_messages SET delivered_at = NOW\(\)`).
+		WithArgs(sessionID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	w := agentRequest(server.PollKumbhaMessages, http.MethodGet, "/v1/kumbha/sessions/"+sessionID.String()+"/messages/poll",
+		gin.Params{{Key: "id", Value: sessionID.String()}}, sessionID, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Messages []struct {
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(resp.Messages) != 1 || resp.Messages[0].Content != "add a footer" {
+		t.Errorf("got %+v, want one message \"add a footer\"", resp.Messages)
+	}
+}
+
+// A session with a saved workspace and an approved plan, but the Gateway
+// never got WithAgent (no APIBaseURL/token minter configured) — the build
+// pipeline itself is present (kumbhaBuild != nil), but nothing can mint the
+// fetch-workspace initContainer its credential, so this must degrade to
+// the same honest "not available" 404 as no build service at all, not a
+// 500.
+func TestBuildKumbhaSession_AgentNotConfiguredIs404(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	server := (&Server{store: cStore}).WithKumbha(gw).WithKumbhaBuild(newTestBuildService())
+
+	sessionID, projectID := uuid.New(), uuid.New()
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnRows(deployApprovedSessionRow(sessionID))
+	mock.ExpectQuery(`SELECT current_workspace_version FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnRows(sqlmock.NewRows([]string{"current_workspace_version"}).AddRow(1))
+	mock.ExpectQuery(`FROM billing\.kumbha_workspace_versions v`).
+		WithArgs(sessionID, testAccountID, 1).
+		WillReturnRows(sqlmock.NewRows([]string{"version", "files", "skipped", "file_count", "byte_size", "created_by", "created_at"}).
+			AddRow(1, `[{"path":"index.html","content":"<h1>hi</h1>"}]`, `[]`, 1, 11, "agent", nowStub()))
+
+	w := kumbhaRequest(server.BuildKumbhaSession, http.MethodPost, "/v1/kumbha/sessions/"+sessionID.String()+"/build",
+		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, map[string]string{}, nil)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (body: %s)", w.Code, w.Body.String())
 	}
 }

@@ -362,14 +362,25 @@ type deployArgs struct {
 	Env            map[string]string `json:"env,omitempty"`
 }
 
-// deploy builds the current workspace into an image (Kaniko, via the
-// control plane — see /v1/kumbha/sessions/:id/build) and runs it as a
-// real Teepin instance. If no build pipeline is configured on this
-// deployment, the control plane's own 404 for that endpoint surfaces
-// here as a clear "not available" message rather than a confusing raw
-// error — the honest-degradation behaviour this verb had before the
-// build pipeline existed, now reached only when the platform genuinely
-// lacks one.
+// deploy builds the session's current workspace version and runs it as a
+// real Teepin instance, via the SAME control-plane endpoint the console
+// IDE's own Deploy button calls (POST /v1/kumbha/sessions/:id/deploy) —
+// not a second implementation of build-then-create. That convergence
+// matters beyond just avoiding duplicate code: the control plane tracks
+// which compute instance belongs to a session (app_instance_id, see
+// migration 026) so a redeploy tears down the PREVIOUS one instead of
+// leaking an orphan on every call — a guarantee that only holds if every
+// path that can deploy for this session goes through the one endpoint
+// that does the tracking. If the agent deployed via its own separate
+// create_instance call here instead, a customer's later click of the
+// console's Deploy button would have no way to know that instance
+// existed, and vice versa.
+//
+// If no build pipeline is configured on this deployment, the control
+// plane's own 404 for this endpoint surfaces here as a clear "not
+// available" message rather than a confusing raw error — the
+// honest-degradation behaviour this verb had before the build pipeline
+// existed, now reached only when the platform genuinely lacks one.
 func (c *teepinClient) deploy(ctx context.Context, req *mcp.CallToolRequest, args deployArgs) (*mcp.CallToolResult, any, error) {
 	approved, err := c.deployApproved(ctx)
 	if err != nil {
@@ -384,26 +395,62 @@ func (c *teepinClient) deploy(ctx context.Context, req *mcp.CallToolRequest, arg
 		dockerfilePath = "Dockerfile"
 	}
 
-	var built struct {
-		ImageRef string `json:"image_ref"`
+	body := map[string]any{
+		"dockerfile_path": dockerfilePath,
+		"name":            args.Name,
+		"cpu_units":       args.CPUUnits,
+		"memory_gb":       args.MemoryGB,
+		"storage_gb":      args.StorageGB,
+		"env":             args.Env,
 	}
-	buildErr := c.doJSON(ctx, http.MethodPost, "/v1/kumbha/sessions/"+c.sessionID+"/build",
-		map[string]any{"dockerfile_path": dockerfilePath}, &built)
-	if buildErr != nil {
-		if isNotAvailable(buildErr) {
-			return textResult("Building the workspace into a running instance is not available on " +
-				"this deployment (no source-to-image build pipeline is configured). If an image for " +
-				"this app already exists in a registry, use create_instance with that image instead.")
+	if len(args.Ports) > 0 {
+		portsOut := make([]map[string]any, len(args.Ports))
+		for i, p := range args.Ports {
+			portsOut[i] = map[string]any{"container": p.Container, "protocol": p.Protocol}
 		}
-		return textResult("The build failed: %s", buildErr.Error())
+		body["ports"] = portsOut
 	}
 
-	instance, err := c.provisionInstance(ctx, args.Name, built.ImageRef, args.CPUUnits, args.MemoryGB, args.StorageGB, args.Ports, args.Env, nil, nil)
-	if err != nil {
-		return nil, nil, err
+	var deployed struct {
+		ImageRef     string  `json:"image_ref"`
+		InstanceID   string  `json:"instance_id"`
+		Endpoint     string  `json:"endpoint"`
+		Status       string  `json:"status"`
+		PricePerHour float64 `json:"price_per_hour"`
 	}
-	return textResult("Built %s and created instance %s (status: %s). Endpoint: %s. Cost: $%.4f/hour.",
-		built.ImageRef, instance.ID, instance.Status, instance.Endpoint, instance.Price)
+	deployErr := c.doJSON(ctx, http.MethodPost, "/v1/kumbha/sessions/"+c.sessionID+"/deploy", body, &deployed)
+	if deployErr != nil {
+		if isNotAvailable(deployErr) {
+			// Deliberately worded as a DEAD END, not a hint to try something
+			// else. The earlier phrasing ("...use create_instance with that
+			// image instead") read as a workaround worth hunting for, and an
+			// agent did exactly that — found live 2026-08-25: after this
+			// message, one build spent thousands of reasoning tokens across
+			// a dozen turns re-reading the tool descriptions, theorising
+			// about Docker Hub, pushing an image itself, or some hidden
+			// build-from-workspace mode, none of which exist. There is no
+			// path: the agent cannot build an image (no pipeline here) and
+			// cannot push one (no registry credentials, and its egress is
+			// not a substitute), so create_instance is only reachable if the
+			// CUSTOMER already has a pullable image, which is not something
+			// the agent can arrange for itself. Saying so plainly, and
+			// telling it exactly what to do instead, is what stops the
+			// budget-burning search.
+			return textResult("DEPLOYMENT IS NOT POSSIBLE IN THIS ENVIRONMENT. There is no " +
+				"source-to-image build pipeline configured here, and you have no way to build or " +
+				"push a container image yourself — no registry credentials, no image builder. " +
+				"Do NOT try to work around this: there is no alternative path, and no other tool " +
+				"or command will succeed. Stop attempting to deploy. Tell the customer the app is " +
+				"built and ready in the workspace but cannot be deployed from here yet, summarise " +
+				"what you built, and end your turn. (create_instance works ONLY if the customer " +
+				"independently supplies an already-published image reference — it is not something " +
+				"you can produce.)")
+		}
+		return textResult("The deploy failed: %s", deployErr.Error())
+	}
+
+	return textResult("Built %s and deployed instance %s (status: %s). Endpoint: %s. Cost: $%.4f/hour.",
+		deployed.ImageRef, deployed.InstanceID, deployed.Status, deployed.Endpoint, deployed.PricePerHour)
 }
 
 // isNotAvailable reports whether an error from doJSON came from a 404 —

@@ -5,7 +5,10 @@ package kumbha
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -53,6 +56,17 @@ type AgentConfig struct {
 	// project/robot account/secret behind this name is operator-provisioned
 	// once, out of band, directly against whichever cluster runs the pods.
 	ImagePullSecret string
+	// VisionCapable gates whether the agent's browser_screenshot tool
+	// attaches the actual screenshot for the model to look at, versus
+	// text-only console/network/page signals (see deploy/kumbha-agent/
+	// browser_tool.py's module docstring). Operator-set, not
+	// auto-detected: sending an image content block to a route whose
+	// model cannot handle multimodal input is a real risk (a
+	// malformed/rejected request breaks the whole next model turn, not
+	// just the screenshot itself), so this defaults to false (safe) until
+	// an operator has actually confirmed the hosted model supports
+	// vision.
+	VisionCapable bool
 }
 
 // TokenMinter mints the agent's own short-lived, session-scoped
@@ -120,10 +134,11 @@ func (g *Gateway) LaunchAgent(ctx context.Context, sess *Session, prompt string)
 			// The agent's own credential and everything it needs to start
 			// working — never a platform-wide token, never long-lived (see
 			// TokenMinter's doc comment and MintSessionToken).
-			"TEEPIN_SESSION_TOKEN": token,
-			"TEEPIN_SESSION_ID":    sess.ID.String(),
-			"TEEPIN_PROMPT":        prompt,
-			"TEEPIN_API_BASE_URL":  g.agentConfig.APIBaseURL,
+			"TEEPIN_SESSION_TOKEN":  token,
+			"TEEPIN_SESSION_ID":     sess.ID.String(),
+			"TEEPIN_PROMPT":         prompt,
+			"TEEPIN_API_BASE_URL":   g.agentConfig.APIBaseURL,
+			"TEEPIN_VISION_CAPABLE": strconv.FormatBool(g.agentConfig.VisionCapable),
 		},
 		Labels:             map[string]string{agentLabel: "true"},
 		CPUUnits:           g.agentConfig.CPUUnits,
@@ -164,4 +179,101 @@ func (g *Gateway) LaunchAgent(ctx context.Context, sess *Session, prompt string)
 	}
 	sess.AgentInstanceID = podID
 	return nil
+}
+
+// MintWorkspaceFetchToken mints a short-lived credential authorising
+// exactly a GET of this session's current workspace archive, plus the URL
+// to fetch it from. Used by the build pipeline's Kaniko pod: an
+// initContainer fetches the archive over HTTP using this token and unpacks
+// it as the build context, instead of mounting the agent's own live PVC —
+// so a customer's IDE edit or a rollback (both of which only ever change
+// what pkg/kumbha/workspace.go considers "current", never the agent pod's
+// own working copy) is what actually gets built, not whatever the agent's
+// pod happens to still have on disk.
+//
+// Reuses the exact same TokenMinter and APIBaseURL WithAgent already
+// configured — same trust boundary and TTL policy as the agent's own
+// credential, not a second mechanism to keep in sync. Returns
+// ErrAgentNotConfigured if WithAgent was never called: without it there is
+// no APIBaseURL to build a reachable URL from, so there is nothing this
+// method could correctly return.
+func (g *Gateway) MintWorkspaceFetchToken(sess *Session, ttl time.Duration) (token, archiveURL string, err error) {
+	if g.mintToken == nil || g.agentConfig.APIBaseURL == "" {
+		return "", "", ErrAgentNotConfigured
+	}
+	token, err = g.mintToken(sess.AccountID, sess.ProjectID, sess.ID, ttl)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to mint workspace fetch token: %w", err)
+	}
+	archiveURL = strings.TrimRight(g.agentConfig.APIBaseURL, "/") +
+		"/v1/kumbha/sessions/" + sess.ID.String() + "/workspace/archive"
+	return token, archiveURL, nil
+}
+
+// isAgentRunning reports whether a session's agent pod is currently
+// pending or running — "will eventually reach its poll loop", not
+// "idle right now". A pod mid-completion still counts: it will pick up
+// a queued message once its current turn ends. False (with no error) for
+// both "no agent has ever been launched" and "the pod has exited" — the
+// caller (DeliverMessage) treats both the same way, by launching one.
+func (g *Gateway) isAgentRunning(ctx context.Context, sess *Session) (bool, error) {
+	if g.cluster == nil || sess.AgentInstanceID == "" {
+		return false, nil
+	}
+	status, err := g.cluster.GetInstanceStatus(ctx, cluster.ProjectScope(sess.ProjectID.String()), sess.AgentInstanceID)
+	if err != nil {
+		if errors.Is(err, cluster.ErrNotFound) {
+			return false, nil
+		}
+		// An ambiguous failure (cluster unreachable, etc.) is NOT the same
+		// as "confirmed gone" — propagate rather than guess and risk
+		// launching a duplicate agent pod alongside one that is actually
+		// still fine.
+		return false, fmt.Errorf("failed to check agent status: %w", err)
+	}
+	return status.Status == "pending" || status.Status == "running", nil
+}
+
+// DeliverMessage is the whole of "chat + resume": queue a follow-up for
+// the agent's own poll loop to pick up if it's still alive (run.py's
+// wait_for_next_instruction, resuming the SAME conversation with full
+// history intact — nothing about a queued message launches a new agent by
+// itself), or relaunch the agent with the message as a fresh prompt if the
+// previous pod already exited.
+//
+// The relaunch path is an honest, bounded degradation, not real
+// conversation persistence: a relaunched agent has NO memory of what it
+// discussed before (no persistence_dir/conversation_id wiring exists
+// yet — a real follow-up item, not silently glossed over here) — but the
+// WORKSPACE it built is still there (versioned, on disk via the PVC), and
+// the relaunch prompt says so explicitly, so the agent inspects what
+// exists rather than starting over or contradicting itself.
+//
+// Returns relaunched=true when a new agent pod was started rather than an
+// existing one resuming — the caller (SendMessage's HTTP handler) surfaces
+// this so the console can explain a longer-than-usual wait before the
+// activity feed picks back up.
+func (g *Gateway) DeliverMessage(ctx context.Context, sess *Session, content string) (relaunched bool, err error) {
+	running, err := g.isAgentRunning(ctx, sess)
+	if err != nil {
+		return false, err
+	}
+	if running {
+		if _, err := g.store.SendMessage(ctx, sess.ID, content); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+
+	if g.mintToken == nil {
+		return false, ErrAgentNotConfigured
+	}
+	resumePrompt := "The customer sent a new message after your previous run ended: \"" + content + "\"\n\n" +
+		"Your workspace already contains what you built before this message — inspect its current " +
+		"contents before making any change, and do not discard or rewrite existing work unless the " +
+		"customer explicitly asks you to."
+	if err := g.LaunchAgent(ctx, sess, resumePrompt); err != nil {
+		return false, err
+	}
+	return true, nil
 }
