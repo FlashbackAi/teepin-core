@@ -21,6 +21,7 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/cluster"
 	"github.com/FlashbackAi/teepin-core/pkg/compute"
 	"github.com/FlashbackAi/teepin-core/pkg/gpu"
+	"github.com/FlashbackAi/teepin-core/pkg/models"
 )
 
 func init() {
@@ -1043,5 +1044,68 @@ func TestImagePorts_UnresolvableImageReturns200WithEmptyPorts(t *testing.T) {
 	}
 	if len(resp.Ports) != 0 {
 		t.Errorf("ports = %+v, want empty for a non-allowlisted registry", resp.Ports)
+	}
+}
+
+// TestInstanceSpec_AutoAttachesKumbhaBuildPullSecretOnlyForItsOwnImages
+// is the regression test for a real 2026-08-26 incident: a Kumbha
+// deploy built and pushed its own image cleanly, then failed to create
+// the resulting instance with "pull access denied ... no basic auth
+// credentials" — nothing had ever wired a pull credential for it.
+// Confirms the fix (instanceSpec auto-attaching
+// kumbhaBuildImagePullSecret) is scoped strictly to images whose
+// reference starts with the configured Kumbha build registry prefix —
+// an ordinary customer image (any other registry) must never get it.
+func TestInstanceSpec_AutoAttachesKumbhaBuildPullSecretOnlyForItsOwnImages(t *testing.T) {
+	s := (&Server{}).WithKumbhaBuildImagePullSecret(
+		"880254196251.dkr.ecr.us-east-1.amazonaws.com/teepin/kumbha-builds-dev",
+		"teepin-kumbha-ecr",
+	)
+
+	kumbhaSpec := s.instanceSpec("inst-1", uuid.New(), uuid.New(), uuid.New(), &models.CreateInstanceRequest{
+		Image: "880254196251.dkr.ecr.us-east-1.amazonaws.com/teepin/kumbha-builds-dev:4ab155f0",
+	}, nil)
+	if kumbhaSpec.ImagePullSecret != "teepin-kumbha-ecr" {
+		t.Errorf("Kumbha-built image: ImagePullSecret = %q, want \"teepin-kumbha-ecr\"", kumbhaSpec.ImagePullSecret)
+	}
+
+	ordinarySpec := s.instanceSpec("inst-2", uuid.New(), uuid.New(), uuid.New(), &models.CreateInstanceRequest{
+		Image: "nginx:latest",
+	}, nil)
+	if ordinarySpec.ImagePullSecret != "" {
+		t.Errorf("ordinary customer image: ImagePullSecret = %q, want empty — must never borrow the Kumbha build secret", ordinarySpec.ImagePullSecret)
+	}
+}
+
+func TestInstanceSpec_NoPullSecretWhenNotConfigured(t *testing.T) {
+	s := &Server{} // WithKumbhaBuildImagePullSecret never called
+
+	spec := s.instanceSpec("inst-1", uuid.New(), uuid.New(), uuid.New(), &models.CreateInstanceRequest{
+		Image: "nginx:latest",
+	}, nil)
+	if spec.ImagePullSecret != "" {
+		t.Errorf("ImagePullSecret = %q, want empty when the feature is not configured at all", spec.ImagePullSecret)
+	}
+}
+
+// TestInstanceSpec_GrantsFilesystemOwnershipChangesToEveryCustomerInstance
+// is the regression test for a real 2026-08-26 finding: nginx's own
+// completely standard docker-entrypoint startup dance (chown to drop
+// from root to its own less-privileged user) failed outright under the
+// platform's "drop ALL capabilities" pod policy — the same failure class
+// already fixed narrowly for Kaniko. Confirmed directly with the
+// platform owner as the intended trade-off (not decided unilaterally)
+// before broadening it here to every ordinary customer instance, since
+// it weakens isolation for customer-controlled images, not just Teepin's
+// own trusted build tooling.
+func TestInstanceSpec_GrantsFilesystemOwnershipChangesToEveryCustomerInstance(t *testing.T) {
+	s := &Server{}
+
+	spec := s.instanceSpec("inst-1", uuid.New(), uuid.New(), uuid.New(), &models.CreateInstanceRequest{
+		Image: "nginx:alpine",
+	}, nil)
+
+	if !spec.AllowFilesystemOwnershipChanges {
+		t.Error("AllowFilesystemOwnershipChanges = false, want true for every customer instance — nginx's own startup chown would fail otherwise")
 	}
 }

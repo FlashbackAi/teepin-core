@@ -233,6 +233,43 @@ func (c instanceCluster) ListInstanceStatuses(context.Context, cluster.Scope) ([
 	return c.instances, nil
 }
 
+// capturingCluster records the InstanceSpec CreateInstance was actually
+// called with, so a test can assert on how a command was decoded rather
+// than only on whether the call succeeded.
+type capturingCluster struct {
+	nullCluster
+	captured cluster.InstanceSpec
+}
+
+func (c *capturingCluster) CreateInstance(_ context.Context, spec cluster.InstanceSpec) (*cluster.InstanceResult, error) {
+	c.captured = spec
+	return &cluster.InstanceResult{PodName: spec.InstanceID}, nil
+}
+
+// TestHandleCreate_DecodesAllowFilesystemOwnershipChanges is a
+// regression test for a real 2026-08-26 incident: a field added to
+// InstanceSpec/PodSecurityContext alone does not reach a home-class
+// provider — this codebase runs in agent mode in production, and every
+// InstanceSpec field needs an explicit round trip through the proto and
+// both translation sites (pkg/cluster/agent.go's encode side, and this
+// package's decode side) or it silently never reaches the local
+// cluster.Client. Confirms the decode half specifically.
+func TestHandleCreate_DecodesAllowFilesystemOwnershipChanges(t *testing.T) {
+	fc := &capturingCluster{}
+	r := New(Config{ProviderID: "test-provider", Cluster: fc})
+	s := newStubStream()
+
+	r.handleCreate(context.Background(), s, "req-1", &agentpb.CreateInstanceCommand{
+		InstanceId:                      "kaniko-build-x",
+		Image:                           "gcr.io/kaniko-project/executor:v1.23.2-debug",
+		AllowFilesystemOwnershipChanges: true,
+	})
+
+	if !fc.captured.AllowFilesystemOwnershipChanges {
+		t.Error("AllowFilesystemOwnershipChanges was not decoded onto the local InstanceSpec")
+	}
+}
+
 // TestReconnect_ReportsEveryInstanceAgain is the regression test for a
 // bug that made running, billed instances invisible to their owner.
 //

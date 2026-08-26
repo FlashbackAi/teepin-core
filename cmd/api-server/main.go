@@ -632,6 +632,29 @@ func main() {
 						log.Printf("⚠️  ECR build registry initialization failed: %v", err)
 					} else {
 						kumbhaRegistry = ecrSvc
+
+						// A deployed Kumbha app's own instance must be able to
+						// PULL the image Kaniko just PUSHED — a different
+						// credential (see WithKumbhaBuildImagePullSecret's own
+						// doc comment for why this is resolved here, once, from
+						// the image's own registry prefix, rather than a
+						// customer-settable field). Found live 2026-08-26: a
+						// real deploy built and pushed cleanly, then failed
+						// instance creation with "pull access denied ... no
+						// basic auth credentials" — nothing had ever wired this.
+						// Best-effort: a failure here disables auto-attach
+						// (deploys keep working for a public image, fail
+						// exactly as they did before this fix for a private
+						// one) rather than blocking the whole build pipeline
+						// from starting.
+						if secretName := getEnv("TEEPIN_KUMBHA_BUILD_IMAGE_PULL_SECRET", ""); secretName != "" {
+							prefix, err := ecrSvc.ImagePrefix(context.Background(), uuid.Nil, "")
+							if err != nil {
+								log.Printf("⚠️  could not resolve the Kumbha build registry's own URI (deploys of a Kumbha-built private image will fail to pull): %v", err)
+							} else {
+								apiServer = apiServer.WithKumbhaBuildImagePullSecret(prefix, secretName)
+							}
+						}
 					}
 				}
 				if kumbhaRegistry != nil {
@@ -1129,6 +1152,7 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 		{
 			kumbhaGroup.POST("/sessions", apiServer.CreateKumbhaSession)
 			kumbhaGroup.GET("/sessions", apiServer.ListKumbhaSessions)
+			kumbhaGroup.POST("/sessions/bulk-delete", apiServer.DeleteKumbhaSessions)
 			kumbhaGroup.GET("/sessions/:id", apiServer.GetKumbhaSession)
 			kumbhaGroup.POST("/sessions/:id/close", apiServer.CloseKumbhaSession)
 			kumbhaGroup.POST("/sessions/:id/approve-deploy", apiServer.ApproveKumbhaDeploy)

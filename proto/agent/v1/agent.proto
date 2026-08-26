@@ -131,6 +131,19 @@ message CreateInstanceCommand {
   // false (default) preserves prior Always behaviour for every other
   // caller.
   bool never_restart = 23;
+
+  // Grants CAP_CHOWN/DAC_OVERRIDE/FOWNER/FSETID/SETFCAP instead of the
+  // default "drop ALL" posture — a narrow, explicit opt-in for the ONE
+  // workload that genuinely needs it: Kaniko (pkg/build.Service), which
+  // must chown/chmod arbitrary files it does not own while unpacking a
+  // base image's layers, inherent to how it reproduces `docker build` in
+  // userspace. Found live 2026-08-26: a real build died on "chown
+  // /etc/shadow: operation not permitted" unpacking nginx:alpine — about
+  // as ordinary a base image as exists, so every real build hit this,
+  // not an edge case. False (default) preserves the fully locked-down
+  // posture for every other caller — see InstanceSpec's own Go doc
+  // comment (pkg/cluster/client.go) for the full reasoning.
+  bool allow_filesystem_ownership_changes = 24;
 }
 
 message PortMapping {

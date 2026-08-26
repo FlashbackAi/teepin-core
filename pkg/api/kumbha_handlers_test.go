@@ -16,6 +16,7 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 
 	"github.com/FlashbackAi/teepin-core/pkg/auth"
 	"github.com/FlashbackAi/teepin-core/pkg/billing"
@@ -836,5 +837,79 @@ func TestBuildKumbhaSession_AgentNotConfiguredIs404(t *testing.T) {
 		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, map[string]string{}, nil)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+// TestDeleteKumbhaSessions_ClosesAnOpenOneThenDeletesBoth exercises the
+// real end-to-end DeleteSessions behavior (2026-08-26 rework): an open
+// session is closed (settling usage, tearing down any agent pod) before
+// the delete, not skipped — a customer's explicit, confirmed delete
+// request is authorization to stop a still-building session too, not
+// just clean up ones that already finished. The other id doesn't belong
+// to this account at all, so it never reaches Close and correctly ends
+// up in "skipped" — existence-must-not-leak, same as everywhere else.
+func TestDeleteKumbhaSessions_ClosesAnOpenOneThenDeletesBoth(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	server := (&Server{store: cStore}).WithKumbha(gw)
+
+	openID, notOwnedID, projectID := uuid.New(), uuid.New(), uuid.New()
+
+	mock.ExpectQuery(`SELECT id, account_id, project_id, budget, spent, status`).
+		WithArgs(openID, testAccountID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "account_id", "project_id", "budget", "spent", "status", "label",
+			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
+		}).AddRow(openID, testAccountID, projectID, 5.0, 0.0, "open", nil, nil, nil, false, nowStub(), nil))
+	mock.ExpectQuery(`UPDATE billing\.inference_sessions`).
+		WithArgs(openID, testAccountID, "closed").
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "account_id", "project_id", "budget", "spent", "status", "label",
+			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
+		}).AddRow(openID, testAccountID, projectID, 5.0, 0.0, "closed", nil, nil, nil, false, nowStub(), nowStub()))
+	mock.ExpectQuery(`SELECT route, provider, input_tokens, output_tokens`).
+		WithArgs(openID).
+		WillReturnRows(sqlmock.NewRows([]string{"route", "provider", "input_tokens", "output_tokens"}))
+
+	mock.ExpectQuery(`SELECT id, account_id, project_id, budget, spent, status`).
+		WithArgs(notOwnedID, testAccountID).
+		WillReturnError(sqlNoRows())
+
+	mock.ExpectQuery(`DELETE FROM billing\.inference_sessions`).
+		WithArgs(testAccountID, pq.Array([]uuid.UUID{openID, notOwnedID})).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(openID))
+
+	w := kumbhaRequest(server.DeleteKumbhaSessions, http.MethodPost, "/v1/kumbha/sessions/bulk-delete", nil,
+		uuid.New(), map[string]any{"ids": []string{openID.String(), notOwnedID.String()}}, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Deleted []string `json:"deleted"`
+		Skipped []string `json:"skipped"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(resp.Deleted) != 1 || resp.Deleted[0] != openID.String() {
+		t.Errorf("got deleted %v, want only %v (closed then deleted)", resp.Deleted, openID)
+	}
+	if len(resp.Skipped) != 1 || resp.Skipped[0] != notOwnedID.String() {
+		t.Errorf("got skipped %v, want only %v (not this account's session)", resp.Skipped, notOwnedID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestDeleteKumbhaSessions_EmptyIDsIs400(t *testing.T) {
+	_, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	server := (&Server{store: cStore}).WithKumbha(gw)
+
+	w := kumbhaRequest(server.DeleteKumbhaSessions, http.MethodPost, "/v1/kumbha/sessions/bulk-delete", nil,
+		uuid.New(), map[string]any{"ids": []string{}}, nil)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", w.Code, w.Body.String())
 	}
 }

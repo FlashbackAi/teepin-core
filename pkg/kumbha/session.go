@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 // maxSessionBudget caps a single session's pre-authorised spend. Mirrors
@@ -367,6 +368,50 @@ func (s *Store) ListByProject(ctx context.Context, accountID, projectID uuid.UUI
 		sessions = append(sessions, &sess)
 	}
 	return sessions, rows.Err()
+}
+
+// Delete removes the given sessions' history — the console's bulk-delete
+// on the "Previous builds" list. Scoped by account (an id belonging to
+// another customer is silently ignored, same existence-must-not-leak
+// posture as everywhere else) and restricted to sessions NOT currently
+// open: an active build has a live agent pod whose session-scoped
+// credential resolves through this exact row (see auth.Middleware's
+// session_id check) — deleting it out from under a running agent would
+// turn its very next request into a confusing 401 instead of a clean
+// close. Best-effort, not all-or-nothing: returns whichever of the
+// requested ids were actually deleted, so one still-open session in a
+// larger batch does not block the rest from being cleaned up.
+//
+// Safe to cascade: billing.kumbha_workspace_versions and
+// billing.kumbha_messages both reference inference_sessions with ON
+// DELETE CASCADE (migrations 025/027) and hold nothing but this session's
+// own source/chat history. billing.usage_records — the actual invoiced
+// ledger — does NOT reference inference_sessions at all (subject_id is a
+// polymorphic string column, migration 024); a deleted build's spend
+// stays on the customer's invoice exactly as it already was.
+func (s *Store) Delete(ctx context.Context, accountID uuid.UUID, ids []uuid.UUID) ([]uuid.UUID, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		DELETE FROM billing.inference_sessions
+		WHERE account_id = $1 AND id = ANY($2) AND status != 'open'
+		RETURNING id
+	`, accountID, pq.Array(ids))
+	if err != nil {
+		return nil, fmt.Errorf("failed to delete sessions: %w", err)
+	}
+	defer rows.Close()
+
+	var deleted []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("failed to scan deleted session id: %w", err)
+		}
+		deleted = append(deleted, id)
+	}
+	return deleted, rows.Err()
 }
 
 func nullIfEmpty(s string) any {

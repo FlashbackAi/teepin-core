@@ -150,6 +150,77 @@ func (s *Server) ListKumbhaSessions(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"sessions": out, "count": len(out)})
 }
 
+// deleteKumbhaSessionsRequest is the body of a bulk-delete call — a POST,
+// not a DELETE with a query-string list, because the id list can
+// plausibly be large (a customer clearing out most of their history) and
+// this keeps the same request shape whether one or many are removed.
+type deleteKumbhaSessionsRequest struct {
+	IDs []string `json:"ids" binding:"required"`
+}
+
+// DeleteKumbhaSessions removes the given sessions from the account's
+// "Previous builds" list — best-effort, not all-or-nothing: an id that is
+// still open (an agent actively building) is silently skipped rather than
+// failing the whole batch, same posture as Store.Delete. The response
+// reports both sets explicitly so the console can tell the customer which
+// selected rows, if any, are still in progress and could not be removed.
+// POST /v1/kumbha/sessions/bulk-delete
+func (s *Server) DeleteKumbhaSessions(c *gin.Context) {
+	if s.kumbha == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha Gateway is not available on this deployment"})
+		return
+	}
+
+	var req deleteKumbhaSessionsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if len(req.IDs) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "ids must not be empty"})
+		return
+	}
+
+	ids := make([]uuid.UUID, 0, len(req.IDs))
+	for _, raw := range req.IDs {
+		id, err := uuid.Parse(raw)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid session id: " + raw})
+			return
+		}
+		ids = append(ids, id)
+	}
+
+	_, accountID, ok := s.requireScope(c)
+	if !ok {
+		return
+	}
+
+	deleted, err := s.kumbha.DeleteSessions(c.Request.Context(), accountID, ids)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	deletedSet := make(map[uuid.UUID]bool, len(deleted))
+	for _, id := range deleted {
+		deletedSet[id] = true
+	}
+	skipped := make([]string, 0, len(ids)-len(deleted))
+	for _, id := range ids {
+		if !deletedSet[id] {
+			skipped = append(skipped, id.String())
+		}
+	}
+
+	deletedStr := make([]string, len(deleted))
+	for i, id := range deleted {
+		deletedStr[i] = id.String()
+	}
+
+	c.JSON(http.StatusOK, gin.H{"deleted": deletedStr, "skipped": skipped})
+}
+
 // CloseKumbhaSession explicitly ends a session and settles its ledger —
 // one usage_records line per (route, direction) the session touched,
 // drawn against the account's credits.
@@ -462,6 +533,16 @@ func (s *Server) DeployKumbhaSession(c *gin.Context) {
 			log.Printf("WARN: Kumbha session %s redeployed but failed to tear down its previous instance %s (status %d): %s",
 				sessionID, previousInstanceID, delStatus, string(delBody))
 		}
+	}
+
+	// The customer-visible "Version history" only ever gains an entry
+	// here — a successful deploy — not on every intermediate agent write
+	// (see CheckpointWorkspace/SaveVersion). Best-effort, same posture as
+	// SetAppInstanceID just above: the app is real and running; failing to
+	// flip a bookkeeping flag is not worth failing the customer's deploy
+	// over, only worth logging so it can be reconciled.
+	if err := s.kumbha.CheckpointWorkspace(c.Request.Context(), sessionID); err != nil {
+		log.Printf("WARN: deployed Kumbha session %s but failed to checkpoint its workspace version: %v", sessionID, err)
 	}
 
 	c.JSON(http.StatusOK, gin.H{

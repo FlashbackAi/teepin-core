@@ -12,6 +12,7 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 func newMockStore(t *testing.T) (*Store, sqlmock.Sqlmock) {
@@ -238,5 +239,43 @@ func TestStore_Close_OnlyClosesAnOpenSession(t *testing.T) {
 	_, err := store.Close(context.Background(), id, accountID, "budget_exhausted")
 	if !errors.Is(err, ErrSessionNotFound) {
 		t.Errorf("got %v, want ErrSessionNotFound (already closed or wrong account)", err)
+	}
+}
+
+func TestStore_Delete_EmptyIDsIsNoQuery(t *testing.T) {
+	store, mock := newMockStore(t)
+	deleted, err := store.Delete(context.Background(), uuid.New(), nil)
+	if err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if len(deleted) != 0 {
+		t.Errorf("got %v, want no deleted ids", deleted)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestStore_Delete_ReturnsExactlyWhatWasDeleted(t *testing.T) {
+	store, mock := newMockStore(t)
+	accountID := uuid.New()
+	closedID, openID := uuid.New(), uuid.New()
+
+	// Requested both a closed and a still-open session; only the closed
+	// one comes back — the open one is silently skipped (WHERE status !=
+	// 'open' in the real query), not an error for the whole batch.
+	mock.ExpectQuery(`DELETE FROM billing\.inference_sessions`).
+		WithArgs(accountID, pq.Array([]uuid.UUID{closedID, openID})).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(closedID))
+
+	deleted, err := store.Delete(context.Background(), accountID, []uuid.UUID{closedID, openID})
+	if err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if len(deleted) != 1 || deleted[0] != closedID {
+		t.Errorf("got %v, want only %v deleted", deleted, closedID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -179,6 +180,82 @@ func TestCreateInstance_NeverRestartSetsPodRestartPolicyNever(t *testing.T) {
 	}
 }
 
+// TestCreateInstance_AllowFilesystemOwnershipChangesGrantsCapabilities
+// and its sibling below are the regression tests for two real 2026-08-26
+// incidents on the SAME "drop ALL capabilities" SecurityContext (see
+// InstanceSpec.AllowFilesystemOwnershipChanges' own doc comment): first,
+// every Kaniko build failed unpacking even the most ordinary base image
+// (nginx:alpine) with "chown /etc/shadow: operation not permitted";
+// then, one build later, a deployed nginx instance's own worker
+// processes failed with "setgid(101): Operation not permitted" doing
+// the completely standard root-to-less-privileged-user startup drop
+// most daemon images use. Both capability groups are asserted together
+// since both are granted by the same InstanceSpec field.
+func TestCreateInstance_AllowFilesystemOwnershipChangesGrantsCapabilities(t *testing.T) {
+	c := newTestClient()
+
+	_, err := c.CreateInstance(context.Background(), InstanceSpec{
+		InstanceID:                      "kaniko-build-abc123",
+		Image:                           "gcr.io/kaniko-project/executor:v1.23.2-debug",
+		CPUUnits:                        2,
+		MemoryGB:                        4,
+		AllowFilesystemOwnershipChanges: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	pods, _ := c.k8s.CoreV1().Pods(workloadNamespace).List(context.Background(), metav1.ListOptions{})
+	caps := pods.Items[0].Spec.Containers[0].SecurityContext.Capabilities.Add
+
+	for _, want := range []corev1.Capability{"CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "SETFCAP", "SETGID", "SETUID"} {
+		found := false
+		for _, got := range caps {
+			if got == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("capability %q not granted; got %v", want, caps)
+		}
+	}
+}
+
+// TestCreateInstance_FilesystemOwnershipCapabilitiesNotGrantedByDefault
+// covers the buildPod mechanism itself, at the cluster layer: given a
+// spec that does NOT ask for AllowFilesystemOwnershipChanges, none of
+// these capabilities are added — independent of whatever policy a
+// specific caller (pkg/api.instanceSpec now grants this to every
+// customer instance; pkg/build.Service to every Kaniko build) happens to
+// choose. The knob itself must still correctly withhold the grant when
+// unset, or turning it off for some future workload would not actually
+// do anything.
+func TestCreateInstance_FilesystemOwnershipCapabilitiesNotGrantedByDefault(t *testing.T) {
+	c := newTestClient()
+
+	_, err := c.CreateInstance(context.Background(), InstanceSpec{
+		InstanceID: "inst-ordinary",
+		Image:      "nginx:latest",
+		CPUUnits:   1,
+		MemoryGB:   1,
+	})
+	if err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	pods, _ := c.k8s.CoreV1().Pods(workloadNamespace).List(context.Background(), metav1.ListOptions{})
+	caps := pods.Items[0].Spec.Containers[0].SecurityContext.Capabilities.Add
+
+	for _, forbidden := range []corev1.Capability{"CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "SETFCAP", "SETGID", "SETUID"} {
+		for _, got := range caps {
+			if got == forbidden {
+				t.Errorf("AllowFilesystemOwnershipChanges=false still granted %q — the knob does not work", forbidden)
+			}
+		}
+	}
+}
+
 func TestCreateInstance_CommandAndArgsPreserved(t *testing.T) {
 	c := newTestClient()
 
@@ -253,6 +330,47 @@ func TestPodStatus_ImagePullIsFailedNotPending(t *testing.T) {
 	}
 	if st.Message == "" {
 		t.Error("failed status should carry a message the customer can act on")
+	}
+}
+
+// TestPodStatus_TerminatedContainerCarriesExitReason covers a real
+// 2026-08-26 incident: a Kaniko build container that actually STARTED
+// and then exited non-zero (by far the common build-failure shape) has
+// State.Terminated set, not State.Waiting — the only branch podStatus
+// checked before this fix. pod.Status.Reason (the other source this
+// function reads) is also typically empty for a plain container-exit
+// failure (it's really for pod-level eviction/admission failures), so
+// Message stayed "" end to end, and the caller (pkg/build.Service.Build)
+// fell back to the useless "build failed: failed" — a real customer saw
+// exactly that, with no way to diagnose their own broken Dockerfile.
+func TestPodStatus_TerminatedContainerCarriesExitReason(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{labelInstanceID: "inst-badbuild"},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodFailed,
+			ContainerStatuses: []corev1.ContainerStatus{{
+				State: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						ExitCode: 1,
+						Reason:   "Error",
+						Message:  "wget: can't open '/tmp/workspace.zip': No such file or directory",
+					},
+				},
+			}},
+		},
+	}
+
+	st := podStatus(pod)
+	if st.Status != "failed" {
+		t.Errorf("got status %q, want \"failed\"", st.Status)
+	}
+	if st.Message == "" {
+		t.Fatal("failed status should carry a message the customer can act on, got empty")
+	}
+	if !strings.Contains(st.Message, "exit code 1") || !strings.Contains(st.Message, "workspace.zip") {
+		t.Errorf("got message %q, want it to name the exit code and the container's own failure detail", st.Message)
 	}
 }
 

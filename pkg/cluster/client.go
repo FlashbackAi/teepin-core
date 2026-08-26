@@ -122,6 +122,32 @@ type InstanceSpec struct {
 	// preserves Always for every other caller, which IS the correct
 	// behaviour for a customer's persistent compute instance.
 	NeverRestart bool
+
+	// AllowFilesystemOwnershipChanges grants CAP_CHOWN/DAC_OVERRIDE/
+	// FOWNER/FSETID/SETFCAP instead of the default "drop ALL" posture.
+	// Originally added narrowly for Kaniko (pkg/build.Service), which
+	// must chown/chmod arbitrary files it does not own while unpacking a
+	// base image's layers onto disk (inherent to how Kaniko reproduces
+	// `docker build` in userspace, not something skippable via flags) —
+	// found live 2026-08-26: a real build died on "chown /etc/shadow:
+	// operation not permitted" unpacking nginx:alpine.
+	//
+	// Broadened the same day to every ordinary customer compute instance
+	// too (pkg/api.instanceSpec sets this unconditionally): the exact
+	// same failure class hit a deployed nginx instance's own, completely
+	// standard docker-entrypoint startup dance (chown to drop from root
+	// to its own less-privileged user) — a pattern most official images
+	// use (postgres, redis, mysql, and more), so the "drop ALL
+	// capabilities" posture added 2026-08-22 was breaking ordinary,
+	// non-malicious images, not just an edge case. Confirmed as the
+	// intended trade-off directly with the platform owner rather than
+	// decided unilaterally, given it weakens isolation for every
+	// customer workload, not only Kaniko's own trusted tooling.
+	//
+	// Still deliberately NOT set for the Kumbha agent pod itself
+	// (LaunchAgent, pkg/kumbha/agent.go) — that workload has no
+	// legitimate need for it and stays on the fully locked-down default.
+	AllowFilesystemOwnershipChanges bool
 }
 
 type PortMapping struct {

@@ -165,6 +165,32 @@ func TestBuildInstanceSpec_ScriptFetchesWorkspaceWritesDockerConfigThenExecsKani
 	}
 }
 
+// TestBuildInstanceSpec_CreatesTmpBeforeFetchingWorkspace covers a real
+// 2026-08-26 incident: every single build was failing, unconditionally,
+// on the very first real command — the debug Kaniko image cannot be
+// assumed to already have a /tmp directory, so `wget -O /tmp/...`
+// failed with "can't open ... No such file or directory" before the
+// customer's own Dockerfile was ever reached. Checks ORDER, not just
+// presence: a `mkdir -p /tmp` anywhere in the script isn't enough if it
+// comes after the wget line that needs it.
+func TestBuildInstanceSpec_CreatesTmpBeforeFetchingWorkspace(t *testing.T) {
+	s := newTestService(t)
+	spec := s.buildInstanceSpec("kaniko-build-sess1", testRequest(), `{"auths":{}}`, "registry.teepin.cloud/proj:sess1")
+	script := spec.Args[0]
+
+	mkdirIdx := strings.Index(script, "mkdir -p /tmp")
+	wgetIdx := strings.Index(script, "wget")
+	if mkdirIdx == -1 {
+		t.Fatal("script does not create /tmp at all")
+	}
+	if wgetIdx == -1 {
+		t.Fatal("script does not fetch the workspace at all")
+	}
+	if mkdirIdx > wgetIdx {
+		t.Errorf("mkdir -p /tmp (at %d) must come BEFORE the wget fetch (at %d), not after:\n%s", mkdirIdx, wgetIdx, script)
+	}
+}
+
 func TestBuildInstanceSpec_SecretsReachTheContainerOnlyThroughEnvNeverArgv(t *testing.T) {
 	s := newTestService(t)
 	req := testRequest()
@@ -253,6 +279,30 @@ func TestWaitForCompletion_RespectsContextCancellation(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("waitForCompletion did not return after its context was cancelled")
+	}
+}
+
+// TestCaptureFailureLog_ReplaysLogsThroughOnLogLine covers the fix for a
+// real 2026-08-26 incident: a customer's failed build always came back
+// with an empty log, because Build() relied ENTIRELY on a live-follow
+// goroutine that raced the very failure it was meant to capture (the
+// moment waitForCompletion sees "failed", Build()'s own deferred cleanup
+// deletes the instance and cancels ctx). captureFailureLog is the
+// synchronous, non-following fallback called on every failure path —
+// this confirms it independently delivers log content through
+// onLogLine, without depending on the live-goroutine's timing at all.
+func TestCaptureFailureLog_ReplaysLogsThroughOnLogLine(t *testing.T) {
+	fc := &fakeCluster{logs: "fetching workspace...\nwget: unable to resolve host\n"}
+	s := NewService(fc, nil, DefaultConfig())
+
+	var lines []string
+	s.captureFailureLog(cluster.AllTenants(), "kaniko-build-x", func(line string) {
+		lines = append(lines, line)
+	})
+
+	want := []string{"fetching workspace...", "wget: unable to resolve host"}
+	if len(lines) != len(want) || lines[0] != want[0] || lines[1] != want[1] {
+		t.Errorf("got %v, want %v", lines, want)
 	}
 }
 

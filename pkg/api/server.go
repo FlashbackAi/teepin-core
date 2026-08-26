@@ -108,6 +108,14 @@ type Server struct {
 	// disables the feature cleanly: BuildKumbhaSession returns 404, same
 	// as every other optional Kumbha capability.
 	kumbhaBuild *build.Service
+
+	// kumbhaBuildImageRegistryPrefix/kumbhaBuildImagePullSecret together
+	// let a home/datacenter node pull a Kumbha-built image back down
+	// from ECR to actually run it — see instanceSpec's own use of these
+	// and WithKumbhaBuildImagePullSecret's doc comment for why this is
+	// NOT a customer-facing request field.
+	kumbhaBuildImageRegistryPrefix string
+	kumbhaBuildImagePullSecret     string
 }
 
 // WithExecTickets enables interactive exec's REST half (ticket issuance).
@@ -145,6 +153,38 @@ func (s *Server) WithKumbhaEventTickets(tickets *kumbha.EventTicketStore) *Serve
 // BuildKumbhaSession returning 404.
 func (s *Server) WithKumbhaBuild(b *build.Service) *Server {
 	s.kumbhaBuild = b
+	return s
+}
+
+// WithKumbhaBuildImagePullSecret configures how a deployed Kumbha app
+// instance pulls its own just-built image back down from ECR to
+// actually run it — a DIFFERENT credential from the one Kaniko uses to
+// PUSH it (pkg/ecrregistry's DockerConfigJSONForBuild, injected into the
+// build pod directly, never a cluster Secret). Found live 2026-08-26: a
+// real deploy built and pushed an image cleanly, then failed instance
+// creation outright with "pull access denied ... no basic auth
+// credentials" — nothing had ever wired a pull credential for the
+// resulting instance at all.
+//
+// Deliberately NOT a models.CreateInstanceRequest field the customer
+// could set directly: every workload pod lives in one shared namespace
+// (cluster.WorkloadNamespace) across all tenants, so a customer-supplied
+// secret NAME would let them reference (not read the contents of, but
+// borrow the registry-pull use of) a secret they do not own, just by
+// guessing or learning its name — a narrow but real tenant-isolation
+// gap not worth opening for this. Instead, instanceSpec auto-attaches
+// this secret ONLY when the image reference itself starts with
+// registryPrefix — the one, stable, control-plane-owned ECR repository
+// every Kumbha build pushes to (see ecrregistry.Service.ImagePrefix,
+// which returns the SAME URI regardless of project) — so which secret
+// gets used is a server-side policy keyed off the image string's own
+// structure, never something a request body can influence. A pull
+// secret name with no registry prefix (or vice versa) is a
+// misconfiguration this treats as "feature disabled" rather than
+// guessing: instanceSpec only attaches when BOTH are non-empty.
+func (s *Server) WithKumbhaBuildImagePullSecret(registryPrefix, secretName string) *Server {
+	s.kumbhaBuildImageRegistryPrefix = registryPrefix
+	s.kumbhaBuildImagePullSecret = secretName
 	return s
 }
 
@@ -956,6 +996,31 @@ func (s *Server) instanceSpec(instanceID string, instanceUUID, projectID, accoun
 		spec.EphemeralStorageGB = s.ephemeralStorageGB
 	} else {
 		spec.EphemeralStorageGB = defaultEphemeralStorageGB
+	}
+
+	// Every customer compute instance gets this — see
+	// InstanceSpec.AllowFilesystemOwnershipChanges' own doc comment.
+	// Confirmed decision, 2026-08-26: found live that nginx's own
+	// (completely standard) docker-entrypoint startup dance —
+	// chown("/var/cache/nginx/client_temp", 101) to drop from root to
+	// its own less-privileged user — fails outright without it, and the
+	// same pattern (start as root, chown, then run as a dedicated user)
+	// is standard across most official images (postgres, redis, mysql,
+	// and more) — the "drop ALL capabilities" policy added 2026-08-22
+	// was breaking basic usability for ordinary, non-malicious images,
+	// not just an edge case. Deliberately NOT applied to the Kumbha
+	// agent pod itself (LaunchAgent, agent.go) — that workload has no
+	// legitimate need for it, and stays on the fully locked-down default.
+	spec.AllowFilesystemOwnershipChanges = true
+
+	// Auto-attach the Kumbha build registry's pull secret ONLY for an
+	// image that actually came from there — see
+	// WithKumbhaBuildImagePullSecret's own doc comment for why this is
+	// keyed off the image string itself rather than a customer-settable
+	// field.
+	if s.kumbhaBuildImagePullSecret != "" && s.kumbhaBuildImageRegistryPrefix != "" &&
+		strings.HasPrefix(req.Image, s.kumbhaBuildImageRegistryPrefix) {
+		spec.ImagePullSecret = s.kumbhaBuildImagePullSecret
 	}
 
 	if projectID != uuid.Nil {

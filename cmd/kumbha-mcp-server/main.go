@@ -54,14 +54,21 @@ func main() {
 		Name: "create_instance",
 		Description: "Create a running Teepin compute instance from a container image. " +
 			"Requires the customer to have approved the deployment plan first — call " +
-			"present_deployment_plan and wait if you have not done that yet.",
+			"present_deployment_plan and wait if you have not done that yet. IMPORTANT: " +
+			"for anyone to reach the instance, you MUST set ports to the port the " +
+			"container listens on — an instance created with no ports has no public " +
+			"endpoint at all.",
 	}, client.createInstance)
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "deploy",
 		Description: "Build the current workspace into a container image and run it as " +
 			"a Teepin instance. Requires the customer to have approved the deployment " +
-			"plan first.",
+			"plan first. IMPORTANT: for anyone (including the customer) to actually " +
+			"reach the deployed app, you MUST set ports to the port your app listens " +
+			"on inside the container (e.g. 80 for a typical web server on nginx). An " +
+			"instance deployed with no ports has no public endpoint at all — it will " +
+			"show as running, but nobody can open it.",
 	}, client.deploy)
 
 	mcp.AddTool(server, &mcp.Tool{
@@ -278,7 +285,7 @@ func (c *teepinClient) presentDeploymentPlan(ctx context.Context, req *mcp.CallT
 // --- create_instance ---
 
 type portArg struct {
-	Container int    `json:"container"`
+	Container int    `json:"container" jsonschema:"the port YOUR APP listens on inside the container (e.g. 80 for a typical web server, 8080/3000/5000 for common app frameworks) — required for the instance to get a public endpoint at all; an instance created with no ports has no way for anyone to reach it"`
 	Protocol  string `json:"protocol,omitempty" jsonschema:"tcp or udp; defaults to tcp"`
 }
 

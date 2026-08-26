@@ -242,6 +242,39 @@ func TestAgentClient_CreateSendsCommandAndCachesStatus(t *testing.T) {
 	}
 }
 
+// TestAgentClient_CreateSendsAllowFilesystemOwnershipChanges is a
+// regression test for a real 2026-08-26 incident: a field added to
+// InstanceSpec (client.go) or PodSecurityContext (direct.go) alone does
+// NOT reach a home-class provider — this codebase runs in agent mode in
+// production, and every InstanceSpec field needs an explicit round trip
+// through the proto (proto/agent/v1/agent.proto) and both translation
+// sites (this file's CreateInstance, and pkg/agentrunner/runner.go's
+// decode side) or it silently never crosses the wire. Confirms the
+// encode half for AllowFilesystemOwnershipChanges specifically — the
+// flag Kaniko needs to unpack a base image's layers.
+func TestAgentClient_CreateSendsAllowFilesystemOwnershipChanges(t *testing.T) {
+	fake := newFakeAgent(&agentpb.CommandResult{Success: true, PodName: "kaniko-build-pod"})
+	c := NewAgentClient(registryWith(fake.session))
+
+	_, err := c.CreateInstance(context.Background(), InstanceSpec{
+		InstanceID:                      "kaniko-build-x",
+		ProjectID:                       "project-alice",
+		Image:                           "gcr.io/kaniko-project/executor:v1.23.2-debug",
+		AllowFilesystemOwnershipChanges: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	cmd := fake.lastSent().GetCreateInstance()
+	if cmd == nil {
+		t.Fatal("expected a CreateInstanceCommand")
+	}
+	if !cmd.AllowFilesystemOwnershipChanges {
+		t.Error("AllowFilesystemOwnershipChanges did not reach the wire command")
+	}
+}
+
 func TestAgentClient_ResourceExhaustedIsTyped(t *testing.T) {
 	fake := newFakeAgent(&agentpb.CommandResult{
 		Success:      false,

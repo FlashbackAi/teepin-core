@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/google/uuid"
@@ -109,6 +110,42 @@ func (g *Gateway) ListSessions(ctx context.Context, accountID, projectID uuid.UU
 	return g.store.ListByProject(ctx, accountID, projectID)
 }
 
+// DeleteSessions removes the given sessions from the account's build
+// history — a customer explicitly requesting a delete (through a
+// confirming UI, see build/page.tsx's BulkDeleteDialog) is authorization
+// to stop it too if it is still building, not just to clean up ones that
+// already finished. There is no separate "stop, then delete" step:
+// found live 2026-08-26 that requiring one is worse UX for no real safety
+// gain, since the confirmation dialog already IS the "are you sure" gate
+// — the same one-step pattern GitHub Actions/Vercel/Render use for
+// cancelling a running job.
+//
+// For each requested id still marked "open" in the DB, this closes it
+// first via CloseSession — settling any unbilled usage and tearing down
+// the agent pod, exactly as an explicit customer Close already does —
+// before Store.Delete removes the row. This also fixes a related bug
+// found the same day: the stored status column alone is not trustworthy
+// evidence of a live pod (nothing closes a session whose pod died on its
+// own — crashed, evicted, or exited after its own idle timeout — without
+// ever reaching CloseSession), so without this step an account's history
+// could get stuck showing "Building" indefinitely and be entirely
+// undeletable.
+func (g *Gateway) DeleteSessions(ctx context.Context, accountID uuid.UUID, ids []uuid.UUID) ([]uuid.UUID, error) {
+	for _, id := range ids {
+		sess, err := g.store.Get(ctx, id, accountID)
+		if err != nil || sess.Status != "open" {
+			continue // not found, wrong account, or already closed — Store.Delete handles it
+		}
+		if _, err := g.CloseSession(ctx, id, accountID, "closed"); err != nil {
+			// Best-effort, same posture as CloseSession's own settlement
+			// errors: log for an operator, but still let Store.Delete
+			// below decide this row's fate on its now-updated status.
+			log.Printf("WARN: closing Kumbha session %s before delete had settlement errors: %v", id, err)
+		}
+	}
+	return g.store.Delete(ctx, accountID, ids)
+}
+
 // SaveWorkspaceVersion appends a new workspace version for a session and
 // moves the current-version pointer to it. createdBy distinguishes an
 // agent's automatic save (after a file_editor call) from a customer's
@@ -133,11 +170,19 @@ func (g *Gateway) WorkspaceVersion(ctx context.Context, sessionID, accountID uui
 	return g.store.GetVersion(ctx, sessionID, accountID, version)
 }
 
-// WorkspaceHistory returns every version's metadata (no file content),
-// newest first, scoped to the owning account — the console's version
-// history list.
+// WorkspaceHistory returns every checkpointed version's metadata (no file
+// content), newest first, scoped to the owning account — the console's
+// version history list.
 func (g *Gateway) WorkspaceHistory(ctx context.Context, sessionID, accountID uuid.UUID) ([]VersionInfo, error) {
 	return g.store.ListVersions(ctx, sessionID, accountID)
+}
+
+// CheckpointWorkspace marks the session's current draft workspace version
+// as a permanent, customer-visible checkpoint — called once, right after
+// a Kumbha deploy actually succeeds (see DeployKumbhaSession). See
+// Store.CheckpointCurrentVersion for the full reasoning.
+func (g *Gateway) CheckpointWorkspace(ctx context.Context, sessionID uuid.UUID) error {
+	return g.store.CheckpointCurrentVersion(ctx, sessionID)
 }
 
 // PollMessages returns and marks-delivered every undelivered follow-up

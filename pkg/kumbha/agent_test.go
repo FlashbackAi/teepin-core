@@ -14,6 +14,7 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 
 	"github.com/FlashbackAi/teepin-core/pkg/cluster"
 )
@@ -454,5 +455,96 @@ func TestGateway_DeliverMessage_RelaunchesWhenAgentNotRunning(t *testing.T) {
 	}
 	if !strings.Contains(prompt, "workspace already contains") {
 		t.Errorf("relaunch prompt = %q, want it to tell the agent its previous work still exists", prompt)
+	}
+}
+
+// --- DeleteSessions ---
+
+// TestGateway_DeleteSessions_StopsAnOpenSessionThenDeletesIt covers BOTH
+// a genuinely still-building session (a customer's explicit delete is
+// authorization to stop it, no separate "stop first" step — see
+// DeleteSessions' own doc comment) and a "zombie" one whose pod already
+// died without anyone calling Close: fakeCluster's default (no
+// statusResult/statusErr set) reports the pod as not found, which is
+// exactly the zombie case, and DeleteSessions no longer distinguishes
+// the two — either way CloseSession runs before the delete.
+func TestGateway_DeleteSessions_StopsAnOpenSessionThenDeletesIt(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessID, accountID, projectID := uuid.New(), uuid.New(), uuid.New()
+	startedAt := time.Now()
+	agentPodID := "kumbha-agent-" + sessID.String()[:8]
+
+	// Get: session is nominally "open" in the DB.
+	mock.ExpectQuery(`SELECT id, account_id, project_id, budget, spent, status`).
+		WithArgs(sessID, accountID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "account_id", "project_id", "budget", "spent", "status", "label",
+			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
+		}).AddRow(sessID, accountID, projectID, 5.0, 0.0, "open", nil, agentPodID, nil, false, startedAt, nil))
+
+	// CloseSession: Close + RouteUsage + tear down the agent pod.
+	mock.ExpectQuery(`UPDATE billing\.inference_sessions`).
+		WithArgs(sessID, accountID, "closed").
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "account_id", "project_id", "budget", "spent", "status", "label",
+			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
+		}).AddRow(sessID, accountID, projectID, 5.0, 0.0, "closed", nil, agentPodID, nil, false, startedAt, startedAt))
+	mock.ExpectQuery(`SELECT route, provider, input_tokens, output_tokens`).
+		WithArgs(sessID).
+		WillReturnRows(sqlmock.NewRows([]string{"route", "provider", "input_tokens", "output_tokens"}))
+
+	// Finally, the actual delete.
+	mock.ExpectQuery(`DELETE FROM billing\.inference_sessions`).
+		WithArgs(accountID, pq.Array([]uuid.UUID{sessID})).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(sessID))
+
+	fc := &fakeCluster{}
+	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+		WithAgent(fc, fakeMintToken, AgentConfig{})
+
+	deleted, err := gw.DeleteSessions(context.Background(), accountID, []uuid.UUID{sessID})
+	if err != nil {
+		t.Fatalf("DeleteSessions: %v", err)
+	}
+	if len(deleted) != 1 || deleted[0] != sessID {
+		t.Errorf("got %v, want %v deleted", deleted, sessID)
+	}
+	if len(fc.deleted) != 1 || fc.deleted[0] != agentPodID {
+		t.Errorf("agent pod was not torn down: deleted = %v, want [%s]", fc.deleted, agentPodID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestGateway_DeleteSessions_AlreadyClosedSessionSkipsCloseCall(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessID, accountID, projectID := uuid.New(), uuid.New(), uuid.New()
+	startedAt := time.Now()
+
+	mock.ExpectQuery(`SELECT id, account_id, project_id, budget, spent, status`).
+		WithArgs(sessID, accountID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "account_id", "project_id", "budget", "spent", "status", "label",
+			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
+		}).AddRow(sessID, accountID, projectID, 5.0, 0.0, "closed", nil, nil, nil, false, startedAt, startedAt))
+
+	// No Close-related queries expected — already closed, nothing to stop.
+
+	mock.ExpectQuery(`DELETE FROM billing\.inference_sessions`).
+		WithArgs(accountID, pq.Array([]uuid.UUID{sessID})).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(sessID))
+
+	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{})
+
+	deleted, err := gw.DeleteSessions(context.Background(), accountID, []uuid.UUID{sessID})
+	if err != nil {
+		t.Fatalf("DeleteSessions: %v", err)
+	}
+	if len(deleted) != 1 || deleted[0] != sessID {
+		t.Errorf("got %v, want %v deleted", deleted, sessID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
 	}
 }

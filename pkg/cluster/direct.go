@@ -993,11 +993,16 @@ func (c *DirectClient) buildPod(spec InstanceSpec) (*corev1.Pod, error) {
 						AllowPrivilegeEscalation: boolPtr(false),
 						Capabilities: &corev1.Capabilities{
 							Drop: []corev1.Capability{"ALL"},
-							// Re-added deliberately: without it, an image that
-							// binds a port below 1024 as root (nginx's default
-							// config does exactly this) fails to start once
-							// every other capability is dropped.
-							Add: []corev1.Capability{"NET_BIND_SERVICE"},
+							// NET_BIND_SERVICE re-added deliberately: without
+							// it, an image that binds a port below 1024 as
+							// root (nginx's default config does exactly this)
+							// fails to start once every other capability is
+							// dropped. The filesystem-ownership set is added
+							// ONLY when the caller explicitly asked for it
+							// (see InstanceSpec.AllowFilesystemOwnershipChanges'
+							// own doc comment) — every other workload keeps
+							// the fully locked-down set.
+							Add: append([]corev1.Capability{"NET_BIND_SERVICE"}, filesystemOwnershipCapabilities(spec)...),
 						},
 					},
 					Resources: corev1.ResourceRequirements{
@@ -1299,7 +1304,61 @@ func podStatus(pod *corev1.Pod) InstanceStatus {
 		}
 	}
 
+	// A container that actually started and then exited non-zero (by far
+	// the common case for a build script failing) never hits the Waiting
+	// branch above — it has State.Terminated, not State.Waiting, by the
+	// time the pod is observed as PodFailed. pod.Status.Reason (set
+	// above) is a pod-level field that Kubernetes leaves empty for a
+	// plain container-exit failure — it's really for eviction/admission
+	// failures — so without this, Message stayed "" for the single most
+	// common build failure, and the caller (pkg/build.Service.Build)
+	// fell back to the uninformative "build failed: failed". Found live
+	// 2026-08-26 from a real customer-facing 422 with an empty log and
+	// that exact message.
+	if st.Status == "failed" && st.Message == "" {
+		for _, cs := range pod.Status.ContainerStatuses {
+			t := cs.State.Terminated
+			if t == nil {
+				continue
+			}
+			reason := t.Reason
+			if reason == "" {
+				reason = "Error"
+			}
+			if t.Message != "" {
+				st.Message = fmt.Sprintf("exit code %d: %s (%s)", t.ExitCode, reason, t.Message)
+			} else {
+				st.Message = fmt.Sprintf("exit code %d: %s", t.ExitCode, reason)
+			}
+			break
+		}
+	}
+
 	return st
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+// filesystemOwnershipCapabilities returns the extra capabilities a
+// workload needs to manage file ownership AND its own process identity
+// as root normally would — see InstanceSpec.AllowFilesystemOwnershipChanges'
+// own doc comment for the two incidents this now covers. CHOWN/FOWNER
+// let it set ownership on files it does not own; DAC_OVERRIDE/FSETID/
+// SETFCAP cover permission bits and extended file capabilities a real
+// base image layer can legitimately carry — all five are what Kaniko
+// needs to unpack an image. SETGID/SETUID are a SEPARATE, later addition
+// (found live 2026-08-26, one build after the first five alone): the
+// standard "start as root, fork workers, drop each to a dedicated
+// less-privileged user" pattern most daemon images use (nginx, postgres,
+// and more) calls setgid()/setuid() to do that drop, and without these
+// two nginx's own worker processes failed outright with "setgid(101):
+// Operation not permitted" — a build unpacking a base image and a
+// running daemon dropping its own privileges are different operations,
+// so both capability groups are genuinely needed, not overlapping.
+// Empty (no extra grant) unless the caller explicitly opted in.
+func filesystemOwnershipCapabilities(spec InstanceSpec) []corev1.Capability {
+	if !spec.AllowFilesystemOwnershipChanges {
+		return nil
+	}
+	return []corev1.Capability{"CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "SETFCAP", "SETGID", "SETUID"}
+}

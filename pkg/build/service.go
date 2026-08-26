@@ -211,19 +211,66 @@ func (s *Service) Build(ctx context.Context, req Request, onLogLine OnLogLine) (
 		go s.streamLogs(ctx, scope, instanceID, onLogLine)
 	}
 
-	status, err := s.waitForCompletion(ctx, scope, instanceID)
-	if err != nil {
-		return nil, err
+	status, waitErr := s.waitForCompletion(ctx, scope, instanceID)
+	if waitErr != nil {
+		// Timed out or was cancelled — still worth a best-effort capture
+		// of whatever the instance had printed before giving up, same
+		// reasoning as the failure path below.
+		if onLogLine != nil {
+			s.captureFailureLog(scope, instanceID, onLogLine)
+		}
+		return nil, waitErr
 	}
 	if status.Status != "terminated" {
 		msg := status.Message
 		if msg == "" {
 			msg = status.Status
 		}
+		// Best-effort, synchronous, one-shot fetch of whatever the failed
+		// container actually printed — NOT reliant on the live-follow
+		// goroutine started above, which races the very failure it is
+		// trying to capture: the moment waitForCompletion reports
+		// "failed", this function's own deferred cleanup deletes the
+		// instance and cancels ctx, so a fast failure (a build script
+		// erroring within the first couple of seconds — the common case)
+		// could easily leave the live stream having captured nothing at
+		// all. Found live 2026-08-26: a real customer-facing build
+		// failure came back with "log":"" every single time. Errors from
+		// this fetch are swallowed — it is a diagnostic nicety, not
+		// itself something that should mask the real failure below.
+		if onLogLine != nil {
+			s.captureFailureLog(scope, instanceID, onLogLine)
+		}
 		return nil, fmt.Errorf("build failed: %s", msg)
 	}
 
 	return &Result{ImageRef: imageRef}, nil
+}
+
+// captureFailureLog does a synchronous, non-following fetch of a build
+// instance's log output and replays it line by line through onLogLine —
+// see Build's own doc comment on why the live-follow goroutine cannot be
+// relied on for this. Uses a fresh, short-lived context, not the
+// caller's (which may already be cancelled or near its own deadline),
+// and never returns an error: this is best-effort diagnostics, and a
+// failure to fetch it must not mask the real build failure.
+func (s *Service) captureFailureLog(scope cluster.Scope, instanceID string, onLogLine OnLogLine) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	pr, pw := io.Pipe()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		scanner := bufio.NewScanner(pr)
+		for scanner.Scan() {
+			onLogLine(scanner.Text())
+		}
+	}()
+
+	_ = s.cluster.StreamLogs(ctx, scope, instanceID, cluster.LogOptions{Follow: false}, pw)
+	_ = pw.Close()
+	<-done
 }
 
 // waitForCompletion polls the build instance's status. Polling rather
@@ -320,7 +367,16 @@ func (s *Service) streamLogs(ctx context.Context, scope cluster.Scope, instanceI
 // shell metacharacters, so this is not shell-injectable the way building
 // the script text via fmt.Sprintf(dockerfilePath) would be.
 func (s *Service) buildInstanceSpec(instanceID string, req Request, dockerConfigJSON, imageRef string) cluster.InstanceSpec {
+	// mkdir -p /tmp first: found live 2026-08-26 that the debug Kaniko
+	// image cannot be assumed to already have a /tmp directory the way a
+	// full distro would — every single build was failing, 100% of the
+	// time, on the very first real command (wget: can't open
+	// '/tmp/workspace.zip': No such file or directory), before the
+	// customer's own Dockerfile was ever reached. The script already did
+	// this for /kaniko/.docker a few lines down; it just never applied
+	// the same caution to /tmp.
 	const script = `set -e
+mkdir -p /tmp
 wget -q --header="Authorization: Bearer $TEEPIN_TOKEN" -O /tmp/workspace.zip "$TEEPIN_ARCHIVE_URL"
 unzip -o -q /tmp/workspace.zip -d /workspace
 rm -f /tmp/workspace.zip
@@ -351,5 +407,10 @@ exec /kaniko/executor --dockerfile="$TEEPIN_DOCKERFILE_PATH" --context=dir:///wo
 		// class of incident InstanceSpec.NeverRestart's own doc comment
 		// already documents from the Kumbha agent pod's history.
 		NeverRestart: true,
+		// Kaniko must chown/chmod arbitrary files it does not own while
+		// unpacking a base image's layers — see the field's own doc
+		// comment. The one workload in this codebase that legitimately
+		// needs it.
+		AllowFilesystemOwnershipChanges: true,
 	}
 }
