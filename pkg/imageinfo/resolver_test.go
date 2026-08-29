@@ -154,6 +154,34 @@ func TestResolvePorts_MissingImageOnAllowlistedRegistryReturnsEmpty(t *testing.T
 	}
 }
 
+// TestResolvePortsWithAuth_BypassesAllowlist is the regression test for
+// the actual point of this function: DeployKumbhaSession's own image
+// reference (TEEPIN's private build registry, e.g. ECR) is never on
+// allowedRegistries — that allowlist exists for arbitrary customer-typed
+// image strings, a threat model that does not apply to a reference the
+// control plane constructed itself. Same real, reachable test registry
+// TestResolvePorts_RegistryNotAllowlistedReturnsEmpty proves gets
+// REJECTED by the plain ResolvePorts path — here it must succeed.
+func TestResolvePortsWithAuth_BypassesAllowlist(t *testing.T) {
+	host := newTestRegistry(t)
+	pushImage(t, host, "myapp:v1", map[string]struct{}{"80/tcp": {}})
+
+	ports, err := ResolvePortsWithAuth(context.Background(), host+"/myapp:v1", "user", "pass")
+	if err != nil {
+		t.Fatalf("ResolvePortsWithAuth: %v", err)
+	}
+	if len(ports) != 1 || ports[0] != (PortInfo{80, "tcp"}) {
+		t.Errorf("got %+v, want [{80 tcp}]", ports)
+	}
+}
+
+func TestResolvePortsWithAuth_InvalidReferenceIsError(t *testing.T) {
+	_, err := ResolvePortsWithAuth(context.Background(), "not a valid image ref !!!", "user", "pass")
+	if err == nil {
+		t.Error("expected an error for a malformed image reference")
+	}
+}
+
 func TestParsePortSpec(t *testing.T) {
 	cases := []struct {
 		spec         string

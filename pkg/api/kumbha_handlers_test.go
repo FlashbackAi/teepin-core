@@ -10,11 +10,18 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
+	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/registry"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
+	"github.com/google/go-containerregistry/pkg/v1/random"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 
@@ -374,6 +381,88 @@ func TestParseCompletionRequest_RejectsInvalidJSON(t *testing.T) {
 	_, err := parseCompletionRequest([]byte(`not json`))
 	if err == nil {
 		t.Error("expected an error for invalid JSON")
+	}
+}
+
+// --- detectKumbhaPorts ---
+
+// newTestRegistry and pushTestImage mirror pkg/imageinfo's own test
+// harness (unexported there, so not directly reusable) — an in-memory
+// OCI registry real enough to exercise the actual remote-fetch code
+// path, rather than mocking it away.
+func newTestRegistry(t *testing.T) string {
+	t.Helper()
+	srv := httptest.NewServer(registry.New())
+	t.Cleanup(srv.Close)
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("parse test registry URL: %v", err)
+	}
+	return u.Host
+}
+
+func pushTestImage(t *testing.T, registryHost, repo string, exposedPorts map[string]struct{}) {
+	t.Helper()
+	base, err := random.Image(64, 1)
+	if err != nil {
+		t.Fatalf("build base image: %v", err)
+	}
+	img, err := mutate.Config(base, v1.Config{ExposedPorts: exposedPorts})
+	if err != nil {
+		t.Fatalf("set image config: %v", err)
+	}
+	ref, err := name.ParseReference(registryHost + "/" + repo)
+	if err != nil {
+		t.Fatalf("parse push reference: %v", err)
+	}
+	if err := remote.Write(ref, img); err != nil {
+		t.Fatalf("push test image: %v", err)
+	}
+}
+
+// fakeRegistryProvider satisfies build.RegistryProvider against the
+// in-memory test registry above — the test registry has no auth at all,
+// so ImageAuth's returned credential is never actually checked, only
+// threaded through the same path a real one (Harbor/ECR) would take.
+type fakeRegistryProvider struct{ prefix string }
+
+func (f *fakeRegistryProvider) ImagePrefix(context.Context, uuid.UUID, string) (string, error) {
+	return f.prefix, nil
+}
+func (f *fakeRegistryProvider) DockerConfigJSONForBuild(context.Context, uuid.UUID) (string, error) {
+	return "", nil
+}
+func (f *fakeRegistryProvider) ImageAuth(context.Context, uuid.UUID) (string, string, error) {
+	return "user", "pass", nil
+}
+
+// TestDetectKumbhaPorts_ReadsExposedPortsFromTheBuiltImage is the
+// regression test for a real 2026-08-26 finding: DeployKumbhaSession
+// required the agent to separately remember and pass `ports` on every
+// deploy, when the image it just built already declares this in its own
+// manifest — directly asked "why should I tell it to expose a port, it
+// should have that as part of the deployment, right?" This confirms the
+// full chain end to end: detectKumbhaPorts -> Service.ImageAuth ->
+// imageinfo.ResolvePortsWithAuth, against a real (in-memory) registry,
+// not a mocked-away shortcut.
+func TestDetectKumbhaPorts_ReadsExposedPortsFromTheBuiltImage(t *testing.T) {
+	host := newTestRegistry(t)
+	pushTestImage(t, host, "myapp:v1", map[string]struct{}{"80/tcp": {}, "443/tcp": {}})
+
+	buildSvc := build.NewService(newFakeCluster(), &fakeRegistryProvider{}, build.DefaultConfig())
+	s := &Server{kumbhaBuild: buildSvc}
+
+	ports := s.detectKumbhaPorts(context.Background(), uuid.New(), host+"/myapp:v1")
+
+	if len(ports) != 2 || ports[0].Container != 80 || ports[1].Container != 443 {
+		t.Errorf("got %+v, want ports 80 and 443 detected from the image's own ExposedPorts", ports)
+	}
+}
+
+func TestDetectKumbhaPorts_NoBuildServiceReturnsNil(t *testing.T) {
+	s := &Server{}
+	if ports := s.detectKumbhaPorts(context.Background(), uuid.New(), "nginx:alpine"); ports != nil {
+		t.Errorf("got %+v, want nil when no build service is configured", ports)
 	}
 }
 

@@ -142,32 +142,12 @@ type dockerAuth struct {
 // /kaniko/.docker/config.json via Env. projectID is accepted only to
 // satisfy pkg/build.RegistryProvider — see the Service doc comment on why
 // ECR access is not project-scoped the way Harbor's is.
-func (s *Service) DockerConfigJSONForBuild(ctx context.Context, _ uuid.UUID) (string, error) {
-	out, err := s.client.GetAuthorizationToken(ctx, &ecr.GetAuthorizationTokenInput{})
+func (s *Service) DockerConfigJSONForBuild(ctx context.Context, projectID uuid.UUID) (string, error) {
+	registry, username, password, err := s.imageAuthDetails(ctx)
 	if err != nil {
-		return "", fmt.Errorf("ecrregistry: get authorization token: %w", err)
-	}
-	if len(out.AuthorizationData) == 0 {
-		return "", fmt.Errorf("ecrregistry: no authorization data returned")
-	}
-	data := out.AuthorizationData[0]
-
-	// AuthorizationToken is base64("AWS:<password>") per ECR's own API
-	// contract — decoded here so Username/Password are populated
-	// individually, matching the shape Harbor's own robot-account
-	// credentials already produce, rather than passing the pre-encoded
-	// token through as an opaque blob a reader would need to already
-	// know ECR's own encoding to make sense of.
-	decoded, err := base64.StdEncoding.DecodeString(aws.ToString(data.AuthorizationToken))
-	if err != nil {
-		return "", fmt.Errorf("ecrregistry: decode authorization token: %w", err)
-	}
-	username, password, ok := strings.Cut(string(decoded), ":")
-	if !ok {
-		return "", fmt.Errorf("ecrregistry: unexpected authorization token format")
+		return "", err
 	}
 
-	registry := strings.TrimPrefix(aws.ToString(data.ProxyEndpoint), "https://")
 	authString := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
 	cfg := dockerConfigJSON{
 		Auths: map[string]dockerAuth{
@@ -179,4 +159,49 @@ func (s *Service) DockerConfigJSONForBuild(ctx context.Context, _ uuid.UUID) (st
 		return "", fmt.Errorf("ecrregistry: encode docker config: %w", err)
 	}
 	return string(raw), nil
+}
+
+// ImageAuth returns the same ECR authorization token
+// DockerConfigJSONForBuild wraps into a .dockerconfigjson, as a plain
+// (username, password) pair — for build.RegistryProvider callers that
+// need to authenticate a registry client directly (e.g. pkg/imageinfo's
+// manifest read, resolving a just-built image's own declared ports)
+// rather than write a Kaniko config file. projectID is unused (same as
+// DockerConfigJSONForBuild — ECR's token is registry-wide, not
+// per-project), kept only to satisfy the shared RegistryProvider shape.
+func (s *Service) ImageAuth(ctx context.Context, _ uuid.UUID) (username, password string, err error) {
+	_, username, password, err = s.imageAuthDetails(ctx)
+	return username, password, err
+}
+
+// imageAuthDetails is the shared lookup behind DockerConfigJSONForBuild
+// and ImageAuth: a fresh ECR authorization token, decoded into
+// (username, password), plus the registry host it is valid against.
+func (s *Service) imageAuthDetails(ctx context.Context) (registry, username, password string, err error) {
+	out, err := s.client.GetAuthorizationToken(ctx, &ecr.GetAuthorizationTokenInput{})
+	if err != nil {
+		return "", "", "", fmt.Errorf("ecrregistry: get authorization token: %w", err)
+	}
+	if len(out.AuthorizationData) == 0 {
+		return "", "", "", fmt.Errorf("ecrregistry: no authorization data returned")
+	}
+	data := out.AuthorizationData[0]
+
+	// AuthorizationToken is base64("AWS:<password>") per ECR's own API
+	// contract — decoded here so Username/Password are populated
+	// individually, matching the shape Harbor's own robot-account
+	// credentials already produce, rather than passing the pre-encoded
+	// token through as an opaque blob a reader would need to already
+	// know ECR's own encoding to make sense of.
+	decoded, err := base64.StdEncoding.DecodeString(aws.ToString(data.AuthorizationToken))
+	if err != nil {
+		return "", "", "", fmt.Errorf("ecrregistry: decode authorization token: %w", err)
+	}
+	username, password, ok := strings.Cut(string(decoded), ":")
+	if !ok {
+		return "", "", "", fmt.Errorf("ecrregistry: unexpected authorization token format")
+	}
+
+	registry = strings.TrimPrefix(aws.ToString(data.ProxyEndpoint), "https://")
+	return registry, username, password, nil
 }

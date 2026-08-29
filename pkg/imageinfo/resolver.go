@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 )
@@ -82,15 +83,52 @@ func resolvePorts(ctx context.Context, imageRef string, allowed map[string]bool)
 	if err != nil {
 		return nil, fmt.Errorf("invalid image reference: %w", err)
 	}
-
 	if !allowed[ref.Context().RegistryStr()] {
 		return nil, nil
 	}
+	return resolveConfigPorts(ctx, ref, nil)
+}
 
+// ResolvePortsWithAuth reads imageRef's manifest exactly like
+// ResolvePorts, but authenticates the pull with the given credential and
+// does NOT apply allowedRegistries. Only for a caller passing an image
+// reference IT constructed itself — never customer-supplied input: the
+// SSRF guard ResolvePorts enforces (see allowedRegistries' own doc
+// comment) exists specifically because a customer can put an arbitrary
+// host in a create-instance request; DeployKumbhaSession's imageRef, by
+// contrast, is built entirely server-side (the Kumbha build registry's
+// own resolved prefix + a session tag), so there is nothing here for a
+// customer to redirect.
+//
+// Used to auto-populate a deploy's ports from the image TEEPIN ITSELF
+// just built and pushed — found live 2026-08-26: a customer correctly
+// pointed out that requiring the agent to separately remember and pass
+// `ports` on every deploy, when the built image's own manifest already
+// declares it (via the Dockerfile's EXPOSE, inherited through FROM same
+// as `docker build` itself resolves it), is not something the customer
+// or the model should have to get right by hand.
+func ResolvePortsWithAuth(ctx context.Context, imageRef, username, password string) ([]PortInfo, error) {
+	ref, err := name.ParseReference(imageRef)
+	if err != nil {
+		return nil, fmt.Errorf("invalid image reference: %w", err)
+	}
+	return resolveConfigPorts(ctx, ref, &authn.Basic{Username: username, Password: password})
+}
+
+// resolveConfigPorts is the shared manifest fetch + ExposedPorts parse
+// behind both ResolvePorts and ResolvePortsWithAuth. auth nil means an
+// anonymous pull (the public-registry path); non-nil authenticates the
+// request.
+func resolveConfigPorts(ctx context.Context, ref name.Reference, auth authn.Authenticator) ([]PortInfo, error) {
 	ctx, cancel := context.WithTimeout(ctx, resolveTimeout)
 	defer cancel()
 
-	img, err := remote.Image(ref, remote.WithContext(ctx))
+	opts := []remote.Option{remote.WithContext(ctx)}
+	if auth != nil {
+		opts = append(opts, remote.WithAuth(auth))
+	}
+
+	img, err := remote.Image(ref, opts...)
 	if err != nil {
 		// Registry unreachable, image not found, or private without
 		// credentials — all normal, expected outcomes for an arbitrary

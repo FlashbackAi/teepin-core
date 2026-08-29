@@ -252,34 +252,15 @@ func (s *Service) GetRegistryCredentials(ctx context.Context, projectID uuid.UUI
 // this method exists specifically for that one internal, non-HTTP-exposed
 // caller, never returned from a customer-facing endpoint.
 func (s *Service) DockerConfigJSONForBuild(ctx context.Context, projectID uuid.UUID) (string, error) {
-	query := `
-		SELECT harbor_project_name, robot_account_name, docker_config_json
-		FROM auth.registry_credentials
-		WHERE project_id = $1 AND revoked_at IS NULL
-	`
-	var harborProjectName, robotName, encryptedToken string
-	err := s.db.QueryRowContext(ctx, query, projectID).Scan(&harborProjectName, &robotName, &encryptedToken)
-	if err == sql.ErrNoRows {
-		return "", fmt.Errorf("registry not provisioned for project")
-	}
+	registryURL, robotName, token, err := s.imageAuthDetails(ctx, projectID)
 	if err != nil {
-		return "", fmt.Errorf("failed to get credentials: %w", err)
-	}
-
-	token, err := s.decrypt(encryptedToken)
-	if err != nil {
-		return "", fmt.Errorf("failed to decrypt registry credential: %w", err)
-	}
-
-	project, err := s.client.GetProject(ctx, harborProjectName)
-	if err != nil {
-		return "", fmt.Errorf("failed to get Harbor project: %w", err)
+		return "", err
 	}
 
 	authString := base64.StdEncoding.EncodeToString([]byte(robotName + ":" + token))
 	dockerConfig := DockerConfigJSON{
 		Auths: map[string]DockerAuth{
-			project.RegistryURL: {Username: robotName, Password: token, Auth: authString},
+			registryURL: {Username: robotName, Password: token, Auth: authString},
 		},
 	}
 	raw, err := json.Marshal(dockerConfig)
@@ -287,6 +268,51 @@ func (s *Service) DockerConfigJSONForBuild(ctx context.Context, projectID uuid.U
 		return "", fmt.Errorf("failed to encode docker config: %w", err)
 	}
 	return string(raw), nil
+}
+
+// ImageAuth returns the same robot-account credential
+// DockerConfigJSONForBuild wraps into a .dockerconfigjson, as a plain
+// (username, password) pair — for build.RegistryProvider callers that
+// need to authenticate a registry client directly (e.g. pkg/imageinfo's
+// manifest read, resolving a just-built image's own declared ports)
+// rather than write a Kaniko config file.
+func (s *Service) ImageAuth(ctx context.Context, projectID uuid.UUID) (username, password string, err error) {
+	_, robotName, token, err := s.imageAuthDetails(ctx, projectID)
+	if err != nil {
+		return "", "", err
+	}
+	return robotName, token, nil
+}
+
+// imageAuthDetails is the shared lookup behind DockerConfigJSONForBuild
+// and ImageAuth: the project's Harbor robot account, decrypted, plus the
+// registry URL that credential is valid against.
+func (s *Service) imageAuthDetails(ctx context.Context, projectID uuid.UUID) (registryURL, robotName, token string, err error) {
+	query := `
+		SELECT harbor_project_name, robot_account_name, docker_config_json
+		FROM auth.registry_credentials
+		WHERE project_id = $1 AND revoked_at IS NULL
+	`
+	var harborProjectName, encryptedToken string
+	err = s.db.QueryRowContext(ctx, query, projectID).Scan(&harborProjectName, &robotName, &encryptedToken)
+	if err == sql.ErrNoRows {
+		return "", "", "", fmt.Errorf("registry not provisioned for project")
+	}
+	if err != nil {
+		return "", "", "", fmt.Errorf("failed to get credentials: %w", err)
+	}
+
+	token, err = s.decrypt(encryptedToken)
+	if err != nil {
+		return "", "", "", fmt.Errorf("failed to decrypt registry credential: %w", err)
+	}
+
+	project, err := s.client.GetProject(ctx, harborProjectName)
+	if err != nil {
+		return "", "", "", fmt.Errorf("failed to get Harbor project: %w", err)
+	}
+
+	return project.RegistryURL, robotName, token, nil
 }
 
 // RevokeRegistryAccess deletes robot account, ImagePullSecret, and marks as revoked

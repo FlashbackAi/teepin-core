@@ -20,6 +20,7 @@ import (
 
 	"github.com/FlashbackAi/teepin-core/pkg/auth"
 	"github.com/FlashbackAi/teepin-core/pkg/build"
+	"github.com/FlashbackAi/teepin-core/pkg/imageinfo"
 	"github.com/FlashbackAi/teepin-core/pkg/inference"
 	"github.com/FlashbackAi/teepin-core/pkg/kumbha"
 	"github.com/FlashbackAi/teepin-core/pkg/models"
@@ -400,6 +401,46 @@ func (s *Server) buildKumbhaImage(ctx context.Context, sess *kumbha.Session, acc
 	return result.ImageRef, 0, nil
 }
 
+// detectKumbhaPorts reads imageRef's own manifest (the image just built
+// and pushed) for its declared EXPOSE ports, so a deploy that didn't
+// explicitly ask for any still ends up with a real public endpoint —
+// found live 2026-08-26: an agent's deploy call routinely omitted
+// `ports`, and asked directly, the customer's own — correct — reaction
+// was that this shouldn't need to be something the agent (or a human)
+// remembers to specify by hand when the built image already declares
+// it, the same way `docker build`/`docker run` itself resolves EXPOSE
+// through the image's layers, including ones inherited from FROM rather
+// than restated in the customer's own Dockerfile (Tempo's own
+// `FROM nginx:1.27-alpine` never re-declared EXPOSE 80 itself — nginx's
+// own base image already does).
+//
+// Best-effort: any failure (registry unreachable, credential lookup
+// failure, an image with genuinely no ExposedPorts) degrades to an empty
+// result, same as today's behaviour before this existed — never blocks
+// or fails the deploy itself over a convenience default.
+func (s *Server) detectKumbhaPorts(ctx context.Context, projectID uuid.UUID, imageRef string) []models.PortMapping {
+	if s.kumbhaBuild == nil {
+		return nil
+	}
+	username, password, err := s.kumbhaBuild.ImageAuth(ctx, projectID)
+	if err != nil {
+		log.Printf("WARN: could not resolve registry credentials to auto-detect deploy ports for %s: %v", imageRef, err)
+		return nil
+	}
+	found, err := imageinfo.ResolvePortsWithAuth(ctx, imageRef, username, password)
+	if err != nil || len(found) == 0 {
+		if err != nil {
+			log.Printf("WARN: could not auto-detect deploy ports for %s: %v", imageRef, err)
+		}
+		return nil
+	}
+	ports := make([]models.PortMapping, len(found))
+	for i, p := range found {
+		ports[i] = models.PortMapping{Container: p.Port, Protocol: p.Protocol}
+	}
+	return ports
+}
+
 // deployKumbhaSessionRequest is what the console IDE's Deploy button
 // sends. DockerfilePath aside, this is deliberately the same shape
 // POST /v1/compute/instances itself accepts (Name/CPUUnits/MemoryGB/
@@ -492,13 +533,18 @@ func (s *Server) DeployKumbhaSession(c *gin.Context) {
 		return
 	}
 
+	ports := req.Ports
+	if len(ports) == 0 {
+		ports = s.detectKumbhaPorts(c.Request.Context(), sess.ProjectID, imageRef)
+	}
+
 	createReq := models.CreateInstanceRequest{
 		Name:      req.Name,
 		Image:     imageRef,
 		CPUUnits:  req.CPUUnits,
 		Memory:    fmt.Sprintf("%dGB", req.MemoryGB),
 		StorageGB: req.StorageGB,
-		Ports:     req.Ports,
+		Ports:     ports,
 		Env:       req.Env,
 	}
 	createStatus, createBody := s.invokeInternally(s.CreateInstance, http.MethodPost, "/v1/compute/instances", nil, accountID, projectID, userID, createReq)

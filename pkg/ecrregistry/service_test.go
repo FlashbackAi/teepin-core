@@ -175,6 +175,41 @@ func TestDockerConfigJSONForBuild_DecodesTokenIntoUsernamePassword(t *testing.T)
 	}
 }
 
+// TestImageAuth_DecodesTokenIntoUsernamePassword covers the same token
+// decode as TestDockerConfigJSONForBuild_DecodesTokenIntoUsernamePassword,
+// via the plain-(username,password) accessor pkg/imageinfo's port-detection
+// uses instead of a full .dockerconfigjson.
+func TestImageAuth_DecodesTokenIntoUsernamePassword(t *testing.T) {
+	rawToken := base64.StdEncoding.EncodeToString([]byte("AWS:supersecrettoken"))
+	api := &fakeECRAPI{
+		tokenOut: &ecr.GetAuthorizationTokenOutput{
+			AuthorizationData: []types.AuthorizationData{{
+				AuthorizationToken: aws.String(rawToken),
+				ProxyEndpoint:      aws.String("https://123.dkr.ecr.us-east-1.amazonaws.com"),
+				ExpiresAt:          aws.Time(time.Now().Add(12 * time.Hour)),
+			}},
+		},
+	}
+	s := &Service{client: api, RepositoryName: "teepin/kumbha-builds-dev"}
+
+	username, password, err := s.ImageAuth(context.Background(), uuid.New())
+	if err != nil {
+		t.Fatalf("ImageAuth: %v", err)
+	}
+	if username != "AWS" || password != "supersecrettoken" {
+		t.Errorf("got username=%q password=%q, want AWS/supersecrettoken", username, password)
+	}
+}
+
+func TestImageAuth_NoAuthorizationDataIsError(t *testing.T) {
+	api := &fakeECRAPI{tokenOut: &ecr.GetAuthorizationTokenOutput{}}
+	s := &Service{client: api, RepositoryName: "teepin/kumbha-builds-dev"}
+
+	if _, _, err := s.ImageAuth(context.Background(), uuid.New()); err == nil {
+		t.Error("got nil error for an empty AuthorizationData response, want an error")
+	}
+}
+
 func TestDockerConfigJSONForBuild_NoAuthorizationDataIsError(t *testing.T) {
 	api := &fakeECRAPI{tokenOut: &ecr.GetAuthorizationTokenOutput{}}
 	s := &Service{client: api, RepositoryName: "teepin/kumbha-builds-dev"}

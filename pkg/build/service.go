@@ -57,6 +57,13 @@ type RegistryProvider interface {
 	// DockerConfigJSONForBuild returns a marshaled .dockerconfigjson
 	// granting push access to that same prefix.
 	DockerConfigJSONForBuild(ctx context.Context, projectID uuid.UUID) (string, error)
+	// ImageAuth returns the same credential DockerConfigJSONForBuild
+	// wraps into a .dockerconfigjson, as a plain (username, password)
+	// pair — for a caller that wants to authenticate a registry client
+	// directly (see DeployKumbhaSession's use of pkg/imageinfo to
+	// resolve a just-pushed image's own declared ports) rather than
+	// write a Kaniko config file.
+	ImageAuth(ctx context.Context, projectID uuid.UUID) (username, password string, err error)
 }
 
 // Config is the operator-fixed policy every build runs under — not
@@ -168,6 +175,15 @@ type OnLogLine func(line string)
 // concurrently.
 func buildInstanceID(tag string) string {
 	return "kaniko-build-" + tag
+}
+
+// ImageAuth exposes the registry credential a just-built image was
+// pushed with — see RegistryProvider.ImageAuth's own doc comment. A
+// thin delegation so a caller holding only this exported *Service (e.g.
+// pkg/api.DeployKumbhaSession) does not need its own reference to the
+// unexported registry field.
+func (s *Service) ImageAuth(ctx context.Context, projectID uuid.UUID) (username, password string, err error) {
+	return s.registry.ImageAuth(ctx, projectID)
 }
 
 // Build provisions the project's registry, launches one build instance
