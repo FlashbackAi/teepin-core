@@ -234,6 +234,9 @@ func (f *streamRetryCluster) GetInstanceStatus(context.Context, cluster.Scope, s
 func (f *streamRetryCluster) CreateInstance(context.Context, cluster.InstanceSpec) (*cluster.InstanceResult, error) {
 	return nil, errors.New("not implemented")
 }
+func (f *streamRetryCluster) UpdateInstance(context.Context, cluster.Scope, cluster.InstanceSpec) (*cluster.InstanceResult, error) {
+	return nil, errors.New("not implemented")
+}
 func (f *streamRetryCluster) DeleteInstance(context.Context, cluster.Scope, string) error {
 	return errors.New("not implemented")
 }

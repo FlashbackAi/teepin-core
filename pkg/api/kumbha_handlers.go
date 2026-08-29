@@ -20,6 +20,8 @@ import (
 
 	"github.com/FlashbackAi/teepin-core/pkg/auth"
 	"github.com/FlashbackAi/teepin-core/pkg/build"
+	"github.com/FlashbackAi/teepin-core/pkg/cluster"
+	"github.com/FlashbackAi/teepin-core/pkg/compute"
 	"github.com/FlashbackAi/teepin-core/pkg/imageinfo"
 	"github.com/FlashbackAi/teepin-core/pkg/inference"
 	"github.com/FlashbackAi/teepin-core/pkg/kumbha"
@@ -42,7 +44,13 @@ type createKumbhaSessionRequest struct {
 }
 
 // kumbhaSessionResponse is the shared JSON shape for every endpoint that
-// returns a session — creation, status polling, and close.
+// returns a session — creation, listing, and close. agent_running here is
+// the CHEAP proxy (was a pod ever launched and never explicitly torn
+// down), not a live cluster read — correct enough for a list of past
+// builds, where a per-row live pod-status check would mean one cluster
+// round trip per row on every poll. GetKumbhaSession (the single-session
+// read the console detail page actually polls) overrides it with a real
+// live check — see its own doc comment.
 func kumbhaSessionResponse(sess *kumbha.Session) gin.H {
 	return gin.H{
 		"id":              sess.ID,
@@ -56,8 +64,17 @@ func kumbhaSessionResponse(sess *kumbha.Session) gin.H {
 		// underway, never the underlying pod identifier (Kumbha's own
 		// workload; see pkg/kumbha/agent.go's LaunchAgent doc comment).
 		"agent_running": sess.AgentInstanceID != "",
-		"started_at":    sess.StartedAt,
-		"ended_at":      sess.EndedAt,
+		// app_instance_id names the real compute instance this session's
+		// deploy(s) produced (see Session.AppInstanceID's own doc
+		// comment) — exposed so the console can link straight to
+		// /compute/{id} and, on a fresh page load with no event history
+		// yet, populate the Preview tab immediately rather than waiting
+		// for the agent's own event stream to mention a URL (see
+		// build/[id]/page.tsx's extractAppUrl, which this is the
+		// complement to).
+		"app_instance_id": sess.AppInstanceID,
+		"started_at":      sess.StartedAt,
+		"ended_at":        sess.EndedAt,
 	}
 }
 
@@ -461,21 +478,21 @@ type deployKumbhaSessionRequest struct {
 // Deploy button, and the thing that finally makes an IDE edit or a
 // version rollback actually reachable at a URL, not just buildable.
 //
-// Reuses CreateInstance/DeleteInstance UNCHANGED via invokeInternally
-// (see its own doc comment) rather than re-implementing GPU/home
-// placement, the payment gate, endpoint provisioning, or the
+// The FIRST deploy of a session reuses CreateInstance UNCHANGED via
+// invokeInternally (see its own doc comment) rather than re-implementing
+// GPU/home placement, the payment gate, endpoint provisioning, or the
 // compute.instances billing row a second time — the resulting instance
 // must be indistinguishable from one the customer created by hand, and
-// duplicated logic is one drifted line away from silently not being that.
-//
-// Each call creates a NEW instance — the compute layer has no in-place
-// "swap the image on a running instance" capability yet (see migration
-// 026's own note) — and tears down whatever instance THIS session's
-// previous deploy created, so redeploying does not leak one orphaned
-// instance per click. The resulting endpoint hostname changes on every
-// deploy as a consequence; that is the same behaviour the agent's own
-// `deploy` MCP verb already has today, not a new limitation introduced
-// here.
+// duplicated logic is one drifted line away from silently not being
+// that. Every deploy AFTER the first — sess.AppInstanceID already
+// set — instead swaps the EXISTING instance's pod in place
+// (redeployKumbhaInstance, cluster.Client.UpdateInstance): same
+// instance ID, same hostname, same TLS cert, same compute.instances row,
+// only the running code changes. Found live 2026-08-29: the prior
+// create-a-new-instance-then-delete-the-old-one behaviour churned a
+// fresh hostname and billing row on every single click, which is neither
+// what "redeploy" means to a customer nor how any comparable platform
+// (Vercel, Render, Fly) behaves.
 // POST /v1/kumbha/sessions/:id/deploy
 func (s *Server) DeployKumbhaSession(c *gin.Context) {
 	if s.kumbha == nil || s.kumbhaBuild == nil {
@@ -537,6 +554,19 @@ func (s *Server) DeployKumbhaSession(c *gin.Context) {
 	if len(ports) == 0 {
 		ports = s.detectKumbhaPorts(c.Request.Context(), sess.ProjectID, imageRef)
 	}
+	if status, body := validatePorts(ports); status != 0 {
+		c.JSON(status, body)
+		return
+	}
+	if status, body := validateStorageGB(req.StorageGB); status != 0 {
+		c.JSON(status, body)
+		return
+	}
+
+	if sess.AppInstanceID != "" {
+		s.redeployKumbhaInstance(c, sessionID, sess, projectID, accountID, imageRef, ports, req.Env)
+		return
+	}
 
 	createReq := models.CreateInstanceRequest{
 		Name:      req.Name,
@@ -562,23 +592,18 @@ func (s *Server) DeployKumbhaSession(c *gin.Context) {
 		return
 	}
 
-	previousInstanceID := sess.AppInstanceID
+	// sess.AppInstanceID is always empty here — the branch above already
+	// routed any session with an existing instance to
+	// redeployKumbhaInstance instead — so this is unconditionally the
+	// FIRST instance this session has ever created, never a replacement.
 	if err := s.kumbha.SetAppInstanceID(c.Request.Context(), sessionID, created.ID); err != nil {
 		// The instance is real and running; only OUR bookkeeping of which
 		// one belongs to this session failed. Not worth failing the
 		// customer's deploy over — logged so an operator can reconcile —
-		// the worst outcome is the NEXT deploy failing to clean this one
-		// up, not the customer losing the app they just got.
+		// the worst outcome is the NEXT deploy failing to find it and
+		// creating a second instance instead of redeploying this one, not
+		// the customer losing the app they just got.
 		log.Printf("WARN: deployed instance %s for Kumbha session %s but failed to record it: %v", created.ID, sessionID, err)
-	}
-
-	if previousInstanceID != "" && previousInstanceID != created.ID {
-		delStatus, delBody := s.invokeInternally(s.DeleteInstance, http.MethodDelete, "/v1/compute/instances/"+previousInstanceID,
-			gin.Params{{Key: "id", Value: previousInstanceID}}, accountID, projectID, userID, nil)
-		if delStatus != http.StatusOK {
-			log.Printf("WARN: Kumbha session %s redeployed but failed to tear down its previous instance %s (status %d): %s",
-				sessionID, previousInstanceID, delStatus, string(delBody))
-		}
 	}
 
 	// The customer-visible "Version history" only ever gains an entry
@@ -597,6 +622,107 @@ func (s *Server) DeployKumbhaSession(c *gin.Context) {
 		"endpoint":       created.Endpoint,
 		"status":         created.Status,
 		"price_per_hour": created.PricePerHour,
+	})
+}
+
+// redeployKumbhaInstance is DeployKumbhaSession's path for every deploy
+// after the session's first: sess.AppInstanceID already names a real,
+// running compute instance, so this swaps its pod for one running
+// imageRef via cluster.Client.UpdateInstance instead of creating (and
+// then tearing down) a second instance. Same instance ID, same
+// Service/Ingress/hostname/TLS cert, same compute.instances row — a
+// customer watching the Preview tab sees the same URL start serving new
+// code, not a URL that just changed out from under them.
+//
+// CPU/Memory/StorageGB are read from the EXISTING record rather than
+// req — a redeploy changes what code runs, not how big the instance is;
+// resizing an existing instance is a different, unbuilt feature (and one
+// the console's own Deploy button has never offered a control for).
+func (s *Server) redeployKumbhaInstance(c *gin.Context, sessionID uuid.UUID, sess *kumbha.Session, projectID, accountID uuid.UUID, imageRef string, ports []models.PortMapping, env map[string]string) {
+	if s.store == nil {
+		// Persistence is what remembers an existing instance's sizing and
+		// what UpdateImage reconciles afterward — without it there is no
+		// safe way to redeploy in place at all (see the CPU/Memory comment
+		// above). Standalone mode never sets AppInstanceID in the first
+		// place (SetAppInstanceID is itself a no-op without a store), so
+		// this should be unreachable outside a misconfiguration.
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot redeploy: no instance store configured"})
+		return
+	}
+
+	existing, err := s.store.Get(c.Request.Context(), sess.AppInstanceID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if existing == nil || existing.AccountID != accountID {
+		// Another tenant's instance is indistinguishable from a missing
+		// one, same as GetInstance/DeleteInstance elsewhere in this file —
+		// existence must not leak. In practice this session's own
+		// AppInstanceID can only ever have been set by ITS OWN earlier
+		// deploy (SetAppInstanceID, above), so a mismatch here means the
+		// instance was deleted out from under the session some other way
+		// (e.g. by hand in the Compute page) rather than a real tenancy
+		// violation — surfaced as 404 either way, since "redeploy" has
+		// nothing left to target.
+		c.JSON(http.StatusNotFound, gin.H{"error": "this session's previously deployed instance no longer exists"})
+		return
+	}
+
+	req := models.CreateInstanceRequest{
+		Name:      existing.Name,
+		Image:     imageRef,
+		CPUUnits:  existing.CPUUnits,
+		Memory:    fmt.Sprintf("%dGB", existing.MemoryGB),
+		StorageGB: existing.StorageGB,
+		Ports:     ports,
+		Env:       env,
+	}
+	spec := s.instanceSpec(existing.ID, endpointUUIDFor(existing.ID), projectID, accountID, &req, nil)
+
+	result, err := s.cluster.UpdateInstance(c.Request.Context(), scopeFor(projectID), spec)
+	if err != nil {
+		if errors.Is(err, cluster.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "this session's previously deployed instance no longer exists in the cluster"})
+			return
+		}
+		if errors.Is(err, cluster.ErrClusterUnavailable) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": "no GPU capacity is reachable right now; the existing instance is unaffected",
+			})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to redeploy instance: %v", err)})
+		return
+	}
+
+	containerPort := 0
+	if len(ports) > 0 {
+		containerPort = ports[0].Container
+	}
+	if err := s.store.UpdateImage(c.Request.Context(), existing.ID, imageRef, result.PodName, containerPort); err != nil {
+		// The pod is real and running the new code; only OUR record of
+		// which image/pod it is now on failed to update. Not worth
+		// failing the customer's redeploy over — logged so an operator
+		// can reconcile — the instance is still reachable at its
+		// unchanged hostname regardless.
+		log.Printf("WARN: redeployed instance %s for Kumbha session %s but failed to update its record: %v", existing.ID, sessionID, err)
+	}
+
+	if err := s.kumbha.CheckpointWorkspace(c.Request.Context(), sessionID); err != nil {
+		log.Printf("WARN: redeployed Kumbha session %s but failed to checkpoint its workspace version: %v", sessionID, err)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"image_ref":   imageRef,
+		"instance_id": existing.ID,
+		// The endpoint is UNCHANGED by a redeploy — same Service/Ingress,
+		// same hostname — so it is read back from the existing record
+		// rather than from `result`, which (being a pod-only replace)
+		// never re-provisions or re-reports it.
+		"endpoint":       existing.Endpoint,
+		"status":         compute.StatusPending,
+		"price_per_hour": 0.0, // Kumbha apps are CPU-only; see CreateInstance's own note that this is only ever non-zero for a GPU allocation.
 	})
 }
 
@@ -654,9 +780,22 @@ func joinTail(lines []string, limit int) string {
 }
 
 // GetKumbhaSession returns a session's current status — budget, spend,
-// and deploy_approved. Read by the console for the live budget meter, and
-// by the Kumbha MCP tool server (cmd/kumbha-mcp-server) to check
-// deploy_approved before any provisioning verb makes a real API call.
+// deploy_approved, and (unlike every other endpoint returning a session —
+// see kumbhaSessionResponse's own comment) a LIVE read of whether the
+// agent is actually still running and what state its deployed app is
+// actually in, not the cheap "was one ever launched" proxies. This is the
+// endpoint the console's build detail page polls every few seconds (see
+// budget-meter.tsx), and by the Kumbha MCP tool server
+// (cmd/kumbha-mcp-server) to check deploy_approved before any
+// provisioning verb makes a real API call — worth one extra cluster read
+// or two here for a UI that needs "Building" to stop being true the
+// moment the agent pod actually exits, and "Deployed"/"Error" to reflect
+// the app's real status rather than staying frozen at whatever
+// buildKumbhaImage last reported. Found live 2026-08-29: a session's
+// status stayed "Building" (agent_running derived only from
+// agent_instance_id != "") long after the agent pod had exited, and the
+// deployed app's own health was not visible anywhere in this response at
+// all.
 // GET /v1/kumbha/sessions/:id
 func (s *Server) GetKumbhaSession(c *gin.Context) {
 	if s.kumbha == nil {
@@ -670,7 +809,7 @@ func (s *Server) GetKumbhaSession(c *gin.Context) {
 		return
 	}
 
-	_, accountID, ok := s.requireScope(c)
+	projectID, accountID, ok := s.requireScope(c)
 	if !ok {
 		return
 	}
@@ -684,7 +823,40 @@ func (s *Server) GetKumbhaSession(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, kumbhaSessionResponse(sess))
+
+	resp := kumbhaSessionResponse(sess)
+
+	// Live agent status, not the "was one ever launched and never torn
+	// down" proxy the shared response defaults to. Best-effort: a cluster
+	// read failure degrades to the cheap proxy already in resp rather than
+	// failing the whole session read over a UI nicety.
+	if sess.AgentInstanceID != "" {
+		if running, err := s.kumbha.IsAgentRunning(c.Request.Context(), sess); err == nil {
+			resp["agent_running"] = running
+		}
+	}
+
+	// The deployed app's own live status — "pending"/"running"/"failed"/
+	// "terminated", cluster's own vocabulary (see compute.Status* and
+	// statusToInstance) — is what actually answers "did the last deploy
+	// work", which agent_running alone cannot: the agent can finish (or
+	// never have been running this whole time, on a page reload) while
+	// the app it deployed is crash-looping. Empty when no deploy has
+	// happened yet, or the read failed — never guessed.
+	if sess.AppInstanceID != "" && s.cluster != nil {
+		if st, err := s.cluster.GetInstanceStatus(c.Request.Context(), scopeFor(projectID), sess.AppInstanceID); err == nil {
+			resp["app_status"] = st.Status
+			resp["app_status_message"] = st.Message
+			// The endpoint too, straight off the same live read — this is
+			// what lets the console populate its Preview tab and "open the
+			// instance" link the moment a deploy succeeds, whether it was
+			// the agent's own deploy call or the console IDE's Deploy
+			// button, without waiting for (or parsing) an event summary.
+			resp["app_endpoint"] = st.EndpointURL
+		}
+	}
+
+	c.JSON(http.StatusOK, resp)
 }
 
 // ApproveKumbhaDeploy flips a session's pre-deploy cost-approval gate.
@@ -719,6 +891,71 @@ func (s *Server) ApproveKumbhaDeploy(c *gin.Context) {
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	sess, err := s.kumbha.GetSession(c.Request.Context(), sessionID, accountID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, kumbhaSessionResponse(sess))
+}
+
+// updateKumbhaBudgetRequest is the console's "raise budget" control on
+// the live budget meter — the replacement for the composer's old
+// up-front budget picker (see build/page.tsx and the composer's own
+// removed BUDGET_PRESETS).
+type updateKumbhaBudgetRequest struct {
+	Budget float64 `json:"budget" binding:"required"`
+}
+
+// UpdateKumbhaBudget raises an open session's pre-authorised spend cap.
+// A raise only — see Gateway.IncreaseBudget's own doc comment for why a
+// lower or equal value is rejected rather than silently accepted as a
+// no-op.
+// PATCH /v1/kumbha/sessions/:id/budget
+func (s *Server) UpdateKumbhaBudget(c *gin.Context) {
+	if s.kumbha == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha Gateway is not available on this deployment"})
+		return
+	}
+
+	sessionID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid session id"})
+		return
+	}
+
+	var req updateKumbhaBudgetRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	_, accountID, ok := s.requireScope(c)
+	if !ok {
+		return
+	}
+
+	if err := s.kumbha.IncreaseBudget(c.Request.Context(), sessionID, accountID, req.Budget); err != nil {
+		switch {
+		case errors.Is(err, kumbha.ErrSessionNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
+		case errors.Is(err, kumbha.ErrSessionClosed):
+			c.JSON(http.StatusConflict, gin.H{"error": "this session is no longer open"})
+		case errors.Is(err, kumbha.ErrBudgetNotIncreased):
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		case errors.Is(err, kumbha.ErrPaymentRequired):
+			c.JSON(http.StatusPaymentRequired, gin.H{"error": err.Error(), "code": "payment_method_required"})
+		case errors.Is(err, kumbha.ErrGateUnavailable):
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "unable to verify billing status, please retry"})
+		default:
+			// A cap-exceeded rejection from the store's own defence-in-depth
+			// check lands here — a plain 400, since it is the customer's
+			// requested value that is wrong, not a server problem.
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		}
 		return
 	}
 

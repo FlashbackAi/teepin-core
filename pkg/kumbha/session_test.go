@@ -228,6 +228,46 @@ func TestStore_SetDeployApproved_NotFoundOrClosedIsErrSessionNotFound(t *testing
 	}
 }
 
+func TestStore_IncreaseBudget_Success(t *testing.T) {
+	store, mock := newMockStore(t)
+	id, accountID := uuid.New(), uuid.New()
+
+	mock.ExpectExec(`UPDATE billing\.inference_sessions SET budget`).
+		WithArgs(15.0, id, accountID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := store.IncreaseBudget(context.Background(), id, accountID, 15.0); err != nil {
+		t.Fatalf("IncreaseBudget: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestStore_IncreaseBudget_NotFoundOrNotHigherIsErrSessionNotFound(t *testing.T) {
+	store, mock := newMockStore(t)
+	id, accountID := uuid.New(), uuid.New()
+
+	mock.ExpectExec(`UPDATE billing\.inference_sessions SET budget`).
+		WithArgs(15.0, id, accountID).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	err := store.IncreaseBudget(context.Background(), id, accountID, 15.0)
+	if !errors.Is(err, ErrSessionNotFound) {
+		t.Errorf("got %v, want ErrSessionNotFound", err)
+	}
+}
+
+func TestStore_IncreaseBudget_RejectsOverTheCap(t *testing.T) {
+	store, _ := newMockStore(t)
+	id, accountID := uuid.New(), uuid.New()
+
+	err := store.IncreaseBudget(context.Background(), id, accountID, maxSessionBudget+1)
+	if err == nil {
+		t.Error("expected an error for a budget over maxSessionBudget, got nil")
+	}
+}
+
 func TestStore_Close_OnlyClosesAnOpenSession(t *testing.T) {
 	store, mock := newMockStore(t)
 	id, accountID := uuid.New(), uuid.New()

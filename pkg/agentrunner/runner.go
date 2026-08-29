@@ -316,20 +316,33 @@ func (r *Runner) handleCreate(ctx context.Context, s stream, requestID string, c
 	// Idempotency: a command redelivered after a reconnect must not
 	// create a second pod. The control plane uses the instance ID as the
 	// request ID precisely so this check is possible.
-	if existing, err := r.cfg.Cluster.GetInstanceStatus(
-		ctx, cluster.AllTenants(), cmd.InstanceId); err == nil && existing != nil {
-		log.Printf("Instance %s already exists - treating redelivered command as success", cmd.InstanceId)
-		_ = r.send(s, &agentpb.AgentMessage{
-			RequestId: requestID,
-			Payload: &agentpb.AgentMessage_Result{Result: &agentpb.CommandResult{
-				Success: true,
-				PodName: existing.PodName,
-			}},
-		})
-		return
+	//
+	// Deliberately skipped when ReplaceExisting is set: that command is
+	// issued BECAUSE the instance already exists and must be swapped —
+	// treating its existence as "already done, nothing to do" would make
+	// a replace a permanent no-op.
+	if !cmd.ReplaceExisting {
+		if existing, err := r.cfg.Cluster.GetInstanceStatus(
+			ctx, cluster.AllTenants(), cmd.InstanceId); err == nil && existing != nil {
+			log.Printf("Instance %s already exists - treating redelivered command as success", cmd.InstanceId)
+			_ = r.send(s, &agentpb.AgentMessage{
+				RequestId: requestID,
+				Payload: &agentpb.AgentMessage_Result{Result: &agentpb.CommandResult{
+					Success: true,
+					PodName: existing.PodName,
+				}},
+			})
+			return
+		}
 	}
 
-	result, err := r.cfg.Cluster.CreateInstance(ctx, spec)
+	var result *cluster.InstanceResult
+	var err error
+	if cmd.ReplaceExisting {
+		result, err = r.cfg.Cluster.UpdateInstance(ctx, cluster.AllTenants(), spec)
+	} else {
+		result, err = r.cfg.Cluster.CreateInstance(ctx, spec)
+	}
 	if err != nil {
 		log.Printf("Create %s failed: %v", cmd.InstanceId, err)
 		r.replyError(s, requestID, errorCodeFor(err), err.Error())

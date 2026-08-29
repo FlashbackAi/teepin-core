@@ -818,3 +818,109 @@ func TestCreateInstance_ProvisioningFailureIsNonFatal(t *testing.T) {
 		t.Error("EndpointURL should be empty when provisioning failed")
 	}
 }
+
+// TestUpdateInstance_ReplacesPodKeepsEndpoint is the core guarantee
+// UpdateInstance exists for (a Kumbha redeploy): the pod is swapped for a
+// new one running the new image, but the Service/Ingress the customer's
+// hostname resolves to is never recreated — same DNSName, same endpoint,
+// because CreateInstance's own Service/Ingress creation is
+// IsAlreadyExists-tolerant and the new pod carries the identical
+// app.teepin.cloud/instance-id label the existing Service already
+// selects on.
+func TestUpdateInstance_ReplacesPodKeepsEndpoint(t *testing.T) {
+	provisioner := &fakeProvisioner{info: &networking.EndpointInfo{
+		HTTPSURL:   "https://inst-swap0001.teepin.com",
+		DNSName:    "inst-swap0001.teepin.com",
+		TLSEnabled: true,
+		TLSReady:   true,
+	}}
+	c := NewDirectClient(fake.NewSimpleClientset(), provisioner, nil, "nvidia")
+	instanceUUID := uuid.New()
+
+	spec := InstanceSpec{
+		InstanceID: "inst-swap0001",
+		Image:      "myapp:v1",
+		CPUUnits:   1,
+		MemoryGB:   1,
+		Ports:      []PortMapping{{Container: 80, Protocol: "tcp"}},
+		Labels:     map[string]string{labelInstanceUUID: instanceUUID.String()},
+	}
+	if _, err := c.CreateInstance(context.Background(), spec); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	before, _ := c.k8s.CoreV1().Pods(workloadNamespace).List(context.Background(), metav1.ListOptions{})
+	if len(before.Items) != 1 {
+		t.Fatalf("expected exactly 1 pod after create, got %d", len(before.Items))
+	}
+	oldPodName := before.Items[0].Name
+
+	spec.Image = "myapp:v2"
+	result, err := c.UpdateInstance(context.Background(), Scope{}, spec)
+	if err != nil {
+		t.Fatalf("UpdateInstance: %v", err)
+	}
+	if result.DNSName != "inst-swap0001.teepin.com" {
+		t.Errorf("DNSName = %q, want the SAME hostname the original create got", result.DNSName)
+	}
+
+	after, _ := c.k8s.CoreV1().Pods(workloadNamespace).List(context.Background(), metav1.ListOptions{})
+	if len(after.Items) != 1 {
+		t.Fatalf("expected exactly 1 pod after update (old one replaced, not left behind), got %d", len(after.Items))
+	}
+	if after.Items[0].Name == oldPodName {
+		t.Error("pod name did not change — the old pod was never actually replaced")
+	}
+	if after.Items[0].Spec.Containers[0].Image != "myapp:v2" {
+		t.Errorf("new pod image = %q, want myapp:v2", after.Items[0].Spec.Containers[0].Image)
+	}
+	if after.Items[0].Labels[labelInstanceID] != "inst-swap0001" {
+		t.Error("replacement pod must carry the same instance-id label the Service already selects on")
+	}
+}
+
+// TestUpdateInstance_NoExistingInstanceIsNotFound: an update targeting an
+// instance ID nothing created yet must not silently provision a fresh,
+// orphaned instance — that would defeat the whole "same ID in, same ID
+// out" contract this method exists for.
+func TestUpdateInstance_NoExistingInstanceIsNotFound(t *testing.T) {
+	c := newTestClient()
+
+	_, err := c.UpdateInstance(context.Background(), Scope{}, InstanceSpec{
+		InstanceID: "inst-neverexisted",
+		Image:      "myapp:v1",
+		CPUUnits:   1,
+		MemoryGB:   1,
+	})
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("UpdateInstance on a non-existent instance: err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestUpdateInstance_ScopedToProjectLikeAnyOtherMutation: an update must
+// not be able to reach or replace another tenant's instance merely by
+// guessing its ID — the same tenancy predicate DeleteInstance/GetInstance
+// already enforce.
+func TestUpdateInstance_ScopedToProjectLikeAnyOtherMutation(t *testing.T) {
+	c := newTestClient()
+	if _, err := c.CreateInstance(context.Background(), InstanceSpec{
+		InstanceID: "inst-tenantA01",
+		Image:      "myapp:v1",
+		CPUUnits:   1,
+		MemoryGB:   1,
+		ProjectID:  "project-alice",
+	}); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	_, err := c.UpdateInstance(context.Background(), ProjectScope("project-bob"), InstanceSpec{
+		InstanceID: "inst-tenantA01",
+		Image:      "myapp:v2",
+		CPUUnits:   1,
+		MemoryGB:   1,
+		ProjectID:  "project-bob",
+	})
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("cross-tenant UpdateInstance: err = %v, want ErrNotFound", err)
+	}
+}

@@ -189,6 +189,37 @@ func (s *Store) UpdateStatus(ctx context.Context, id, status string) error {
 	return nil
 }
 
+// UpdateImage records a redeploy that swapped an existing instance's pod
+// in place — same id, new image/pod/container port. The only caller
+// today is DeployKumbhaSession's redeploy path (a Kumbha customer's app
+// hostname must not change just because new code shipped — see
+// cluster.Client.UpdateInstance's own doc comment for the cluster-layer
+// half of this).
+//
+// Status resets to pending: a fresh pod was just created and has not
+// been observed running yet, the same state a brand new instance starts
+// in. started_at is deliberately left untouched — the instance has been
+// running (and billing) continuously since its ORIGINAL create; a
+// redeploy is not a new billing period. Endpoint fields (dns_name,
+// public_ip, tls_*) are untouched for the same reason UpdateInstance
+// never re-provisions them: they cannot have changed, since the
+// Service/Ingress they describe were never recreated.
+func (s *Store) UpdateImage(ctx context.Context, id, image, podName string, containerPort int) error {
+	query := `
+		UPDATE compute.instances
+		SET image = $1, k8s_pod_name = $2, container_port = $3, status = $4
+		WHERE id = $5 AND terminated_at IS NULL
+	`
+	res, err := s.db.ExecContext(ctx, query, image, podName, containerPort, StatusPending, id)
+	if err != nil {
+		return fmt.Errorf("failed to update image for %s: %w", id, err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return fmt.Errorf("instance %s not found or already terminated", id)
+	}
+	return nil
+}
+
 // MarkTerminated finalizes an instance: status becomes terminated and
 // terminated_at is stamped, which stops billing collection for it.
 // Idempotent: terminating an already-terminated instance is a no-op.

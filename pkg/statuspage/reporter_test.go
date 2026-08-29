@@ -23,6 +23,9 @@ func (s stubCluster) Inventory(context.Context) ([]cluster.NodeInventory, error)
 func (stubCluster) CreateInstance(context.Context, cluster.InstanceSpec) (*cluster.InstanceResult, error) {
 	return nil, nil
 }
+func (stubCluster) UpdateInstance(context.Context, cluster.Scope, cluster.InstanceSpec) (*cluster.InstanceResult, error) {
+	return nil, nil
+}
 func (stubCluster) DeleteInstance(context.Context, cluster.Scope, string) error { return nil }
 func (stubCluster) GetInstanceStatus(context.Context, cluster.Scope, string) (*cluster.InstanceStatus, error) {
 	return nil, nil

@@ -269,6 +269,71 @@ func NewServer(clusterClient cluster.Client, gpuAllocator *gpu.Allocator, store 
 // (no database) there is no tenancy and the scope is unrestricted;
 // otherwise it is pinned to the caller's project, which requireScope has
 // already established is present.
+// validatePorts checks a create/redeploy request's requested ports against
+// this platform's constraints. Returns status == 0 and a nil body when
+// every port is valid; otherwise the exact status/body the caller should
+// write via c.JSON and return. Shared by CreateInstance and
+// DeployKumbhaSession's redeploy path (see redeployKumbhaInstance) so a
+// redeploy cannot bypass validation an initial create would have enforced
+// merely by taking a different code path.
+func validatePorts(ports []models.PortMapping) (status int, body gin.H) {
+	// There is no per-instance public port in this architecture: every
+	// instance is reached by hostname on 443 through the shared edge
+	// (pkg/networking's ProvisionEndpoint hardcodes ExternalPort 443).
+	// Silently accepting a port the platform cannot honour is worse than
+	// rejecting it — a customer who set `public` and got a different port
+	// (or none) would have no way to know their request was ignored.
+	//
+	// Protocol is validated here rather than left to silently fall back to
+	// TCP downstream: a typo ("udp " with a trailing space, "UDP1") should
+	// be a 400 the customer can fix, not a request that quietly runs as
+	// something other than what was asked for.
+	for _, port := range ports {
+		if port.Public != 0 {
+			return http.StatusBadRequest, gin.H{
+				"error": "public port assignment is not supported; instances are reached by hostname on 443, not a chosen port",
+			}
+		}
+		switch strings.ToLower(port.Protocol) {
+		case "", "tcp", "udp":
+		default:
+			return http.StatusBadRequest, gin.H{
+				"error": fmt.Sprintf("invalid port protocol %q: must be tcp or udp", port.Protocol),
+			}
+		}
+		// The valid TCP/UDP port range. Below this, 0 is "no port" (should
+		// never reach here as a real request) and negative values are a
+		// client bug; above it, the value cannot be a port at all. This is
+		// a sanity bound, not a privilege restriction — containers in this
+		// platform are free to listen on any port including <1024 (e.g.
+		// nginx's default of 80), since that is a container-namespace bind,
+		// not a host one, and carries none of a bare process's root
+		// requirement.
+		if port.Container < 1 || port.Container > 65535 {
+			return http.StatusBadRequest, gin.H{
+				"error": fmt.Sprintf("invalid container port %d: must be between 1 and 65535", port.Container),
+			}
+		}
+	}
+	return 0, nil
+}
+
+// validateStorageGB checks a create/redeploy request's requested volume
+// size. Same status==0-means-valid contract as validatePorts, and shared
+// for the same reason.
+func validateStorageGB(gb int) (status int, body gin.H) {
+	// 1000GB is an operator-chosen sanity bound, not a technical limit —
+	// there is no plan tier anywhere near it yet, and it exists purely to
+	// reject a fat-fingered request (or an integer overflow upstream)
+	// before it reaches PVC provisioning.
+	if gb < 0 || gb > 1000 {
+		return http.StatusBadRequest, gin.H{
+			"error": fmt.Sprintf("invalid storage_gb %d: must be between 0 and 1000", gb),
+		}
+	}
+	return 0, nil
+}
+
 func scopeFor(projectID uuid.UUID) cluster.Scope {
 	if projectID == uuid.Nil {
 		return cluster.AllTenants()
@@ -371,56 +436,12 @@ func (s *Server) CreateInstance(c *gin.Context) {
 		return
 	}
 
-	// There is no per-instance public port in this architecture: every
-	// instance is reached by hostname on 443 through the shared edge
-	// (pkg/networking's ProvisionEndpoint hardcodes ExternalPort 443).
-	// Silently accepting a port the platform cannot honour is worse than
-	// rejecting it — a customer who set `public` and got a different port
-	// (or none) would have no way to know their request was ignored.
-	//
-	// Protocol is validated here rather than left to silently fall back to
-	// TCP downstream: a typo ("udp " with a trailing space, "UDP1") should
-	// be a 400 the customer can fix, not a request that quietly runs as
-	// something other than what was asked for.
-	for _, port := range req.Ports {
-		if port.Public != 0 {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error": "public port assignment is not supported; instances are reached by hostname on 443, not a chosen port",
-			})
-			return
-		}
-		switch strings.ToLower(port.Protocol) {
-		case "", "tcp", "udp":
-		default:
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error": fmt.Sprintf("invalid port protocol %q: must be tcp or udp", port.Protocol),
-			})
-			return
-		}
-		// The valid TCP/UDP port range. Below this, 0 is "no port" (should
-		// never reach here as a real request) and negative values are a
-		// client bug; above it, the value cannot be a port at all. This is
-		// a sanity bound, not a privilege restriction — containers in this
-		// platform are free to listen on any port including <1024 (e.g.
-		// nginx's default of 80), since that is a container-namespace bind,
-		// not a host one, and carries none of a bare process's root
-		// requirement.
-		if port.Container < 1 || port.Container > 65535 {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error": fmt.Sprintf("invalid container port %d: must be between 1 and 65535", port.Container),
-			})
-			return
-		}
+	if status, body := validatePorts(req.Ports); status != 0 {
+		c.JSON(status, body)
+		return
 	}
-
-	// 1000GB is an operator-chosen sanity bound, not a technical limit —
-	// there is no plan tier anywhere near it yet, and it exists purely to
-	// reject a fat-fingered request (or an integer overflow upstream)
-	// before it reaches PVC provisioning.
-	if req.StorageGB < 0 || req.StorageGB > 1000 {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": fmt.Sprintf("invalid storage_gb %d: must be between 0 and 1000", req.StorageGB),
-		})
+	if status, body := validateStorageGB(req.StorageGB); status != 0 {
+		c.JSON(status, body)
 		return
 	}
 
@@ -457,9 +478,16 @@ func (s *Server) CreateInstance(c *gin.Context) {
 		}
 	}
 
-	// Generate instance UUID
-	instanceUUID := uuid.New()
-	instanceID := fmt.Sprintf("inst-%s", instanceUUID.String()[:8])
+	// The customer-facing instance ID is random; the endpoint UUID that
+	// names its Service/Ingress/TLS resources is deterministically derived
+	// FROM it (see endpointUUIDFor) rather than minted separately — that
+	// is what lets a later Kumbha redeploy (DeployKumbhaSession) recompute
+	// the exact same value the original create used, with nothing to
+	// persist or look up, so its endpoint-provisioning call lands on the
+	// SAME already-existing Service/Ingress instead of creating a second,
+	// differently-named pair alongside them.
+	instanceID := fmt.Sprintf("inst-%s", uuid.New().String()[:8])
+	instanceUUID := endpointUUIDFor(instanceID)
 
 	// Home-class placement — OPT-IN ONLY. This branch is entered solely
 	// when the request explicitly asks for node_class:"home", so a normal
@@ -955,6 +983,27 @@ func (s *Server) requireScope(c *gin.Context) (projectID, accountID uuid.UUID, o
 	}
 
 	return projectID, accountID, true
+}
+
+// endpointUUIDNamespace is an arbitrary, fixed UUID used purely as the
+// namespace argument to endpointUUIDFor's UUIDv5 derivation — its value
+// carries no meaning beyond "a constant unique to this codebase," it just
+// needs to never change once instances exist that depend on it.
+var endpointUUIDNamespace = uuid.MustParse("6f6e8e2e-2f0a-4b8a-9b0f-2c6a2e7c9d1a")
+
+// endpointUUIDFor deterministically derives the UUID that names an
+// instance's Service/Ingress/TLS resources (networking.Service's
+// generateServiceName/generateIngressName) from its stable, customer-
+// facing instance ID — see the CreateInstance call site's own comment for
+// why this must be a pure function of instanceID rather than a randomly
+// minted value: a Kumbha redeploy (DeployKumbhaSession) swaps an
+// instance's pod in place under the SAME instanceID and needs to hand
+// UpdateInstance the identical endpoint UUID the original create used, or
+// endpoint provisioning (IsAlreadyExists-tolerant only when the name
+// actually matches) would create a second, orphaned Service/Ingress pair
+// instead of reusing the live one.
+func endpointUUIDFor(instanceID string) uuid.UUID {
+	return uuid.NewSHA1(endpointUUIDNamespace, []byte(instanceID))
 }
 
 // instanceSpec translates a validated request plus a resolved GPU

@@ -109,6 +109,32 @@ func TestUpdateStatus(t *testing.T) {
 	}
 }
 
+func TestUpdateImage(t *testing.T) {
+	store, mock := newMockStore(t)
+
+	mock.ExpectExec(`UPDATE compute\.instances`).
+		WithArgs("new-image:v2", "inst-abc12345-pod", 8080, StatusPending, "inst-abc12345").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := store.UpdateImage(context.Background(), "inst-abc12345", "new-image:v2", "inst-abc12345-pod", 8080); err != nil {
+		t.Fatalf("UpdateImage failed: %v", err)
+	}
+
+	// Unknown or already-terminated instance is an error — same contract
+	// as UpdateStatus, so a redeploy targeting a vanished instance fails
+	// loudly rather than silently doing nothing.
+	mock.ExpectExec(`UPDATE compute\.instances`).
+		WithArgs("new-image:v2", "inst-missing0-pod", 8080, StatusPending, "inst-missing0").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	if err := store.UpdateImage(context.Background(), "inst-missing0", "new-image:v2", "inst-missing0-pod", 8080); err == nil {
+		t.Error("expected error for missing instance")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
 func TestMarkTerminated_Idempotent(t *testing.T) {
 	store, mock := newMockStore(t)
 

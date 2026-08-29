@@ -311,6 +311,41 @@ func (c *DirectClient) CreateInstance(ctx context.Context, spec InstanceSpec) (*
 	return result, nil
 }
 
+// UpdateInstance replaces an existing instance's pod in place: it deletes
+// only the pod (never the Service, Ingress, PVC or NetworkPolicy — see
+// DeleteInstance, which tears down all of those, for contrast), then
+// calls CreateInstance again with the same spec. CreateInstance already
+// tolerates every one of those other resources still existing
+// (PVC/NetworkPolicy creation is IsAlreadyExists-tolerant, and so is
+// Service/Ingress creation inside networking.Service) and the fresh pod
+// carries the SAME app.teepin.cloud/instance-id label the existing
+// Service already selects on — so once the new pod is Ready, traffic
+// reaches it automatically with no DNS/TLS/Ingress change at all.
+//
+// Returns ErrNotFound if the instance does not exist in scope, rather
+// than silently falling through to CreateInstance and provisioning a
+// fresh, orphaned instance under an ID nothing else points to.
+func (c *DirectClient) UpdateInstance(ctx context.Context, scope Scope, spec InstanceSpec) (*InstanceResult, error) {
+	pods, err := c.k8s.CoreV1().Pods(workloadNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: instanceSelector(scope, spec.InstanceID),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list pods: %w", err)
+	}
+	if len(pods.Items) == 0 {
+		return nil, ErrNotFound
+	}
+
+	for _, pod := range pods.Items {
+		if delErr := c.k8s.CoreV1().Pods(workloadNamespace).Delete(
+			ctx, pod.Name, metav1.DeleteOptions{}); delErr != nil && !apierrors.IsNotFound(delErr) {
+			return nil, fmt.Errorf("delete pod %s: %w", pod.Name, delErr)
+		}
+	}
+
+	return c.CreateInstance(ctx, spec)
+}
+
 // ResolveInstanceAddress returns instanceID's pod IP, for the Stage 3
 // tunnel's agent-side proxy handler. Deliberately the pod IP, not a
 // Service ClusterIP — a home node has no Service at all (networking is nil

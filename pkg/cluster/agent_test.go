@@ -275,6 +275,36 @@ func TestAgentClient_CreateSendsAllowFilesystemOwnershipChanges(t *testing.T) {
 	}
 }
 
+// TestAgentClient_UpdateInstanceSetsReplaceExisting confirms the encode
+// side of the swap: UpdateInstance's ONLY difference from an ordinary
+// CreateInstance call, on the wire, is replace_existing — everything else
+// (the field mapping, which oneof case is used) is identical, since
+// pkg/agentrunner's handleCreate is what actually branches on the flag.
+func TestAgentClient_UpdateInstanceSetsReplaceExisting(t *testing.T) {
+	fake := newFakeAgent(&agentpb.CommandResult{Success: true, PodName: "inst-swap0001-pod"})
+	c := NewAgentClient(registryWith(fake.session))
+
+	_, err := c.UpdateInstance(context.Background(), Scope{}, InstanceSpec{
+		InstanceID: "inst-swap0001",
+		ProjectID:  "project-alice",
+		Image:      "myapp:v2",
+	})
+	if err != nil {
+		t.Fatalf("UpdateInstance: %v", err)
+	}
+
+	cmd := fake.lastSent().GetCreateInstance()
+	if cmd == nil {
+		t.Fatal("expected a CreateInstanceCommand (replace reuses the same wire message)")
+	}
+	if !cmd.ReplaceExisting {
+		t.Error("UpdateInstance must set replace_existing on the wire command")
+	}
+	if cmd.Image != "myapp:v2" {
+		t.Errorf("cmd.Image = %q, want myapp:v2", cmd.Image)
+	}
+}
+
 func TestAgentClient_ResourceExhaustedIsTyped(t *testing.T) {
 	fake := newFakeAgent(&agentpb.CommandResult{
 		Success:      false,

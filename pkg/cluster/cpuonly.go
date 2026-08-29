@@ -32,6 +32,10 @@ func (c *CPUOnly) CreateInstance(context.Context, InstanceSpec) (*InstanceResult
 	return nil, ErrClusterUnavailable
 }
 
+func (c *CPUOnly) UpdateInstance(context.Context, Scope, InstanceSpec) (*InstanceResult, error) {
+	return nil, ErrClusterUnavailable
+}
+
 func (c *CPUOnly) DeleteInstance(context.Context, Scope, string) error {
 	return ErrClusterUnavailable
 }

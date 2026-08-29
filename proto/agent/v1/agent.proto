@@ -144,6 +144,22 @@ message CreateInstanceCommand {
   // posture for every other caller — see InstanceSpec's own Go doc
   // comment (pkg/cluster/client.go) for the full reasoning.
   bool allow_filesystem_ownership_changes = 24;
+
+  // When true, the agent replaces an EXISTING instance's pod in place
+  // (same instance_id, same Service/Ingress/PVC/NetworkPolicy — only the
+  // pod itself, and therefore the image/command/args/env/ports it was
+  // built from, changes) instead of creating a new one. False (default)
+  // preserves ordinary create behaviour, including the existing
+  // redelivery-safe idempotency check ("instance already exists ->
+  // report success without recreating") — that check is specifically
+  // WRONG for a replace, which is issued precisely because the instance
+  // already exists and must be swapped, so replace_existing routes past
+  // it instead of into it. Added for Kumbha redeploys (KUMBHA-DESIGN.md):
+  // a customer's app hostname must not change just because the agent (or
+  // the customer, via the IDE) shipped new code — found live 2026-08-29,
+  // the prior create-new-then-delete-old redeploy churned a fresh
+  // hostname, TLS cert and compute.instances row on every single deploy.
+  bool replace_existing = 25;
 }
 
 message PortMapping {

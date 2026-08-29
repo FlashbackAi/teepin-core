@@ -43,6 +43,14 @@ func (f *fakeCluster) CreateInstance(_ context.Context, spec cluster.InstanceSpe
 	return &cluster.InstanceResult{PodName: spec.InstanceID}, nil
 }
 
+func (f *fakeCluster) UpdateInstance(_ context.Context, _ cluster.Scope, spec cluster.InstanceSpec) (*cluster.InstanceResult, error) {
+	if f.createErr != nil {
+		return nil, f.createErr
+	}
+	f.created = append(f.created, spec)
+	return &cluster.InstanceResult{PodName: spec.InstanceID}, nil
+}
+
 func (f *fakeCluster) DeleteInstance(_ context.Context, _ cluster.Scope, instanceID string) error {
 	f.deleted = append(f.deleted, instanceID)
 	return nil
@@ -141,6 +149,23 @@ func TestBuildInstanceSpec_UsesDebugKanikoImageAndBusyboxShell(t *testing.T) {
 	}
 	if spec.NeverRestart != true {
 		t.Error("NeverRestart must be true — a restarted build would silently re-run from scratch")
+	}
+}
+
+// TestBuildInstanceSpec_HiddenFromCustomerComputeList is the regression
+// test for a real 2026-08-29 incident: a Kaniko build pod carried no
+// label distinguishing it from a customer-created instance, so it showed
+// up in the customer's own Compute list (ListInstances is cluster-
+// authoritative — see pkg/cluster's managedSelector, which excludes
+// anything carrying this exact label). Teepin's own build tooling should
+// never be something a customer sees or is tempted to click Delete on.
+func TestBuildInstanceSpec_HiddenFromCustomerComputeList(t *testing.T) {
+	s := newTestService(t)
+	spec := s.buildInstanceSpec("kaniko-build-sess1", testRequest(), `{"auths":{}}`, "registry.teepin.cloud/proj:sess1")
+
+	if spec.Labels[hiddenFromComputeListLabel] != "true" {
+		t.Errorf("Labels[%q] = %q, want \"true\" — a Kaniko build pod must be excluded from the customer's Compute list",
+			hiddenFromComputeListLabel, spec.Labels[hiddenFromComputeListLabel])
 	}
 }
 

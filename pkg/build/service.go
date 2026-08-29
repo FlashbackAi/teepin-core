@@ -92,6 +92,23 @@ type Config struct {
 	Timeout time.Duration
 }
 
+// hiddenFromComputeListLabel marks a pod as Teepin's own workload rather
+// than a customer-managed compute instance — pkg/cluster's managedSelector
+// (the query behind ListInstances) excludes anything carrying it. MUST
+// match pkg/cluster's own labelKumbhaAgent and pkg/kumbha's own
+// agentLabel exactly (duplicated rather than imported: pkg/cluster
+// cannot depend on pkg/build, and this package intentionally has no
+// dependency on pkg/kumbha either — see the string's own history at
+// pkg/cluster/direct.go's labelKumbhaAgent for why this label predates
+// and is broader than its name suggests).
+//
+// Found live 2026-08-29: a Kaniko build pod (kaniko-build-<session>) had
+// no such label at all, so it showed up in the customer's Compute list —
+// wrongly, since it is Teepin's own build tooling, not something the
+// customer created or can meaningfully manage (it always finishes and
+// self-terminates within the build timeout).
+const hiddenFromComputeListLabel = "teepin.io/kumbha-agent"
+
 // DefaultConfig is used wherever an operator has not overridden a field —
 // see NewService.
 func DefaultConfig() Config {
@@ -407,6 +424,9 @@ exec /kaniko/executor --dockerfile="$TEEPIN_DOCKERFILE_PATH" --context=dir:///wo
 		Image:      s.cfg.KanikoImage,
 		Command:    []string{"/busybox/sh", "-c"},
 		Args:       []string{script},
+		// See hiddenFromComputeListLabel's own doc comment: this is
+		// Teepin's own build tooling, not a customer-managed instance.
+		Labels: map[string]string{hiddenFromComputeListLabel: "true"},
 		Env: map[string]string{
 			"TEEPIN_TOKEN":           req.WorkspaceToken,
 			"TEEPIN_ARCHIVE_URL":     req.WorkspaceArchiveURL,

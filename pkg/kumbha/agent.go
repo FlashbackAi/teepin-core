@@ -237,6 +237,15 @@ func (g *Gateway) isAgentRunning(ctx context.Context, sess *Session) (bool, erro
 	return status.Status == "pending" || status.Status == "running", nil
 }
 
+// IsAgentRunning is isAgentRunning, exported for GetKumbhaSession — the
+// console's build detail page polls it for a LIVE "is the agent still
+// actually working" read, rather than the cheap agent_instance_id != ""
+// proxy every other session-returning endpoint uses (see
+// kumbhaSessionResponse's own comment on why that split exists).
+func (g *Gateway) IsAgentRunning(ctx context.Context, sess *Session) (bool, error) {
+	return g.isAgentRunning(ctx, sess)
+}
+
 // DeliverMessage is the whole of "chat + resume": queue a follow-up for
 // the agent's own poll loop to pick up if it's still alive (run.py's
 // wait_for_next_instruction, resuming the SAME conversation with full

@@ -41,6 +41,11 @@ var (
 	// ErrBudgetExhausted means the request would push spend past the
 	// session's pre-authorised budget. Maps to 402 at the HTTP layer.
 	ErrBudgetExhausted = errors.New("session budget exhausted")
+	// ErrBudgetNotIncreased means IncreaseBudget was called with a value
+	// at or below the session's current budget — a raise, not a generic
+	// overwrite; a customer cannot use this to accidentally (or
+	// deliberately) shrink their own already-authorised spend cap.
+	ErrBudgetNotIncreased = errors.New("new budget must be higher than the current budget")
 )
 
 // Session mirrors one billing.inference_sessions row.
@@ -53,12 +58,13 @@ type Session struct {
 	Status          string // "open" | "closed" | "budget_exhausted" | "idle_timeout"
 	Label           string
 	AgentInstanceID string
-	// AppInstanceID names the customer-facing app instance this session's
-	// Deploy most recently created (a real compute.instances row, billed
-	// and manageable like any other) — distinct from AgentInstanceID,
-	// which is Kumbha's own never-customer-visible agent pod. See
-	// migration 026's own note on why a redeploy replaces this rather than
-	// updating an instance in place.
+	// AppInstanceID names the customer-facing app instance this session
+	// deployed (a real compute.instances row, billed and manageable like
+	// any other) — distinct from AgentInstanceID, which is Kumbha's own
+	// never-customer-visible agent pod. Set once, by the session's FIRST
+	// deploy; every deploy after that swaps THIS instance's pod in place
+	// (pkg/api.redeployKumbhaInstance, cluster.Client.UpdateInstance)
+	// rather than replacing it — see that function's own doc comment.
 	AppInstanceID  string
 	DeployApproved bool
 	StartedAt      time.Time
@@ -125,6 +131,39 @@ func (s *Store) IsSessionOpen(ctx context.Context, id, accountID uuid.UUID) (boo
 		return false, fmt.Errorf("failed to check session status: %w", err)
 	}
 	return open, nil
+}
+
+// IncreaseBudget raises an open session's pre-authorised spend cap — the
+// console's "raise budget" control on the live budget meter, added
+// alongside removing the composer's upfront budget picker (a customer
+// cannot sensibly judge a build's cost before it has started; this lets
+// them ask for more once they can actually see spend against the fixed
+// default they started with). Same validation as Create (positive, at
+// most maxSessionBudget) plus one more: the new value must be STRICTLY
+// GREATER than the current budget — this is a one-way raise, not a
+// generic overwrite, so it can never be used to shrink a session's spend
+// cap out from under an agent mid-turn.
+func (s *Store) IncreaseBudget(ctx context.Context, id, accountID uuid.UUID, newBudget float64) error {
+	if newBudget > maxSessionBudget {
+		return fmt.Errorf("budget %.2f exceeds the per-session cap of %.2f", newBudget, maxSessionBudget)
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE billing.inference_sessions SET budget = $1
+		WHERE id = $2 AND account_id = $3 AND status = 'open' AND $1 > budget
+	`, newBudget, id, accountID)
+	if err != nil {
+		return fmt.Errorf("failed to increase budget: %w", err)
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		// Ambiguous on purpose, same as SetDeployApproved: could be "no
+		// such open session" or "newBudget was not actually higher" — the
+		// caller (Gateway.IncreaseBudget) checks the latter itself first
+		// and returns a specific error for it, so by the time execution
+		// reaches here a zero-rows result really does mean "not found or
+		// not open".
+		return ErrSessionNotFound
+	}
+	return nil
 }
 
 // SetDeployApproved flips the pre-deploy cost-approval gate — see

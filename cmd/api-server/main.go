@@ -1156,6 +1156,7 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 			kumbhaGroup.GET("/sessions/:id", apiServer.GetKumbhaSession)
 			kumbhaGroup.POST("/sessions/:id/close", apiServer.CloseKumbhaSession)
 			kumbhaGroup.POST("/sessions/:id/approve-deploy", apiServer.ApproveKumbhaDeploy)
+			kumbhaGroup.PATCH("/sessions/:id/budget", apiServer.UpdateKumbhaBudget)
 			kumbhaGroup.POST("/sessions/:id/events", apiServer.CreateKumbhaEventTicket)
 			kumbhaGroup.POST("/sessions/:id/build", apiServer.BuildKumbhaSession)
 			// Deploy: build + create (or replace) a real, customer-facing

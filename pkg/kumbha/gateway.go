@@ -104,6 +104,44 @@ func (g *Gateway) GetSession(ctx context.Context, id, accountID uuid.UUID) (*Ses
 	return g.store.Get(ctx, id, accountID)
 }
 
+// IncreaseBudget raises an open session's pre-authorised spend cap — the
+// console's "raise budget" control (build/[id]/budget-meter.tsx),
+// replacing the old up-front budget picker on the composer: a customer
+// cannot sensibly judge a build's cost before it has started, so every
+// session now starts at a fixed default and asks for more only once
+// there is real spend to judge it against. Same payment-gate check
+// CreateSession applies — more authorised spend is the same kind of
+// commitment a new session's own budget is.
+//
+// Loads the session first (rather than leaving the "was it too low"
+// distinction to a SQL WHERE clause's RowsAffected) so the caller gets a
+// specific, actionable error — ErrBudgetNotIncreased vs ErrSessionNotFound
+// vs ErrSessionClosed — instead of one ambiguous failure for all three.
+func (g *Gateway) IncreaseBudget(ctx context.Context, id, accountID uuid.UUID, newBudget float64) error {
+	if g.gate != nil {
+		allowed, reason, err := g.gate.AccountCanProvision(ctx, accountID)
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrGateUnavailable, err)
+		}
+		if !allowed {
+			return fmt.Errorf("%w: %s", ErrPaymentRequired, reason)
+		}
+	}
+
+	sess, err := g.store.Get(ctx, id, accountID)
+	if err != nil {
+		return err
+	}
+	if sess.Status != "open" {
+		return ErrSessionClosed
+	}
+	if newBudget <= sess.Budget {
+		return ErrBudgetNotIncreased
+	}
+
+	return g.store.IncreaseBudget(ctx, id, accountID, newBudget)
+}
+
 // ListSessions returns a project's Kumbha build history, most recent
 // first.
 func (g *Gateway) ListSessions(ctx context.Context, accountID, projectID uuid.UUID) ([]*Session, error) {

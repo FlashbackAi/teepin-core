@@ -37,6 +37,9 @@ func (s *stubCluster) ListInstanceStatuses(_ context.Context, scope cluster.Scop
 func (s *stubCluster) CreateInstance(context.Context, cluster.InstanceSpec) (*cluster.InstanceResult, error) {
 	return nil, s.err
 }
+func (s *stubCluster) UpdateInstance(context.Context, cluster.Scope, cluster.InstanceSpec) (*cluster.InstanceResult, error) {
+	return nil, s.err
+}
 func (s *stubCluster) DeleteInstance(context.Context, cluster.Scope, string) error { return s.err }
 func (s *stubCluster) GetInstanceStatus(context.Context, cluster.Scope, string) (*cluster.InstanceStatus, error) {
 	return nil, s.err

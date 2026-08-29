@@ -286,6 +286,19 @@ type Client interface {
 	// caller can reallocate.
 	CreateInstance(ctx context.Context, spec InstanceSpec) (*InstanceResult, error)
 
+	// UpdateInstance replaces an EXISTING instance's pod in place —
+	// same instance ID, same Service/Ingress/PVC/NetworkPolicy, only the
+	// pod (and therefore the image/command/args/env/ports it runs) is
+	// swapped. The public hostname, TLS cert, and any billing/database
+	// row keyed on the instance ID never change as a result.
+	//
+	// spec must describe the SAME instance a prior CreateInstance already
+	// created (same InstanceID, and the same InstanceUUID label if one
+	// was set) — this is a replace, not a second create. Returns
+	// ErrNotFound if no such instance exists in scope, so a caller never
+	// silently creates an orphaned pod under an ID nothing points to.
+	UpdateInstance(ctx context.Context, scope Scope, spec InstanceSpec) (*InstanceResult, error)
+
 	// DeleteInstance removes an instance and its endpoint. Deleting a
 	// missing instance returns nil — idempotent, because commands may be
 	// redelivered after a reconnect.

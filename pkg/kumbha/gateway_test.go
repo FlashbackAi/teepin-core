@@ -224,3 +224,80 @@ func TestGateway_CloseSession_SettlesEachRouteLineAndConsumesCredit(t *testing.T
 		t.Error(err)
 	}
 }
+
+// --- IncreaseBudget ---
+
+// getSessionRow mocks the plain SELECT Store.Get issues — same column
+// shape as CloseSession's own RETURNING row above, different query text.
+func getSessionRow(sessID, accountID, projectID uuid.UUID, budget float64, status string) *sqlmock.Rows {
+	return sqlmock.NewRows([]string{
+		"id", "account_id", "project_id", "budget", "spent", "status", "label",
+		"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
+	}).AddRow(sessID, accountID, projectID, budget, 0.0, status, nil, nil, nil, false, time.Now(), nil)
+}
+
+func TestGateway_IncreaseBudget_Success(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessID, accountID, projectID := uuid.New(), uuid.New(), uuid.New()
+
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
+		WithArgs(sessID, accountID).
+		WillReturnRows(getSessionRow(sessID, accountID, projectID, 5.0, "open"))
+	mock.ExpectExec(`UPDATE billing\.inference_sessions SET budget`).
+		WithArgs(15.0, sessID, accountID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{})
+	if err := gw.IncreaseBudget(context.Background(), sessID, accountID, 15.0); err != nil {
+		t.Fatalf("IncreaseBudget: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestGateway_IncreaseBudget_NotHigherIsErrBudgetNotIncreased(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessID, accountID, projectID := uuid.New(), uuid.New(), uuid.New()
+
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
+		WithArgs(sessID, accountID).
+		WillReturnRows(getSessionRow(sessID, accountID, projectID, 5.0, "open"))
+
+	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{})
+	err := gw.IncreaseBudget(context.Background(), sessID, accountID, 5.0)
+	if !errors.Is(err, ErrBudgetNotIncreased) {
+		t.Errorf("got %v, want ErrBudgetNotIncreased for a value equal to the current budget", err)
+	}
+	// The SQL UPDATE must never even be attempted — the check happens
+	// entirely off the row already loaded, no wasted round trip on a
+	// request that was always going to be rejected.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestGateway_IncreaseBudget_ClosedSessionIsErrSessionClosed(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessID, accountID, projectID := uuid.New(), uuid.New(), uuid.New()
+
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
+		WithArgs(sessID, accountID).
+		WillReturnRows(getSessionRow(sessID, accountID, projectID, 5.0, "closed"))
+
+	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{})
+	err := gw.IncreaseBudget(context.Background(), sessID, accountID, 15.0)
+	if !errors.Is(err, ErrSessionClosed) {
+		t.Errorf("got %v, want ErrSessionClosed", err)
+	}
+}
+
+func TestGateway_IncreaseBudget_GateDeniesIsPaymentRequired(t *testing.T) {
+	store, _ := newMockStore(t)
+	gw := NewGateway(store, NewRouter(nil), &fakeGate{allowed: false, reason: "no card on file"}, &fakePricing{}, &fakeUsageRecorder{})
+
+	err := gw.IncreaseBudget(context.Background(), uuid.New(), uuid.New(), 15.0)
+	if !errors.Is(err, ErrPaymentRequired) {
+		t.Errorf("got %v, want ErrPaymentRequired", err)
+	}
+}

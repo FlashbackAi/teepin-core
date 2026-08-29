@@ -56,6 +56,7 @@ type fakeInstance struct {
 	status    string
 	message   string
 	logs      string
+	endpoint  string
 }
 
 func newFakeCluster() *fakeCluster {
@@ -68,6 +69,15 @@ func (f *fakeCluster) add(instanceID, projectID, status string) {
 		status:    status,
 		logs:      "log line one\nlog line two\n",
 	}
+}
+
+// setEndpoint mutates an already-added instance's reported EndpointURL —
+// a separate setter rather than a wider add() so its 10 existing call
+// sites (which never cared about an endpoint) stay untouched.
+func (f *fakeCluster) setEndpoint(instanceID, url string) {
+	inst := f.instances[instanceID]
+	inst.endpoint = url
+	f.instances[instanceID] = inst
 }
 
 // visible applies the tenancy predicate. Mirrors the label-selector
@@ -87,6 +97,28 @@ func (f *fakeCluster) CreateInstance(_ context.Context, spec cluster.InstanceSpe
 	f.lastSpec = spec
 	if f.failWith != nil {
 		return nil, f.failWith
+	}
+	f.instances[spec.InstanceID] = fakeInstance{
+		projectID: spec.ProjectID,
+		status:    compute.StatusPending,
+	}
+	if f.nextResult != nil {
+		result := *f.nextResult
+		if result.PodName == "" {
+			result.PodName = spec.InstanceID + "-pod"
+		}
+		return &result, nil
+	}
+	return &cluster.InstanceResult{PodName: spec.InstanceID + "-pod"}, nil
+}
+
+func (f *fakeCluster) UpdateInstance(_ context.Context, _ cluster.Scope, spec cluster.InstanceSpec) (*cluster.InstanceResult, error) {
+	f.lastSpec = spec
+	if f.failWith != nil {
+		return nil, f.failWith
+	}
+	if _, ok := f.instances[spec.InstanceID]; !ok {
+		return nil, cluster.ErrNotFound
 	}
 	f.instances[spec.InstanceID] = fakeInstance{
 		projectID: spec.ProjectID,
@@ -123,10 +155,11 @@ func (f *fakeCluster) GetInstanceStatus(_ context.Context, scope cluster.Scope, 
 		return nil, cluster.ErrNotFound
 	}
 	return &cluster.InstanceStatus{
-		InstanceID: id,
-		Status:     inst.status,
-		Message:    inst.message,
-		ObservedAt: time.Now().UTC(),
+		InstanceID:  id,
+		Status:      inst.status,
+		Message:     inst.message,
+		EndpointURL: inst.endpoint,
+		ObservedAt:  time.Now().UTC(),
 	}, nil
 }
 
@@ -1107,5 +1140,31 @@ func TestInstanceSpec_GrantsFilesystemOwnershipChangesToEveryCustomerInstance(t 
 
 	if !spec.AllowFilesystemOwnershipChanges {
 		t.Error("AllowFilesystemOwnershipChanges = false, want true for every customer instance — nginx's own startup chown would fail otherwise")
+	}
+}
+
+// TestEndpointUUIDFor_DeterministicFromInstanceID is the property the
+// whole Kumbha in-place-redeploy path depends on (see
+// redeployKumbhaInstance in kumbha_handlers.go): a redeploy recomputes
+// this value from nothing but the instance's already-known ID and must
+// land on the EXACT same UUID the original create used, or
+// UpdateInstance's endpoint provisioning would create a second,
+// differently-named Service/Ingress instead of reusing the live one.
+func TestEndpointUUIDFor_DeterministicFromInstanceID(t *testing.T) {
+	a := endpointUUIDFor("inst-6fea56ce")
+	b := endpointUUIDFor("inst-6fea56ce")
+	if a != b {
+		t.Errorf("endpointUUIDFor is not deterministic: %s != %s for the same instance ID", a, b)
+	}
+}
+
+// TestEndpointUUIDFor_DistinctInstancesDoNotCollide guards the other half:
+// two different instance IDs must not derive the same endpoint UUID,
+// which would make their Service/Ingress objects collide.
+func TestEndpointUUIDFor_DistinctInstancesDoNotCollide(t *testing.T) {
+	a := endpointUUIDFor("inst-aaaaaaaa")
+	b := endpointUUIDFor("inst-bbbbbbbb")
+	if a == b {
+		t.Error("two distinct instance IDs derived the same endpoint UUID")
 	}
 }

@@ -43,6 +43,14 @@ func (f *fakeCluster) CreateInstance(_ context.Context, spec cluster.InstanceSpe
 	return &cluster.InstanceResult{PodName: spec.InstanceID}, nil
 }
 
+func (f *fakeCluster) UpdateInstance(_ context.Context, _ cluster.Scope, spec cluster.InstanceSpec) (*cluster.InstanceResult, error) {
+	if f.createErr != nil {
+		return nil, f.createErr
+	}
+	f.created = append(f.created, spec)
+	return &cluster.InstanceResult{PodName: spec.InstanceID}, nil
+}
+
 func (f *fakeCluster) DeleteInstance(_ context.Context, _ cluster.Scope, instanceID string) error {
 	if f.deleteErr != nil {
 		return f.deleteErr
@@ -284,6 +292,26 @@ func TestGateway_CloseSession_NoAgentPodMeansNoDeleteCall(t *testing.T) {
 }
 
 // --- isAgentRunning / DeliverMessage ---
+
+// TestGateway_IsAgentRunning_ExportedWrapperMatchesInternal confirms the
+// exported IsAgentRunning (pkg/api.GetKumbhaSession's own live-status
+// read) is not a second, drifted implementation — just isAgentRunning
+// itself, thoroughly covered by the tests below via its private name.
+func TestGateway_IsAgentRunning_ExportedWrapperMatchesInternal(t *testing.T) {
+	store, _ := newMockStore(t)
+	fc := &fakeCluster{statusResult: &cluster.InstanceStatus{Status: "running"}}
+	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+		WithAgent(fc, fakeMintToken, AgentConfig{})
+	sess := &Session{ID: uuid.New(), ProjectID: uuid.New(), AgentInstanceID: "kumbha-agent-abc"}
+
+	running, err := gw.IsAgentRunning(context.Background(), sess)
+	if err != nil {
+		t.Fatalf("IsAgentRunning: %v", err)
+	}
+	if !running {
+		t.Error("got running=false, want true for a status of \"running\"")
+	}
+}
 
 func TestIsAgentRunning_NoClusterConfiguredIsFalse(t *testing.T) {
 	store, _ := newMockStore(t)

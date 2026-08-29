@@ -8,12 +8,15 @@
 -- POST /v1/compute/instances path any customer-created instance goes
 -- through (billed, endpoint-provisioned, manageable from Compute).
 --
--- Redeploying (Save an edit, click Deploy again) creates a NEW instance
--- from the newly built image and tears down the one this column named —
--- there is no in-place "swap the image on a running instance" capability
--- in the compute layer yet, so each deploy is a fresh instance with a
--- fresh id/endpoint, and this column is how the handler finds the
--- previous one to clean up rather than leaking one per click.
+-- Redeploying (Save an edit, click Deploy again) swaps THIS instance's
+-- pod in place for one running the newly built image — same id, same
+-- hostname/TLS cert, same compute.instances row (see
+-- cluster.Client.UpdateInstance and pkg/api.redeployKumbhaInstance) —
+-- and this column is how the handler finds which instance to update.
+-- (Originally, before that in-place capability existed, a redeploy
+-- created a brand new instance and tore down the one this column named;
+-- kept here as historical context for why the column reads "most
+-- recently deployed" rather than "the only one ever deployed.")
 
 BEGIN;
 

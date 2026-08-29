@@ -28,9 +28,11 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/auth"
 	"github.com/FlashbackAi/teepin-core/pkg/billing"
 	"github.com/FlashbackAi/teepin-core/pkg/build"
+	"github.com/FlashbackAi/teepin-core/pkg/cluster"
 	"github.com/FlashbackAi/teepin-core/pkg/compute"
 	"github.com/FlashbackAi/teepin-core/pkg/inference"
 	"github.com/FlashbackAi/teepin-core/pkg/kumbha"
+	"github.com/FlashbackAi/teepin-core/pkg/models"
 )
 
 // nowStub / sqlNoRows are tiny readability helpers so the sqlmock setup
@@ -587,6 +589,180 @@ func TestDeployKumbhaSession_NoWorkspaceIs409(t *testing.T) {
 	}
 }
 
+// --- redeployKumbhaInstance ---
+//
+// Exercised directly (below buildKumbhaImage/DeployKumbhaSession itself)
+// for the same reason invokeInternally is tested separately from
+// CreateInstance: the full build-then-deploy path needs a real Kaniko pod
+// and Harbor client, which this package's tests deliberately stop short
+// of (see the comment above the "--- DeployKumbhaSession ---" section).
+// What's genuinely new here — reading the existing instance's sizing,
+// calling UpdateInstance instead of Create+Delete, reporting the
+// UNCHANGED endpoint back — has no such live-infra dependency, so it is
+// tested on its own.
+
+// newRedeployTestContext builds a *gin.Context carrying the tenancy this
+// package's auth middleware would normally set from a verified JWT —
+// redeployKumbhaInstance is called directly (it is not itself a
+// gin.HandlerFunc; DeployKumbhaSession supplies these arguments after its
+// own request parsing), so there is no request body to route through
+// kumbhaRequest here.
+func newRedeployTestContext(projectID uuid.UUID) (*gin.Context, *httptest.ResponseRecorder) {
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+	c.Set(string(auth.ProjectIDKey), projectID)
+	c.Set(string(auth.AccountIDKey), testAccountID)
+	return c, w
+}
+
+// instanceRecordRow builds a compute.instances SELECT result matching
+// pkg/compute's own selectColumns — column order copied from there
+// verbatim so a drift between the two would be caught by a real scan
+// failure, not silently mismatch.
+func instanceRecordRow(id string, accountID, projectID uuid.UUID, name, image string, cpuUnits, memoryGB, storageGB, containerPort int, endpoint string) *sqlmock.Rows {
+	return sqlmock.NewRows([]string{
+		"id", "account_id", "project_id", "user_id", "name", "image",
+		"instance_type_id", "status", "gpu_vram_gb", "cpu_units", "memory_gb", "endpoint",
+		"k8s_pod_name", "k8s_namespace", "provider_id", "dns_name", "public_ip",
+		"tls_enabled", "tls_ready", "container_port", "storage_gb",
+		"created_at", "updated_at", "started_at", "terminated_at",
+	}).AddRow(id, accountID, projectID, uuid.Nil, name, image,
+		"", compute.StatusRunning, 0, cpuUnits, memoryGB, endpoint,
+		id+"-pod", "default", "", id+".teepin.com", "",
+		true, true, containerPort, storageGB,
+		nowStub(), nowStub(), nil, nil)
+}
+
+func TestRedeployKumbhaInstance_UpdatesExistingInstanceInPlace(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+
+	projectID, sessionID := uuid.New(), uuid.New()
+	existingID := "inst-existing1"
+	fc := newFakeCluster()
+	fc.add(existingID, projectID.String(), compute.StatusRunning)
+	server := (&Server{store: cStore, cluster: fc}).WithKumbha(gw)
+
+	mock.ExpectQuery(`SELECT .+ FROM compute\.instances`).
+		WithArgs(existingID).
+		WillReturnRows(instanceRecordRow(existingID, testAccountID, projectID, "kumbha-abc123", "old-image:v1", 1, 1, 0, 80, "https://inst-existing1.teepin.com"))
+	mock.ExpectExec(`UPDATE compute\.instances`).
+		WithArgs("new-image:v2", existingID+"-pod", 80, compute.StatusPending, existingID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE billing\.kumbha_workspace_versions`).
+		WithArgs(sessionID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	sess := &kumbha.Session{ID: sessionID, AccountID: testAccountID, ProjectID: projectID, AppInstanceID: existingID}
+	c, w := newRedeployTestContext(projectID)
+	server.redeployKumbhaInstance(c, sessionID, sess, projectID, testAccountID, "new-image:v2",
+		[]models.PortMapping{{Container: 80, Protocol: "tcp"}}, nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["instance_id"] != existingID {
+		t.Errorf("instance_id = %v, want the SAME id the session already had (%s) — a redeploy must not mint a new one", resp["instance_id"], existingID)
+	}
+	// The whole point: the endpoint the customer already has bookmarked
+	// must be reported back unchanged, not derived from `result` (which,
+	// being a pod-only replace, never re-provisions or re-reports it).
+	if resp["endpoint"] != "https://inst-existing1.teepin.com" {
+		t.Errorf("endpoint = %v, want the UNCHANGED original endpoint", resp["endpoint"])
+	}
+	if fc.lastSpec.Image != "new-image:v2" {
+		t.Errorf("UpdateInstance was called with Image = %q, want new-image:v2", fc.lastSpec.Image)
+	}
+	// Sizing must come from the EXISTING record, not be re-derived or
+	// left at zero — a redeploy does not resize the instance.
+	if fc.lastSpec.CPUUnits != 1 || fc.lastSpec.MemoryGB != 1 {
+		t.Errorf("UpdateInstance spec sizing = %d CPU / %d GB, want the existing instance's own sizing (1/1)", fc.lastSpec.CPUUnits, fc.lastSpec.MemoryGB)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations: %v", err)
+	}
+}
+
+func TestRedeployKumbhaInstance_InstanceGoneIs404(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	server := (&Server{store: cStore, cluster: newFakeCluster()}).WithKumbha(gw)
+
+	projectID, sessionID := uuid.New(), uuid.New()
+	existingID := "inst-deleted-by-hand"
+	mock.ExpectQuery(`SELECT .+ FROM compute\.instances`).
+		WithArgs(existingID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "account_id", "project_id", "user_id", "name", "image",
+			"instance_type_id", "status", "gpu_vram_gb", "cpu_units", "memory_gb", "endpoint",
+			"k8s_pod_name", "k8s_namespace", "provider_id", "dns_name", "public_ip",
+			"tls_enabled", "tls_ready", "container_port", "storage_gb",
+			"created_at", "updated_at", "started_at", "terminated_at",
+		})) // no rows
+
+	sess := &kumbha.Session{ID: sessionID, AccountID: testAccountID, ProjectID: projectID, AppInstanceID: existingID}
+	c, w := newRedeployTestContext(projectID)
+	server.redeployKumbhaInstance(c, sessionID, sess, projectID, testAccountID, "new-image:v2", nil, nil)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+// TestRedeployKumbhaInstance_WrongAccountIsNotFound is the tenancy
+// regression test: even if some future bug let a session's AppInstanceID
+// point at another tenant's instance ID, redeployKumbhaInstance must
+// treat it as absent rather than updating (or leaking the existence of)
+// an instance that is not this account's — the same "another tenant's
+// instance is indistinguishable from a nonexistent one" rule GetInstance/
+// DeleteInstance already enforce elsewhere in this file.
+func TestRedeployKumbhaInstance_WrongAccountIsNotFound(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	server := (&Server{store: cStore, cluster: newFakeCluster()}).WithKumbha(gw)
+
+	projectID, sessionID := uuid.New(), uuid.New()
+	existingID := "inst-someone-elses"
+	otherAccount := uuid.New()
+	mock.ExpectQuery(`SELECT .+ FROM compute\.instances`).
+		WithArgs(existingID).
+		WillReturnRows(instanceRecordRow(existingID, otherAccount, projectID, "not-mine", "img:v1", 1, 1, 0, 80, "https://inst-someone-elses.teepin.com"))
+
+	sess := &kumbha.Session{ID: sessionID, AccountID: testAccountID, ProjectID: projectID, AppInstanceID: existingID}
+	c, w := newRedeployTestContext(projectID)
+	server.redeployKumbhaInstance(c, sessionID, sess, projectID, testAccountID, "new-image:v2", nil, nil)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+func TestRedeployKumbhaInstance_ClusterUnavailableMapsTo503(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+
+	projectID, sessionID := uuid.New(), uuid.New()
+	existingID := "inst-existing2"
+	fc := newFakeCluster()
+	fc.failWith = cluster.ErrClusterUnavailable
+	server := (&Server{store: cStore, cluster: fc}).WithKumbha(gw)
+
+	mock.ExpectQuery(`SELECT .+ FROM compute\.instances`).
+		WithArgs(existingID).
+		WillReturnRows(instanceRecordRow(existingID, testAccountID, projectID, "kumbha-def456", "old-image:v1", 1, 1, 0, 80, "https://inst-existing2.teepin.com"))
+
+	sess := &kumbha.Session{ID: sessionID, AccountID: testAccountID, ProjectID: projectID, AppInstanceID: existingID}
+	c, w := newRedeployTestContext(projectID)
+	server.redeployKumbhaInstance(c, sessionID, sess, projectID, testAccountID, "new-image:v2", nil, nil)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
 // echoIdentityHandler is a minimal gin.HandlerFunc that reports back
 // exactly what invokeInternally put into the synthetic context — used to
 // verify the dispatch mechanism itself (identity, params, body) rather
@@ -988,6 +1164,200 @@ func TestDeleteKumbhaSessions_ClosesAnOpenOneThenDeletesBoth(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Error(err)
+	}
+}
+
+// --- GetKumbhaSession ---
+//
+// What's worth testing here specifically is the split GetKumbhaSession
+// introduces over every other session-returning endpoint (see
+// kumbhaSessionResponse's own comment): a LIVE read of agent/app status
+// rather than the cheap "was a pod ever launched" proxy.
+
+// liveSessionRow is sessionRow (kumbha_workspace_handlers_test.go) with
+// agent_instance_id/app_instance_id actually populated, so a test can
+// exercise GetKumbhaSession's live-status enrichment instead of the
+// no-agent-yet default every other helper row leaves at NULL.
+func liveSessionRow(sessionID uuid.UUID, agentInstanceID, appInstanceID string) *sqlmock.Rows {
+	return sqlmock.NewRows([]string{
+		"id", "account_id", "project_id", "budget", "spent", "status", "label",
+		"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
+	}).AddRow(sessionID, testAccountID, uuid.New(), 5.0, 0.0, "open", nil, agentInstanceID, appInstanceID, true, nowStub(), nil)
+}
+
+func TestGetKumbhaSession_ExposesAppInstanceID(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	server := (&Server{store: cStore}).WithKumbha(gw) // no cluster wired
+
+	sessionID, projectID := uuid.New(), uuid.New()
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnRows(liveSessionRow(sessionID, "", "inst-deployed1"))
+
+	w := kumbhaRequest(server.GetKumbhaSession, http.MethodGet, "/v1/kumbha/sessions/"+sessionID.String(),
+		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, nil, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["app_instance_id"] != "inst-deployed1" {
+		t.Errorf("app_instance_id = %v, want inst-deployed1", resp["app_instance_id"])
+	}
+	// No cluster wired: app_status must be absent, not guessed.
+	if _, ok := resp["app_status"]; ok {
+		t.Errorf("app_status = %v present with no cluster configured, want absent", resp["app_status"])
+	}
+}
+
+func TestGetKumbhaSession_LiveAgentRunningOverridesTheCheapProxy(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	fc := newFakeCluster()
+	server := (&Server{store: cStore, cluster: fc}).WithKumbha(gw)
+
+	sessionID, projectID := uuid.New(), uuid.New()
+	agentID := "kumbha-agent-abcd1234"
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnRows(liveSessionRow(sessionID, agentID, ""))
+
+	// The agent pod already EXITED (found live 2026-08-29: this is
+	// exactly the case the cheap agent_instance_id != "" proxy gets
+	// wrong — it would report true here forever).
+	// fakeCluster never had this id added, so GetInstanceStatus reports
+	// cluster.ErrNotFound, which isAgentRunning maps to (false, nil).
+
+	w := kumbhaRequest(server.GetKumbhaSession, http.MethodGet, "/v1/kumbha/sessions/"+sessionID.String(),
+		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, nil, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["agent_running"] != false {
+		t.Errorf("agent_running = %v, want false — the pod has exited even though agent_instance_id is still set", resp["agent_running"])
+	}
+}
+
+func TestGetKumbhaSession_ReportsLiveAppStatus(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	fc := newFakeCluster()
+	appID := "inst-deployed2"
+
+	sessionID, projectID := uuid.New(), uuid.New()
+	fc.add(appID, projectID.String(), compute.StatusRunning)
+	server := (&Server{store: cStore, cluster: fc}).WithKumbha(gw)
+
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnRows(liveSessionRow(sessionID, "", appID))
+
+	w := kumbhaRequest(server.GetKumbhaSession, http.MethodGet, "/v1/kumbha/sessions/"+sessionID.String(),
+		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, nil, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["app_status"] != compute.StatusRunning {
+		t.Errorf("app_status = %v, want %q", resp["app_status"], compute.StatusRunning)
+	}
+}
+
+// TestGetKumbhaSession_ReportsLiveAppEndpoint is what actually lets the
+// console auto-switch to its Preview tab and link straight to the
+// deployed instance the moment a deploy succeeds — whether that deploy
+// was the agent's own `deploy` MCP call or the console IDE's Deploy
+// button — without parsing a URL out of an activity-feed event summary.
+func TestGetKumbhaSession_ReportsLiveAppEndpoint(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	fc := newFakeCluster()
+	appID := "inst-deployed3"
+
+	sessionID, projectID := uuid.New(), uuid.New()
+	fc.add(appID, projectID.String(), compute.StatusRunning)
+	fc.setEndpoint(appID, "https://inst-deployed3.teepin.com")
+	server := (&Server{store: cStore, cluster: fc}).WithKumbha(gw)
+
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnRows(liveSessionRow(sessionID, "", appID))
+
+	w := kumbhaRequest(server.GetKumbhaSession, http.MethodGet, "/v1/kumbha/sessions/"+sessionID.String(),
+		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, nil, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["app_endpoint"] != "https://inst-deployed3.teepin.com" {
+		t.Errorf("app_endpoint = %v, want https://inst-deployed3.teepin.com", resp["app_endpoint"])
+	}
+}
+
+// --- UpdateKumbhaBudget ---
+
+func TestUpdateKumbhaBudget_Success(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	server := (&Server{store: cStore}).WithKumbha(gw)
+
+	sessionID, projectID := uuid.New(), uuid.New()
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnRows(sessionRow(sessionID)) // budget=5.0, status=open
+	mock.ExpectExec(`UPDATE billing\.inference_sessions SET budget`).
+		WithArgs(15.0, sessionID, testAccountID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "account_id", "project_id", "budget", "spent", "status", "label",
+			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
+		}).AddRow(sessionID, testAccountID, uuid.New(), 15.0, 0.0, "open", nil, nil, nil, false, nowStub(), nil))
+
+	w := kumbhaRequest(server.UpdateKumbhaBudget, http.MethodPatch, "/v1/kumbha/sessions/"+sessionID.String()+"/budget",
+		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, map[string]float64{"budget": 15.0}, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["budget"] != 15.0 {
+		t.Errorf("budget = %v, want 15", resp["budget"])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations: %v", err)
+	}
+}
+
+func TestUpdateKumbhaBudget_NotHigherIs400(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	server := (&Server{store: cStore}).WithKumbha(gw)
+
+	sessionID, projectID := uuid.New(), uuid.New()
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnRows(sessionRow(sessionID)) // budget=5.0
+
+	w := kumbhaRequest(server.UpdateKumbhaBudget, http.MethodPatch, "/v1/kumbha/sessions/"+sessionID.String()+"/budget",
+		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, map[string]float64{"budget": 5.0}, nil)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+func TestUpdateKumbhaBudget_NotAvailableWhenKumbhaNil(t *testing.T) {
+	server := &Server{}
+	w := kumbhaRequest(server.UpdateKumbhaBudget, http.MethodPatch, "/v1/kumbha/sessions/"+uuid.New().String()+"/budget",
+		nil, uuid.New(), map[string]float64{"budget": 15.0}, nil)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", w.Code)
 	}
 }
 

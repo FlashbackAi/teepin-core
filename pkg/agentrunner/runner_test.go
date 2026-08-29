@@ -70,6 +70,9 @@ type nullCluster struct{}
 func (nullCluster) CreateInstance(context.Context, cluster.InstanceSpec) (*cluster.InstanceResult, error) {
 	return &cluster.InstanceResult{}, nil
 }
+func (nullCluster) UpdateInstance(context.Context, cluster.Scope, cluster.InstanceSpec) (*cluster.InstanceResult, error) {
+	return &cluster.InstanceResult{}, nil
+}
 func (nullCluster) DeleteInstance(context.Context, cluster.Scope, string) error { return nil }
 func (nullCluster) GetInstanceStatus(context.Context, cluster.Scope, string) (*cluster.InstanceStatus, error) {
 	return nil, cluster.ErrNotFound
@@ -236,14 +239,37 @@ func (c instanceCluster) ListInstanceStatuses(context.Context, cluster.Scope) ([
 // capturingCluster records the InstanceSpec CreateInstance was actually
 // called with, so a test can assert on how a command was decoded rather
 // than only on whether the call succeeded.
+//
+// existingStatus, when set, is what GetInstanceStatus reports — used by
+// the replace_existing tests to simulate "this instance is already
+// running", the exact condition that must route past the ordinary
+// idempotency short-circuit and into UpdateInstance instead of being
+// treated as an already-handled redelivery.
 type capturingCluster struct {
 	nullCluster
-	captured cluster.InstanceSpec
+	captured       cluster.InstanceSpec
+	calledCreate   bool
+	calledUpdate   bool
+	existingStatus *cluster.InstanceStatus
 }
 
 func (c *capturingCluster) CreateInstance(_ context.Context, spec cluster.InstanceSpec) (*cluster.InstanceResult, error) {
 	c.captured = spec
+	c.calledCreate = true
 	return &cluster.InstanceResult{PodName: spec.InstanceID}, nil
+}
+
+func (c *capturingCluster) UpdateInstance(_ context.Context, _ cluster.Scope, spec cluster.InstanceSpec) (*cluster.InstanceResult, error) {
+	c.captured = spec
+	c.calledUpdate = true
+	return &cluster.InstanceResult{PodName: spec.InstanceID}, nil
+}
+
+func (c *capturingCluster) GetInstanceStatus(context.Context, cluster.Scope, string) (*cluster.InstanceStatus, error) {
+	if c.existingStatus != nil {
+		return c.existingStatus, nil
+	}
+	return nil, cluster.ErrNotFound
 }
 
 // TestHandleCreate_DecodesAllowFilesystemOwnershipChanges is a
@@ -267,6 +293,55 @@ func TestHandleCreate_DecodesAllowFilesystemOwnershipChanges(t *testing.T) {
 
 	if !fc.captured.AllowFilesystemOwnershipChanges {
 		t.Error("AllowFilesystemOwnershipChanges was not decoded onto the local InstanceSpec")
+	}
+}
+
+// TestHandleCreate_ReplaceExistingRoutesToUpdateInstance is the regression
+// test for the actual point of replace_existing: a Kumbha redeploy's
+// instance ID ALREADY exists by construction (that's why it's a replace,
+// not a create), so the ordinary "instance already exists -> treat
+// redelivery as success, do nothing" idempotency check (see the comment
+// above it in runner.go) would make every replace command a permanent
+// no-op if it weren't explicitly bypassed.
+func TestHandleCreate_ReplaceExistingRoutesToUpdateInstance(t *testing.T) {
+	fc := &capturingCluster{existingStatus: &cluster.InstanceStatus{Status: "running", PodName: "inst-old-pod"}}
+	r := New(Config{ProviderID: "test-provider", Cluster: fc})
+	s := newStubStream()
+
+	r.handleCreate(context.Background(), s, "req-1", &agentpb.CreateInstanceCommand{
+		InstanceId:      "inst-swap0001",
+		Image:           "myapp:v2",
+		ReplaceExisting: true,
+	})
+
+	if fc.calledCreate {
+		t.Error("ReplaceExisting must not call CreateInstance")
+	}
+	if !fc.calledUpdate {
+		t.Error("ReplaceExisting must call UpdateInstance, not treat the existing instance as an already-handled redelivery")
+	}
+	if fc.captured.Image != "myapp:v2" {
+		t.Errorf("captured Image = %q, want myapp:v2", fc.captured.Image)
+	}
+}
+
+// TestHandleCreate_OrdinaryCreateStillShortCircuitsOnExisting confirms
+// replace_existing's bypass is scoped to the flag itself: an ordinary
+// (non-replace) create redelivered against an instance ID that already
+// exists must still take the original "already done" path, not start
+// calling UpdateInstance for a request that never asked for one.
+func TestHandleCreate_OrdinaryCreateStillShortCircuitsOnExisting(t *testing.T) {
+	fc := &capturingCluster{existingStatus: &cluster.InstanceStatus{Status: "running", PodName: "inst-existing-pod"}}
+	r := New(Config{ProviderID: "test-provider", Cluster: fc})
+	s := newStubStream()
+
+	r.handleCreate(context.Background(), s, "req-1", &agentpb.CreateInstanceCommand{
+		InstanceId: "inst-already-there",
+		Image:      "myapp:v1",
+	})
+
+	if fc.calledCreate || fc.calledUpdate {
+		t.Error("a redelivered ordinary create against an existing instance must short-circuit, calling neither Create nor Update")
 	}
 }
 

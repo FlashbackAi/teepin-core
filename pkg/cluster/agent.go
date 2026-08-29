@@ -152,6 +152,21 @@ func scopeAllows(scope Scope, status InstanceStatus) bool {
 }
 
 func (c *AgentClient) CreateInstance(ctx context.Context, spec InstanceSpec) (*InstanceResult, error) {
+	return c.createOrReplace(ctx, spec, false)
+}
+
+// UpdateInstance replaces an existing instance's pod in place — see the
+// Client interface's own doc comment. On the wire this is the same
+// CreateInstanceCommand as an ordinary create, with replace_existing set:
+// the agent (pkg/agentrunner) routes that flag past its usual "already
+// exists -> report success without recreating" idempotency check and into
+// DirectClient.UpdateInstance instead, which deletes only the pod and
+// recreates it under the same instance ID.
+func (c *AgentClient) UpdateInstance(ctx context.Context, _ Scope, spec InstanceSpec) (*InstanceResult, error) {
+	return c.createOrReplace(ctx, spec, true)
+}
+
+func (c *AgentClient) createOrReplace(ctx context.Context, spec InstanceSpec, replaceExisting bool) (*InstanceResult, error) {
 	// Route to the OWNING provider when placement resolved one (home-class,
 	// multi-provider). Falls back to Any() only for the single-provider
 	// datacenter path where no provider was resolved. Sending a create for
@@ -202,10 +217,13 @@ func (c *AgentClient) CreateInstance(ctx context.Context, spec InstanceSpec) (*I
 		AlwaysPullImage:                 spec.AlwaysPullImage,
 		NeverRestart:                    spec.NeverRestart,
 		AllowFilesystemOwnershipChanges: spec.AllowFilesystemOwnershipChanges,
+		ReplaceExisting:                 replaceExisting,
 	}
 
 	// The instance ID is the idempotency key: a command redelivered after
-	// a reconnect must not produce a second pod.
+	// a reconnect must not produce a second pod. (This does not apply to a
+	// replace: replaceExisting routes the agent past that exact check —
+	// see the proto field's own doc comment.)
 	result, err := session.dispatch(ctx, &agentpb.ControlMessage{
 		RequestId: spec.InstanceID,
 		Payload:   &agentpb.ControlMessage_CreateInstance{CreateInstance: cmd},

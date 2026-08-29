@@ -40,6 +40,10 @@ func (u *Unavailable) CreateInstance(context.Context, InstanceSpec) (*InstanceRe
 	return nil, ErrClusterUnavailable
 }
 
+func (u *Unavailable) UpdateInstance(context.Context, Scope, InstanceSpec) (*InstanceResult, error) {
+	return nil, ErrClusterUnavailable
+}
+
 func (u *Unavailable) DeleteInstance(context.Context, Scope, string) error {
 	return ErrClusterUnavailable
 }
