@@ -238,6 +238,19 @@ func (g *Gateway) SetAppInstanceID(ctx context.Context, sessionID uuid.UUID, ins
 	return g.store.SetAppInstanceID(ctx, sessionID, instanceID)
 }
 
+// SaveScreenshot records the deployed app's most recently captured
+// screenshot — called only by the screenshot pod's own upload endpoint,
+// see Store.SaveScreenshot.
+func (g *Gateway) SaveScreenshot(ctx context.Context, sessionID uuid.UUID, png []byte) error {
+	return g.store.SaveScreenshot(ctx, sessionID, png)
+}
+
+// Screenshot returns a session's most recently captured screenshot,
+// scoped to the owning account — see Store.GetScreenshot.
+func (g *Gateway) Screenshot(ctx context.Context, sessionID, accountID uuid.UUID) ([]byte, time.Time, error) {
+	return g.store.GetScreenshot(ctx, sessionID, accountID)
+}
+
 // RollbackWorkspace moves the current-version pointer to an existing,
 // older (or newer) version — the undo for a customer edit or an agent
 // step that broke something. Does not delete or overwrite anything: the

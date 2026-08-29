@@ -597,6 +597,16 @@ func main() {
 						VisionCapable: getEnvBool("TEEPIN_KUMBHA_VISION_CAPABLE", false),
 					})
 					log.Printf("✅ Kumbha agent pod orchestration enabled (image %s)", agentImage)
+					// Deployment-thumbnail capture (console Preview tab) rides
+					// along on this SAME image — no separate image/registry/
+					// deploy pipeline: deploy/kumbha-agent/Dockerfile already
+					// installs Chromium for the agent's own browser tool and
+					// now also builds the small kumbha-screenshot binary
+					// (CaptureScreenshot launches it via a Command override,
+					// see that method's own doc comment). Automatically
+					// available whenever agent orchestration is, nothing
+					// further to configure.
+					log.Println("Kumbha deployment screenshot capture enabled (reuses the agent image)")
 				} else {
 					log.Println("Kumbha agent pod orchestration not configured (TEEPIN_KUMBHA_AGENT_IMAGE unset) — LaunchAgent unavailable")
 				}
@@ -1188,6 +1198,12 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 			kumbhaGroup.GET("/sessions/:id/workspace/versions", apiServer.ListKumbhaWorkspaceVersions)
 			kumbhaGroup.POST("/sessions/:id/workspace/rollback", apiServer.RollbackKumbhaWorkspace)
 			kumbhaGroup.GET("/sessions/:id/workspace/archive", apiServer.DownloadKumbhaWorkspace)
+			// Screenshot: the console Preview tab's thumbnail. The capture
+			// pod POSTs (session-scoped credential, may only write its own
+			// session, same restriction as the workspace upload above); the
+			// customer GETs its own account-scoped read.
+			kumbhaGroup.POST("/sessions/:id/screenshot", apiServer.UploadKumbhaScreenshot)
+			kumbhaGroup.GET("/sessions/:id/screenshot", apiServer.GetKumbhaScreenshot)
 		}
 
 		// Compute endpoints require auth — requireScope (server.go) rejects

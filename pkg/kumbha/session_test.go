@@ -319,3 +319,92 @@ func TestStore_Delete_ReturnsExactlyWhatWasDeleted(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+func TestStore_SaveScreenshot_UpdatesBytesAndTimestamp(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessID := uuid.New()
+	png := []byte{0x89, 'P', 'N', 'G'}
+
+	mock.ExpectExec(`UPDATE billing\.inference_sessions\s+SET screenshot`).
+		WithArgs(sessID, png).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := store.SaveScreenshot(context.Background(), sessID, png); err != nil {
+		t.Fatalf("SaveScreenshot: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestStore_SaveScreenshot_UnknownSessionIsNotFound(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessID := uuid.New()
+	png := []byte{0x89, 'P', 'N', 'G'}
+
+	mock.ExpectExec(`UPDATE billing\.inference_sessions\s+SET screenshot`).
+		WithArgs(sessID, png).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	err := store.SaveScreenshot(context.Background(), sessID, png)
+	if !errors.Is(err, ErrSessionNotFound) {
+		t.Errorf("got %v, want ErrSessionNotFound", err)
+	}
+}
+
+func TestStore_GetScreenshot_ReturnsStoredBytes(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessID, accountID := uuid.New(), uuid.New()
+	png := []byte{0x89, 'P', 'N', 'G'}
+	capturedAt := time.Now()
+
+	mock.ExpectQuery(`SELECT screenshot, screenshot_captured_at`).
+		WithArgs(sessID, accountID).
+		WillReturnRows(sqlmock.NewRows([]string{"screenshot", "screenshot_captured_at"}).AddRow(png, capturedAt))
+
+	got, gotAt, err := store.GetScreenshot(context.Background(), sessID, accountID)
+	if err != nil {
+		t.Fatalf("GetScreenshot: %v", err)
+	}
+	if string(got) != string(png) {
+		t.Errorf("got %v, want %v", got, png)
+	}
+	if !gotAt.Equal(capturedAt) {
+		t.Errorf("capturedAt = %v, want %v", gotAt, capturedAt)
+	}
+}
+
+// TestStore_GetScreenshot_NoCaptureYetIsNilNotError covers a session that
+// has deployed but whose capture pod hasn't finished (or was never
+// configured) — screenshot/screenshot_captured_at are both NULL, and that
+// must read back as "nothing yet", not a failure.
+func TestStore_GetScreenshot_NoCaptureYetIsNilNotError(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessID, accountID := uuid.New(), uuid.New()
+
+	mock.ExpectQuery(`SELECT screenshot, screenshot_captured_at`).
+		WithArgs(sessID, accountID).
+		WillReturnRows(sqlmock.NewRows([]string{"screenshot", "screenshot_captured_at"}).AddRow(nil, nil))
+
+	got, _, err := store.GetScreenshot(context.Background(), sessID, accountID)
+	if err != nil {
+		t.Fatalf("GetScreenshot: %v", err)
+	}
+	if got != nil {
+		t.Errorf("got %v, want nil", got)
+	}
+}
+
+func TestStore_GetScreenshot_WrongAccountIsNotFound(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessID, accountID := uuid.New(), uuid.New()
+
+	mock.ExpectQuery(`SELECT screenshot, screenshot_captured_at`).
+		WithArgs(sessID, accountID).
+		WillReturnError(sql.ErrNoRows)
+
+	_, _, err := store.GetScreenshot(context.Background(), sessID, accountID)
+	if !errors.Is(err, ErrSessionNotFound) {
+		t.Errorf("got %v, want ErrSessionNotFound", err)
+	}
+}

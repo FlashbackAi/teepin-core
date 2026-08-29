@@ -314,6 +314,49 @@ func (s *Store) SetAppInstanceID(ctx context.Context, sessionID uuid.UUID, appIn
 	return nil
 }
 
+// SaveScreenshot stores the most recent capture of a session's deployed
+// app — overwritten on every successful capture, no history kept (see
+// migration 029's own doc comment: one row per session, not a version
+// table). Written only by the screenshot pod's own upload call,
+// authenticated by a session-scoped token exactly like
+// MintWorkspaceFetchToken's fetch token — never customer-supplied.
+func (s *Store) SaveScreenshot(ctx context.Context, sessionID uuid.UUID, png []byte) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE billing.inference_sessions
+		SET screenshot = $2, screenshot_captured_at = now()
+		WHERE id = $1
+	`, sessionID, png)
+	if err != nil {
+		return fmt.Errorf("failed to save screenshot: %w", err)
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return ErrSessionNotFound
+	}
+	return nil
+}
+
+// GetScreenshot returns a session's most recently captured screenshot,
+// scoped to accountID exactly like GetSession — this is read by the
+// customer-facing console. A nil slice (with no error) means no capture
+// has ever succeeded yet: a session that hasn't deployed, or whose
+// capture pod hasn't finished, is a normal state, not a failure.
+func (s *Store) GetScreenshot(ctx context.Context, sessionID, accountID uuid.UUID) ([]byte, time.Time, error) {
+	var png []byte
+	var capturedAt sql.NullTime
+	err := s.db.QueryRowContext(ctx, `
+		SELECT screenshot, screenshot_captured_at
+		FROM billing.inference_sessions
+		WHERE id = $1 AND account_id = $2
+	`, sessionID, accountID).Scan(&png, &capturedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, time.Time{}, ErrSessionNotFound
+	}
+	if err != nil {
+		return nil, time.Time{}, fmt.Errorf("failed to load screenshot: %w", err)
+	}
+	return png, capturedAt.Time, nil
+}
+
 func (s *Store) RouteUsage(ctx context.Context, sessionID uuid.UUID) ([]RouteUsage, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT route, provider, input_tokens, output_tokens

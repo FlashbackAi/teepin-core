@@ -616,6 +616,8 @@ func (s *Server) DeployKumbhaSession(c *gin.Context) {
 		log.Printf("WARN: deployed Kumbha session %s but failed to checkpoint its workspace version: %v", sessionID, err)
 	}
 
+	s.triggerScreenshotCapture(sessionID, sess, created.Endpoint)
+
 	c.JSON(http.StatusOK, gin.H{
 		"image_ref":      imageRef,
 		"instance_id":    created.ID,
@@ -623,6 +625,28 @@ func (s *Server) DeployKumbhaSession(c *gin.Context) {
 		"status":         created.Status,
 		"price_per_hour": created.PricePerHour,
 	})
+}
+
+// triggerScreenshotCapture kicks off a best-effort deployment thumbnail
+// capture in the background — called right after a deploy or redeploy
+// succeeds, from both DeployKumbhaSession and redeployKumbhaInstance. Runs
+// detached from the request context (which is about to be torn down the
+// moment this handler returns) with its own bounded timeout, and never
+// blocks or fails the deploy response: a missing thumbnail is cosmetic,
+// see Gateway.CaptureScreenshot's own doc comment. A no-op when
+// targetURL is empty (no exposed port — nothing to screenshot) or the
+// Gateway isn't configured at all.
+func (s *Server) triggerScreenshotCapture(sessionID uuid.UUID, sess *kumbha.Session, targetURL string) {
+	if s.kumbha == nil || targetURL == "" {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+		if err := s.kumbha.CaptureScreenshot(ctx, sess, targetURL); err != nil {
+			log.Printf("WARN: screenshot capture failed for Kumbha session %s: %v", sessionID, err)
+		}
+	}()
 }
 
 // redeployKumbhaInstance is DeployKumbhaSession's path for every deploy
@@ -712,6 +736,8 @@ func (s *Server) redeployKumbhaInstance(c *gin.Context, sessionID uuid.UUID, ses
 	if err := s.kumbha.CheckpointWorkspace(c.Request.Context(), sessionID); err != nil {
 		log.Printf("WARN: redeployed Kumbha session %s but failed to checkpoint its workspace version: %v", sessionID, err)
 	}
+
+	s.triggerScreenshotCapture(sessionID, sess, existing.Endpoint)
 
 	c.JSON(http.StatusOK, gin.H{
 		"image_ref":   imageRef,

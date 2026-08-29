@@ -213,6 +213,148 @@ func (g *Gateway) MintWorkspaceFetchToken(sess *Session, ttl time.Duration) (tok
 	return token, archiveURL, nil
 }
 
+// screenshotCPUUnits/screenshotMemoryGB size the capture pod — small and
+// fixed, not operator-configurable. Deliberately much smaller than a real
+// agent session's own AgentConfig sizing: this launches the SAME image
+// LaunchAgent does (see CaptureScreenshot below), just with a different
+// Command and a request sized for "run one headless-Chromium capture and
+// exit" rather than "run an autonomous coding session."
+const (
+	screenshotCPUUnits = 1
+	screenshotMemoryGB = 1
+)
+
+// captureTimeoutDefault bounds how long CaptureScreenshot waits for the
+// pod to finish before giving up and cleaning it up — a hung headless
+// browser (a page that never reaches load, a broken navigation) must not
+// leak a pod forever.
+const captureTimeoutDefault = 45 * time.Second
+
+// screenshotTokenTTL bounds the capture pod's own upload credential —
+// comfortably past captureTimeoutDefault, so the server's own timeout
+// governs a stuck capture rather than the token itself expiring mid-
+// upload and turning into a confusing 401 instead of a clear timeout.
+const screenshotTokenTTL = 5 * time.Minute
+
+// screenshotBinaryPath is where deploy/kumbha-agent/Dockerfile installs
+// the kumbha-screenshot binary — see that Dockerfile's own comment on why
+// this rides along on the agent image rather than getting a separate one.
+const screenshotBinaryPath = "/usr/local/bin/kumbha-screenshot"
+
+// CaptureScreenshot launches a short-lived headless-browser pod that
+// screenshots targetURL and uploads the result to this session's own
+// screenshot storage (POST /v1/kumbha/sessions/:id/screenshot,
+// Gateway.SaveScreenshot) — what backs the console's Preview tab thumbnail.
+//
+// Deliberately reuses the SAME image AgentConfig.Image names, rather than
+// a separate screenshot-specific image: deploy/kumbha-agent/Dockerfile
+// already installs Chromium for the agent's own browser tool and now also
+// builds the small kumbha-screenshot binary alongside teepin-mcp-server,
+// so there is no second image/registry/deploy pipeline to provision or
+// keep pull-secrets in sync with — this is just the SAME pod-launch
+// mechanism LaunchAgent already uses, with Command overriding run.py's
+// entrypoint. Reuses the exact same TokenMinter and APIBaseURL WithAgent
+// already configured, same trust boundary as MintWorkspaceFetchToken.
+//
+// Synchronous: waits for the pod to finish (or captureTimeoutDefault to
+// elapse) and deletes it before returning, success or failure — the pod's
+// own result is entirely the SIDE EFFECT of it calling the upload
+// endpoint, not this method's return value, so there is nothing
+// customer-visible left behind to inspect after the fact, same posture as
+// pkg/build.Service.Build. Callers are expected to run this in a
+// background goroutine after a deploy's own HTTP response is already
+// sent — a slow or hung page render must never add latency to the deploy
+// itself — and to treat a returned error as best-effort/log-only, the
+// same posture as CheckpointWorkspace/SetAppInstanceID: a missing
+// thumbnail is a cosmetic gap, not a failed deployment.
+func (g *Gateway) CaptureScreenshot(ctx context.Context, sess *Session, targetURL string) error {
+	if g.cluster == nil || g.mintToken == nil || g.agentConfig.APIBaseURL == "" || g.agentConfig.Image == "" {
+		return ErrAgentNotConfigured
+	}
+
+	token, err := g.mintToken(sess.AccountID, sess.ProjectID, sess.ID, screenshotTokenTTL)
+	if err != nil {
+		return fmt.Errorf("failed to mint screenshot upload token: %w", err)
+	}
+	uploadURL := strings.TrimRight(g.agentConfig.APIBaseURL, "/") +
+		"/v1/kumbha/sessions/" + sess.ID.String() + "/screenshot"
+
+	ctx, cancel := context.WithTimeout(ctx, captureTimeoutDefault)
+	defer cancel()
+
+	podID := "kumbha-shot-" + sess.ID.String()[:8]
+	scope := cluster.ProjectScope(sess.ProjectID.String())
+
+	spec := cluster.InstanceSpec{
+		InstanceID: podID,
+		AccountID:  sess.AccountID.String(),
+		ProjectID:  sess.ProjectID.String(),
+		Image:      g.agentConfig.Image,
+		Command:    []string{screenshotBinaryPath},
+		Env: map[string]string{
+			"TEEPIN_TARGET_URL": targetURL,
+			"TEEPIN_UPLOAD_URL": uploadURL,
+			"TEEPIN_TOKEN":      token,
+		},
+		Labels:          map[string]string{agentLabel: "true"},
+		CPUUnits:        screenshotCPUUnits,
+		MemoryGB:        screenshotMemoryGB,
+		NeverRestart:    true,
+		ImagePullSecret: g.agentConfig.ImagePullSecret,
+		// Same reasoning as LaunchAgent's own AlwaysPullImage: the image
+		// tag is not guaranteed immutable in every deployment, and a stale
+		// cached binary silently drifting from what was actually pushed is
+		// a worse failure mode than one extra pull.
+		AlwaysPullImage: true,
+	}
+	if _, err := g.cluster.CreateInstance(ctx, spec); err != nil {
+		return fmt.Errorf("failed to launch screenshot capture pod: %w", err)
+	}
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		_ = g.cluster.DeleteInstance(cleanupCtx, scope, podID)
+	}()
+
+	return g.waitForCaptureCompletion(ctx, scope, podID)
+}
+
+// waitForCaptureCompletion polls the capture pod until it reaches a
+// terminal state, mirroring pkg/build.Service.waitForCompletion's own
+// poll-every-2s shape — kept as a separate, smaller copy rather than a
+// shared helper: the two packages' cluster.Client wiring is independent
+// (pkg/build takes its own directly; Gateway's is optional and
+// agent-launch-flavoured), and duplicating ~15 lines is cheaper than
+// introducing a cross-package dependency for it.
+func (g *Gateway) waitForCaptureCompletion(ctx context.Context, scope cluster.Scope, podID string) error {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("screenshot capture timed out or was cancelled: %w", ctx.Err())
+		case <-ticker.C:
+			status, err := g.cluster.GetInstanceStatus(ctx, scope, podID)
+			if err != nil {
+				if errors.Is(err, cluster.ErrNotFound) {
+					continue // creation may not have propagated to this read yet
+				}
+				return fmt.Errorf("failed to check screenshot capture status: %w", err)
+			}
+			if status.Status == "terminated" {
+				return nil
+			}
+			if status.Status == "failed" {
+				msg := status.Message
+				if msg == "" {
+					msg = status.Status
+				}
+				return fmt.Errorf("screenshot capture failed: %s", msg)
+			}
+		}
+	}
+}
+
 // isAgentRunning reports whether a session's agent pod is currently
 // pending or running — "will eventually reach its poll loop", not
 // "idle right now". A pod mid-completion still counts: it will pick up

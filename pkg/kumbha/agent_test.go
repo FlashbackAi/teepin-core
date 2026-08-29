@@ -576,3 +576,99 @@ func TestGateway_DeleteSessions_AlreadyClosedSessionSkipsCloseCall(t *testing.T)
 		t.Error(err)
 	}
 }
+
+func TestGateway_CaptureScreenshot_NotConfiguredWithoutWithAgent(t *testing.T) {
+	store, _ := newMockStore(t)
+	// CaptureScreenshot reuses AgentConfig.Image (deploy/kumbha-agent's
+	// own image) — there is no separate "screenshots configured"
+	// capability to enable, so WithAgent alone is both necessary and
+	// sufficient.
+	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{})
+
+	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), ProjectID: uuid.New()}
+	err := gw.CaptureScreenshot(context.Background(), sess, "https://inst-abc123.teepin.com")
+	if !errors.Is(err, ErrAgentNotConfigured) {
+		t.Errorf("got %v, want ErrAgentNotConfigured", err)
+	}
+}
+
+// TestGateway_CaptureScreenshot_Success covers the whole happy path: the
+// capture pod reuses the SAME image LaunchAgent does (no separate
+// screenshot image/registry), overrides its entrypoint to the capture
+// binary, is launched with the right target/upload/token env vars, hidden
+// from the customer's Compute list (agentLabel), carries the agent
+// image's own pull secret, and is torn down once it reports "terminated"
+// — mirroring pkg/build.Service.Build's own launch-poll-cleanup shape.
+func TestGateway_CaptureScreenshot_Success(t *testing.T) {
+	store, _ := newMockStore(t)
+	fc := &fakeCluster{statusResult: &cluster.InstanceStatus{Status: "terminated"}}
+	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+		WithAgent(fc, fakeMintToken, AgentConfig{
+			Image:           "kumbha-agent:latest",
+			APIBaseURL:      "http://teepin-api.default.svc.cluster.local:8080",
+			ImagePullSecret: "teepin-kumbha-ecr",
+		})
+
+	sessID, accountID, projectID := uuid.New(), uuid.New(), uuid.New()
+	sess := &Session{ID: sessID, AccountID: accountID, ProjectID: projectID}
+
+	if err := gw.CaptureScreenshot(context.Background(), sess, "https://inst-abc123.teepin.com"); err != nil {
+		t.Fatalf("CaptureScreenshot: %v", err)
+	}
+
+	if len(fc.created) != 1 {
+		t.Fatalf("got %d CreateInstance calls, want 1", len(fc.created))
+	}
+	spec := fc.created[0]
+	if spec.Image != "kumbha-agent:latest" {
+		t.Errorf("Image = %q, want the SAME agent image reused, not a separate one", spec.Image)
+	}
+	if len(spec.Command) != 1 || spec.Command[0] != screenshotBinaryPath {
+		t.Errorf("Command = %v, want an override to %q", spec.Command, screenshotBinaryPath)
+	}
+	if spec.Env["TEEPIN_TARGET_URL"] != "https://inst-abc123.teepin.com" {
+		t.Errorf("capture pod did not receive the target URL: %+v", spec.Env)
+	}
+	wantUploadURL := "http://teepin-api.default.svc.cluster.local:8080/v1/kumbha/sessions/" + sessID.String() + "/screenshot"
+	if spec.Env["TEEPIN_UPLOAD_URL"] != wantUploadURL {
+		t.Errorf("upload URL = %q, want %q", spec.Env["TEEPIN_UPLOAD_URL"], wantUploadURL)
+	}
+	if spec.Env["TEEPIN_TOKEN"] != "fake-agent-token" {
+		t.Errorf("capture pod did not receive its upload token: %+v", spec.Env)
+	}
+	if spec.Labels[agentLabel] != "true" {
+		t.Error("capture pod is missing the label that hides it from the customer's Compute list")
+	}
+	if spec.ImagePullSecret != "teepin-kumbha-ecr" {
+		t.Errorf("ImagePullSecret = %q, want the agent image's own secret reused", spec.ImagePullSecret)
+	}
+	if !spec.NeverRestart {
+		t.Error("capture pod spec did not set NeverRestart")
+	}
+	if len(fc.deleted) != 1 || fc.deleted[0] != spec.InstanceID {
+		t.Errorf("capture pod was not torn down: deleted = %v, want [%s]", fc.deleted, spec.InstanceID)
+	}
+}
+
+// TestGateway_CaptureScreenshot_FailurePropagatesAndStillCleansUp proves
+// a failed capture pod both returns an error (so the caller's WARN log
+// says why) AND is still deleted — a failed thumbnail capture must never
+// leak a pod, the same posture as a failed build.
+func TestGateway_CaptureScreenshot_FailurePropagatesAndStillCleansUp(t *testing.T) {
+	store, _ := newMockStore(t)
+	fc := &fakeCluster{statusResult: &cluster.InstanceStatus{Status: "failed", Message: "chrome crashed"}}
+	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+		WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest", APIBaseURL: "http://api.internal"})
+
+	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), ProjectID: uuid.New()}
+	err := gw.CaptureScreenshot(context.Background(), sess, "https://inst-abc123.teepin.com")
+	if err == nil {
+		t.Fatal("got nil error for a failed capture pod, want one")
+	}
+	if len(fc.created) != 1 {
+		t.Fatalf("got %d CreateInstance calls, want 1", len(fc.created))
+	}
+	if len(fc.deleted) != 1 || fc.deleted[0] != fc.created[0].InstanceID {
+		t.Errorf("capture pod was not torn down after failing: deleted = %v", fc.deleted)
+	}
+}
