@@ -1280,12 +1280,19 @@ func TestGetKumbhaSession_ReportsLiveAppEndpoint(t *testing.T) {
 
 	sessionID, projectID := uuid.New(), uuid.New()
 	fc.add(appID, projectID.String(), compute.StatusRunning)
-	fc.setEndpoint(appID, "https://inst-deployed3.teepin.com")
 	server := (&Server{store: cStore, cluster: fc}).WithKumbha(gw)
 
 	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
 		WithArgs(sessionID, testAccountID).
 		WillReturnRows(liveSessionRow(sessionID, "", appID))
+	// The endpoint must come from the STORED record, not
+	// cluster.InstanceStatus.EndpointURL directly — that field is only
+	// ever populated by DirectClient; AgentClient's cached status (the
+	// platform's actual home-node topology) never carries it. See
+	// resolveEndpoint's own doc comment (found live 2026-08-29).
+	mock.ExpectQuery(`SELECT .+ FROM compute\.instances`).
+		WithArgs(appID).
+		WillReturnRows(instanceRecordRow(appID, testAccountID, projectID, "kumbha-deployed3", "img:v1", 1, 1, 0, 80, "https://inst-deployed3.teepin.com"))
 
 	w := kumbhaRequest(server.GetKumbhaSession, http.MethodGet, "/v1/kumbha/sessions/"+sessionID.String(),
 		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, nil, nil)

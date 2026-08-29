@@ -1147,31 +1147,12 @@ func statusToInstance(st cluster.InstanceStatus, record *compute.InstanceRecord,
 	instance.CPUUnits = record.CPUUnits
 	instance.Memory = fmt.Sprintf("%dGB", record.MemoryGB)
 	instance.InstanceType = record.InstanceType
-	instance.Endpoint = record.Endpoint
-	instance.DNSName = record.DNSName
 	instance.PublicIP = record.PublicIP
-	instance.TLSEnabled = record.TLSEnabled
-	instance.TLSReady = record.TLSReady
 	instance.ContainerPort = record.ContainerPort
 	instance.StorageGB = record.StorageGB
 
-	// Self-healing fallback: the tunnel (pkg/api's tunnelMiddleware) routes
-	// by hostname convention alone and never consults record.Endpoint, so
-	// an instance can be genuinely reachable while these columns are NULL
-	// — found live 2026-08-21 against a real running instance
-	// (inst-0f0bdb64), whose endpoint/dns_name/tls_ready all came back
-	// null from the API despite curl succeeding against its derived
-	// hostname. Only fires when the stored value is empty — never
-	// overrides a populated one, so a datacenter instance's real
-	// cert-manager-issued endpoint is untouched. Requires ContainerPort >
-	// 0: an instance with no exposed port genuinely has no endpoint, and
-	// deriving one would be a broken link, not a helpful fallback.
-	if instance.Endpoint == "" && record.ContainerPort > 0 && domain != "" {
-		instance.DNSName = record.ID + "." + domain
-		instance.Endpoint = "https://" + instance.DNSName
-		instance.TLSEnabled = true
-		instance.TLSReady = true
-	}
+	instance.Endpoint, instance.DNSName, instance.TLSEnabled, instance.TLSReady =
+		resolveEndpoint(record, domain)
 
 	if record.GPUVRAMGB > 0 {
 		instance.GPUVRAM = fmt.Sprintf("%dGB", record.GPUVRAMGB)
@@ -1183,6 +1164,44 @@ func statusToInstance(st cluster.InstanceStatus, record *compute.InstanceRecord,
 	}
 
 	return instance
+}
+
+// resolveEndpoint returns record's stored endpoint, DNS name, and TLS
+// state — or, if none was stored, derives the same self-healing fallback
+// statusToInstance always has: the tunnel (pkg/api's tunnelMiddleware)
+// routes by hostname convention alone and never consults record.Endpoint,
+// so an instance can be genuinely reachable while these columns are NULL
+// — found live 2026-08-21 against a real running instance
+// (inst-0f0bdb64), whose endpoint/dns_name/tls_ready all came back null
+// from the API despite curl succeeding against its derived hostname. Only
+// fires when the stored value is empty — never overrides a populated one,
+// so a datacenter instance's real cert-manager-issued endpoint is
+// untouched. Requires ContainerPort > 0: an instance with no exposed port
+// genuinely has no endpoint, and deriving one would be a broken link, not
+// a helpful fallback.
+//
+// Pulled out of statusToInstance so GetKumbhaSession's own live-status
+// enrichment can resolve the SAME endpoint GetInstance would report,
+// rather than trusting cluster.InstanceStatus.EndpointURL directly — that
+// field is only ever populated by DirectClient (statusWithEndpoint);
+// AgentClient's cached status (the actual topology this platform runs in
+// today, home-node placement) never carries it, so a Kumbha deploy's own
+// session read came back with a real, running app and an empty endpoint
+// — found live 2026-08-29 against inst-55b4d443, whose
+// /v1/compute/instances/:id response had a working
+// https://inst-55b4d443.dev.teepin.com the session endpoint never saw.
+func resolveEndpoint(record *compute.InstanceRecord, domain string) (endpoint, dnsName string, tlsEnabled, tlsReady bool) {
+	if record == nil {
+		return "", "", false, false
+	}
+	endpoint, dnsName, tlsEnabled, tlsReady = record.Endpoint, record.DNSName, record.TLSEnabled, record.TLSReady
+	if endpoint == "" && record.ContainerPort > 0 && domain != "" {
+		dnsName = record.ID + "." + domain
+		endpoint = "https://" + dnsName
+		tlsEnabled = true
+		tlsReady = true
+	}
+	return endpoint, dnsName, tlsEnabled, tlsReady
 }
 
 // parseMemoryGB parses memory strings like "32GB" or "512MB" to whole

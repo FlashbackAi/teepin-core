@@ -847,12 +847,19 @@ func (s *Server) GetKumbhaSession(c *gin.Context) {
 		if st, err := s.cluster.GetInstanceStatus(c.Request.Context(), scopeFor(projectID), sess.AppInstanceID); err == nil {
 			resp["app_status"] = st.Status
 			resp["app_status_message"] = st.Message
-			// The endpoint too, straight off the same live read — this is
-			// what lets the console populate its Preview tab and "open the
-			// instance" link the moment a deploy succeeds, whether it was
-			// the agent's own deploy call or the console IDE's Deploy
-			// button, without waiting for (or parsing) an event summary.
-			resp["app_endpoint"] = st.EndpointURL
+			// The endpoint comes from the STORED record (same resolution
+			// GetInstance uses), not st.EndpointURL directly — that field is
+			// only ever populated by DirectClient; AgentClient's cached
+			// status (the actual topology this platform runs on, home-node
+			// placement) never carries it, so trusting it here left the
+			// Preview tab empty for a real, running, reachable app. See
+			// resolveEndpoint's own doc comment (found live 2026-08-29).
+			var record *compute.InstanceRecord
+			if s.store != nil {
+				record, _ = s.store.Get(c.Request.Context(), sess.AppInstanceID)
+			}
+			endpoint, _, _, _ := resolveEndpoint(record, s.endpointDomain)
+			resp["app_endpoint"] = endpoint
 		}
 	}
 
