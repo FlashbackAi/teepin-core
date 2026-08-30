@@ -648,6 +648,25 @@ func (s *Server) CreateInstance(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to persist instance: %v", err)})
 			return
 		}
+
+		// A Kumbha session that just provisioned REAL infrastructure needs
+		// its current workspace draft checkpointed — the same thing
+		// DeployKumbhaSession already does after its own create call, but
+		// this one covers every OTHER way a session-scoped credential can
+		// reach here (create_instance's MCP tool being the live example:
+		// used as a workaround when `deploy` was erroring, it left a real,
+		// working build's only saved draft un-checkpointed and therefore
+		// invisible in the console's History — is_checkpoint-filtered,
+		// see ListVersions — even though the file content itself was safe
+		// in Postgres the whole time. Found live 2026-08-31. Best-effort:
+		// the instance is real either way; only the console's history
+		// view would be short one entry if this fails, not worth undoing
+		// a successful create over.
+		if s.kumbha != nil && kumbhaSessionID != uuid.Nil {
+			if err := s.kumbha.CheckpointWorkspace(c.Request.Context(), kumbhaSessionID); err != nil {
+				log.Printf("WARN: instance %s created for Kumbha session %s but failed to checkpoint its workspace: %v", instanceID, kumbhaSessionID, err)
+			}
+		}
 	}
 
 	// Build response

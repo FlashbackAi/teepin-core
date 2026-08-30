@@ -422,7 +422,28 @@ func (c *DirectClient) DeleteInstance(ctx context.Context, scope Scope, instance
 		return fmt.Errorf("list pods: %w", err)
 	}
 
+	// A Kumbha agent pod's PVC is its customer's actual workspace — the
+	// files it wrote, meant to survive the pod being killed and relaunched
+	// (StopAgent's own doc comment: "Whatever the agent had written to the
+	// workspace (PVC) up to the moment of the kill is kept"). But every
+	// path that tears down that pod (StopAgent's hard-kill, LaunchAgent's
+	// own launch-failed cleanup) goes through this SAME DeleteInstance a
+	// customer's own compute-instance deletion uses — and that one
+	// correctly DOES wipe storage, since the customer is done with it for
+	// good. Found live 2026-08-31: a relaunched agent found its own
+	// workspace completely empty — no app code, no Dockerfile, nothing
+	// from a build that had deployed successfully hours earlier — because
+	// this method deleted the PVC unconditionally, silently breaking the
+	// promise StopAgent's own comment makes. Detected via the pod's own
+	// label (the same teepin.io/kumbha-agent marker LaunchAgent stamps on
+	// it and ListInstanceStatuses already filters on — an established
+	// precedent for this exact kind of special-casing, not a new one) so
+	// a customer's ordinary instance delete is entirely unaffected.
+	isKumbhaAgent := false
 	for _, pod := range pods.Items {
+		if pod.Labels[labelKumbhaAgent] == "true" {
+			isKumbhaAgent = true
+		}
 		if delErr := c.k8s.CoreV1().Pods(workloadNamespace).Delete(
 			ctx, pod.Name, metav1.DeleteOptions{}); delErr != nil && !apierrors.IsNotFound(delErr) {
 			return fmt.Errorf("delete pod %s: %w", pod.Name, delErr)
@@ -443,9 +464,11 @@ func (c *DirectClient) DeleteInstance(ctx context.Context, scope Scope, instance
 	// delete by name, same idempotent IsNotFound-is-success idiom as the
 	// pod delete above. A PVC delete when StorageGB was never set simply
 	// finds nothing, which is not an error.
-	if err := c.k8s.CoreV1().PersistentVolumeClaims(workloadNamespace).Delete(
-		ctx, pvcName(instanceID), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("delete pvc: %w", err)
+	if !isKumbhaAgent {
+		if err := c.k8s.CoreV1().PersistentVolumeClaims(workloadNamespace).Delete(
+			ctx, pvcName(instanceID), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete pvc: %w", err)
+		}
 	}
 	if err := c.k8s.NetworkingV1().NetworkPolicies(workloadNamespace).Delete(
 		ctx, networkPolicyName(instanceID), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {

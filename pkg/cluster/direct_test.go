@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
@@ -282,6 +283,67 @@ func TestCreateInstance_CommandAndArgsPreserved(t *testing.T) {
 	}
 	if len(container.Args) != 3 {
 		t.Errorf("Args = %v, want 3 elements", container.Args)
+	}
+}
+
+// TestDeleteInstance_PreservesKumbhaAgentPVC is the regression test for a
+// live 2026-08-31 incident: a relaunched Kumbha agent found its own
+// workspace completely empty — hours of prior work gone — because
+// DeleteInstance (called by StopAgent's hard-kill, or LaunchAgent's own
+// launch-failed cleanup) wiped the PVC unconditionally, contradicting
+// StopAgent's own documented promise that the workspace survives a kill.
+// A pod carrying the teepin.io/kumbha-agent label (LaunchAgent stamps
+// this on every agent pod it creates) must keep its PVC through delete.
+func TestDeleteInstance_PreservesKumbhaAgentPVC(t *testing.T) {
+	c := newTestClient()
+	ctx := context.Background()
+
+	if _, err := c.CreateInstance(ctx, InstanceSpec{
+		InstanceID: "kumbha-agent-abcd1234",
+		Image:      "teepin/kumbha-agent:latest",
+		CPUUnits:   2,
+		MemoryGB:   4,
+		StorageGB:  10,
+		Labels:     map[string]string{labelKumbhaAgent: "true"},
+	}); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	if err := c.DeleteInstance(ctx, AllTenants(), "kumbha-agent-abcd1234"); err != nil {
+		t.Fatalf("DeleteInstance: %v", err)
+	}
+
+	if _, err := c.k8s.CoreV1().PersistentVolumeClaims(workloadNamespace).
+		Get(ctx, pvcName("kumbha-agent-abcd1234"), metav1.GetOptions{}); err != nil {
+		t.Errorf("PVC was deleted along with a Kumbha agent pod, want it preserved: %v", err)
+	}
+}
+
+// TestDeleteInstance_DeletesOrdinaryInstancePVC locks in the UNCHANGED
+// behaviour for everything else: a customer deleting their own compute
+// instance must still wipe its storage — only a Kumbha agent pod's own
+// workspace gets the exception above.
+func TestDeleteInstance_DeletesOrdinaryInstancePVC(t *testing.T) {
+	c := newTestClient()
+	ctx := context.Background()
+
+	if _, err := c.CreateInstance(ctx, InstanceSpec{
+		InstanceID: "inst-ordinary01",
+		Image:      "nginx:latest",
+		CPUUnits:   2,
+		MemoryGB:   4,
+		StorageGB:  10,
+	}); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	if err := c.DeleteInstance(ctx, AllTenants(), "inst-ordinary01"); err != nil {
+		t.Fatalf("DeleteInstance: %v", err)
+	}
+
+	if _, err := c.k8s.CoreV1().PersistentVolumeClaims(workloadNamespace).
+		Get(ctx, pvcName("inst-ordinary01"), metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Errorf("ordinary instance's PVC should be gone after delete, got err=%v", err)
 	}
 }
 

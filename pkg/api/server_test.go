@@ -21,6 +21,7 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/cluster"
 	"github.com/FlashbackAi/teepin-core/pkg/compute"
 	"github.com/FlashbackAi/teepin-core/pkg/gpu"
+	"github.com/FlashbackAi/teepin-core/pkg/kumbha"
 	"github.com/FlashbackAi/teepin-core/pkg/models"
 )
 
@@ -1030,6 +1031,56 @@ func TestCreateInstance_PersistsEndpointFields(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("INSERT did not carry the expected endpoint-field args: %v", err)
+	}
+}
+
+// TestCreateInstance_CheckspointsKumbhaWorkspaceWhenSessionLinked is the
+// regression test for a live 2026-08-31 incident: a Kumbha agent's real,
+// successfully-built workspace never showed up in the console's History
+// list because it was never checkpointed — CheckpointWorkspace only ever
+// ran inside DeployKumbhaSession's own handler, so an instance created via
+// the create_instance MCP tool (used as a workaround when `deploy` itself
+// was erroring) left the customer's only saved draft permanently filtered
+// out of ListVersions' is_checkpoint-only query, even though the file
+// content was safe in Postgres the whole time. CreateInstance must now
+// checkpoint the calling session's workspace whenever the request carries
+// a Kumbha session credential (auth.SessionIDKey) — the same signal
+// migration 032's instance/session linkage already introduced.
+func TestCreateInstance_CheckspointsKumbhaWorkspaceWhenSessionLinked(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{in: 1, out: 1}, noopUsageRecorder{})
+	server := NewServer(newFakeCluster(), nil, cStore, nil, allowGate{}).WithKumbha(gw)
+
+	sessionID := uuid.New()
+
+	mock.ExpectQuery(`INSERT INTO compute\.instances`).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"created_at", "updated_at"}).
+			AddRow(time.Now(), time.Now()))
+	mock.ExpectExec(`UPDATE billing\.kumbha_workspace_versions`).
+		WithArgs(sessionID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/",
+		strings.NewReader(`{"name":"t","image":"nginx","cpu_units":1,"memory":"2GB"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set(string(auth.ProjectIDKey), uuid.New())
+	c.Set(string(auth.AccountIDKey), testAccountID)
+	c.Set(string(auth.SessionIDKey), sessionID)
+	server.CreateInstance(c)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body: %s)", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("expected the workspace checkpoint UPDATE to run: %v", err)
 	}
 }
 
