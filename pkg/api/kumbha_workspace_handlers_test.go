@@ -95,9 +95,9 @@ func TestUploadKumbhaWorkspace_Success(t *testing.T) {
 
 	sessionID := uuid.New()
 	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT v\.version, v\.is_checkpoint`).
+	mock.ExpectQuery(`SELECT v\.version, v\.is_checkpoint, v\.file_count`).
 		WithArgs(sessionID).
-		WillReturnRows(sqlmock.NewRows([]string{"version", "is_checkpoint"}).AddRow(nil, nil))
+		WillReturnRows(sqlmock.NewRows([]string{"version", "is_checkpoint", "file_count"}).AddRow(nil, nil, nil))
 	mock.ExpectQuery(`SELECT COALESCE\(MAX\(version\), 0\) FROM billing\.kumbha_workspace_versions`).
 		WithArgs(sessionID).
 		WillReturnRows(sqlmock.NewRows([]string{"coalesce"}).AddRow(0))

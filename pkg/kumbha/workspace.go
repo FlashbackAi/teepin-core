@@ -215,16 +215,37 @@ func (s *Store) SaveVersion(ctx context.Context, sessionID uuid.UUID, files []Wo
 	if createdBy == CreatedByAgent {
 		var currentVersion sql.NullInt64
 		var isCheckpoint sql.NullBool
+		var currentFileCount sql.NullInt64
 		if err := tx.QueryRowContext(ctx, `
-			SELECT v.version, v.is_checkpoint
+			SELECT v.version, v.is_checkpoint, v.file_count
 			FROM billing.inference_sessions s
 			LEFT JOIN billing.kumbha_workspace_versions v
 			    ON v.session_id = s.id AND v.version = s.current_workspace_version
 			WHERE s.id = $1
-		`, sessionID).Scan(&currentVersion, &isCheckpoint); err != nil {
+		`, sessionID).Scan(&currentVersion, &isCheckpoint, &currentFileCount); err != nil {
 			return 0, fmt.Errorf("failed to check current draft version: %w", err)
 		}
 		if currentVersion.Valid && !isCheckpoint.Bool {
+			// Never let an empty save overwrite a draft that had real
+			// content — run.py calls upload_workspace() unconditionally at
+			// the end of EVERY run, including one that never touched a
+			// file (e.g. a relaunch that just inspected an already-empty
+			// PVC and did nothing else). Before this guard, that automatic
+			// final save silently clobbered the only saved copy of a real,
+			// already-deployed build with zero files — a live 2026-08-31
+			// incident: the PVC-wipe bug emptied the filesystem, then this
+			// path faithfully (and destructively) recorded that emptiness
+			// over the actual site source, which by then existed nowhere
+			// else. A customer explicitly clearing their own workspace is
+			// not something this automatic background path does — that
+			// would be a deliberate action of its own — so refusing an
+			// empty overwrite here has no legitimate case to break.
+			if len(files) == 0 && currentFileCount.Valid && currentFileCount.Int64 > 0 {
+				if err := tx.Commit(); err != nil {
+					return 0, fmt.Errorf("failed to commit workspace version: %w", err)
+				}
+				return int(currentVersion.Int64), nil
+			}
 			if _, err := tx.ExecContext(ctx, `
 				UPDATE billing.kumbha_workspace_versions
 				SET files = $1, skipped = $2, file_count = $3, byte_size = $4, created_at = NOW()

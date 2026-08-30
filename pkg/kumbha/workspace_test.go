@@ -129,9 +129,9 @@ func TestSaveVersion_InsertsVersionOneWhenNoneExistAndMovesPointer(t *testing.T)
 	sessionID := uuid.New()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT v\.version, v\.is_checkpoint`).
+	mock.ExpectQuery(`SELECT v\.version, v\.is_checkpoint, v\.file_count`).
 		WithArgs(sessionID).
-		WillReturnRows(sqlmock.NewRows([]string{"version", "is_checkpoint"}).AddRow(nil, nil))
+		WillReturnRows(sqlmock.NewRows([]string{"version", "is_checkpoint", "file_count"}).AddRow(nil, nil, nil))
 	mock.ExpectQuery(`SELECT COALESCE\(MAX\(version\), 0\) FROM billing\.kumbha_workspace_versions`).
 		WithArgs(sessionID).
 		WillReturnRows(sqlmock.NewRows([]string{"coalesce"}).AddRow(0))
@@ -192,9 +192,9 @@ func TestSaveVersion_RefusesPastVersionLimit(t *testing.T) {
 	sessionID := uuid.New()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT v\.version, v\.is_checkpoint`).
+	mock.ExpectQuery(`SELECT v\.version, v\.is_checkpoint, v\.file_count`).
 		WithArgs(sessionID).
-		WillReturnRows(sqlmock.NewRows([]string{"version", "is_checkpoint"}).AddRow(nil, nil))
+		WillReturnRows(sqlmock.NewRows([]string{"version", "is_checkpoint", "file_count"}).AddRow(nil, nil, nil))
 	mock.ExpectQuery(`SELECT COALESCE\(MAX\(version\), 0\) FROM billing\.kumbha_workspace_versions`).
 		WithArgs(sessionID).
 		WillReturnRows(sqlmock.NewRows([]string{"coalesce"}).AddRow(MaxWorkspaceVersions))
@@ -211,9 +211,9 @@ func TestSaveVersion_AgentReusesUncheckpointedDraftInPlace(t *testing.T) {
 	sessionID := uuid.New()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT v\.version, v\.is_checkpoint`).
+	mock.ExpectQuery(`SELECT v\.version, v\.is_checkpoint, v\.file_count`).
 		WithArgs(sessionID).
-		WillReturnRows(sqlmock.NewRows([]string{"version", "is_checkpoint"}).AddRow(3, false))
+		WillReturnRows(sqlmock.NewRows([]string{"version", "is_checkpoint", "file_count"}).AddRow(3, false, 1))
 	mock.ExpectExec(`UPDATE billing\.kumbha_workspace_versions`).
 		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), 1, int64(len("hi")), sessionID, int64(3)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -232,14 +232,77 @@ func TestSaveVersion_AgentReusesUncheckpointedDraftInPlace(t *testing.T) {
 	}
 }
 
+// TestSaveVersion_EmptyAgentSaveDoesNotClobberRealDraft is the regression
+// test for a live 2026-08-31 incident: run.py calls upload_workspace()
+// unconditionally at the end of EVERY run, including one that never
+// touched a file. Before this guard, that automatic final save silently
+// overwrote a real, already-deployed build's only saved draft with zero
+// files the moment a relaunch found an already-empty PVC (a separate PVC-
+// wipe bug, fixed the same day) and did nothing else — destroying the
+// last remaining copy of the actual source in the database too. An empty
+// save must be a no-op when the current draft already has real content.
+func TestSaveVersion_EmptyAgentSaveDoesNotClobberRealDraft(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessionID := uuid.New()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT v\.version, v\.is_checkpoint, v\.file_count`).
+		WithArgs(sessionID).
+		WillReturnRows(sqlmock.NewRows([]string{"version", "is_checkpoint", "file_count"}).AddRow(3, false, 4))
+	// No UPDATE expected — an empty save against a non-empty draft must be
+	// refused, not silently applied.
+	mock.ExpectCommit()
+
+	version, err := store.SaveVersion(context.Background(), sessionID, nil, nil, CreatedByAgent)
+	if err != nil {
+		t.Fatalf("SaveVersion: %v", err)
+	}
+	if version != 3 {
+		t.Errorf("got version %d, want the existing draft version 3 unchanged", version)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+// TestSaveVersion_EmptyAgentSaveOverEmptyDraftIsFine proves the guard is
+// specifically about REGRESSING real content, not about rejecting empty
+// saves outright: a session with no files yet saving nothing is the
+// ordinary case (a fresh session's first automatic save before the agent
+// has written anything), not something to refuse.
+func TestSaveVersion_EmptyAgentSaveOverEmptyDraftIsFine(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessionID := uuid.New()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT v\.version, v\.is_checkpoint, v\.file_count`).
+		WithArgs(sessionID).
+		WillReturnRows(sqlmock.NewRows([]string{"version", "is_checkpoint", "file_count"}).AddRow(3, false, 0))
+	mock.ExpectExec(`UPDATE billing\.kumbha_workspace_versions`).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), 0, int64(0), sessionID, int64(3)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	version, err := store.SaveVersion(context.Background(), sessionID, nil, nil, CreatedByAgent)
+	if err != nil {
+		t.Fatalf("SaveVersion: %v", err)
+	}
+	if version != 3 {
+		t.Errorf("got version %d, want 3", version)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
 func TestSaveVersion_AgentStartsNewDraftAfterCurrentIsCheckpointed(t *testing.T) {
 	store, mock := newMockStore(t)
 	sessionID := uuid.New()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT v\.version, v\.is_checkpoint`).
+	mock.ExpectQuery(`SELECT v\.version, v\.is_checkpoint, v\.file_count`).
 		WithArgs(sessionID).
-		WillReturnRows(sqlmock.NewRows([]string{"version", "is_checkpoint"}).AddRow(3, true))
+		WillReturnRows(sqlmock.NewRows([]string{"version", "is_checkpoint", "file_count"}).AddRow(3, true, 1))
 	mock.ExpectQuery(`SELECT COALESCE\(MAX\(version\), 0\) FROM billing\.kumbha_workspace_versions`).
 		WithArgs(sessionID).
 		WillReturnRows(sqlmock.NewRows([]string{"coalesce"}).AddRow(3))
