@@ -660,7 +660,7 @@ func TestRedeployKumbhaInstance_UpdatesExistingInstanceInPlace(t *testing.T) {
 
 	sess := &kumbha.Session{ID: sessionID, AccountID: testAccountID, ProjectID: projectID, AppInstanceID: existingID}
 	c, w := newRedeployTestContext(projectID)
-	server.redeployKumbhaInstance(c, sessionID, sess, projectID, testAccountID, "new-image:v2",
+	server.redeployKumbhaInstance(context.Background(), c, sessionID, sess, projectID, testAccountID, "new-image:v2",
 		[]models.PortMapping{{Container: 80, Protocol: "tcp"}}, nil)
 
 	if w.Code != http.StatusOK {
@@ -709,7 +709,7 @@ func TestRedeployKumbhaInstance_InstanceGoneIs404(t *testing.T) {
 
 	sess := &kumbha.Session{ID: sessionID, AccountID: testAccountID, ProjectID: projectID, AppInstanceID: existingID}
 	c, w := newRedeployTestContext(projectID)
-	server.redeployKumbhaInstance(c, sessionID, sess, projectID, testAccountID, "new-image:v2", nil, nil)
+	server.redeployKumbhaInstance(context.Background(), c, sessionID, sess, projectID, testAccountID, "new-image:v2", nil, nil)
 
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404 (body: %s)", w.Code, w.Body.String())
@@ -737,7 +737,7 @@ func TestRedeployKumbhaInstance_WrongAccountIsNotFound(t *testing.T) {
 
 	sess := &kumbha.Session{ID: sessionID, AccountID: testAccountID, ProjectID: projectID, AppInstanceID: existingID}
 	c, w := newRedeployTestContext(projectID)
-	server.redeployKumbhaInstance(c, sessionID, sess, projectID, testAccountID, "new-image:v2", nil, nil)
+	server.redeployKumbhaInstance(context.Background(), c, sessionID, sess, projectID, testAccountID, "new-image:v2", nil, nil)
 
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404 (body: %s)", w.Code, w.Body.String())
@@ -760,7 +760,7 @@ func TestRedeployKumbhaInstance_ClusterUnavailableMapsTo503(t *testing.T) {
 
 	sess := &kumbha.Session{ID: sessionID, AccountID: testAccountID, ProjectID: projectID, AppInstanceID: existingID}
 	c, w := newRedeployTestContext(projectID)
-	server.redeployKumbhaInstance(c, sessionID, sess, projectID, testAccountID, "new-image:v2", nil, nil)
+	server.redeployKumbhaInstance(context.Background(), c, sessionID, sess, projectID, testAccountID, "new-image:v2", nil, nil)
 
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503 (body: %s)", w.Code, w.Body.String())

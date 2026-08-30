@@ -557,6 +557,13 @@ type deployKumbhaSessionRequest struct {
 // what "redeploy" means to a customer nor how any comparable platform
 // (Vercel, Render, Fly) behaves.
 // POST /v1/kumbha/sessions/:id/deploy
+// deployFlowTimeout bounds the detached context DeployKumbhaSession uses
+// for its own work (see the doc comment on that context below) —
+// comfortably past build.DefaultConfig().Timeout (15 minutes) plus the
+// redeploy/checkpoint steps after it, same margin reasoning as
+// cmd/kumbha-mcp-server's own deployHTTPTimeout.
+const deployFlowTimeout = 18 * time.Minute
+
 func (s *Server) DeployKumbhaSession(c *gin.Context) {
 	if s.kumbha == nil || s.kumbhaBuild == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha build pipeline is not available on this deployment"})
@@ -593,7 +600,29 @@ func (s *Server) DeployKumbhaSession(c *gin.Context) {
 	}
 	userID, _ := auth.GetUserID(c)
 
-	sess, err := s.kumbha.GetSession(c.Request.Context(), sessionID, accountID)
+	// Detached from c.Request.Context() from here on: the build+redeploy
+	// flow below can legitimately run for minutes (buildKumbhaImage's own
+	// 15-minute ceiling), and tying it to the incoming HTTP connection
+	// meant ANY client-side disconnect — a page refresh, a closed tab, an
+	// impatient navigate-away while watching a bare loading spinner with
+	// no progress feedback — silently abandoned the deploy mid-flight:
+	// the Kaniko pod kept building in the cluster regardless, but nothing
+	// on the control plane was left to swap the instance's image,
+	// checkpoint the workspace, or clear last_deploy_failed once it
+	// finished. Found live 2026-08-31: a build whose own Kaniko logs
+	// showed it completed and pushed successfully, yet the instance's
+	// stored image never updated and last_deploy_failed stayed stuck on
+	// an unrelated timeout from 23 minutes earlier — exactly this
+	// abandonment. A fresh context.Background() here means the flow runs
+	// to completion (bounded by deployFlowTimeout) even if nobody is left
+	// listening for the HTTP response — c is still used below for
+	// everything that only needs the ORIGINAL request (param/body
+	// parsing, already done above, and c.JSON/c.Data to answer it if the
+	// connection is still alive).
+	ctx, cancel := context.WithTimeout(context.Background(), deployFlowTimeout)
+	defer cancel()
+
+	sess, err := s.kumbha.GetSession(ctx, sessionID, accountID)
 	if err != nil {
 		if errors.Is(err, kumbha.ErrSessionNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
@@ -607,30 +636,30 @@ func (s *Server) DeployKumbhaSession(c *gin.Context) {
 		return
 	}
 
-	imageRef, status, body := s.buildKumbhaImage(c.Request.Context(), sess, accountID, req.DockerfilePath)
+	imageRef, status, body := s.buildKumbhaImage(ctx, sess, accountID, req.DockerfilePath)
 	if status != 0 {
-		s.recordDeployOutcome(c.Request.Context(), sessionID, errorFromBody(body))
+		s.recordDeployOutcome(ctx, sessionID, errorFromBody(body))
 		c.JSON(status, body)
 		return
 	}
 
 	ports := req.Ports
 	if len(ports) == 0 {
-		ports = s.detectKumbhaPorts(c.Request.Context(), sess.ProjectID, imageRef)
+		ports = s.detectKumbhaPorts(ctx, sess.ProjectID, imageRef)
 	}
 	if status, body := validatePorts(ports); status != 0 {
-		s.recordDeployOutcome(c.Request.Context(), sessionID, errorFromBody(body))
+		s.recordDeployOutcome(ctx, sessionID, errorFromBody(body))
 		c.JSON(status, body)
 		return
 	}
 	if status, body := validateStorageGB(req.StorageGB); status != 0 {
-		s.recordDeployOutcome(c.Request.Context(), sessionID, errorFromBody(body))
+		s.recordDeployOutcome(ctx, sessionID, errorFromBody(body))
 		c.JSON(status, body)
 		return
 	}
 
 	if sess.AppInstanceID != "" {
-		s.redeployKumbhaInstance(c, sessionID, sess, projectID, accountID, imageRef, ports, req.Env)
+		s.redeployKumbhaInstance(ctx, c, sessionID, sess, projectID, accountID, imageRef, ports, req.Env)
 		return
 	}
 
@@ -645,7 +674,7 @@ func (s *Server) DeployKumbhaSession(c *gin.Context) {
 	}
 	createStatus, createBody := s.invokeInternally(s.CreateInstance, http.MethodPost, "/v1/compute/instances", nil, accountID, projectID, userID, sessionID, createReq)
 	if createStatus != http.StatusCreated {
-		s.recordDeployOutcome(c.Request.Context(), sessionID, errorFromJSONBody(createBody))
+		s.recordDeployOutcome(ctx, sessionID, errorFromJSONBody(createBody))
 		// CreateInstance's own error already explains a payment gate,
 		// invalid ports, or GPU/home capacity far better than a generic
 		// message here would — surfaced verbatim rather than re-worded.
@@ -663,7 +692,7 @@ func (s *Server) DeployKumbhaSession(c *gin.Context) {
 	// routed any session with an existing instance to
 	// redeployKumbhaInstance instead — so this is unconditionally the
 	// FIRST instance this session has ever created, never a replacement.
-	if err := s.kumbha.SetAppInstanceID(c.Request.Context(), sessionID, created.ID); err != nil {
+	if err := s.kumbha.SetAppInstanceID(ctx, sessionID, created.ID); err != nil {
 		// The instance is real and running; only OUR bookkeeping of which
 		// one belongs to this session failed. Not worth failing the
 		// customer's deploy over — logged so an operator can reconcile —
@@ -679,12 +708,12 @@ func (s *Server) DeployKumbhaSession(c *gin.Context) {
 	// SetAppInstanceID just above: the app is real and running; failing to
 	// flip a bookkeeping flag is not worth failing the customer's deploy
 	// over, only worth logging so it can be reconciled.
-	if err := s.kumbha.CheckpointWorkspace(c.Request.Context(), sessionID); err != nil {
+	if err := s.kumbha.CheckpointWorkspace(ctx, sessionID); err != nil {
 		log.Printf("WARN: deployed Kumbha session %s but failed to checkpoint its workspace version: %v", sessionID, err)
 	}
 
 	s.triggerScreenshotCapture(sessionID, sess, created.Endpoint)
-	s.recordDeployOutcome(c.Request.Context(), sessionID, "")
+	s.recordDeployOutcome(ctx, sessionID, "")
 
 	c.JSON(http.StatusOK, gin.H{
 		"image_ref":      imageRef,
@@ -730,7 +759,11 @@ func (s *Server) triggerScreenshotCapture(sessionID uuid.UUID, sess *kumbha.Sess
 // req — a redeploy changes what code runs, not how big the instance is;
 // resizing an existing instance is a different, unbuilt feature (and one
 // the console's own Deploy button has never offered a control for).
-func (s *Server) redeployKumbhaInstance(c *gin.Context, sessionID uuid.UUID, sess *kumbha.Session, projectID, accountID uuid.UUID, imageRef string, ports []models.PortMapping, env map[string]string) {
+// ctx is the detached, DeployKumbhaSession-owned context (see its own doc
+// comment) — used for every piece of real work below; c is kept only to
+// answer the original HTTP request (c.JSON), which may or may not still
+// have anyone listening by the time this returns.
+func (s *Server) redeployKumbhaInstance(ctx context.Context, c *gin.Context, sessionID uuid.UUID, sess *kumbha.Session, projectID, accountID uuid.UUID, imageRef string, ports []models.PortMapping, env map[string]string) {
 	if s.store == nil {
 		// Persistence is what remembers an existing instance's sizing and
 		// what UpdateImage reconciles afterward — without it there is no
@@ -742,7 +775,7 @@ func (s *Server) redeployKumbhaInstance(c *gin.Context, sessionID uuid.UUID, ses
 		return
 	}
 
-	existing, err := s.store.Get(c.Request.Context(), sess.AppInstanceID)
+	existing, err := s.store.Get(ctx, sess.AppInstanceID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -772,7 +805,7 @@ func (s *Server) redeployKumbhaInstance(c *gin.Context, sessionID uuid.UUID, ses
 	}
 	spec := s.instanceSpec(existing.ID, endpointUUIDFor(existing.ID), projectID, accountID, &req, nil)
 
-	result, err := s.cluster.UpdateInstance(c.Request.Context(), scopeFor(projectID), spec)
+	result, err := s.cluster.UpdateInstance(ctx, scopeFor(projectID), spec)
 	if err != nil {
 		var errMsg string
 		switch {
@@ -792,7 +825,7 @@ func (s *Server) redeployKumbhaInstance(c *gin.Context, sessionID uuid.UUID, ses
 		// "Failed" status on the console's build list is actually meant
 		// to mean: not "nothing is running", but "your last action here
 		// didn't work".
-		s.recordDeployOutcome(c.Request.Context(), sessionID, errMsg)
+		s.recordDeployOutcome(ctx, sessionID, errMsg)
 		return
 	}
 
@@ -800,7 +833,7 @@ func (s *Server) redeployKumbhaInstance(c *gin.Context, sessionID uuid.UUID, ses
 	if len(ports) > 0 {
 		containerPort = ports[0].Container
 	}
-	if err := s.store.UpdateImage(c.Request.Context(), existing.ID, imageRef, result.PodName, containerPort); err != nil {
+	if err := s.store.UpdateImage(ctx, existing.ID, imageRef, result.PodName, containerPort); err != nil {
 		// The pod is real and running the new code; only OUR record of
 		// which image/pod it is now on failed to update. Not worth
 		// failing the customer's redeploy over — logged so an operator
@@ -809,12 +842,12 @@ func (s *Server) redeployKumbhaInstance(c *gin.Context, sessionID uuid.UUID, ses
 		log.Printf("WARN: redeployed instance %s for Kumbha session %s but failed to update its record: %v", existing.ID, sessionID, err)
 	}
 
-	if err := s.kumbha.CheckpointWorkspace(c.Request.Context(), sessionID); err != nil {
+	if err := s.kumbha.CheckpointWorkspace(ctx, sessionID); err != nil {
 		log.Printf("WARN: redeployed Kumbha session %s but failed to checkpoint its workspace version: %v", sessionID, err)
 	}
 
 	s.triggerScreenshotCapture(sessionID, sess, existing.Endpoint)
-	s.recordDeployOutcome(c.Request.Context(), sessionID, "")
+	s.recordDeployOutcome(ctx, sessionID, "")
 
 	c.JSON(http.StatusOK, gin.H{
 		"image_ref":   imageRef,
