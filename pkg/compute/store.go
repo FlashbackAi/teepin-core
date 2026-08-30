@@ -74,11 +74,21 @@ type InstanceRecord struct {
 	// StorageGB is the persistent volume size requested at create time; 0
 	// means no volume was provisioned. Not called PersistentStorageGB —
 	// matches the JSON/proto field name used everywhere else in this flow.
-	StorageGB    int
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
-	StartedAt    *time.Time
-	TerminatedAt *time.Time
+	StorageGB int
+	// KumbhaSessionID records which Kumbha build session (if any) created
+	// this instance — set from the creating credential's own SessionID
+	// claim (a Kumbha session token) or threaded explicitly through
+	// invokeInternally for the deploy path, so NO instance a Kumbha agent
+	// provisions — via create_instance, deploy, or any future verb — can
+	// ever go untracked. Deliberately independent of AppInstanceID on
+	// kumbha.Session (which designates the ONE instance that IS "the
+	// app"): this column answers "did Kumbha create this" for every
+	// instance, sidecars included, whether or not it ever becomes the app.
+	KumbhaSessionID uuid.UUID
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+	StartedAt       *time.Time
+	TerminatedAt    *time.Time
 }
 
 // Store provides CRUD access to compute.instances.
@@ -101,9 +111,9 @@ func (s *Store) Create(ctx context.Context, rec *InstanceRecord) error {
 		(id, account_id, project_id, user_id, name, image, instance_type_id, status,
 		 gpu_vram_gb, cpu_units, memory_gb, endpoint, k8s_pod_name, k8s_namespace,
 		 provider_id, node_id, dns_name, public_ip, tls_enabled, tls_ready, container_port,
-		 storage_gb)
+		 storage_gb, kumbha_session_id)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-		 (SELECT id FROM compute.nodes WHERE node_name = $16), $17, $18, $19, $20, $21, $22)
+		 (SELECT id FROM compute.nodes WHERE node_name = $16), $17, $18, $19, $20, $21, $22, $23)
 		RETURNING created_at, updated_at
 	`
 
@@ -122,7 +132,7 @@ func (s *Store) Create(ctx context.Context, rec *InstanceRecord) error {
 		nullIfEmpty(rec.Endpoint), nullIfEmpty(rec.K8sPodName), rec.K8sNamespace,
 		nullIfEmpty(rec.ProviderID), nullIfEmpty(rec.NodeName),
 		nullIfEmpty(rec.DNSName), nullIfEmpty(rec.PublicIP), rec.TLSEnabled, rec.TLSReady,
-		containerPort, rec.StorageGB,
+		containerPort, rec.StorageGB, nullUUID(rec.KumbhaSessionID),
 	).Scan(&rec.CreatedAt, &rec.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("failed to persist instance %s: %w", rec.ID, err)
@@ -274,6 +284,17 @@ func (s *Store) ListByProject(ctx context.Context, accountID, projectID uuid.UUI
 		accountID, projectID)
 }
 
+// ListByKumbhaSession returns every instance (running or terminated) a
+// Kumbha session has ever created — see KumbhaSessionID's own doc comment
+// on why this exists: without it, an instance created via create_instance
+// as a deploy workaround is invisible to the session and the console both.
+// No terminated_at filter, unlike ListByProject: a terminated row here is
+// still worth showing (e.g. "this session's earlier attempt, cleaned up"),
+// not silently dropped.
+func (s *Store) ListByKumbhaSession(ctx context.Context, sessionID uuid.UUID) ([]InstanceRecord, error) {
+	return s.query(ctx, "WHERE kumbha_session_id = $1 ORDER BY created_at DESC", sessionID)
+}
+
 // selectColumns previously omitted provider_id even though Create wrote
 // it — every GET/LIST saw an empty ProviderID regardless of what was
 // stored (Stage 3 defect 8). Now selected and scanned below.
@@ -284,7 +305,7 @@ const selectColumns = `
 	       COALESCE(k8s_pod_name, ''), COALESCE(k8s_namespace, ''),
 	       COALESCE(provider_id, ''), COALESCE(dns_name, ''), COALESCE(public_ip, ''),
 	       tls_enabled, tls_ready, COALESCE(container_port, 0), storage_gb,
-	       created_at, updated_at, started_at, terminated_at
+	       created_at, updated_at, started_at, terminated_at, kumbha_session_id
 	FROM compute.instances
 `
 
@@ -305,7 +326,7 @@ func (s *Store) query(ctx context.Context, where string, args ...interface{}) ([
 			&rec.K8sPodName, &rec.K8sNamespace,
 			&rec.ProviderID, &rec.DNSName, &rec.PublicIP, &rec.TLSEnabled, &rec.TLSReady,
 			&rec.ContainerPort, &rec.StorageGB,
-			&rec.CreatedAt, &rec.UpdatedAt, &rec.StartedAt, &rec.TerminatedAt,
+			&rec.CreatedAt, &rec.UpdatedAt, &rec.StartedAt, &rec.TerminatedAt, &rec.KumbhaSessionID,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan instance: %w", err)
 		}

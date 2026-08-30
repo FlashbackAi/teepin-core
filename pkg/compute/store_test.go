@@ -29,7 +29,7 @@ func TestCreate_PersistsGPUInstance(t *testing.T) {
 	mock.ExpectQuery(`INSERT INTO compute\.instances`).
 		WithArgs("inst-abc12345", accountID, projectID, userID, "my-app", "nginx:latest",
 			"gpu.h100.2g.20gb", StatusPending, int64(20), 8, 32,
-			nil, "my-app-x1y2z", "default", nil, nil, nil, nil, false, false, nil, 0).
+			nil, "my-app-x1y2z", "default", nil, nil, nil, nil, false, false, nil, 0, nil).
 		WillReturnRows(sqlmock.NewRows([]string{"created_at", "updated_at"}).
 			AddRow(time.Now(), time.Now()))
 
@@ -72,7 +72,7 @@ func TestCreate_NilUserIDStoresNull(t *testing.T) {
 
 	mock.ExpectQuery(`INSERT INTO compute\.instances`).
 		WithArgs("inst-noattr001", accountID, projectID, nil, "web", "nginx:latest",
-			"", StatusPending, nil, 2, 4, nil, "web-abcde", "default", nil, nil, nil, nil, false, false, nil, 0).
+			"", StatusPending, nil, 2, 4, nil, "web-abcde", "default", nil, nil, nil, nil, false, false, nil, 0, nil).
 		WillReturnRows(sqlmock.NewRows([]string{"created_at", "updated_at"}).
 			AddRow(time.Now(), time.Now()))
 
@@ -97,7 +97,7 @@ func TestCreate_CPUInstanceStoresNullVRAM(t *testing.T) {
 	// gpu_vram_gb must be NULL (not 0) for CPU-only instances.
 	mock.ExpectQuery(`INSERT INTO compute\.instances`).
 		WithArgs("inst-cpu00001", accountID, projectID, userID, "web", "nginx:latest",
-			"", StatusPending, nil, 2, 4, nil, "web-abcde", "default", nil, nil, nil, nil, false, false, nil, 0).
+			"", StatusPending, nil, 2, 4, nil, "web-abcde", "default", nil, nil, nil, nil, false, false, nil, 0, nil).
 		WillReturnRows(sqlmock.NewRows([]string{"created_at", "updated_at"}).
 			AddRow(time.Now(), time.Now()))
 
@@ -109,6 +109,44 @@ func TestCreate_CPUInstanceStoresNullVRAM(t *testing.T) {
 
 	if err := store.Create(context.Background(), rec); err != nil {
 		t.Fatalf("Create failed: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+// TestListByKumbhaSession_ReturnsOnlyThatSessionsInstances proves the new
+// tracking query round-trips a real kumbha_session_id — the linkage
+// migration 032 added specifically so a Kumbha agent's create_instance
+// fallback can no longer create an instance the session has no record of
+// (found live 2026-08-30/31: two untracked instances from one build).
+func TestListByKumbhaSession_ReturnsOnlyThatSessionsInstances(t *testing.T) {
+	store, mock := newMockStore(t)
+	accountID, projectID, sessionID := uuid.New(), uuid.New(), uuid.New()
+
+	mock.ExpectQuery(`SELECT .+ FROM compute\.instances WHERE kumbha_session_id = \$1`).
+		WithArgs(sessionID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "account_id", "project_id", "user_id", "name", "image",
+			"instance_type_id", "status", "gpu_vram_gb", "cpu_units", "memory_gb", "endpoint",
+			"k8s_pod_name", "k8s_namespace", "provider_id", "dns_name", "public_ip",
+			"tls_enabled", "tls_ready", "container_port", "storage_gb",
+			"created_at", "updated_at", "started_at", "terminated_at", "kumbha_session_id",
+		}).AddRow("inst-broken01", accountID, projectID, uuid.Nil, "web", "nginx:1.27-alpine",
+			"", StatusRunning, 0, 1, 1, "https://inst-broken01.teepin.com",
+			"inst-broken01-pod", "default", "", "", "",
+			true, true, 80, 0,
+			time.Now(), time.Now(), nil, nil, sessionID))
+
+	records, err := store.ListByKumbhaSession(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("ListByKumbhaSession failed: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("len(records) = %d, want 1", len(records))
+	}
+	if records[0].KumbhaSessionID != sessionID {
+		t.Errorf("KumbhaSessionID = %s, want %s", records[0].KumbhaSessionID, sessionID)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Error(err)
@@ -193,7 +231,7 @@ func instanceRows() *sqlmock.Rows {
 		"k8s_pod_name", "k8s_namespace",
 		"provider_id", "dns_name", "public_ip", "tls_enabled", "tls_ready", "container_port",
 		"storage_gb",
-		"created_at", "updated_at", "started_at", "terminated_at",
+		"created_at", "updated_at", "started_at", "terminated_at", "kumbha_session_id",
 	})
 }
 
@@ -209,7 +247,7 @@ func TestListActive(t *testing.T) {
 			"my-app-x1y2z", "default",
 			"", "", "", false, false, 0,
 			0,
-			time.Now(), time.Now(), time.Now(), nil,
+			time.Now(), time.Now(), time.Now(), nil, nil,
 		))
 
 	instances, err := store.ListActive(context.Background())

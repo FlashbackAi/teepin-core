@@ -1164,6 +1164,7 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 			kumbhaGroup.GET("/sessions", apiServer.ListKumbhaSessions)
 			kumbhaGroup.POST("/sessions/bulk-delete", apiServer.DeleteKumbhaSessions)
 			kumbhaGroup.GET("/sessions/:id", apiServer.GetKumbhaSession)
+			kumbhaGroup.GET("/sessions/:id/instances", apiServer.ListKumbhaSessionInstances)
 			// Stop: interrupt a currently-running agent turn (hard kill,
 			// not a graceful pause — see Gateway.StopAgent's own doc
 			// comment). Replaces the old "Close session" endpoint, which

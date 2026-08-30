@@ -453,6 +453,14 @@ func (s *Server) CreateInstance(c *gin.Context) {
 		return
 	}
 	userID, _ := auth.GetUserID(c)
+	// Present only on a Kumbha session-scoped credential (auth.MintSessionToken)
+	// — a human/API-key request never carries this claim, so it stays
+	// uuid.Nil and record.KumbhaSessionID below is written as SQL NULL
+	// (see nullUUID). This is what lets every instance a Kumbha agent
+	// creates via create_instance be traced back to its session, closing
+	// the gap that let two untracked instances come out of one build
+	// (found live 2026-08-30/31 — see migration 032's own doc comment).
+	kumbhaSessionID, _ := auth.GetSessionID(c)
 
 	// Payment gate: no validated payment method (or a non-active account),
 	// no resources. Checked here — after identity is resolved, before any
@@ -589,17 +597,18 @@ func (s *Server) CreateInstance(c *gin.Context) {
 	// the workload must not keep running unbilled: roll back.
 	if s.store != nil {
 		record := &compute.InstanceRecord{
-			ID:           instanceID,
-			AccountID:    accountID,
-			ProjectID:    projectID,
-			UserID:       userID,
-			Name:         req.Name,
-			Image:        req.Image,
-			Status:       compute.StatusPending,
-			CPUUnits:     req.CPUUnits,
-			MemoryGB:     parseMemoryGB(req.Memory),
-			K8sPodName:   result.PodName,
-			K8sNamespace: "default",
+			ID:              instanceID,
+			AccountID:       accountID,
+			ProjectID:       projectID,
+			UserID:          userID,
+			KumbhaSessionID: kumbhaSessionID,
+			Name:            req.Name,
+			Image:           req.Image,
+			Status:          compute.StatusPending,
+			CPUUnits:        req.CPUUnits,
+			MemoryGB:        parseMemoryGB(req.Memory),
+			K8sPodName:      result.PodName,
+			K8sNamespace:    "default",
 		}
 		if allocation != nil {
 			record.InstanceType = allocation.InstanceType

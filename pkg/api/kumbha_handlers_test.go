@@ -627,12 +627,12 @@ func instanceRecordRow(id string, accountID, projectID uuid.UUID, name, image st
 		"instance_type_id", "status", "gpu_vram_gb", "cpu_units", "memory_gb", "endpoint",
 		"k8s_pod_name", "k8s_namespace", "provider_id", "dns_name", "public_ip",
 		"tls_enabled", "tls_ready", "container_port", "storage_gb",
-		"created_at", "updated_at", "started_at", "terminated_at",
+		"created_at", "updated_at", "started_at", "terminated_at", "kumbha_session_id",
 	}).AddRow(id, accountID, projectID, uuid.Nil, name, image,
 		"", compute.StatusRunning, 0, cpuUnits, memoryGB, endpoint,
 		id+"-pod", "default", "", id+".teepin.com", "",
 		true, true, containerPort, storageGB,
-		nowStub(), nowStub(), nil, nil)
+		nowStub(), nowStub(), nil, nil, uuid.Nil)
 }
 
 func TestRedeployKumbhaInstance_UpdatesExistingInstanceInPlace(t *testing.T) {
@@ -772,14 +772,17 @@ func echoIdentityHandler(c *gin.Context) {
 	accountID, _ := auth.GetAccountID(c)
 	projectID, _ := auth.GetProjectID(c)
 	userID, _ := auth.GetUserID(c)
+	sessionID, sessionIDPresent := auth.GetSessionID(c)
 	var body map[string]any
 	_ = c.ShouldBindJSON(&body)
 	c.JSON(http.StatusTeapot, gin.H{
-		"account_id": accountID.String(),
-		"project_id": projectID.String(),
-		"user_id":    userID.String(),
-		"param_id":   c.Param("id"),
-		"body":       body,
+		"account_id":         accountID.String(),
+		"project_id":         projectID.String(),
+		"user_id":            userID.String(),
+		"session_id":         sessionID.String(),
+		"session_id_present": sessionIDPresent,
+		"param_id":           c.Param("id"),
+		"body":               body,
 	})
 }
 
@@ -790,7 +793,7 @@ func TestInvokeInternally_CarriesIdentityParamsAndBodyThrough(t *testing.T) {
 
 	accountID, projectID, userID := uuid.New(), uuid.New(), uuid.New()
 	status, body := server.invokeInternally(echoIdentityHandler, http.MethodPost, "/v1/internal/echo/abc123",
-		gin.Params{{Key: "id", Value: "abc123"}}, accountID, projectID, userID, map[string]string{"k": "v"})
+		gin.Params{{Key: "id", Value: "abc123"}}, accountID, projectID, userID, uuid.Nil, map[string]string{"k": "v"})
 
 	if status != http.StatusTeapot {
 		t.Fatalf("status = %d, want %d (body: %s)", status, http.StatusTeapot, body)
@@ -828,7 +831,7 @@ func TestInvokeInternally_OmitsUserIDFromContextWhenNil(t *testing.T) {
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	_, body := server.invokeInternally(echoIdentityHandler, http.MethodPost, "/v1/internal/echo",
-		nil, uuid.New(), uuid.New(), uuid.Nil, nil)
+		nil, uuid.New(), uuid.New(), uuid.Nil, uuid.Nil, nil)
 
 	var resp struct {
 		UserID string `json:"user_id"`
@@ -838,6 +841,33 @@ func TestInvokeInternally_OmitsUserIDFromContextWhenNil(t *testing.T) {
 	}
 	if resp.UserID != uuid.Nil.String() {
 		t.Errorf("user_id = %q, want the zero UUID (no attribution) when userID is uuid.Nil", resp.UserID)
+	}
+}
+
+// TestInvokeInternally_CarriesKumbhaSessionIDThrough proves DeployKumbhaSession's
+// internal CreateInstance call tags the resulting instance with the
+// session it came from, via the exact same auth.SessionIDKey mechanism a
+// real Kumbha session token uses on the create_instance MCP path — see
+// migration 032's own doc comment for the live incident (two untracked
+// instances from one build) this closes.
+func TestInvokeInternally_CarriesKumbhaSessionIDThrough(t *testing.T) {
+	_, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	server := (&Server{store: cStore}).WithKumbha(gw)
+
+	sessionID := uuid.New()
+	_, body := server.invokeInternally(echoIdentityHandler, http.MethodPost, "/v1/internal/echo",
+		nil, uuid.New(), uuid.New(), uuid.Nil, sessionID, nil)
+
+	var resp struct {
+		SessionID        string `json:"session_id"`
+		SessionIDPresent bool   `json:"session_id_present"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !resp.SessionIDPresent || resp.SessionID != sessionID.String() {
+		t.Errorf("session_id = (%q, present=%v), want (%q, true)", resp.SessionID, resp.SessionIDPresent, sessionID.String())
 	}
 }
 

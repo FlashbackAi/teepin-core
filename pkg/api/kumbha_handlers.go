@@ -643,7 +643,7 @@ func (s *Server) DeployKumbhaSession(c *gin.Context) {
 		Ports:     ports,
 		Env:       req.Env,
 	}
-	createStatus, createBody := s.invokeInternally(s.CreateInstance, http.MethodPost, "/v1/compute/instances", nil, accountID, projectID, userID, createReq)
+	createStatus, createBody := s.invokeInternally(s.CreateInstance, http.MethodPost, "/v1/compute/instances", nil, accountID, projectID, userID, sessionID, createReq)
 	if createStatus != http.StatusCreated {
 		s.recordDeployOutcome(c.Request.Context(), sessionID, errorFromJSONBody(createBody))
 		// CreateInstance's own error already explains a payment gate,
@@ -841,7 +841,7 @@ func (s *Server) redeployKumbhaInstance(c *gin.Context, sessionID uuid.UUID, ses
 // not being that. userID is optional (zero value omitted) — CreateInstance
 // itself treats a missing one as "no attribution", the same as a normal
 // request whose JWT happens to carry none.
-func (s *Server) invokeInternally(handler gin.HandlerFunc, method, path string, params gin.Params, accountID, projectID, userID uuid.UUID, body any) (status int, respBody []byte) {
+func (s *Server) invokeInternally(handler gin.HandlerFunc, method, path string, params gin.Params, accountID, projectID, userID, kumbhaSessionID uuid.UUID, body any) (status int, respBody []byte) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
 
@@ -859,6 +859,14 @@ func (s *Server) invokeInternally(handler gin.HandlerFunc, method, path string, 
 	c.Set(string(auth.ProjectIDKey), projectID)
 	if userID != uuid.Nil {
 		c.Set(string(auth.UserIDKey), userID)
+	}
+	// Set so CreateInstance's own auth.GetSessionID(c) tags the resulting
+	// instance with this session — same mechanism a real Kumbha session
+	// token uses on the create_instance MCP path, so every instance this
+	// handler provisions is tracked identically regardless of which route
+	// created it (see migration 032's own doc comment).
+	if kumbhaSessionID != uuid.Nil {
+		c.Set(string(auth.SessionIDKey), kumbhaSessionID)
 	}
 
 	handler(c)
@@ -987,6 +995,87 @@ func (s *Server) enrichKumbhaAppStatus(ctx context.Context, resp gin.H, sess *ku
 			resp["app_endpoint"] = endpoint
 		}
 	}
+}
+
+// kumbhaSessionInstance is one row of ListKumbhaSessionInstances' response
+// — deliberately built from the stored record alone (no live cluster
+// read): unlike the single "app" instance enrichKumbhaAppStatus enriches,
+// a session can have several of these (found live 2026-08-30/31: a broken
+// deploy workaround produced two), so a per-row live status call here
+// would repeat the exact per-row cluster-read cost ListKumbhaSessions'
+// own doc comment already explains avoiding. The stored status is what
+// the reconciler last observed, same staleness bound as the plain Compute
+// list between reconciler ticks.
+type kumbhaSessionInstance struct {
+	ID           string     `json:"id"`
+	Name         string     `json:"name"`
+	Image        string     `json:"image"`
+	Status       string     `json:"status"`
+	Endpoint     string     `json:"endpoint"`
+	IsApp        bool       `json:"is_app"`
+	CreatedAt    time.Time  `json:"created_at"`
+	TerminatedAt *time.Time `json:"terminated_at,omitempty"`
+}
+
+// ListKumbhaSessionInstances lists every compute instance this session has
+// ever created, regardless of which tool created it (deploy's own
+// bookkeeping vs. a raw create_instance call) — the console surfaces this
+// so nothing a Kumbha agent provisions can go unseen and unbilled-for
+// awareness again (see migration 032's own doc comment for the live
+// incident this closes). Deletion reuses the existing DeleteInstance
+// endpoint; this is read-only.
+// GET /v1/kumbha/sessions/:id/instances
+func (s *Server) ListKumbhaSessionInstances(c *gin.Context) {
+	if s.kumbha == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha Gateway is not available on this deployment"})
+		return
+	}
+	if s.store == nil {
+		c.JSON(http.StatusOK, gin.H{"instances": []kumbhaSessionInstance{}})
+		return
+	}
+
+	sessionID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid session id"})
+		return
+	}
+
+	_, accountID, ok := s.requireScope(c)
+	if !ok {
+		return
+	}
+
+	sess, err := s.kumbha.GetSession(c.Request.Context(), sessionID, accountID)
+	if err != nil {
+		if errors.Is(err, kumbha.ErrSessionNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	records, err := s.store.ListByKumbhaSession(c.Request.Context(), sessionID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	out := make([]kumbhaSessionInstance, 0, len(records))
+	for _, r := range records {
+		out = append(out, kumbhaSessionInstance{
+			ID:           r.ID,
+			Name:         r.Name,
+			Image:        r.Image,
+			Status:       r.Status,
+			Endpoint:     r.Endpoint,
+			IsApp:        r.ID == sess.AppInstanceID,
+			CreatedAt:    r.CreatedAt,
+			TerminatedAt: r.TerminatedAt,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"instances": out})
 }
 
 // ApproveKumbhaDeploy flips a session's pre-deploy cost-approval gate.
