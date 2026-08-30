@@ -202,6 +202,26 @@ type InstanceStatus struct {
 	PublicIP    string
 	TLSEnabled  bool
 	TLSReady    bool
+
+	// Hidden marks a pod as Teepin's own workload (Kaniko builds, the
+	// Kumbha agent pod, the screenshot capture pod — anything carrying
+	// the "hide from Compute list" label) rather than something the
+	// customer manages. DirectClient never needs this: it excludes such
+	// pods at the k8s API level via managedSelector's own label
+	// selector, before a status object is even constructed (see
+	// direct.go). AgentClient's cache has no labels to filter on the
+	// same way — CreateInstance seeds this cache immediately, from the
+	// spec's own Labels, for every instance including ones the home
+	// node's own sweep would otherwise correctly exclude from ever
+	// crossing the wire — so ListInstanceStatuses filters on this field
+	// explicitly instead. Never set by GetInstanceStatus's own targeted
+	// lookup path: a caller who already knows a pod's exact ID (build's
+	// own poll loop, CaptureScreenshot's own poll loop) must still find
+	// it, the same asymmetry instanceSelector/managedSelector already
+	// has in DirectClient. Found live 2026-08-29: a customer's Compute
+	// list showed a transient, nameless "kaniko-build-xyz" entry for the
+	// duration of every build.
+	Hidden bool
 }
 
 // NodeInventory is a point-in-time report of one node's GPU capacity.

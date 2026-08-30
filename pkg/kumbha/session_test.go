@@ -408,3 +408,54 @@ func TestStore_GetScreenshot_WrongAccountIsNotFound(t *testing.T) {
 		t.Errorf("got %v, want ErrSessionNotFound", err)
 	}
 }
+
+// --- SetLastDeployStatus ---
+
+func TestStore_SetLastDeployStatus_RecordsFailure(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessID := uuid.New()
+
+	mock.ExpectExec(`UPDATE billing\.inference_sessions\s+SET last_deploy_failed`).
+		WithArgs(sessID, true, "Kaniko build failed: exit code 1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := store.SetLastDeployStatus(context.Background(), sessID, "Kaniko build failed: exit code 1"); err != nil {
+		t.Fatalf("SetLastDeployStatus: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+// TestStore_SetLastDeployStatus_EmptyMessageClearsFailure is what lets a
+// stale "Failed" never linger once the customer has since shipped
+// successfully — an empty errMsg means the attempt succeeded.
+func TestStore_SetLastDeployStatus_EmptyMessageClearsFailure(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessID := uuid.New()
+
+	mock.ExpectExec(`UPDATE billing\.inference_sessions\s+SET last_deploy_failed`).
+		WithArgs(sessID, false, nil).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := store.SetLastDeployStatus(context.Background(), sessID, ""); err != nil {
+		t.Fatalf("SetLastDeployStatus: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestStore_SetLastDeployStatus_UnknownSessionIsNotFound(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessID := uuid.New()
+
+	mock.ExpectExec(`UPDATE billing\.inference_sessions\s+SET last_deploy_failed`).
+		WithArgs(sessID, true, "boom").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	err := store.SetLastDeployStatus(context.Background(), sessID, "boom")
+	if !errors.Is(err, ErrSessionNotFound) {
+		t.Errorf("got %v, want ErrSessionNotFound", err)
+	}
+}

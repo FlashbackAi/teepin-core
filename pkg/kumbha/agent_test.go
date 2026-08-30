@@ -244,10 +244,6 @@ func TestGateway_CloseSession_TearsDownAgentPod(t *testing.T) {
 			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
 		}).AddRow(sessID, accountID, projectID, 5.0, 0.0, "closed", nil, agentPodID, nil, false, startedAt, startedAt))
 
-	mock.ExpectQuery(`SELECT route, provider, input_tokens, output_tokens`).
-		WithArgs(sessID).
-		WillReturnRows(sqlmock.NewRows([]string{"route", "provider", "input_tokens", "output_tokens"}))
-
 	fc := &fakeCluster{}
 	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
 		WithAgent(fc, fakeMintToken, AgentConfig{})
@@ -275,10 +271,6 @@ func TestGateway_CloseSession_NoAgentPodMeansNoDeleteCall(t *testing.T) {
 			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
 		}).AddRow(sessID, accountID, projectID, 5.0, 0.0, "closed", nil, nil, nil, false, startedAt, startedAt))
 
-	mock.ExpectQuery(`SELECT route, provider, input_tokens, output_tokens`).
-		WithArgs(sessID).
-		WillReturnRows(sqlmock.NewRows([]string{"route", "provider", "input_tokens", "output_tokens"}))
-
 	fc := &fakeCluster{}
 	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
 		WithAgent(fc, fakeMintToken, AgentConfig{})
@@ -288,6 +280,42 @@ func TestGateway_CloseSession_NoAgentPodMeansNoDeleteCall(t *testing.T) {
 	}
 	if len(fc.deleted) != 0 {
 		t.Errorf("DeleteInstance was called with no agent pod on the session: %v", fc.deleted)
+	}
+}
+
+// TestGateway_CloseSession_NeverSettlesAnything is the regression test for
+// the actual point of removing settlement from CloseSession: Complete()
+// already settled every completion's cost as it happened (see
+// TestGateway_Complete_SuccessPricesAndAccrues), so CloseSession must
+// NEVER touch usage.RecordUsage/ConsumeCredit at all — doing so again
+// from RouteUsage's cumulative totals would double-charge the account for
+// spend that was already settled per-completion.
+func TestGateway_CloseSession_NeverSettlesAnything(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessID, accountID, projectID := uuid.New(), uuid.New(), uuid.New()
+	startedAt := time.Now()
+
+	mock.ExpectQuery(`UPDATE billing\.inference_sessions`).
+		WithArgs(sessID, accountID, "closed").
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "account_id", "project_id", "budget", "spent", "status", "label",
+			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
+		}).AddRow(sessID, accountID, projectID, 5.0, 3.5, "closed", nil, nil, nil, false, startedAt, startedAt))
+
+	usage := &fakeUsageRecorder{}
+	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{in: 2.0, out: 8.0}, usage)
+
+	if _, err := gw.CloseSession(context.Background(), sessID, accountID, "closed"); err != nil {
+		t.Fatalf("CloseSession: %v", err)
+	}
+	if len(usage.records) != 0 {
+		t.Errorf("CloseSession wrote %d usage_records lines, want 0 — settlement is Complete()'s job now", len(usage.records))
+	}
+	if len(usage.consumed) != 0 {
+		t.Errorf("CloseSession called ConsumeCredit %d times, want 0", len(usage.consumed))
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
 	}
 }
 
@@ -508,18 +536,17 @@ func TestGateway_DeleteSessions_StopsAnOpenSessionThenDeletesIt(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "account_id", "project_id", "budget", "spent", "status", "label",
 			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
-		}).AddRow(sessID, accountID, projectID, 5.0, 0.0, "open", nil, agentPodID, nil, false, startedAt, nil))
+			"last_deploy_failed", "last_deploy_error", "last_deploy_at",
+		}).AddRow(sessID, accountID, projectID, 5.0, 0.0, "open", nil, agentPodID, nil, false, startedAt, nil, false, nil, nil))
 
-	// CloseSession: Close + RouteUsage + tear down the agent pod.
+	// CloseSession: Close + tear down the agent pod (no settlement any
+	// more — see Gateway.CloseSession's own doc comment).
 	mock.ExpectQuery(`UPDATE billing\.inference_sessions`).
 		WithArgs(sessID, accountID, "closed").
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "account_id", "project_id", "budget", "spent", "status", "label",
 			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
 		}).AddRow(sessID, accountID, projectID, 5.0, 0.0, "closed", nil, agentPodID, nil, false, startedAt, startedAt))
-	mock.ExpectQuery(`SELECT route, provider, input_tokens, output_tokens`).
-		WithArgs(sessID).
-		WillReturnRows(sqlmock.NewRows([]string{"route", "provider", "input_tokens", "output_tokens"}))
 
 	// Finally, the actual delete.
 	mock.ExpectQuery(`DELETE FROM billing\.inference_sessions`).
@@ -555,7 +582,8 @@ func TestGateway_DeleteSessions_AlreadyClosedSessionSkipsCloseCall(t *testing.T)
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "account_id", "project_id", "budget", "spent", "status", "label",
 			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
-		}).AddRow(sessID, accountID, projectID, 5.0, 0.0, "closed", nil, nil, nil, false, startedAt, startedAt))
+			"last_deploy_failed", "last_deploy_error", "last_deploy_at",
+		}).AddRow(sessID, accountID, projectID, 5.0, 0.0, "closed", nil, nil, nil, false, startedAt, startedAt, false, nil, nil))
 
 	// No Close-related queries expected — already closed, nothing to stop.
 
@@ -670,5 +698,56 @@ func TestGateway_CaptureScreenshot_FailurePropagatesAndStillCleansUp(t *testing.
 	}
 	if len(fc.deleted) != 1 || fc.deleted[0] != fc.created[0].InstanceID {
 		t.Errorf("capture pod was not torn down after failing: deleted = %v", fc.deleted)
+	}
+}
+
+// --- StopAgent ---
+
+func TestGateway_StopAgent_NotConfiguredWithoutWithAgent(t *testing.T) {
+	store, _ := newMockStore(t)
+	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{})
+
+	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), ProjectID: uuid.New(), AgentInstanceID: "kumbha-agent-abcd1234"}
+	if err := gw.StopAgent(context.Background(), sess); !errors.Is(err, ErrAgentNotConfigured) {
+		t.Errorf("got %v, want ErrAgentNotConfigured", err)
+	}
+}
+
+func TestGateway_StopAgent_NoAgentRunningIsErrAgentNotRunning(t *testing.T) {
+	store, _ := newMockStore(t)
+	// fakeCluster's default GetInstanceStatus (no statusResult/statusErr
+	// set) reports cluster.ErrNotFound, which isAgentRunning maps to
+	// (false, nil) — no pod to interrupt.
+	fc := &fakeCluster{}
+	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+		WithAgent(fc, fakeMintToken, AgentConfig{})
+
+	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), ProjectID: uuid.New(), AgentInstanceID: "kumbha-agent-abcd1234"}
+	if err := gw.StopAgent(context.Background(), sess); !errors.Is(err, ErrAgentNotRunning) {
+		t.Errorf("got %v, want ErrAgentNotRunning", err)
+	}
+	if len(fc.deleted) != 0 {
+		t.Errorf("DeleteInstance was called with no agent actually running: %v", fc.deleted)
+	}
+}
+
+// TestGateway_StopAgent_KillsRunningPod is the whole point of Stop: a
+// live agent pod gets torn down immediately (hard kill, not a graceful
+// pause — see StopAgent's own doc comment on why), and the session is
+// left otherwise untouched — no status change, nothing that would block
+// a later message.
+func TestGateway_StopAgent_KillsRunningPod(t *testing.T) {
+	store, _ := newMockStore(t)
+	agentPodID := "kumbha-agent-abcd1234"
+	fc := &fakeCluster{statusResult: &cluster.InstanceStatus{Status: "running"}}
+	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+		WithAgent(fc, fakeMintToken, AgentConfig{})
+
+	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), ProjectID: uuid.New(), AgentInstanceID: agentPodID}
+	if err := gw.StopAgent(context.Background(), sess); err != nil {
+		t.Fatalf("StopAgent: %v", err)
+	}
+	if len(fc.deleted) != 1 || fc.deleted[0] != agentPodID {
+		t.Errorf("agent pod was not torn down: deleted = %v, want [%s]", fc.deleted, agentPodID)
 	}
 }

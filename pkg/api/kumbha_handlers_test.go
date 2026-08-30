@@ -317,7 +317,8 @@ func TestKumbhaChatCompletions_Success(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "account_id", "project_id", "budget", "spent", "status", "label",
 			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
-		}).AddRow(sessionID, testAccountID, uuid.New(), 5.0, 0.0, "open", nil, nil, nil, false, nowStub(), nil))
+			"last_deploy_failed", "last_deploy_error", "last_deploy_at",
+		}).AddRow(sessionID, testAccountID, uuid.New(), 5.0, 0.0, "open", nil, nil, nil, false, nowStub(), nil, false, nil, nil))
 
 	wantCost := 100.0/1e6*2.0 + 20.0/1e6*8.0
 	mock.ExpectBegin()
@@ -864,7 +865,8 @@ func deployApprovedSessionRow(sessionID uuid.UUID) *sqlmock.Rows {
 	return sqlmock.NewRows([]string{
 		"id", "account_id", "project_id", "budget", "spent", "status", "label",
 		"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
-	}).AddRow(sessionID, testAccountID, uuid.New(), 5.0, 0.0, "open", nil, nil, nil, true, nowStub(), nil)
+		"last_deploy_failed", "last_deploy_error", "last_deploy_at",
+	}).AddRow(sessionID, testAccountID, uuid.New(), 5.0, 0.0, "open", nil, nil, nil, true, nowStub(), nil, false, nil, nil)
 }
 
 func TestBuildKumbhaSession_NoWorkspaceIs409(t *testing.T) {
@@ -887,20 +889,42 @@ func TestBuildKumbhaSession_NoWorkspaceIs409(t *testing.T) {
 	}
 }
 
+// TestBuildKumbhaSession_FailurePersistsLastDeployStatus is the
+// regression test for the actual point of migration 030: a build failure
+// must be PERSISTED on the session (last_deploy_failed/last_deploy_error),
+// not just returned once in the HTTP response — what backs the "Failed"
+// status on the console's "Previous builds" list, which reads back a
+// session it did not itself trigger the build from.
+func TestBuildKumbhaSession_FailurePersistsLastDeployStatus(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	server := (&Server{store: cStore}).WithKumbha(gw).WithKumbhaBuild(newTestBuildService())
+
+	sessionID, projectID := uuid.New(), uuid.New()
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnRows(deployApprovedSessionRow(sessionID))
+	mock.ExpectQuery(`SELECT current_workspace_version FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnRows(sqlmock.NewRows([]string{"current_workspace_version"}).AddRow(nil))
+	mock.ExpectExec(`UPDATE billing\.inference_sessions\s+SET last_deploy_failed`).
+		WithArgs(sessionID, true, "nothing has been saved for this build yet").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := kumbhaRequest(server.BuildKumbhaSession, http.MethodPost, "/v1/kumbha/sessions/"+sessionID.String()+"/build",
+		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, map[string]string{}, nil)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body: %s)", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
 // --- SendKumbhaMessage / PollKumbhaMessages ---
 
 func fakeMintKumbhaToken(_, _, _ uuid.UUID, _ time.Duration) (string, error) {
 	return "fake-agent-token", nil
-}
-
-// closedSessionRow is sessionRow with status flipped to closed — the
-// customer-side chat handler must refuse a message to a session with
-// nothing left running to ever receive it.
-func closedSessionRow(sessionID uuid.UUID) *sqlmock.Rows {
-	return sqlmock.NewRows([]string{
-		"id", "account_id", "project_id", "budget", "spent", "status", "label",
-		"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
-	}).AddRow(sessionID, testAccountID, uuid.New(), 5.0, 0.0, "closed", nil, nil, nil, false, nowStub(), nowStub())
 }
 
 func TestSendKumbhaMessage_NotAvailableWhenKumbhaNil(t *testing.T) {
@@ -930,20 +954,52 @@ func TestSendKumbhaMessage_SessionNotFoundIs404(t *testing.T) {
 	}
 }
 
-func TestSendKumbhaMessage_ClosedSessionIs409(t *testing.T) {
+// TestSendKumbhaMessage_ClosedSessionStillRelaunches is the regression
+// test for the actual point of removing the old "Close session" button
+// (2026-08-30): a session's stored status column no longer gates whether
+// a customer can keep chatting at all. A closed session with no live
+// agent pod relaunches exactly like an open one whose pod happened to
+// exit on its own idle timeout — same DeliverMessage relaunch path,
+// same "the workspace already exists" prompt.
+func TestSendKumbhaMessage_ClosedSessionStillRelaunches(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	fc := newFakeCluster()
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{}).
+		WithAgent(fc, fakeMintKumbhaToken, kumbha.AgentConfig{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	sessionID, projectID := uuid.New(), uuid.New()
 	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
 		WithArgs(sessionID, testAccountID).
-		WillReturnRows(closedSessionRow(sessionID))
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "account_id", "project_id", "budget", "spent", "status", "label",
+			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
+			"last_deploy_failed", "last_deploy_error", "last_deploy_at",
+		}).AddRow(sessionID, testAccountID, projectID, 5.0, 0.0, "closed", nil, nil, nil, false, nowStub(), nowStub(), false, nil, nil))
+	mock.ExpectExec(`UPDATE billing\.inference_sessions SET agent_instance_id`).
+		WithArgs(sessionID, "kumbha-agent-"+sessionID.String()[:8]).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := kumbhaRequest(server.SendKumbhaMessage, http.MethodPost, "/v1/kumbha/sessions/"+sessionID.String()+"/messages",
-		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, map[string]string{"content": "hi"}, nil)
-	if w.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want 409 (body: %s)", w.Code, w.Body.String())
+		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, map[string]string{"content": "add a footer"}, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Delivered  bool `json:"delivered"`
+		Relaunched bool `json:"relaunched"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !resp.Delivered || !resp.Relaunched {
+		t.Errorf("got %+v, want delivered=true relaunched=true", resp)
+	}
+	if _, ok := fc.instances["kumbha-agent-"+sessionID.String()[:8]]; !ok {
+		t.Error("relaunch did not create a fresh agent pod")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
 	}
 }
 
@@ -966,7 +1022,8 @@ func TestSendKumbhaMessage_QueuesWhenAgentRunning(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "account_id", "project_id", "budget", "spent", "status", "label",
 			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
-		}).AddRow(sessionID, testAccountID, projectID, 5.0, 0.0, "open", nil, "kumbha-agent-abc", nil, false, nowStub(), nil))
+			"last_deploy_failed", "last_deploy_error", "last_deploy_at",
+		}).AddRow(sessionID, testAccountID, projectID, 5.0, 0.0, "open", nil, "kumbha-agent-abc", nil, false, nowStub(), nil, false, nil, nil))
 	mock.ExpectQuery(`INSERT INTO billing\.kumbha_messages`).
 		WithArgs(sessionID, "add a footer").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(1), nowStub()))
@@ -1006,7 +1063,8 @@ func TestSendKumbhaMessage_EmptyContentIs400(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "account_id", "project_id", "budget", "spent", "status", "label",
 			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
-		}).AddRow(sessionID, testAccountID, projectID, 5.0, 0.0, "open", nil, "kumbha-agent-abc", nil, false, nowStub(), nil))
+			"last_deploy_failed", "last_deploy_error", "last_deploy_at",
+		}).AddRow(sessionID, testAccountID, projectID, 5.0, 0.0, "open", nil, "kumbha-agent-abc", nil, false, nowStub(), nil, false, nil, nil))
 
 	w := kumbhaRequest(server.SendKumbhaMessage, http.MethodPost, "/v1/kumbha/sessions/"+sessionID.String()+"/messages",
 		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, map[string]string{"content": ""}, nil)
@@ -1095,8 +1153,8 @@ func TestBuildKumbhaSession_AgentNotConfiguredIs404(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"current_workspace_version"}).AddRow(1))
 	mock.ExpectQuery(`FROM billing\.kumbha_workspace_versions v`).
 		WithArgs(sessionID, testAccountID, 1).
-		WillReturnRows(sqlmock.NewRows([]string{"version", "files", "skipped", "file_count", "byte_size", "created_by", "created_at"}).
-			AddRow(1, `[{"path":"index.html","content":"<h1>hi</h1>"}]`, `[]`, 1, 11, "agent", nowStub()))
+		WillReturnRows(sqlmock.NewRows([]string{"version", "files", "skipped", "file_count", "byte_size", "created_by", "created_at", "is_checkpoint"}).
+			AddRow(1, `[{"path":"index.html","content":"<h1>hi</h1>"}]`, `[]`, 1, 11, "agent", nowStub(), false))
 
 	w := kumbhaRequest(server.BuildKumbhaSession, http.MethodPost, "/v1/kumbha/sessions/"+sessionID.String()+"/build",
 		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, map[string]string{}, nil)
@@ -1125,16 +1183,14 @@ func TestDeleteKumbhaSessions_ClosesAnOpenOneThenDeletesBoth(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "account_id", "project_id", "budget", "spent", "status", "label",
 			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
-		}).AddRow(openID, testAccountID, projectID, 5.0, 0.0, "open", nil, nil, nil, false, nowStub(), nil))
+			"last_deploy_failed", "last_deploy_error", "last_deploy_at",
+		}).AddRow(openID, testAccountID, projectID, 5.0, 0.0, "open", nil, nil, nil, false, nowStub(), nil, false, nil, nil))
 	mock.ExpectQuery(`UPDATE billing\.inference_sessions`).
 		WithArgs(openID, testAccountID, "closed").
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "account_id", "project_id", "budget", "spent", "status", "label",
 			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
 		}).AddRow(openID, testAccountID, projectID, 5.0, 0.0, "closed", nil, nil, nil, false, nowStub(), nowStub()))
-	mock.ExpectQuery(`SELECT route, provider, input_tokens, output_tokens`).
-		WithArgs(openID).
-		WillReturnRows(sqlmock.NewRows([]string{"route", "provider", "input_tokens", "output_tokens"}))
 
 	mock.ExpectQuery(`SELECT id, account_id, project_id, budget, spent, status`).
 		WithArgs(notOwnedID, testAccountID).
@@ -1182,7 +1238,8 @@ func liveSessionRow(sessionID uuid.UUID, agentInstanceID, appInstanceID string) 
 	return sqlmock.NewRows([]string{
 		"id", "account_id", "project_id", "budget", "spent", "status", "label",
 		"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
-	}).AddRow(sessionID, testAccountID, uuid.New(), 5.0, 0.0, "open", nil, agentInstanceID, appInstanceID, true, nowStub(), nil)
+		"last_deploy_failed", "last_deploy_error", "last_deploy_at",
+	}).AddRow(sessionID, testAccountID, uuid.New(), 5.0, 0.0, "open", nil, agentInstanceID, appInstanceID, true, nowStub(), nil, false, nil, nil)
 }
 
 func TestGetKumbhaSession_ExposesAppInstanceID(t *testing.T) {
@@ -1325,7 +1382,8 @@ func TestUpdateKumbhaBudget_Success(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "account_id", "project_id", "budget", "spent", "status", "label",
 			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
-		}).AddRow(sessionID, testAccountID, uuid.New(), 15.0, 0.0, "open", nil, nil, nil, false, nowStub(), nil))
+			"last_deploy_failed", "last_deploy_error", "last_deploy_at",
+		}).AddRow(sessionID, testAccountID, uuid.New(), 15.0, 0.0, "open", nil, nil, nil, false, nowStub(), nil, false, nil, nil))
 
 	w := kumbhaRequest(server.UpdateKumbhaBudget, http.MethodPatch, "/v1/kumbha/sessions/"+sessionID.String()+"/budget",
 		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, map[string]float64{"budget": 15.0}, nil)
@@ -1377,5 +1435,120 @@ func TestDeleteKumbhaSessions_EmptyIDsIs400(t *testing.T) {
 		uuid.New(), map[string]any{"ids": []string{}}, nil)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+// TestListKumbhaSessions_LiveAgentRunningNotStuckTrue is the regression
+// test for a real live UX bug (found 2026-08-29): the "Previous builds"
+// list showed an animated, ongoing-looking "Building" status for a
+// session whose agent had long since finished — ListKumbhaSessions used
+// to return only the cheap "was one ever launched" proxy for
+// agent_running. It now shares enrichKumbhaAgentRunning with
+// GetKumbhaSession, but deliberately NOT enrichKumbhaAppStatus — a
+// per-row live cluster read on every list poll is a cost this endpoint
+// does not pay (see that method's own doc comment); app_status/
+// app_endpoint stay absent here even though the same session's
+// GetKumbhaSession response would include them.
+func TestListKumbhaSessions_LiveAgentRunningNotStuckTrue(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	fc := newFakeCluster()
+	appID := "inst-listed01"
+	sessID, projectID := uuid.New(), uuid.New()
+	fc.add(appID, projectID.String(), compute.StatusRunning)
+	server := (&Server{store: cStore, cluster: fc}).WithKumbha(gw)
+
+	rows := sqlmock.NewRows([]string{
+		"id", "account_id", "project_id", "budget", "spent", "status", "label",
+		"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
+		"last_deploy_failed", "last_deploy_error", "last_deploy_at",
+	}).AddRow(sessID, testAccountID, projectID, 5.0, 1.0, "open", "a build",
+		"kumbha-agent-abcd1234", appID, true, nowStub(), nil, false, nil, nil)
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
+		WithArgs(testAccountID, projectID).
+		WillReturnRows(rows)
+
+	w := kumbhaRequest(server.ListKumbhaSessions, http.MethodGet, "/v1/kumbha/sessions",
+		nil, projectID, nil, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Sessions []map[string]any `json:"sessions"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(resp.Sessions) != 1 {
+		t.Fatalf("got %d sessions, want 1", len(resp.Sessions))
+	}
+	// The agent pod (fakeCluster never had "kumbha-agent-abcd1234" added)
+	// has exited — agent_running must reflect that live fact, not the
+	// cheap agent_instance_id != "" proxy staying stuck true.
+	if resp.Sessions[0]["agent_running"] != false {
+		t.Errorf("agent_running = %v, want false (live read, agent pod exited)", resp.Sessions[0]["agent_running"])
+	}
+	if _, ok := resp.Sessions[0]["app_status"]; ok {
+		t.Errorf("app_status = %v present on ListKumbhaSessions, want absent — that live read is GetKumbhaSession-only", resp.Sessions[0]["app_status"])
+	}
+}
+
+// --- StopKumbhaAgent ---
+
+func TestStopKumbhaAgent_KillsRunningPod(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	fc := newFakeCluster()
+	sessionID, projectID := uuid.New(), uuid.New()
+	agentID := "kumbha-agent-abcd1234"
+	fc.add(agentID, projectID.String(), "running")
+
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{}).
+		WithAgent(fc, fakeMintKumbhaToken, kumbha.AgentConfig{})
+	server := (&Server{store: cStore}).WithKumbha(gw)
+
+	// liveSessionRow's own project_id is a random uuid, unrelated to the
+	// one this test's fake instance was added under — StopAgent scopes
+	// its live status check to sess.ProjectID, so this row must carry the
+	// SAME projectID the fake instance is visible under, unlike most
+	// other liveSessionRow callers which never exercise a scoped read.
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "account_id", "project_id", "budget", "spent", "status", "label",
+			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
+			"last_deploy_failed", "last_deploy_error", "last_deploy_at",
+		}).AddRow(sessionID, testAccountID, projectID, 5.0, 0.0, "open", nil, agentID, nil, true, nowStub(), nil, false, nil, nil))
+
+	w := kumbhaRequest(server.StopKumbhaAgent, http.MethodPost, "/v1/kumbha/sessions/"+sessionID.String()+"/stop",
+		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, nil, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	if _, ok := fc.instances[agentID]; ok {
+		t.Error("agent pod is still present after Stop, want it torn down")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestStopKumbhaAgent_NothingRunningIs409(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	fc := newFakeCluster()
+	sessionID, projectID := uuid.New(), uuid.New()
+
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{}).
+		WithAgent(fc, fakeMintKumbhaToken, kumbha.AgentConfig{})
+	server := (&Server{store: cStore}).WithKumbha(gw)
+
+	// No agent_instance_id at all on this session — nothing to stop.
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnRows(liveSessionRow(sessionID, "", ""))
+
+	w := kumbhaRequest(server.StopKumbhaAgent, http.MethodPost, "/v1/kumbha/sessions/"+sessionID.String()+"/stop",
+		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, nil, nil)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body: %s)", w.Code, w.Body.String())
 	}
 }

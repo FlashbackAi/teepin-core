@@ -51,7 +51,8 @@ func sessionRow(sessionID uuid.UUID) *sqlmock.Rows {
 	return sqlmock.NewRows([]string{
 		"id", "account_id", "project_id", "budget", "spent", "status", "label",
 		"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
-	}).AddRow(sessionID, testAccountID, uuid.New(), 5.0, 0.0, "open", nil, nil, nil, false, nowStub(), nil)
+		"last_deploy_failed", "last_deploy_error", "last_deploy_at",
+	}).AddRow(sessionID, testAccountID, uuid.New(), 5.0, 0.0, "open", nil, nil, nil, false, nowStub(), nil, false, nil, nil)
 }
 
 func TestUploadKumbhaWorkspace_RequiresSessionCredential(t *testing.T) {
@@ -229,8 +230,8 @@ func TestGetKumbhaWorkspace_Success(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"current_workspace_version"}).AddRow(1))
 	mock.ExpectQuery(`FROM billing\.kumbha_workspace_versions v`).
 		WithArgs(sessionID, testAccountID, 1).
-		WillReturnRows(sqlmock.NewRows([]string{"version", "files", "skipped", "file_count", "byte_size", "created_by", "created_at"}).
-			AddRow(1, `[{"path":"index.html","content":"<h1>hi</h1>"}]`, `[]`, 1, 11, "agent", time.Now()))
+		WillReturnRows(sqlmock.NewRows([]string{"version", "files", "skipped", "file_count", "byte_size", "created_by", "created_at", "is_checkpoint"}).
+			AddRow(1, `[{"path":"index.html","content":"<h1>hi</h1>"}]`, `[]`, 1, 11, "agent", time.Now(), true))
 
 	w := kumbhaRequest(server.GetKumbhaWorkspace, http.MethodGet, "/v1/kumbha/sessions/"+sessionID.String()+"/workspace",
 		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, nil, nil)
@@ -238,14 +239,18 @@ func TestGetKumbhaWorkspace_Success(t *testing.T) {
 		t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
 	}
 	var resp struct {
-		Version int                     `json:"version"`
-		Files   []kumbha.WorkspaceFile  `json:"files"`
+		Version      int                    `json:"version"`
+		Files        []kumbha.WorkspaceFile `json:"files"`
+		IsCheckpoint bool                   `json:"is_checkpoint"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
 	if resp.Version != 1 || len(resp.Files) != 1 || resp.Files[0].Path != "index.html" {
 		t.Errorf("got %+v, want version 1 with one file index.html", resp)
+	}
+	if !resp.IsCheckpoint {
+		t.Error("is_checkpoint did not reach the response — the console's Deploy button needs it to detect \"nothing changed since last deploy\"")
 	}
 }
 
@@ -322,8 +327,8 @@ func TestDownloadKumbhaWorkspace_StreamsAValidZip(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"current_workspace_version"}).AddRow(1))
 	mock.ExpectQuery(`FROM billing\.kumbha_workspace_versions v`).
 		WithArgs(sessionID, testAccountID, 1).
-		WillReturnRows(sqlmock.NewRows([]string{"version", "files", "skipped", "file_count", "byte_size", "created_by", "created_at"}).
-			AddRow(1, `[{"path":"index.html","content":"<h1>hi</h1>"}]`, `[]`, 1, 11, "agent", time.Now()))
+		WillReturnRows(sqlmock.NewRows([]string{"version", "files", "skipped", "file_count", "byte_size", "created_by", "created_at", "is_checkpoint"}).
+			AddRow(1, `[{"path":"index.html","content":"<h1>hi</h1>"}]`, `[]`, 1, 11, "agent", time.Now(), true))
 
 	w := kumbhaRequest(server.DownloadKumbhaWorkspace, http.MethodGet, "/v1/kumbha/sessions/"+sessionID.String()+"/workspace/archive",
 		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, nil, nil)

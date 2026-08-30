@@ -651,3 +651,44 @@ func TestArchivabilityDrill029(t *testing.T) {
 	}
 	t.Log("archivability drill passed: 029 applies, reverts cleanly, and re-applies")
 }
+
+// TestArchivabilityDrill030 proves inference_sessions.last_deploy_failed/
+// last_deploy_error/last_deploy_at (030) are reversible, and that
+// inference_sessions itself survives the round trip.
+func TestArchivabilityDrill030(t *testing.T) {
+	dsn := os.Getenv("TEEPIN_DRILL_DSN")
+	if dsn == "" {
+		t.Skip("set TEEPIN_DRILL_DSN to run the migration drill")
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("initial up: %v", err)
+	}
+	for _, col := range []string{"last_deploy_failed", "last_deploy_error", "last_deploy_at"} {
+		if !columnExists(t, db, "billing", "inference_sessions", col) {
+			t.Fatalf("after up: inference_sessions.%s missing", col)
+		}
+	}
+
+	if err := migrator(t, db).Migrate(29); err != nil {
+		t.Fatalf("migrate down to 029: %v", err)
+	}
+	for _, col := range []string{"last_deploy_failed", "last_deploy_error", "last_deploy_at"} {
+		if columnExists(t, db, "billing", "inference_sessions", col) {
+			t.Errorf("after down: %s still present", col)
+		}
+	}
+	if !tableExists(t, db, "billing", "inference_sessions") {
+		t.Error("after down: inference_sessions was wrongly removed")
+	}
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("re-up: %v", err)
+	}
+	t.Log("archivability drill passed: 030 applies, reverts cleanly, and re-applies")
+}

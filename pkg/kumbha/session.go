@@ -67,8 +67,21 @@ type Session struct {
 	// rather than replacing it — see that function's own doc comment.
 	AppInstanceID  string
 	DeployApproved bool
-	StartedAt      time.Time
-	EndedAt        *time.Time
+	// LastDeployFailed/LastDeployError/LastDeployAt persist the OUTCOME of
+	// the most recent build/deploy attempt (see migration 030) — what
+	// backs the "Failed" status on the console's "Previous builds" list.
+	// Set by buildKumbhaImage/DeployKumbhaSession/redeployKumbhaInstance
+	// on both failure (true + the error) and success (false, cleared),
+	// so a stale failure from days ago never lingers once the customer
+	// has since shipped successfully. LastDeployFailed can be true while
+	// AppInstanceID still names a perfectly healthy, currently-running
+	// instance — the LATEST attempt failing does not touch whatever an
+	// earlier successful deploy already has running.
+	LastDeployFailed bool
+	LastDeployError  string
+	LastDeployAt     *time.Time
+	StartedAt        time.Time
+	EndedAt          *time.Time
 }
 
 // RouteUsage is one session's accumulated tokens for one route — the raw
@@ -188,16 +201,17 @@ func (s *Store) SetDeployApproved(ctx context.Context, id, accountID uuid.UUID) 
 // Get loads a session, scoped to the owning account.
 func (s *Store) Get(ctx context.Context, id, accountID uuid.UUID) (*Session, error) {
 	var sess Session
-	var label, agentInstanceID, appInstanceID sql.NullString
-	var endedAt sql.NullTime
+	var label, agentInstanceID, appInstanceID, lastDeployError sql.NullString
+	var endedAt, lastDeployAt sql.NullTime
 	err := s.db.QueryRowContext(ctx, `
 		SELECT id, account_id, project_id, budget, spent, status, label,
-		       agent_instance_id, app_instance_id, deploy_approved, started_at, ended_at
+		       agent_instance_id, app_instance_id, deploy_approved, started_at, ended_at,
+		       last_deploy_failed, last_deploy_error, last_deploy_at
 		FROM billing.inference_sessions
 		WHERE id = $1 AND account_id = $2
 	`, id, accountID).Scan(&sess.ID, &sess.AccountID, &sess.ProjectID, &sess.Budget,
 		&sess.Spent, &sess.Status, &label, &agentInstanceID, &appInstanceID, &sess.DeployApproved,
-		&sess.StartedAt, &endedAt)
+		&sess.StartedAt, &endedAt, &sess.LastDeployFailed, &lastDeployError, &lastDeployAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrSessionNotFound
 	}
@@ -207,8 +221,12 @@ func (s *Store) Get(ctx context.Context, id, accountID uuid.UUID) (*Session, err
 	sess.Label = label.String
 	sess.AgentInstanceID = agentInstanceID.String
 	sess.AppInstanceID = appInstanceID.String
+	sess.LastDeployError = lastDeployError.String
 	if endedAt.Valid {
 		sess.EndedAt = &endedAt.Time
+	}
+	if lastDeployAt.Valid {
+		sess.LastDeployAt = &lastDeployAt.Time
 	}
 	return &sess, nil
 }
@@ -307,6 +325,29 @@ func (s *Store) SetAppInstanceID(ctx context.Context, sessionID uuid.UUID, appIn
 	`, sessionID, nullIfEmpty(appInstanceID))
 	if err != nil {
 		return fmt.Errorf("failed to record app instance id: %w", err)
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return ErrSessionNotFound
+	}
+	return nil
+}
+
+// SetLastDeployStatus records the outcome of a session's most recent
+// build/deploy attempt (see migration 030) — errMsg empty means the
+// attempt SUCCEEDED, clearing any earlier failure so a stale "Failed"
+// never lingers once the customer has since shipped successfully.
+// Best-effort by design at every call site (buildKumbhaImage/
+// DeployKumbhaSession/redeployKumbhaInstance): a failure to persist THIS
+// bookkeeping must never mask or replace the real build/deploy error
+// already being returned to the customer.
+func (s *Store) SetLastDeployStatus(ctx context.Context, sessionID uuid.UUID, errMsg string) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE billing.inference_sessions
+		SET last_deploy_failed = $2, last_deploy_error = $3, last_deploy_at = now()
+		WHERE id = $1
+	`, sessionID, errMsg != "", nullIfEmpty(errMsg))
+	if err != nil {
+		return fmt.Errorf("failed to record last deploy status: %w", err)
 	}
 	if affected, _ := result.RowsAffected(); affected == 0 {
 		return ErrSessionNotFound
@@ -421,7 +462,8 @@ func (s *Store) Close(ctx context.Context, id, accountID uuid.UUID, reason strin
 func (s *Store) ListByProject(ctx context.Context, accountID, projectID uuid.UUID) ([]*Session, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, account_id, project_id, budget, spent, status, label,
-		       agent_instance_id, app_instance_id, deploy_approved, started_at, ended_at
+		       agent_instance_id, app_instance_id, deploy_approved, started_at, ended_at,
+		       last_deploy_failed, last_deploy_error, last_deploy_at
 		FROM billing.inference_sessions
 		WHERE account_id = $1 AND project_id = $2
 		ORDER BY started_at DESC
@@ -434,16 +476,20 @@ func (s *Store) ListByProject(ctx context.Context, accountID, projectID uuid.UUI
 	var sessions []*Session
 	for rows.Next() {
 		var sess Session
-		var label, agentInstanceID, appInstanceID sql.NullString
-		var endedAt sql.NullTime
+		var label, agentInstanceID, appInstanceID, lastDeployError sql.NullString
+		var endedAt, lastDeployAt sql.NullTime
 		if err := rows.Scan(&sess.ID, &sess.AccountID, &sess.ProjectID, &sess.Budget,
 			&sess.Spent, &sess.Status, &label, &agentInstanceID, &appInstanceID, &sess.DeployApproved,
-			&sess.StartedAt, &endedAt); err != nil {
+			&sess.StartedAt, &endedAt, &sess.LastDeployFailed, &lastDeployError, &lastDeployAt); err != nil {
 			return nil, fmt.Errorf("failed to scan session: %w", err)
 		}
 		sess.Label = label.String
 		sess.AgentInstanceID = agentInstanceID.String
 		sess.AppInstanceID = appInstanceID.String
+		sess.LastDeployError = lastDeployError.String
+		if lastDeployAt.Valid {
+			sess.LastDeployAt = &lastDeployAt.Time
+		}
 		if endedAt.Valid {
 			sess.EndedAt = &endedAt.Time
 		}

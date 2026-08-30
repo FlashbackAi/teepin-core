@@ -285,6 +285,13 @@ func (c *AgentClient) createOrReplace(ctx context.Context, spec InstanceSpec, re
 		PublicIP:    result.PublicIp,
 		TLSEnabled:  tlsEnabled,
 		TLSReady:    tlsReady,
+		// See InstanceStatus.Hidden's own doc comment: this seed is the
+		// ONE place that needs it, since the home node's own sweep
+		// correctly never reports a hidden pod at all (managedSelector
+		// excludes it before a status is even constructed) — nothing
+		// downstream will ever overwrite this with a wire update that
+		// forgets to set it.
+		Hidden: spec.Labels[labelKumbhaAgent] == "true",
 	})
 
 	return &InstanceResult{
@@ -360,6 +367,9 @@ func (c *AgentClient) ListInstanceStatuses(_ context.Context, scope Scope) ([]In
 
 	out := make([]InstanceStatus, 0, len(c.statuses))
 	for _, status := range c.statuses {
+		if status.Hidden {
+			continue
+		}
 		if scopeAllows(scope, status) {
 			out = append(out, status)
 		}

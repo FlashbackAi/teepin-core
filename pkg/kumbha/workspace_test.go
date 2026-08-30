@@ -289,8 +289,8 @@ func TestGetCurrentVersion_ScopesToOwningAccountAndFollowsPointer(t *testing.T) 
 		WillReturnRows(sqlmock.NewRows([]string{"current_workspace_version"}).AddRow(3))
 	mock.ExpectQuery(`FROM billing\.kumbha_workspace_versions v`).
 		WithArgs(sessionID, accountID, 3).
-		WillReturnRows(sqlmock.NewRows([]string{"version", "files", "skipped", "file_count", "byte_size", "created_by", "created_at"}).
-			AddRow(3, `[{"path":"a.txt","content":"hi"}]`, `[]`, 1, 2, "agent", time.Date(2026, 8, 25, 0, 0, 0, 0, time.UTC)))
+		WillReturnRows(sqlmock.NewRows([]string{"version", "files", "skipped", "file_count", "byte_size", "created_by", "created_at", "is_checkpoint"}).
+			AddRow(3, `[{"path":"a.txt","content":"hi"}]`, `[]`, 1, 2, "agent", time.Date(2026, 8, 25, 0, 0, 0, 0, time.UTC), true))
 
 	snap, err := store.GetCurrentVersion(context.Background(), sessionID, accountID)
 	if err != nil {

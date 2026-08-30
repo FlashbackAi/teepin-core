@@ -717,3 +717,81 @@ func TestAgentClient_DatacenterPathNeverSynthesizes(t *testing.T) {
 		t.Errorf("datacenter path must not synthesize an endpoint, got %+v", result)
 	}
 }
+
+// TestAgentClient_CreateInstance_HidesLabeledPodFromListImmediately is the
+// regression test for a real live bug (found 2026-08-29): a customer's
+// Compute list showed a transient, nameless "kaniko-build-xyz" entry for
+// the whole duration of every build. CreateInstance's own immediate
+// cache-seed (RecordStatus, so a read-after-create never reports the
+// instance missing while waiting for the first status push) ran
+// unconditionally, with no check for the "hide from Compute list" label —
+// unlike DirectClient, which excludes such pods at the k8s API level via
+// managedSelector before a status object even exists, AgentClient's cache
+// has no labels to filter on the same way, so this seed is the one place
+// that must set InstanceStatus.Hidden itself.
+func TestAgentClient_CreateInstance_HidesLabeledPodFromListImmediately(t *testing.T) {
+	fake := newFakeAgent(&agentpb.CommandResult{Success: true, PodName: "kaniko-build-pod"})
+	c := NewAgentClient(registryWith(fake.session))
+
+	_, err := c.CreateInstance(context.Background(), InstanceSpec{
+		InstanceID: "kaniko-build-x",
+		ProjectID:  "project-alice",
+		Image:      "gcr.io/kaniko-project/executor:v1.23.2-debug",
+		Labels:     map[string]string{"teepin.io/kumbha-agent": "true"},
+	})
+	if err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	statuses, err := c.ListInstanceStatuses(context.Background(), AllTenants())
+	if err != nil {
+		t.Fatalf("ListInstanceStatuses: %v", err)
+	}
+	for _, st := range statuses {
+		if st.InstanceID == "kaniko-build-x" {
+			t.Fatalf("kaniko-build-x appeared in ListInstanceStatuses (the customer's own Compute list reads this) despite carrying the hide-from-Compute-list label: %+v", st)
+		}
+	}
+
+	// A targeted lookup by its exact ID (what build.Service's own poll
+	// loop does) must still find it — only the LISTING path hides it,
+	// same asymmetry DirectClient's instanceSelector/managedSelector
+	// already has.
+	got, err := c.GetInstanceStatus(context.Background(), AllTenants(), "kaniko-build-x")
+	if err != nil {
+		t.Fatalf("GetInstanceStatus: %v", err)
+	}
+	if got.InstanceID != "kaniko-build-x" {
+		t.Errorf("GetInstanceStatus did not find the hidden instance by its exact ID")
+	}
+}
+
+// TestAgentClient_CreateInstance_OrdinaryInstanceStillListed is the
+// non-regression companion: an instance with no hide-from-Compute-list
+// label must appear in ListInstanceStatuses exactly as before — the
+// Hidden field must default false and never suppress a real customer
+// instance.
+func TestAgentClient_CreateInstance_OrdinaryInstanceStillListed(t *testing.T) {
+	fake := newFakeAgent(&agentpb.CommandResult{Success: true, PodName: "inst-real0001-pod"})
+	c := NewAgentClient(registryWith(fake.session))
+
+	_, err := c.CreateInstance(context.Background(), InstanceSpec{
+		InstanceID: "inst-real0001",
+		ProjectID:  "project-alice",
+		Image:      "nginx:alpine",
+	})
+	if err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	statuses, err := c.ListInstanceStatuses(context.Background(), AllTenants())
+	if err != nil {
+		t.Fatalf("ListInstanceStatuses: %v", err)
+	}
+	for _, st := range statuses {
+		if st.InstanceID == "inst-real0001" {
+			return
+		}
+	}
+	t.Fatal("inst-real0001 did not appear in ListInstanceStatuses")
+}

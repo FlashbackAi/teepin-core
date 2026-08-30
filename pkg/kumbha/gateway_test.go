@@ -166,7 +166,8 @@ func TestGateway_Complete_SuccessPricesAndAccrues(t *testing.T) {
 
 	provider := &fakeProvider{name: "vllm", usage: inference.Usage{InputTokens: 1000, OutputTokens: 500}}
 	router := NewRouter(map[string]Route{"teepin/fast": {Provider: provider, ProviderName: "vllm"}})
-	gw := NewGateway(store, router, nil, &fakePricing{in: 2.0, out: 8.0}, &fakeUsageRecorder{})
+	usage := &fakeUsageRecorder{}
+	gw := NewGateway(store, router, nil, &fakePricing{in: 2.0, out: 8.0}, usage)
 
 	sess := &Session{ID: sessID, AccountID: accountID, Status: "open", Budget: 5.0, Spent: 0}
 	result, err := gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/fast"})
@@ -179,35 +180,11 @@ func TestGateway_Complete_SuccessPricesAndAccrues(t *testing.T) {
 	if result.Spent != wantCost {
 		t.Errorf("Spent = %v, want %v", result.Spent, wantCost)
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Error(err)
-	}
-}
-
-func TestGateway_CloseSession_SettlesEachRouteLineAndConsumesCredit(t *testing.T) {
-	store, mock := newMockStore(t)
-	sessID, accountID, projectID := uuid.New(), uuid.New(), uuid.New()
-	startedAt := time.Now()
-
-	mock.ExpectQuery(`UPDATE billing\.inference_sessions`).
-		WithArgs(sessID, accountID, "closed").
-		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "account_id", "project_id", "budget", "spent", "status", "label",
-			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
-		}).AddRow(sessID, accountID, projectID, 5.0, 1.25, "closed", nil, nil, nil, false, startedAt, startedAt))
-
-	mock.ExpectQuery(`SELECT route, provider, input_tokens, output_tokens`).
-		WithArgs(sessID).
-		WillReturnRows(sqlmock.NewRows([]string{"route", "provider", "input_tokens", "output_tokens"}).
-			AddRow("teepin/fast", "vllm", int64(1000), int64(500)))
-
-	usage := &fakeUsageRecorder{}
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{in: 2.0, out: 8.0}, usage)
-
-	_, err := gw.CloseSession(context.Background(), sessID, accountID, "closed")
-	if err != nil {
-		t.Fatalf("CloseSession: %v", err)
-	}
+	// Settled IMMEDIATELY, not batched until Close (which no longer
+	// settles anything at all — see Gateway.CloseSession's own doc
+	// comment). This is what lets a session's spend become an
+	// invoice-visible, credit-consuming fact even if it is simply
+	// abandoned and never explicitly stopped.
 	if len(usage.records) != 2 {
 		t.Fatalf("got %d usage_records lines, want 2 (input + output)", len(usage.records))
 	}
@@ -233,7 +210,8 @@ func getSessionRow(sessID, accountID, projectID uuid.UUID, budget float64, statu
 	return sqlmock.NewRows([]string{
 		"id", "account_id", "project_id", "budget", "spent", "status", "label",
 		"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
-	}).AddRow(sessID, accountID, projectID, budget, 0.0, status, nil, nil, nil, false, time.Now(), nil)
+		"last_deploy_failed", "last_deploy_error", "last_deploy_at",
+	}).AddRow(sessID, accountID, projectID, budget, 0.0, status, nil, nil, nil, false, time.Now(), nil, false, nil, nil)
 }
 
 func TestGateway_IncreaseBudget_Success(t *testing.T) {

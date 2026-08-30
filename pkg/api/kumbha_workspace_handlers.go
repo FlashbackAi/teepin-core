@@ -164,13 +164,14 @@ func (s *Server) GetKumbhaWorkspace(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"version":    snap.Version,
-		"files":      snap.Files,
-		"skipped":    snap.Skipped,
-		"file_count": snap.FileCount,
-		"byte_size":  snap.ByteSize,
-		"created_by": snap.CreatedBy,
-		"created_at": snap.CreatedAt,
+		"version":       snap.Version,
+		"files":         snap.Files,
+		"skipped":       snap.Skipped,
+		"file_count":    snap.FileCount,
+		"byte_size":     snap.ByteSize,
+		"created_by":    snap.CreatedBy,
+		"created_at":    snap.CreatedAt,
+		"is_checkpoint": snap.IsCheckpoint,
 	})
 }
 

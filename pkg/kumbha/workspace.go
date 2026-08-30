@@ -86,6 +86,17 @@ type Snapshot struct {
 	ByteSize  int64           `json:"byte_size"`
 	CreatedBy CreatedBy       `json:"created_by"`
 	CreatedAt time.Time       `json:"created_at"`
+	// IsCheckpoint on the CURRENT version (what GetCurrentVersion returns)
+	// means nothing has changed since the last successful deploy: a
+	// deploy checkpoints the version it built (CheckpointCurrentVersion),
+	// and SaveVersion only ever mutates a row IN PLACE while it is still
+	// a draft — the moment it's checkpointed, the next write (agent or
+	// customer) creates a NEW, un-checkpointed row instead. So "the
+	// current version is already a checkpoint" and "the current content
+	// is byte-for-byte what's already running" are the same fact. The
+	// console's Deploy button reads this to disable itself when a click
+	// would rebuild and redeploy something that isn't actually different.
+	IsCheckpoint bool `json:"is_checkpoint"`
 }
 
 // VersionInfo is one entry in the history list — metadata only, no file
@@ -317,12 +328,12 @@ func (s *Store) getVersion(ctx context.Context, sessionID, accountID uuid.UUID, 
 	var createdBy string
 
 	err := s.db.QueryRowContext(ctx, `
-		SELECT v.version, v.files, v.skipped, v.file_count, v.byte_size, v.created_by, v.created_at
+		SELECT v.version, v.files, v.skipped, v.file_count, v.byte_size, v.created_by, v.created_at, v.is_checkpoint
 		FROM billing.kumbha_workspace_versions v
 		JOIN billing.inference_sessions s ON s.id = v.session_id
 		WHERE v.session_id = $1 AND s.account_id = $2 AND v.version = $3
 	`, sessionID, accountID, version).Scan(
-		&snap.Version, &filesJSON, &skippedJSON, &snap.FileCount, &snap.ByteSize, &createdBy, &snap.CreatedAt)
+		&snap.Version, &filesJSON, &skippedJSON, &snap.FileCount, &snap.ByteSize, &createdBy, &snap.CreatedAt, &snap.IsCheckpoint)
 	if err != nil {
 		// "No such version" and "not your session" land here identically
 		// (sql.ErrNoRows either way) — existence must not leak, same

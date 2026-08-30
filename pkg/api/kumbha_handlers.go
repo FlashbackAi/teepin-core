@@ -44,13 +44,13 @@ type createKumbhaSessionRequest struct {
 }
 
 // kumbhaSessionResponse is the shared JSON shape for every endpoint that
-// returns a session — creation, listing, and close. agent_running here is
+// returns a session — creation and listing (there is no "close" endpoint
+// any more, see StopKumbhaAgent's own doc comment). agent_running here is
 // the CHEAP proxy (was a pod ever launched and never explicitly torn
 // down), not a live cluster read — correct enough for a list of past
 // builds, where a per-row live pod-status check would mean one cluster
-// round trip per row on every poll. GetKumbhaSession (the single-session
-// read the console detail page actually polls) overrides it with a real
-// live check — see its own doc comment.
+// round trip per row on every poll. GetKumbhaSession/ListKumbhaSessions
+// (see enrichKumbhaAgentRunning) override it with a real live check.
 func kumbhaSessionResponse(sess *kumbha.Session) gin.H {
 	return gin.H{
 		"id":              sess.ID,
@@ -73,8 +73,15 @@ func kumbhaSessionResponse(sess *kumbha.Session) gin.H {
 		// build/[id]/page.tsx's extractAppUrl, which this is the
 		// complement to).
 		"app_instance_id": sess.AppInstanceID,
-		"started_at":      sess.StartedAt,
-		"ended_at":        sess.EndedAt,
+		// The outcome of the most recent build/deploy attempt (see
+		// migration 030 and Session.LastDeployFailed's own doc comment) —
+		// what backs the "Failed" status on the console's "Previous
+		// builds" list. Cheap: a stored column, not a live read, so this
+		// is safe on the list endpoint too, unlike app_status.
+		"last_deploy_failed": sess.LastDeployFailed,
+		"last_deploy_error":  sess.LastDeployError,
+		"started_at":         sess.StartedAt,
+		"ended_at":           sess.EndedAt,
 	}
 }
 
@@ -163,7 +170,13 @@ func (s *Server) ListKumbhaSessions(c *gin.Context) {
 
 	out := make([]gin.H, len(sessions))
 	for i, sess := range sessions {
-		out[i] = kumbhaSessionResponse(sess)
+		resp := kumbhaSessionResponse(sess)
+		// Live agent_running only, not the app-status enrichment
+		// GetKumbhaSession also does — see enrichKumbhaAppStatus's own doc
+		// comment on why a per-row live cluster read is a cost this list
+		// deliberately does not pay.
+		s.enrichKumbhaAgentRunning(c.Request.Context(), resp, sess)
+		out[i] = resp
 	}
 	c.JSON(http.StatusOK, gin.H{"sessions": out, "count": len(out)})
 }
@@ -239,11 +252,17 @@ func (s *Server) DeleteKumbhaSessions(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"deleted": deletedStr, "skipped": skipped})
 }
 
-// CloseKumbhaSession explicitly ends a session and settles its ledger —
-// one usage_records line per (route, direction) the session touched,
-// drawn against the account's credits.
-// POST /v1/kumbha/sessions/:id/close
-func (s *Server) CloseKumbhaSession(c *gin.Context) {
+// StopKumbhaAgent interrupts a session's currently-running agent pod
+// immediately — replaces the old "Close session" button, which bundled
+// this with settling billing (now continuous, see Gateway.Complete's own
+// doc comment) and permanently blocking further chat (removed: nothing
+// about stopping a run should stop the customer from sending another
+// message afterward — DeliverMessage's own relaunch path already handles
+// starting a fresh agent turn from wherever the workspace was left). See
+// Gateway.StopAgent's own doc comment for why this is a hard kill, not a
+// graceful mid-turn pause.
+// POST /v1/kumbha/sessions/:id/stop
+func (s *Server) StopKumbhaAgent(c *gin.Context) {
 	if s.kumbha == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha Gateway is not available on this deployment"})
 		return
@@ -260,11 +279,8 @@ func (s *Server) CloseKumbhaSession(c *gin.Context) {
 		return
 	}
 
-	sess, err := s.kumbha.CloseSession(c.Request.Context(), sessionID, accountID, "closed")
-	if sess == nil {
-		// Only store.Close itself failing returns a nil session — a
-		// settlement error below still returns the (now-closed) session,
-		// handled separately below.
+	sess, err := s.kumbha.GetSession(c.Request.Context(), sessionID, accountID)
+	if err != nil {
 		if errors.Is(err, kumbha.ErrSessionNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
 			return
@@ -272,15 +288,21 @@ func (s *Server) CloseKumbhaSession(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	if err != nil {
-		// A settlement error (RecordUsage/ConsumeCredit failing for one or
-		// more route lines) does not make the session any less closed —
-		// logged loudly as a billing-integrity gap needing operator
-		// attention, but not surfaced as a customer-facing failure.
-		log.Printf("WARN: kumbha session %s closed but settlement had errors: %v", sessionID, err)
+
+	if err := s.kumbha.StopAgent(c.Request.Context(), sess); err != nil {
+		if errors.Is(err, kumbha.ErrAgentNotRunning) {
+			c.JSON(http.StatusConflict, gin.H{"error": "nothing is currently running for this session", "code": "not_running"})
+			return
+		}
+		if errors.Is(err, kumbha.ErrAgentNotConfigured) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha agent is not available on this deployment"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
 	}
 
-	c.JSON(http.StatusOK, kumbhaSessionResponse(sess))
+	c.JSON(http.StatusOK, gin.H{"stopped": true})
 }
 
 // buildKumbhaSessionRequest names the Dockerfile to build and (via the
@@ -352,10 +374,51 @@ func (s *Server) BuildKumbhaSession(c *gin.Context) {
 
 	imageRef, status, body := s.buildKumbhaImage(c.Request.Context(), sess, accountID, req.DockerfilePath)
 	if status != 0 {
+		s.recordDeployOutcome(c.Request.Context(), sessionID, errorFromBody(body))
 		c.JSON(status, body)
 		return
 	}
+	s.recordDeployOutcome(c.Request.Context(), sessionID, "")
 	c.JSON(http.StatusOK, gin.H{"image_ref": imageRef})
+}
+
+// recordDeployOutcome persists the outcome of a build/deploy attempt on
+// the session (see kumbha.Store.SetLastDeployStatus) — errMsg empty means
+// success, clearing any earlier failure so a stale "Failed" from days ago
+// never lingers once the customer has since shipped successfully.
+// Best-effort: a failure to persist this bookkeeping is logged, never
+// surfaced to the customer or allowed to mask the real build/deploy
+// result already being returned in the response this call sits next to.
+func (s *Server) recordDeployOutcome(ctx context.Context, sessionID uuid.UUID, errMsg string) {
+	if err := s.kumbha.SetLastDeployStatus(ctx, sessionID, errMsg); err != nil {
+		log.Printf("WARN: could not record deploy outcome for Kumbha session %s: %v", sessionID, err)
+	}
+}
+
+// errorFromBody extracts the customer-facing message from a handler's own
+// gin.H{"error": ...} response body — every failure path in this file
+// builds its body that way, so this is a safe, narrow way to reuse that
+// exact string as the persisted last_deploy_error rather than a second,
+// possibly-drifted description of the same failure.
+func errorFromBody(body gin.H) string {
+	if msg, ok := body["error"].(string); ok {
+		return msg
+	}
+	return "deploy failed"
+}
+
+// errorFromJSONBody is errorFromBody for a raw JSON []byte response body
+// (invokeInternally's shape) rather than a gin.H — same narrow purpose:
+// reuse CreateInstance's own already-worded error as the persisted
+// last_deploy_error instead of a second, possibly-drifted description.
+func errorFromJSONBody(body []byte) string {
+	var parsed struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil || parsed.Error == "" {
+		return "deploy failed"
+	}
+	return parsed.Error
 }
 
 // buildKumbhaImage is the shared build step behind BuildKumbhaSession
@@ -546,6 +609,7 @@ func (s *Server) DeployKumbhaSession(c *gin.Context) {
 
 	imageRef, status, body := s.buildKumbhaImage(c.Request.Context(), sess, accountID, req.DockerfilePath)
 	if status != 0 {
+		s.recordDeployOutcome(c.Request.Context(), sessionID, errorFromBody(body))
 		c.JSON(status, body)
 		return
 	}
@@ -555,10 +619,12 @@ func (s *Server) DeployKumbhaSession(c *gin.Context) {
 		ports = s.detectKumbhaPorts(c.Request.Context(), sess.ProjectID, imageRef)
 	}
 	if status, body := validatePorts(ports); status != 0 {
+		s.recordDeployOutcome(c.Request.Context(), sessionID, errorFromBody(body))
 		c.JSON(status, body)
 		return
 	}
 	if status, body := validateStorageGB(req.StorageGB); status != 0 {
+		s.recordDeployOutcome(c.Request.Context(), sessionID, errorFromBody(body))
 		c.JSON(status, body)
 		return
 	}
@@ -579,6 +645,7 @@ func (s *Server) DeployKumbhaSession(c *gin.Context) {
 	}
 	createStatus, createBody := s.invokeInternally(s.CreateInstance, http.MethodPost, "/v1/compute/instances", nil, accountID, projectID, userID, createReq)
 	if createStatus != http.StatusCreated {
+		s.recordDeployOutcome(c.Request.Context(), sessionID, errorFromJSONBody(createBody))
 		// CreateInstance's own error already explains a payment gate,
 		// invalid ports, or GPU/home capacity far better than a generic
 		// message here would — surfaced verbatim rather than re-worded.
@@ -617,6 +684,7 @@ func (s *Server) DeployKumbhaSession(c *gin.Context) {
 	}
 
 	s.triggerScreenshotCapture(sessionID, sess, created.Endpoint)
+	s.recordDeployOutcome(c.Request.Context(), sessionID, "")
 
 	c.JSON(http.StatusOK, gin.H{
 		"image_ref":      imageRef,
@@ -706,17 +774,25 @@ func (s *Server) redeployKumbhaInstance(c *gin.Context, sessionID uuid.UUID, ses
 
 	result, err := s.cluster.UpdateInstance(c.Request.Context(), scopeFor(projectID), spec)
 	if err != nil {
-		if errors.Is(err, cluster.ErrNotFound) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "this session's previously deployed instance no longer exists in the cluster"})
-			return
+		var errMsg string
+		switch {
+		case errors.Is(err, cluster.ErrNotFound):
+			errMsg = "this session's previously deployed instance no longer exists in the cluster"
+			c.JSON(http.StatusNotFound, gin.H{"error": errMsg})
+		case errors.Is(err, cluster.ErrClusterUnavailable):
+			errMsg = "no GPU capacity is reachable right now; the existing instance is unaffected"
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": errMsg})
+		default:
+			errMsg = fmt.Sprintf("failed to redeploy instance: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsg})
 		}
-		if errors.Is(err, cluster.ErrClusterUnavailable) {
-			c.JSON(http.StatusServiceUnavailable, gin.H{
-				"error": "no GPU capacity is reachable right now; the existing instance is unaffected",
-			})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to redeploy instance: %v", err)})
+		// The PREVIOUS image is still running unaffected (UpdateInstance
+		// failing never tears down what was already there) — this only
+		// records that the LATEST attempt failed, matching what the
+		// "Failed" status on the console's build list is actually meant
+		// to mean: not "nothing is running", but "your last action here
+		// didn't work".
+		s.recordDeployOutcome(c.Request.Context(), sessionID, errMsg)
 		return
 	}
 
@@ -738,6 +814,7 @@ func (s *Server) redeployKumbhaInstance(c *gin.Context, sessionID uuid.UUID, ses
 	}
 
 	s.triggerScreenshotCapture(sessionID, sess, existing.Endpoint)
+	s.recordDeployOutcome(c.Request.Context(), sessionID, "")
 
 	c.JSON(http.StatusOK, gin.H{
 		"image_ref":   imageRef,
@@ -851,26 +928,48 @@ func (s *Server) GetKumbhaSession(c *gin.Context) {
 	}
 
 	resp := kumbhaSessionResponse(sess)
+	s.enrichKumbhaAgentRunning(c.Request.Context(), resp, sess)
+	s.enrichKumbhaAppStatus(c.Request.Context(), resp, sess, projectID)
 
-	// Live agent status, not the "was one ever launched and never torn
-	// down" proxy the shared response defaults to. Best-effort: a cluster
-	// read failure degrades to the cheap proxy already in resp rather than
-	// failing the whole session read over a UI nicety.
-	if sess.AgentInstanceID != "" {
-		if running, err := s.kumbha.IsAgentRunning(c.Request.Context(), sess); err == nil {
-			resp["agent_running"] = running
-		}
+	c.JSON(http.StatusOK, resp)
+}
+
+// enrichKumbhaAgentRunning replaces the cheap "was one ever launched and
+// never torn down" agent_running proxy with a live cluster read — cheap
+// enough (an in-memory cache lookup in agent-mode topology, the actual
+// production one) to run on every session in ListKumbhaSessions too, not
+// only the single-session GetKumbhaSession read; both call this. Found
+// live 2026-08-29: the cheap proxy alone left the "Previous builds" list
+// showing an animated, ongoing-looking "Building" status for a session
+// whose agent had long since finished.
+func (s *Server) enrichKumbhaAgentRunning(ctx context.Context, resp gin.H, sess *kumbha.Session) {
+	if sess.AgentInstanceID == "" {
+		return
 	}
+	if running, err := s.kumbha.IsAgentRunning(ctx, sess); err == nil {
+		resp["agent_running"] = running
+	}
+}
 
-	// The deployed app's own live status — "pending"/"running"/"failed"/
-	// "terminated", cluster's own vocabulary (see compute.Status* and
-	// statusToInstance) — is what actually answers "did the last deploy
-	// work", which agent_running alone cannot: the agent can finish (or
-	// never have been running this whole time, on a page reload) while
-	// the app it deployed is crash-looping. Empty when no deploy has
-	// happened yet, or the read failed — never guessed.
+// enrichKumbhaAppStatus adds the deployed app's own live status —
+// "pending"/"running"/"failed"/"terminated", cluster's own vocabulary
+// (see compute.Status* and statusToInstance), plus its endpoint — to an
+// already-built kumbhaSessionResponse. This is what actually answers "did
+// the last deploy work", which agent_running alone cannot: the agent can
+// finish (or never have been running this whole time, on a page reload)
+// while the app it deployed is crash-looping. Empty when no deploy has
+// happened yet, or the read failed — never guessed.
+//
+// Deliberately called ONLY from GetKumbhaSession, not
+// ListKumbhaSessions: a per-row live cluster read for every session in a
+// list, on every poll, is a cost that list deliberately does not pay
+// (see build/page.tsx's own SessionStatusPill comment) — the list shows
+// "Deployed" (has shipped at least once) rather than this endpoint's
+// finer running/failed distinction, which stays specific to the detail
+// page a customer has actually opened.
+func (s *Server) enrichKumbhaAppStatus(ctx context.Context, resp gin.H, sess *kumbha.Session, projectID uuid.UUID) {
 	if sess.AppInstanceID != "" && s.cluster != nil {
-		if st, err := s.cluster.GetInstanceStatus(c.Request.Context(), scopeFor(projectID), sess.AppInstanceID); err == nil {
+		if st, err := s.cluster.GetInstanceStatus(ctx, scopeFor(projectID), sess.AppInstanceID); err == nil {
 			resp["app_status"] = st.Status
 			resp["app_status_message"] = st.Message
 			// The endpoint comes from the STORED record (same resolution
@@ -882,14 +981,12 @@ func (s *Server) GetKumbhaSession(c *gin.Context) {
 			// resolveEndpoint's own doc comment (found live 2026-08-29).
 			var record *compute.InstanceRecord
 			if s.store != nil {
-				record, _ = s.store.Get(c.Request.Context(), sess.AppInstanceID)
+				record, _ = s.store.Get(ctx, sess.AppInstanceID)
 			}
 			endpoint, _, _, _ := resolveEndpoint(record, s.endpointDomain)
 			resp["app_endpoint"] = endpoint
 		}
 	}
-
-	c.JSON(http.StatusOK, resp)
 }
 
 // ApproveKumbhaDeploy flips a session's pre-deploy cost-approval gate.
@@ -1212,8 +1309,14 @@ type sendKumbhaMessageRequest struct {
 // session's initial prompt. Gateway.DeliverMessage decides whether that
 // reaches the SAME still-running agent process (queued for its own poll
 // loop, full conversation memory intact) or launches a fresh one (the
-// previous pod already exited) — see its own doc comment for why the
-// latter is an honest, bounded degradation rather than real persistence.
+// previous pod already exited, whether from its own idle timeout or an
+// explicit Stop) — see its own doc comment for why the latter is an
+// honest, bounded degradation rather than real persistence. Deliberately
+// NOT gated on session.Status any more: there is no longer a customer
+// action that puts a session into a state where sending a message should
+// be refused (see StopKumbhaAgent's own doc comment on why Close was
+// removed) — a session that genuinely no longer exists 404s from
+// GetSession below either way.
 // POST /v1/kumbha/sessions/:id/messages
 func (s *Server) SendKumbhaMessage(c *gin.Context) {
 	if s.kumbha == nil {
@@ -1247,11 +1350,6 @@ func (s *Server) SendKumbhaMessage(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	if sess.Status != "open" {
-		c.JSON(http.StatusConflict, gin.H{"error": "session is closed", "code": "session_closed"})
-		return
-	}
-
 	relaunched, err := s.kumbha.DeliverMessage(c.Request.Context(), sess, req.Content)
 	if err != nil {
 		switch {

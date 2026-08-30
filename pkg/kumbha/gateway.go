@@ -59,6 +59,12 @@ var (
 	// caller can tell "not available on this deployment" from "briefly
 	// failed, maybe retry".
 	ErrAgentNotConfigured = errors.New("kumbha agent is not configured on this deployment")
+	// ErrAgentNotRunning means StopAgent was called on a session with no
+	// live agent pod — nothing to interrupt. Distinct from
+	// ErrAgentNotConfigured (no agent capability at all) so the HTTP layer
+	// can return a clear "nothing running" 409 rather than a confusing
+	// "not available on this deployment".
+	ErrAgentNotRunning = errors.New("no agent is currently running for this session")
 )
 
 // Gateway is the Kumbha Gateway's business logic — the request lifecycle
@@ -245,6 +251,12 @@ func (g *Gateway) SaveScreenshot(ctx context.Context, sessionID uuid.UUID, png [
 	return g.store.SaveScreenshot(ctx, sessionID, png)
 }
 
+// SetLastDeployStatus records the outcome of a session's most recent
+// build/deploy attempt — see Store.SetLastDeployStatus.
+func (g *Gateway) SetLastDeployStatus(ctx context.Context, sessionID uuid.UUID, errMsg string) error {
+	return g.store.SetLastDeployStatus(ctx, sessionID, errMsg)
+}
+
 // Screenshot returns a session's most recently captured screenshot,
 // scoped to the owning account — see Store.GetScreenshot.
 func (g *Gateway) Screenshot(ctx context.Context, sessionID, accountID uuid.UUID) ([]byte, time.Time, error) {
@@ -302,10 +314,12 @@ func (g *Gateway) Complete(ctx context.Context, sess *Session, req inference.Req
 		return nil, err
 	}
 
+	start := time.Now()
 	resp, err := route.Provider.Complete(ctx, req)
 	if err != nil {
 		return nil, err
 	}
+	end := time.Now()
 
 	cost := g.cost(ctx, resp.Usage)
 
@@ -320,6 +334,34 @@ func (g *Gateway) Complete(ctx context.Context, sess *Session, req inference.Req
 		return nil, fmt.Errorf("completion served but accrual failed: %w", err)
 	}
 
+	// Settled immediately, per completion — not batched until the session
+	// closes. Billing is metered per-token already; there is no reason a
+	// customer's ability to keep chatting (and thus keep building) should
+	// depend on an explicit "close this session" action, and batching to
+	// Close meant a session that was simply abandoned (never explicitly
+	// closed) left its spend sitting unrecorded in usage_records
+	// indefinitely. See CloseSession's own doc comment for what it does
+	// instead now (pull down its own agent pod only — settlement no
+	// longer happens there at all, so a session's `spent` counter and its
+	// invoice-visible cost never diverge). Best-effort in the sense that a
+	// settlement failure surfaces to the CALLER (so the customer sees it,
+	// same as an accrual failure) but the tokens were already genuinely
+	// spent upstream either way.
+	inRate := g.pricing.LLMPriceInputPerMillion(ctx)
+	outRate := g.pricing.LLMPriceOutputPerMillion(ctx)
+	var settleErrs []error
+	if resp.Usage.InputTokens > 0 {
+		settleErrs = append(settleErrs, g.settleLine(ctx, sess, req.Model+":input", route.ProviderName,
+			float64(resp.Usage.InputTokens), float64(resp.Usage.InputTokens)/1e6*inRate, start, end))
+	}
+	if resp.Usage.OutputTokens > 0 {
+		settleErrs = append(settleErrs, g.settleLine(ctx, sess, req.Model+":output", route.ProviderName,
+			float64(resp.Usage.OutputTokens), float64(resp.Usage.OutputTokens)/1e6*outRate, start, end))
+	}
+	if err := errors.Join(settleErrs...); err != nil {
+		return nil, fmt.Errorf("completion served but settlement failed: %w", err)
+	}
+
 	return &CompletionResult{Response: resp, Cost: cost, Spent: newSpent, Budget: sess.Budget}, nil
 }
 
@@ -330,44 +372,23 @@ func (g *Gateway) cost(ctx context.Context, usage inference.Usage) float64 {
 	return float64(usage.InputTokens)/1e6*inRate + float64(usage.OutputTokens)/1e6*outRate
 }
 
-// CloseSession ends an open session and settles its ledger: one
-// usage_records row per (route, direction) — "kumbha/fast:input",
-// "kumbha/fast:output", and so on for every route the session touched —
-// each immediately drawn against the account's credit balance via the
-// existing ConsumeCredit path. This is what turns a session's running
-// `spent` counter into an invoice-visible, credit-consuming fact; before
-// this runs, spend exists only inside the session row.
+// CloseSession marks a session closed and tears down its agent pod.
 //
-// Best-effort per line: one route's ledger write failing must not lose
-// the others — each is independent money, and losing one is a smaller
-// failure than losing all of them because one had a transient DB error.
-// Errors are collected and returned together so nothing is silently
-// dropped.
+// No longer settles any billing — Complete() settles every completion's
+// cost into usage_records IMMEDIATELY as it happens (see its own doc
+// comment on why: a customer's ability to keep chatting must not depend
+// on an explicit close, and batching settlement to Close left an
+// abandoned-but-never-closed session's spend sitting unrecorded
+// indefinitely). Settling AGAIN here from RouteUsage's cumulative totals
+// would double-charge the account for everything Complete() already
+// settled. This is now purely internal bookkeeping — there is no
+// customer-facing "Close session" action any more; the only caller is
+// DeleteSessions' own stop-then-delete step, closing a still-open session
+// immediately before removing its row.
 func (g *Gateway) CloseSession(ctx context.Context, id, accountID uuid.UUID, reason string) (*Session, error) {
 	sess, err := g.store.Close(ctx, id, accountID, reason)
 	if err != nil {
 		return nil, err
-	}
-
-	usage, err := g.store.RouteUsage(ctx, id)
-	if err != nil {
-		return sess, fmt.Errorf("session closed but its usage could not be loaded for settlement: %w", err)
-	}
-
-	inRate := g.pricing.LLMPriceInputPerMillion(ctx)
-	outRate := g.pricing.LLMPriceOutputPerMillion(ctx)
-	now := time.Now()
-
-	var settleErrs []error
-	for _, u := range usage {
-		if u.InputTokens > 0 {
-			settleErrs = append(settleErrs, g.settleLine(ctx, sess, u.Route+":input", u.Provider,
-				float64(u.InputTokens), float64(u.InputTokens)/1e6*inRate, now))
-		}
-		if u.OutputTokens > 0 {
-			settleErrs = append(settleErrs, g.settleLine(ctx, sess, u.Route+":output", u.Provider,
-				float64(u.OutputTokens), float64(u.OutputTokens)/1e6*outRate, now))
-		}
 	}
 
 	// The agent pod is Kumbha's own workload (see LaunchAgent's doc
@@ -376,16 +397,53 @@ func (g *Gateway) CloseSession(ctx context.Context, id, accountID uuid.UUID, rea
 	// manages it either way.
 	if sess.AgentInstanceID != "" && g.cluster != nil {
 		if err := g.cluster.DeleteInstance(ctx, cluster.ProjectScope(sess.ProjectID.String()), sess.AgentInstanceID); err != nil {
-			settleErrs = append(settleErrs, fmt.Errorf("failed to tear down agent pod %s: %w", sess.AgentInstanceID, err))
+			return sess, fmt.Errorf("failed to tear down agent pod %s: %w", sess.AgentInstanceID, err)
 		}
 	}
 
-	return sess, errors.Join(settleErrs...)
+	return sess, nil
+}
+
+// StopAgent interrupts a session's currently-running agent pod immediately
+// — the "Stop" action (replaces the old "Close session" button, which
+// bundled an unrelated permanent chat-block into what was really just
+// "I want this run to stop"). Deliberately a hard kill, not a graceful
+// mid-turn pause: openhands-sdk exposes no confirmed public API for
+// cleanly cancelling an in-flight conversation step (see
+// deploy/kumbha-agent/run.py's own flagged uncertainty about this SDK's
+// exact surface elsewhere), and guessing at one here would repeat exactly
+// the class of mistake this codebase has been careful to avoid throughout
+// Kumbha's build-out. Whatever the agent had written to the workspace
+// (PVC) up to the moment of the kill is kept — DeliverMessage's own
+// relaunch path already handles resuming from there with a fresh agent
+// turn, the same as when a pod exits on its own idle timeout. The session
+// itself is left "open": nothing about Stop should block a later message.
+func (g *Gateway) StopAgent(ctx context.Context, sess *Session) error {
+	if g.cluster == nil {
+		return ErrAgentNotConfigured
+	}
+	// No agent pod ever recorded on this session is exactly as "nothing
+	// running to interrupt" as one that was recorded but has since
+	// exited — both are ErrAgentNotRunning, not ErrAgentNotConfigured
+	// (reserved for "this platform has no agent capability at all").
+	// isAgentRunning already treats sess.AgentInstanceID == "" as false
+	// with no error, so this short-circuit just skips a redundant call.
+	if sess.AgentInstanceID == "" {
+		return ErrAgentNotRunning
+	}
+	running, err := g.isAgentRunning(ctx, sess)
+	if err != nil {
+		return fmt.Errorf("failed to check agent status: %w", err)
+	}
+	if !running {
+		return ErrAgentNotRunning
+	}
+	return g.cluster.DeleteInstance(ctx, cluster.ProjectScope(sess.ProjectID.String()), sess.AgentInstanceID)
 }
 
 // settleLine writes one usage_records row for a session's (route,
 // direction) and draws it down against the account's credits.
-func (g *Gateway) settleLine(ctx context.Context, sess *Session, resourceType, provider string, quantity, totalCost float64, now time.Time) error {
+func (g *Gateway) settleLine(ctx context.Context, sess *Session, resourceType, provider string, quantity, totalCost float64, start, end time.Time) error {
 	record := &billing.UsageRecord{
 		AccountID:    sess.AccountID,
 		ProjectID:    sess.ProjectID,
@@ -396,8 +454,8 @@ func (g *Gateway) settleLine(ctx context.Context, sess *Session, resourceType, p
 		Unit:         "tokens",
 		TotalCost:    totalCost,
 		Provider:     provider,
-		StartTime:    sess.StartedAt,
-		EndTime:      now,
+		StartTime:    start,
+		EndTime:      end,
 	}
 	if quantity > 0 {
 		record.UnitPrice = totalCost / quantity * 1e6 // back into a per-million rate for display
