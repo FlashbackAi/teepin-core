@@ -60,6 +60,36 @@ func TestCreate_PersistsGPUInstance(t *testing.T) {
 	}
 }
 
+// TestCreate_NilUserIDStoresNull proves a credential with no attributable
+// human user (a Kumbha session token, a project API key — both leave
+// InstanceRecord.UserID at uuid.Nil) inserts SQL NULL for user_id rather
+// than the literal all-zeros UUID, which would violate
+// instances_user_id_fkey (no user row has that id). Regression test for
+// the live bug fixed by migration 031 + nullUUID.
+func TestCreate_NilUserIDStoresNull(t *testing.T) {
+	store, mock := newMockStore(t)
+	accountID, projectID := uuid.New(), uuid.New()
+
+	mock.ExpectQuery(`INSERT INTO compute\.instances`).
+		WithArgs("inst-noattr001", accountID, projectID, nil, "web", "nginx:latest",
+			"", StatusPending, nil, 2, 4, nil, "web-abcde", "default", nil, nil, nil, nil, false, false, nil, 0).
+		WillReturnRows(sqlmock.NewRows([]string{"created_at", "updated_at"}).
+			AddRow(time.Now(), time.Now()))
+
+	rec := &InstanceRecord{
+		ID: "inst-noattr001", AccountID: accountID, ProjectID: projectID, UserID: uuid.Nil,
+		Name: "web", Image: "nginx:latest", Status: StatusPending,
+		CPUUnits: 2, MemoryGB: 4, K8sPodName: "web-abcde", K8sNamespace: "default",
+	}
+
+	if err := store.Create(context.Background(), rec); err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
 func TestCreate_CPUInstanceStoresNullVRAM(t *testing.T) {
 	store, mock := newMockStore(t)
 	accountID, projectID, userID := uuid.New(), uuid.New(), uuid.New()

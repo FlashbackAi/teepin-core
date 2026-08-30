@@ -181,7 +181,16 @@ func (m *Middleware) authenticate(c *gin.Context) *Principal {
 
 // store publishes the principal into the request context.
 func store(c *gin.Context, p *Principal) {
-	c.Set(string(UserIDKey), p.UserID)
+	// Guarded like every other field below: a Kumbha session token
+	// (auth.MintSessionToken) never sets Claims.UserID, leaving it at the
+	// zero value. Setting the key unconditionally made GetUserID report
+	// "present" (ok=true) with value uuid.Nil for such a credential,
+	// which GetCurrentUser (auth_handlers.go) would have accepted as a
+	// real, if nonexistent, user rather than correctly treating it as
+	// "no user on this credential."
+	if p.UserID != uuid.Nil {
+		c.Set(string(UserIDKey), p.UserID)
+	}
 	if p.AccountID != uuid.Nil {
 		c.Set(string(AccountIDKey), p.AccountID)
 	}

@@ -89,8 +89,30 @@ type teepinClient struct {
 	baseURL   string
 	token     string
 	sessionID string
-	http      *http.Client
+	// http is used for every fast call (present_deployment_plan,
+	// create_instance, attach_domain, the deploy_approved check) — a
+	// short ceiling so a genuinely hung request fails quickly rather than
+	// stalling the agent indefinitely.
+	http *http.Client
+	// slowHTTP is used ONLY by deploy, which synchronously runs a full
+	// Kaniko build server-side (buildKumbhaImage) before even attempting
+	// the actual instance create/redeploy step — allowed up to
+	// build.DefaultConfig().Timeout (15 minutes) on the control plane.
+	// Sharing http's short ceiling here meant any real build taking
+	// longer than it (the ordinary case, not an edge one — a base image
+	// pull plus a real layer build routinely runs well past 30s) tripped
+	// the CLIENT's timeout and reported a false "deploy failed" while the
+	// build was often still running — and, worse, might well have gone on
+	// to succeed on the control plane a moment later with no way for the
+	// agent to ever learn that. Found live 2026-08-30.
+	slowHTTP *http.Client
 }
+
+// deployHTTPTimeout comfortably exceeds build.DefaultConfig().Timeout (15
+// minutes) plus the subsequent create/redeploy step's own time — long
+// enough that a timeout here means the deploy is genuinely stuck, not
+// merely a build that is still legitimately in progress.
+const deployHTTPTimeout = 18 * time.Minute
 
 func newTeepinClient() (*teepinClient, error) {
 	baseURL := os.Getenv("TEEPIN_API_BASE_URL")
@@ -104,12 +126,23 @@ func newTeepinClient() (*teepinClient, error) {
 		token:     token,
 		sessionID: sessionID,
 		http:      &http.Client{Timeout: 30 * time.Second},
+		slowHTTP:  &http.Client{Timeout: deployHTTPTimeout},
 	}, nil
 }
 
-// doJSON calls the control plane and decodes a JSON response. body may be
-// nil (GET); out may be nil (no response body expected).
+// doJSON calls the control plane and decodes a JSON response, using the
+// fast (30s) client. body may be nil (GET); out may be nil (no response
+// body expected).
 func (c *teepinClient) doJSON(ctx context.Context, method, path string, body, out any) error {
+	return c.doJSONWithClient(ctx, c.http, method, path, body, out)
+}
+
+// doJSONSlow is doJSON via slowHTTP — deploy's own long-running call.
+func (c *teepinClient) doJSONSlow(ctx context.Context, method, path string, body, out any) error {
+	return c.doJSONWithClient(ctx, c.slowHTTP, method, path, body, out)
+}
+
+func (c *teepinClient) doJSONWithClient(ctx context.Context, client *http.Client, method, path string, body, out any) error {
 	var reqBody io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -128,7 +161,7 @@ func (c *teepinClient) doJSON(ctx context.Context, method, path string, body, ou
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	resp, err := c.http.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("call %s %s: %w", method, path, err)
 	}
@@ -425,7 +458,10 @@ func (c *teepinClient) deploy(ctx context.Context, req *mcp.CallToolRequest, arg
 		Status       string  `json:"status"`
 		PricePerHour float64 `json:"price_per_hour"`
 	}
-	deployErr := c.doJSON(ctx, http.MethodPost, "/v1/kumbha/sessions/"+c.sessionID+"/deploy", body, &deployed)
+	// doJSONSlow, not doJSON: this request triggers a real Kaniko build
+	// server-side before the control plane even responds — see slowHTTP's
+	// own doc comment.
+	deployErr := c.doJSONSlow(ctx, http.MethodPost, "/v1/kumbha/sessions/"+c.sessionID+"/deploy", body, &deployed)
 	if deployErr != nil {
 		if isNotAvailable(deployErr) {
 			// Deliberately worded as a DEAD END, not a hint to try something

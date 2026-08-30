@@ -117,7 +117,7 @@ func (s *Store) Create(ctx context.Context, rec *InstanceRecord) error {
 	}
 
 	err := s.db.QueryRowContext(ctx, query,
-		rec.ID, rec.AccountID, rec.ProjectID, rec.UserID, rec.Name, rec.Image,
+		rec.ID, rec.AccountID, rec.ProjectID, nullUUID(rec.UserID), rec.Name, rec.Image,
 		rec.InstanceType, rec.Status, vram, rec.CPUUnits, rec.MemoryGB,
 		nullIfEmpty(rec.Endpoint), nullIfEmpty(rec.K8sPodName), rec.K8sNamespace,
 		nullIfEmpty(rec.ProviderID), nullIfEmpty(rec.NodeName),
@@ -320,4 +320,17 @@ func nullIfEmpty(s string) sql.NullString {
 		return sql.NullString{}
 	}
 	return sql.NullString{String: s, Valid: true}
+}
+
+// nullUUID converts the zero UUID into SQL NULL. A credential with no
+// attributable human user — a Kumbha session token (auth.MintSessionToken
+// never sets Claims.UserID) or a project API key — carries uuid.Nil for
+// UserID; inserting that literal all-zeros value violated
+// instances_user_id_fkey, since no user row has that id (see migration
+// 031, which also makes the column nullable to receive this).
+func nullUUID(id uuid.UUID) any {
+	if id == uuid.Nil {
+		return nil
+	}
+	return id
 }

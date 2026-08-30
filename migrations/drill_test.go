@@ -65,6 +65,19 @@ func columnExists(t *testing.T, db *sql.DB, schema, table, col string) bool {
 	return exists
 }
 
+func columnNullable(t *testing.T, db *sql.DB, schema, table, col string) bool {
+	t.Helper()
+	var nullable string
+	err := db.QueryRow(`
+		SELECT is_nullable FROM information_schema.columns
+		WHERE table_schema = $1 AND table_name = $2 AND column_name = $3
+	`, schema, table, col).Scan(&nullable)
+	if err != nil {
+		t.Fatalf("check nullability %s.%s.%s: %v", schema, table, col, err)
+	}
+	return nullable == "YES"
+}
+
 // TestArchivabilityDrill proves the home-compute pilot removes cleanly:
 // full up → nodes objects exist → down one → they are gone AND the rest of
 // the schema is intact → up again → they are back. This is the "flag off +
@@ -691,4 +704,41 @@ func TestArchivabilityDrill030(t *testing.T) {
 		t.Fatalf("re-up: %v", err)
 	}
 	t.Log("archivability drill passed: 030 applies, reverts cleanly, and re-applies")
+}
+
+// TestArchivabilityDrill031 proves compute.instances.user_id becoming
+// nullable (031) is reversible, and that compute.instances itself survives
+// the round trip.
+func TestArchivabilityDrill031(t *testing.T) {
+	dsn := os.Getenv("TEEPIN_DRILL_DSN")
+	if dsn == "" {
+		t.Skip("set TEEPIN_DRILL_DSN to run the migration drill")
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("initial up: %v", err)
+	}
+	if !columnNullable(t, db, "compute", "instances", "user_id") {
+		t.Fatal("after up: compute.instances.user_id is still NOT NULL")
+	}
+
+	if err := migrator(t, db).Migrate(30); err != nil {
+		t.Fatalf("migrate down to 030: %v", err)
+	}
+	if columnNullable(t, db, "compute", "instances", "user_id") {
+		t.Error("after down: compute.instances.user_id is still nullable")
+	}
+	if !tableExists(t, db, "compute", "instances") {
+		t.Error("after down: compute.instances was wrongly removed")
+	}
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("re-up: %v", err)
+	}
+	t.Log("archivability drill passed: 031 applies, reverts cleanly, and re-applies")
 }

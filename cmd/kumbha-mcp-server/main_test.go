@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -26,6 +27,7 @@ func newTestClient(t *testing.T, mux *http.ServeMux) *teepinClient {
 		token:     "test-session-token",
 		sessionID: "sess-test",
 		http:      srv.Client(),
+		slowHTTP:  srv.Client(),
 	}
 }
 
@@ -303,6 +305,51 @@ func TestDeploy_Approved_BuildsAndCreatesInstance(t *testing.T) {
 	text := result.Content[0].(*mcp.TextContent).Text
 	if !strings.Contains(text, "inst-xyz789") || !strings.Contains(text, "teepin-app-abc123") {
 		t.Errorf("got %q, want the built image ref and the created instance id", text)
+	}
+}
+
+// TestDeploy_UsesSlowHTTPClientNotTheFastOnesShortTimeout is the
+// regression test for a real live bug (found 2026-08-30): deploy
+// triggers a full Kaniko build server-side before the control plane even
+// responds (up to build.DefaultConfig().Timeout, 15 minutes), but this
+// tool's HTTP call was sharing the SAME client every fast, non-building
+// tool uses (a 30s ceiling) — any real build taking longer than that (the
+// ordinary case) tripped the CLIENT's own timeout and reported a false
+// "deploy failed" while the build was often still genuinely in progress
+// server-side. Proven here by handing the client a fast HTTP client whose
+// timeout is far shorter than the handler's own delay, and a separate
+// slow one with none — deploy must succeed via the slow one regardless.
+func TestDeploy_UsesSlowHTTPClientNotTheFastOnesShortTimeout(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/kumbha/sessions/sess-test", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"deploy_approved":true}`))
+	})
+	mux.HandleFunc("/v1/kumbha/sessions/sess-test/deploy", func(w http.ResponseWriter, r *http.Request) {
+		// Simulate a slow-but-real Kaniko build: response headers don't
+		// arrive until after the FAST client's own timeout would already
+		// have expired.
+		time.Sleep(60 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"image_ref":"img:v1","instance_id":"inst-slow1","status":"running","endpoint":"https://inst-slow1.teepin.com","price_per_hour":0.1}`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := &teepinClient{
+		baseURL:   srv.URL,
+		token:     "test-session-token",
+		sessionID: "sess-test",
+		http:      &http.Client{Timeout: 20 * time.Millisecond}, // deliberately shorter than the handler's delay
+		slowHTTP:  srv.Client(),                                 // no artificial ceiling, like deployHTTPTimeout in production
+	}
+
+	result, _, err := c.deploy(context.Background(), &mcp.CallToolRequest{}, deployArgs{Name: "app"})
+	if err != nil {
+		t.Fatalf("deploy: %v — want it to succeed via slowHTTP even though the fast client's own timeout is far shorter than the handler's delay", err)
+	}
+	text := result.Content[0].(*mcp.TextContent).Text
+	if !strings.Contains(text, "inst-slow1") {
+		t.Errorf("got %q, want the created instance id", text)
 	}
 }
 

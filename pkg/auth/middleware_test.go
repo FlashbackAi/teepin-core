@@ -163,6 +163,35 @@ func TestAuthenticate_SessionTokenForOpenSession(t *testing.T) {
 	}
 }
 
+// A session token never carries a UserID (MintSessionToken doesn't set
+// Claims.UserID, leaving it uuid.Nil). GetUserID must report "absent"
+// (ok=false) for such a request, not "present with value uuid.Nil" — the
+// latter let a zero UUID reach compute.Store.Create as a literal value and
+// violate instances_user_id_fkey (fixed alongside migration 031).
+func TestAuthenticate_SessionTokenLeavesUserIDAbsent(t *testing.T) {
+	svc, _ := newMockService(t)
+	m := NewMiddleware(svc, "test-secret").WithSessionChecker(fakeSessionChecker{open: true})
+
+	accountID, projectID, sessionID := uuid.New(), uuid.New(), uuid.New()
+	token, err := MintSessionToken(accountID, projectID, sessionID, time.Hour, "test-secret")
+	if err != nil {
+		t.Fatalf("MintSessionToken: %v", err)
+	}
+
+	c := newTestContext(t)
+	c.Request.Header.Set("Authorization", "Bearer "+token)
+
+	p := m.authenticate(c)
+	if p == nil {
+		t.Fatal("authenticate returned nil for a session token whose session is open")
+	}
+	store(c, p)
+
+	if userID, ok := GetUserID(c); ok {
+		t.Errorf("GetUserID = (%s, true), want ok=false for a session token (no attributable user)", userID)
+	}
+}
+
 // The single most important negative case: a session token must stop
 // authenticating the instant its session closes — not just at token
 // expiry. This is what makes the credential revocable without a
