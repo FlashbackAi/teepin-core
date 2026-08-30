@@ -86,17 +86,22 @@ type Snapshot struct {
 	ByteSize  int64           `json:"byte_size"`
 	CreatedBy CreatedBy       `json:"created_by"`
 	CreatedAt time.Time       `json:"created_at"`
-	// IsCheckpoint on the CURRENT version (what GetCurrentVersion returns)
-	// means nothing has changed since the last successful deploy: a
-	// deploy checkpoints the version it built (CheckpointCurrentVersion),
-	// and SaveVersion only ever mutates a row IN PLACE while it is still
-	// a draft — the moment it's checkpointed, the next write (agent or
-	// customer) creates a NEW, un-checkpointed row instead. So "the
-	// current version is already a checkpoint" and "the current content
-	// is byte-for-byte what's already running" are the same fact. The
-	// console's Deploy button reads this to disable itself when a click
-	// would rebuild and redeploy something that isn't actually different.
+	// IsCheckpoint means this version is worth showing in the customer-
+	// facing "Version history" list — true once a deploy has checkpointed
+	// it (CheckpointCurrentVersion), OR immediately for a customer's own
+	// edit-and-save (so it shows up right away, without waiting for a
+	// redeploy). It does NOT mean this content is currently running — see
+	// IsDeployed below, which used to be conflated with this field and
+	// broke live 2026-08-31: a customer save is checkpointed on arrival
+	// but had obviously never been deployed.
 	IsCheckpoint bool `json:"is_checkpoint"`
+	// IsDeployed means THIS version is byte-for-byte what CheckpointCurrentVersion
+	// last stamped as inference_sessions.last_deployed_version — i.e. a
+	// real successful deploy actually built and ran this exact content.
+	// This, not IsCheckpoint, is what the console's Deploy button reads to
+	// disable itself when a click would rebuild something that isn't
+	// actually different.
+	IsDeployed bool `json:"is_deployed"`
 }
 
 // VersionInfo is one entry in the history list — metadata only, no file
@@ -112,6 +117,16 @@ type VersionInfo struct {
 	// points to right now — the one a rollback would be a no-op on, and
 	// the one the console highlights as "live".
 	Current bool `json:"current"`
+	// IsDeployed marks the version inference_sessions.last_deployed_version
+	// points to — i.e. what a real successful deploy actually built and
+	// ran, as opposed to merely CreatedBy == agent (found live 2026-08-31:
+	// the console's history list showed every agent-authored row as
+	// "Deployed" and every customer row as "You", neither of which
+	// actually answers "was this one deployed" — an agent row IS always
+	// deploy-checkpointed, so that label happened to be right by
+	// coincidence, but a customer's saved-and-never-deployed edit had no
+	// way to be told apart from one that was later deployed).
+	IsDeployed bool `json:"is_deployed"`
 }
 
 var (
@@ -307,6 +322,17 @@ func (s *Store) SaveVersion(ctx context.Context, sessionID uuid.UUID, files []Wo
 // no-op (not an error) if there is nothing to checkpoint, or the current
 // version is already checkpointed — a redeploy of unchanged content must
 // not spuriously touch history.
+//
+// Also stamps last_deployed_version — deliberately unconditional, unlike
+// the is_checkpoint flip above: a CUSTOMER save is checkpointed the
+// instant it's saved (so it shows in History right away), which means
+// v.is_checkpoint is often already true here even though nothing has
+// actually been deployed yet. is_checkpoint answers "worth showing in
+// History"; last_deployed_version answers "is this exact content what's
+// currently running" — the Deploy button's own no-op guard needs the
+// second question, not the first (found live 2026-08-31: a customer
+// edited and saved, and Deploy immediately disabled itself with "already
+// deployed" for a version that had never been deployed).
 func (s *Store) CheckpointCurrentVersion(ctx context.Context, sessionID uuid.UUID) error {
 	if _, err := s.db.ExecContext(ctx, `
 		UPDATE billing.kumbha_workspace_versions v
@@ -316,6 +342,13 @@ func (s *Store) CheckpointCurrentVersion(ctx context.Context, sessionID uuid.UUI
 		  AND v.is_checkpoint = false
 	`, sessionID); err != nil {
 		return fmt.Errorf("failed to checkpoint current workspace version: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE billing.inference_sessions
+		SET last_deployed_version = current_workspace_version
+		WHERE id = $1
+	`, sessionID); err != nil {
+		return fmt.Errorf("failed to record last deployed version: %w", err)
 	}
 	return nil
 }
@@ -348,13 +381,21 @@ func (s *Store) getVersion(ctx context.Context, sessionID, accountID uuid.UUID, 
 	var snap Snapshot
 	var createdBy string
 
+	// COALESCE(..., false): last_deployed_version is NULL for every
+	// session that predates migration 033 (and for one that's never had a
+	// real deploy succeed yet) — v.version = NULL evaluates to SQL NULL,
+	// not false, which a non-nullable Go bool cannot Scan. Treating
+	// "we don't know if this was ever deployed" as false is also the
+	// correct, conservative default: it leaves the Deploy button enabled
+	// rather than incorrectly claiming something is already live.
 	err := s.db.QueryRowContext(ctx, `
-		SELECT v.version, v.files, v.skipped, v.file_count, v.byte_size, v.created_by, v.created_at, v.is_checkpoint
+		SELECT v.version, v.files, v.skipped, v.file_count, v.byte_size, v.created_by, v.created_at, v.is_checkpoint,
+		       COALESCE(v.version = s.last_deployed_version, false) AS is_deployed
 		FROM billing.kumbha_workspace_versions v
 		JOIN billing.inference_sessions s ON s.id = v.session_id
 		WHERE v.session_id = $1 AND s.account_id = $2 AND v.version = $3
 	`, sessionID, accountID, version).Scan(
-		&snap.Version, &filesJSON, &skippedJSON, &snap.FileCount, &snap.ByteSize, &createdBy, &snap.CreatedAt, &snap.IsCheckpoint)
+		&snap.Version, &filesJSON, &skippedJSON, &snap.FileCount, &snap.ByteSize, &createdBy, &snap.CreatedAt, &snap.IsCheckpoint, &snap.IsDeployed)
 	if err != nil {
 		// "No such version" and "not your session" land here identically
 		// (sql.ErrNoRows either way) — existence must not leak, same
@@ -379,9 +420,14 @@ func (s *Store) getVersion(ctx context.Context, sessionID, accountID uuid.UUID, 
 // not yet a meaningful rollback target, and showing it would reintroduce
 // the "one entry per file write" clutter this split exists to remove.
 func (s *Store) ListVersions(ctx context.Context, sessionID, accountID uuid.UUID) ([]VersionInfo, error) {
+	// COALESCE(..., false) on is_deployed: see getVersion's own comment —
+	// last_deployed_version is NULL for a session that predates migration
+	// 033 or has never had a real deploy succeed, and a bare comparison
+	// against NULL would fail this Scan rather than defaulting to false.
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT v.version, v.file_count, v.byte_size, v.created_by, v.created_at,
-		       v.version = s.current_workspace_version AS is_current
+		       v.version = s.current_workspace_version AS is_current,
+		       COALESCE(v.version = s.last_deployed_version, false) AS is_deployed
 		FROM billing.kumbha_workspace_versions v
 		JOIN billing.inference_sessions s ON s.id = v.session_id
 		WHERE v.session_id = $1 AND s.account_id = $2 AND v.is_checkpoint
@@ -403,7 +449,7 @@ func (s *Store) ListVersions(ctx context.Context, sessionID, accountID uuid.UUID
 	for rows.Next() {
 		var v VersionInfo
 		var createdBy string
-		if err := rows.Scan(&v.Version, &v.FileCount, &v.ByteSize, &createdBy, &v.CreatedAt, &v.Current); err != nil {
+		if err := rows.Scan(&v.Version, &v.FileCount, &v.ByteSize, &createdBy, &v.CreatedAt, &v.Current, &v.IsDeployed); err != nil {
 			return nil, fmt.Errorf("failed to scan workspace version: %w", err)
 		}
 		v.CreatedBy = CreatedBy(createdBy)

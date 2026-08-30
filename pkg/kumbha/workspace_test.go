@@ -334,6 +334,9 @@ func TestCheckpointCurrentVersion_FlipsOnlyTheCurrentDraft(t *testing.T) {
 	mock.ExpectExec(`UPDATE billing\.kumbha_workspace_versions v\s+SET is_checkpoint = true`).
 		WithArgs(sessionID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE billing\.inference_sessions\s+SET last_deployed_version = current_workspace_version`).
+		WithArgs(sessionID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	if err := store.CheckpointCurrentVersion(context.Background(), sessionID); err != nil {
 		t.Fatalf("CheckpointCurrentVersion: %v", err)
@@ -352,8 +355,8 @@ func TestGetCurrentVersion_ScopesToOwningAccountAndFollowsPointer(t *testing.T) 
 		WillReturnRows(sqlmock.NewRows([]string{"current_workspace_version"}).AddRow(3))
 	mock.ExpectQuery(`FROM billing\.kumbha_workspace_versions v`).
 		WithArgs(sessionID, accountID, 3).
-		WillReturnRows(sqlmock.NewRows([]string{"version", "files", "skipped", "file_count", "byte_size", "created_by", "created_at", "is_checkpoint"}).
-			AddRow(3, `[{"path":"a.txt","content":"hi"}]`, `[]`, 1, 2, "agent", time.Date(2026, 8, 25, 0, 0, 0, 0, time.UTC), true))
+		WillReturnRows(sqlmock.NewRows([]string{"version", "files", "skipped", "file_count", "byte_size", "created_by", "created_at", "is_checkpoint", "is_deployed"}).
+			AddRow(3, `[{"path":"a.txt","content":"hi"}]`, `[]`, 1, 2, "agent", time.Date(2026, 8, 25, 0, 0, 0, 0, time.UTC), true, true))
 
 	snap, err := store.GetCurrentVersion(context.Background(), sessionID, accountID)
 	if err != nil {
@@ -364,6 +367,42 @@ func TestGetCurrentVersion_ScopesToOwningAccountAndFollowsPointer(t *testing.T) 
 	}
 	if snap.CreatedBy != CreatedByAgent {
 		t.Errorf("got created_by %q, want %q", snap.CreatedBy, CreatedByAgent)
+	}
+}
+
+// TestGetCurrentVersion_CheckpointedButUndeployedCustomerSaveIsNotDeployed
+// is the regression test for a live 2026-08-31 incident: a customer
+// edited a file in the console IDE and saved. SaveVersion checkpoints a
+// customer save immediately (so it shows in History right away), but that
+// is NOT the same fact as "this content is running" — before this fix,
+// the console's Deploy button read is_checkpoint alone and disabled
+// itself with "Already deployed" for a version that had never been
+// deployed. is_deployed must stay false until a real deploy stamps
+// last_deployed_version, independent of is_checkpoint.
+func TestGetCurrentVersion_CheckpointedButUndeployedCustomerSaveIsNotDeployed(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessionID, accountID := uuid.New(), uuid.New()
+
+	mock.ExpectQuery(`SELECT current_workspace_version FROM billing\.inference_sessions`).
+		WithArgs(sessionID, accountID).
+		WillReturnRows(sqlmock.NewRows([]string{"current_workspace_version"}).AddRow(3))
+	mock.ExpectQuery(`FROM billing\.kumbha_workspace_versions v`).
+		WithArgs(sessionID, accountID, 3).
+		WillReturnRows(sqlmock.NewRows([]string{"version", "files", "skipped", "file_count", "byte_size", "created_by", "created_at", "is_checkpoint", "is_deployed"}).
+			// is_checkpoint=true (a customer save, checkpointed on arrival)
+			// but is_deployed=false (version 3 != last_deployed_version,
+			// still pointing at an earlier version — e.g. 1).
+			AddRow(3, `[{"path":"a.txt","content":"edited"}]`, `[]`, 1, 7, "customer", time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC), true, false))
+
+	snap, err := store.GetCurrentVersion(context.Background(), sessionID, accountID)
+	if err != nil {
+		t.Fatalf("GetCurrentVersion: %v", err)
+	}
+	if !snap.IsCheckpoint {
+		t.Error("IsCheckpoint = false, want true (a customer save is checkpointed on arrival)")
+	}
+	if snap.IsDeployed {
+		t.Error("IsDeployed = true, want false — this version has never actually been deployed")
 	}
 }
 
@@ -415,9 +454,9 @@ func TestListVersions_ReturnsNewestFirstWithCurrentFlagged(t *testing.T) {
 
 	mock.ExpectQuery(`FROM billing\.kumbha_workspace_versions v`).
 		WithArgs(sessionID, accountID).
-		WillReturnRows(sqlmock.NewRows([]string{"version", "file_count", "byte_size", "created_by", "created_at", "is_current"}).
-			AddRow(2, 3, 100, "customer", time.Date(2026, 8, 25, 1, 0, 0, 0, time.UTC), true).
-			AddRow(1, 3, 90, "agent", time.Date(2026, 8, 25, 0, 0, 0, 0, time.UTC), false))
+		WillReturnRows(sqlmock.NewRows([]string{"version", "file_count", "byte_size", "created_by", "created_at", "is_current", "is_deployed"}).
+			AddRow(2, 3, 100, "customer", time.Date(2026, 8, 25, 1, 0, 0, 0, time.UTC), true, false).
+			AddRow(1, 3, 90, "agent", time.Date(2026, 8, 25, 0, 0, 0, 0, time.UTC), false, true))
 
 	versions, err := store.ListVersions(context.Background(), sessionID, accountID)
 	if err != nil {

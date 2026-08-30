@@ -172,6 +172,7 @@ func (s *Server) GetKumbhaWorkspace(c *gin.Context) {
 		"created_by":    snap.CreatedBy,
 		"created_at":    snap.CreatedAt,
 		"is_checkpoint": snap.IsCheckpoint,
+		"is_deployed":   snap.IsDeployed,
 	})
 }
 

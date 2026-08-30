@@ -742,3 +742,77 @@ func TestArchivabilityDrill031(t *testing.T) {
 	}
 	t.Log("archivability drill passed: 031 applies, reverts cleanly, and re-applies")
 }
+
+// TestArchivabilityDrill032 proves compute.instances.kumbha_session_id
+// (032) is reversible, and that compute.instances itself survives the
+// round trip.
+func TestArchivabilityDrill032(t *testing.T) {
+	dsn := os.Getenv("TEEPIN_DRILL_DSN")
+	if dsn == "" {
+		t.Skip("set TEEPIN_DRILL_DSN to run the migration drill")
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("initial up: %v", err)
+	}
+	if !columnExists(t, db, "compute", "instances", "kumbha_session_id") {
+		t.Fatal("after up: compute.instances.kumbha_session_id missing")
+	}
+
+	if err := migrator(t, db).Migrate(31); err != nil {
+		t.Fatalf("migrate down to 031: %v", err)
+	}
+	if columnExists(t, db, "compute", "instances", "kumbha_session_id") {
+		t.Error("after down: compute.instances.kumbha_session_id still present")
+	}
+	if !tableExists(t, db, "compute", "instances") {
+		t.Error("after down: compute.instances was wrongly removed")
+	}
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("re-up: %v", err)
+	}
+	t.Log("archivability drill passed: 032 applies, reverts cleanly, and re-applies")
+}
+
+// TestArchivabilityDrill033 proves
+// inference_sessions.last_deployed_version (033) is reversible, and that
+// inference_sessions itself survives the round trip.
+func TestArchivabilityDrill033(t *testing.T) {
+	dsn := os.Getenv("TEEPIN_DRILL_DSN")
+	if dsn == "" {
+		t.Skip("set TEEPIN_DRILL_DSN to run the migration drill")
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("initial up: %v", err)
+	}
+	if !columnExists(t, db, "billing", "inference_sessions", "last_deployed_version") {
+		t.Fatal("after up: inference_sessions.last_deployed_version missing")
+	}
+
+	if err := migrator(t, db).Migrate(32); err != nil {
+		t.Fatalf("migrate down to 032: %v", err)
+	}
+	if columnExists(t, db, "billing", "inference_sessions", "last_deployed_version") {
+		t.Error("after down: inference_sessions.last_deployed_version still present")
+	}
+	if !tableExists(t, db, "billing", "inference_sessions") {
+		t.Error("after down: inference_sessions was wrongly removed")
+	}
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("re-up: %v", err)
+	}
+	t.Log("archivability drill passed: 033 applies, reverts cleanly, and re-applies")
+}

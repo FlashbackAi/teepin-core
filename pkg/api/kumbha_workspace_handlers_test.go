@@ -230,8 +230,8 @@ func TestGetKumbhaWorkspace_Success(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"current_workspace_version"}).AddRow(1))
 	mock.ExpectQuery(`FROM billing\.kumbha_workspace_versions v`).
 		WithArgs(sessionID, testAccountID, 1).
-		WillReturnRows(sqlmock.NewRows([]string{"version", "files", "skipped", "file_count", "byte_size", "created_by", "created_at", "is_checkpoint"}).
-			AddRow(1, `[{"path":"index.html","content":"<h1>hi</h1>"}]`, `[]`, 1, 11, "agent", time.Now(), true))
+		WillReturnRows(sqlmock.NewRows([]string{"version", "files", "skipped", "file_count", "byte_size", "created_by", "created_at", "is_checkpoint", "is_deployed"}).
+			AddRow(1, `[{"path":"index.html","content":"<h1>hi</h1>"}]`, `[]`, 1, 11, "agent", time.Now(), true, true))
 
 	w := kumbhaRequest(server.GetKumbhaWorkspace, http.MethodGet, "/v1/kumbha/sessions/"+sessionID.String()+"/workspace",
 		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, nil, nil)
@@ -262,9 +262,9 @@ func TestListKumbhaWorkspaceVersions_Success(t *testing.T) {
 	sessionID, projectID := uuid.New(), uuid.New()
 	mock.ExpectQuery(`FROM billing\.kumbha_workspace_versions v`).
 		WithArgs(sessionID, testAccountID).
-		WillReturnRows(sqlmock.NewRows([]string{"version", "file_count", "byte_size", "created_by", "created_at", "is_current"}).
-			AddRow(2, 1, 20, "customer", time.Now(), true).
-			AddRow(1, 1, 11, "agent", time.Now(), false))
+		WillReturnRows(sqlmock.NewRows([]string{"version", "file_count", "byte_size", "created_by", "created_at", "is_current", "is_deployed"}).
+			AddRow(2, 1, 20, "customer", time.Now(), true, false).
+			AddRow(1, 1, 11, "agent", time.Now(), false, true))
 
 	w := kumbhaRequest(server.ListKumbhaWorkspaceVersions, http.MethodGet, "/v1/kumbha/sessions/"+sessionID.String()+"/workspace/versions",
 		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, nil, nil)
@@ -327,8 +327,8 @@ func TestDownloadKumbhaWorkspace_StreamsAValidZip(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"current_workspace_version"}).AddRow(1))
 	mock.ExpectQuery(`FROM billing\.kumbha_workspace_versions v`).
 		WithArgs(sessionID, testAccountID, 1).
-		WillReturnRows(sqlmock.NewRows([]string{"version", "files", "skipped", "file_count", "byte_size", "created_by", "created_at", "is_checkpoint"}).
-			AddRow(1, `[{"path":"index.html","content":"<h1>hi</h1>"}]`, `[]`, 1, 11, "agent", time.Now(), true))
+		WillReturnRows(sqlmock.NewRows([]string{"version", "files", "skipped", "file_count", "byte_size", "created_by", "created_at", "is_checkpoint", "is_deployed"}).
+			AddRow(1, `[{"path":"index.html","content":"<h1>hi</h1>"}]`, `[]`, 1, 11, "agent", time.Now(), true, true))
 
 	w := kumbhaRequest(server.DownloadKumbhaWorkspace, http.MethodGet, "/v1/kumbha/sessions/"+sessionID.String()+"/workspace/archive",
 		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, nil, nil)

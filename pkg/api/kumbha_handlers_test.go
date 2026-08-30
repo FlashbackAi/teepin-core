@@ -654,6 +654,9 @@ func TestRedeployKumbhaInstance_UpdatesExistingInstanceInPlace(t *testing.T) {
 	mock.ExpectExec(`UPDATE billing\.kumbha_workspace_versions`).
 		WithArgs(sessionID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE billing\.inference_sessions\s+SET last_deployed_version = current_workspace_version`).
+		WithArgs(sessionID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	sess := &kumbha.Session{ID: sessionID, AccountID: testAccountID, ProjectID: projectID, AppInstanceID: existingID}
 	c, w := newRedeployTestContext(projectID)
@@ -1183,8 +1186,8 @@ func TestBuildKumbhaSession_AgentNotConfiguredIs404(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"current_workspace_version"}).AddRow(1))
 	mock.ExpectQuery(`FROM billing\.kumbha_workspace_versions v`).
 		WithArgs(sessionID, testAccountID, 1).
-		WillReturnRows(sqlmock.NewRows([]string{"version", "files", "skipped", "file_count", "byte_size", "created_by", "created_at", "is_checkpoint"}).
-			AddRow(1, `[{"path":"index.html","content":"<h1>hi</h1>"}]`, `[]`, 1, 11, "agent", nowStub(), false))
+		WillReturnRows(sqlmock.NewRows([]string{"version", "files", "skipped", "file_count", "byte_size", "created_by", "created_at", "is_checkpoint", "is_deployed"}).
+			AddRow(1, `[{"path":"index.html","content":"<h1>hi</h1>"}]`, `[]`, 1, 11, "agent", nowStub(), false, false))
 
 	w := kumbhaRequest(server.BuildKumbhaSession, http.MethodPost, "/v1/kumbha/sessions/"+sessionID.String()+"/build",
 		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, map[string]string{}, nil)

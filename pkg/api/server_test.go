@@ -1065,6 +1065,9 @@ func TestCreateInstance_CheckspointsKumbhaWorkspaceWhenSessionLinked(t *testing.
 	mock.ExpectExec(`UPDATE billing\.kumbha_workspace_versions`).
 		WithArgs(sessionID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE billing\.inference_sessions\s+SET last_deployed_version = current_workspace_version`).
+		WithArgs(sessionID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
