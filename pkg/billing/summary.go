@@ -46,9 +46,25 @@ type AccountSummary struct {
 // while projects act as cost centres, which is how AWS and GCP behave
 // and what finance teams expect.
 func (s *Service) GetAccountSummary(ctx context.Context, accountID uuid.UUID, start, end time.Time) (*AccountSummary, error) {
-	// resource_type holds the instance type ("gpu.h100.1g.10gb"), which
-	// maps to a customer-facing service name. Grouping in SQL keeps the
-	// whole summary to a single round trip.
+	// resource_type holds the instance type ("gpu.h100.1g.10gb") for
+	// compute, or "kumbha/<route>:input"/":output" for Kumbha's own LLM
+	// spend (see pkg/kumbha.Gateway.settleLine) — either way, it maps to
+	// a customer-facing service name. Grouping in SQL keeps the whole
+	// summary to a single round trip.
+	//
+	// The Kumbha case matters beyond labelling: without it, Kumbha's
+	// "tokens"-unit rows fell into the SAME 'Other' bucket a compute
+	// instance's "hours"-unit rows can also land in when its own
+	// resource_type happens not to match any pattern above — two
+	// DIFFERENT (service, unit) groups that both render the label
+	// "Other". The console keys each service row by that label alone
+	// (billing/page.tsx), so two same-named rows for one project produced
+	// a duplicate React key crash. Invisible before 2026-08-30: Kumbha
+	// billing only ever settled once, at session-close, so the account
+	// summary rarely saw both an "Other" compute row and an "Other"
+	// Kumbha row in the same query; continuous per-completion settlement
+	// (Gateway.Complete) made the collision a live, ordinary occurrence
+	// instead of a rare coincidence.
 	const query = `
 		SELECT p.id, p.name,
 		       CASE
@@ -56,6 +72,7 @@ func (s *Service) GetAccountSummary(ctx context.Context, accountID uuid.UUID, st
 		         WHEN u.resource_type LIKE 'cpu.%'     THEN 'CPU compute'
 		         WHEN u.resource_type LIKE 'storage%'  THEN 'Storage'
 		         WHEN u.resource_type LIKE 'network%'  THEN 'Networking'
+		         WHEN u.resource_type LIKE 'kumbha/%'  THEN 'Kumbha'
 		         ELSE 'Other'
 		       END AS service,
 		       u.unit,
