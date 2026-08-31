@@ -102,7 +102,7 @@ func TestUploadKumbhaWorkspace_Success(t *testing.T) {
 		WithArgs(sessionID).
 		WillReturnRows(sqlmock.NewRows([]string{"coalesce"}).AddRow(0))
 	mock.ExpectExec(`INSERT INTO billing\.kumbha_workspace_versions`).
-		WithArgs(sessionID, 1, sqlmock.AnyArg(), sqlmock.AnyArg(), 1, int64(len("<h1>hi</h1>")), string(kumbha.CreatedByAgent), false).
+		WithArgs(sessionID, 1, sqlmock.AnyArg(), sqlmock.AnyArg(), 1, int64(len("<h1>hi</h1>")), string(kumbha.CreatedByAgent)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`UPDATE billing\.inference_sessions SET current_workspace_version`).
 		WithArgs(1, sessionID).
@@ -156,11 +156,14 @@ func TestSaveKumbhaWorkspace_Success(t *testing.T) {
 		WithArgs(sessionID, testAccountID).
 		WillReturnRows(sessionRow(sessionID))
 	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT v\.version, v\.is_checkpoint, v\.file_count`).
+		WithArgs(sessionID).
+		WillReturnRows(sqlmock.NewRows([]string{"version", "is_checkpoint", "file_count"}).AddRow(1, true, 1))
 	mock.ExpectQuery(`SELECT COALESCE\(MAX\(version\), 0\) FROM billing\.kumbha_workspace_versions`).
 		WithArgs(sessionID).
 		WillReturnRows(sqlmock.NewRows([]string{"coalesce"}).AddRow(1))
 	mock.ExpectExec(`INSERT INTO billing\.kumbha_workspace_versions`).
-		WithArgs(sessionID, 2, sqlmock.AnyArg(), sqlmock.AnyArg(), 1, int64(len("<h1>edited</h1>")), string(kumbha.CreatedByCustomer), true).
+		WithArgs(sessionID, 2, sqlmock.AnyArg(), sqlmock.AnyArg(), 1, int64(len("<h1>edited</h1>")), string(kumbha.CreatedByCustomer)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`UPDATE billing\.inference_sessions SET current_workspace_version`).
 		WithArgs(2, sessionID).

@@ -176,26 +176,34 @@ func validateWorkspaceFiles(files []WorkspaceFile) (int64, error) {
 	return total, nil
 }
 
-// SaveVersion records a workspace save for a session. What that means on
-// disk depends on who is saving:
+// SaveVersion records a workspace save for a session — agent auto-save
+// and a customer's explicit edit-and-save in the console IDE are treated
+// identically: both reuse the CURRENT version's row in place (an UPDATE,
+// not a new row) as long as that row is still a draft (is_checkpoint =
+// false), and NEITHER checkpoints on save. A draft only becomes a new,
+// permanent "Version history" entry when CheckpointCurrentVersion marks
+// it so, at the session's next successful deploy.
 //
-//   - The agent's auto-save (createdBy=agent) reuses the CURRENT version's
-//     row in place — an UPDATE, not a new row — as long as that row is
-//     still a draft (is_checkpoint=false). Found live 2026-08-26: the
-//     agent calls this once per file_editor step, and always inserting a
-//     new row turned an active build into dozens of near-duplicate
-//     entries in the customer-facing "Version history." A draft only
-//     becomes a new, permanent history entry when CheckpointCurrentVersion
-//     marks it so, at the session's next successful deploy.
-//   - A customer's own explicit edit-and-save in the console IDE
-//     (createdBy=customer) always inserts a new version, immediately
-//     checkpointed — a deliberate action earns its own history entry
-//     regardless of deploy state, same as before this behaviour split.
+// This used to special-case a customer save as always-insert,
+// always-checkpointed-immediately — a deliberate edit earning its own
+// history entry regardless of deploy state. Found live 2026-08-31: that
+// meant History showed a new entry on every save whether or not it was
+// ever deployed, and "current" frequently pointed at content that had
+// never actually shipped — a customer asked for History to answer "was
+// this deployed", not "was this saved", which requires treating both
+// write paths the same way here.
+//
+// Found live 2026-08-26 (agent side, still true either way): the agent
+// calls this once per file_editor step, and always inserting a new row
+// turned an active build into dozens of near-duplicate entries in the
+// customer-facing "Version history" — the in-place reuse is what fixed
+// that, now shared by both callers.
 //
 // Either way the current-version pointer moves to whatever row this call
 // touched, so a bad save is always something to roll back FROM, not lost
 // data — an in-place draft update never overwrites a checkpointed version,
-// only ever a still-uncommitted draft of the agent's own most recent work.
+// only ever a still-uncommitted draft of the most recent work (agent or
+// customer — created_by on a reused row updates to whoever wrote last).
 //
 // The version number (for a new row) is assigned as MAX(existing)+1
 // inside the same transaction that inserts it and updates the pointer, so
@@ -227,52 +235,62 @@ func (s *Store) SaveVersion(ctx context.Context, sessionID uuid.UUID, files []Wo
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op once committed
 
-	if createdBy == CreatedByAgent {
-		var currentVersion sql.NullInt64
-		var isCheckpoint sql.NullBool
-		var currentFileCount sql.NullInt64
-		if err := tx.QueryRowContext(ctx, `
-			SELECT v.version, v.is_checkpoint, v.file_count
-			FROM billing.inference_sessions s
-			LEFT JOIN billing.kumbha_workspace_versions v
-			    ON v.session_id = s.id AND v.version = s.current_workspace_version
-			WHERE s.id = $1
-		`, sessionID).Scan(&currentVersion, &isCheckpoint, &currentFileCount); err != nil {
-			return 0, fmt.Errorf("failed to check current draft version: %w", err)
-		}
-		if currentVersion.Valid && !isCheckpoint.Bool {
-			// Never let an empty save overwrite a draft that had real
-			// content — run.py calls upload_workspace() unconditionally at
-			// the end of EVERY run, including one that never touched a
-			// file (e.g. a relaunch that just inspected an already-empty
-			// PVC and did nothing else). Before this guard, that automatic
-			// final save silently clobbered the only saved copy of a real,
-			// already-deployed build with zero files — a live 2026-08-31
-			// incident: the PVC-wipe bug emptied the filesystem, then this
-			// path faithfully (and destructively) recorded that emptiness
-			// over the actual site source, which by then existed nowhere
-			// else. A customer explicitly clearing their own workspace is
-			// not something this automatic background path does — that
-			// would be a deliberate action of its own — so refusing an
-			// empty overwrite here has no legitimate case to break.
-			if len(files) == 0 && currentFileCount.Valid && currentFileCount.Int64 > 0 {
-				if err := tx.Commit(); err != nil {
-					return 0, fmt.Errorf("failed to commit workspace version: %w", err)
-				}
-				return int(currentVersion.Int64), nil
-			}
-			if _, err := tx.ExecContext(ctx, `
-				UPDATE billing.kumbha_workspace_versions
-				SET files = $1, skipped = $2, file_count = $3, byte_size = $4, created_at = NOW()
-				WHERE session_id = $5 AND version = $6
-			`, filesJSON, skippedJSON, len(files), total, sessionID, currentVersion.Int64); err != nil {
-				return 0, fmt.Errorf("failed to update draft workspace version: %w", err)
-			}
+	// Agent and customer saves are now handled identically here: BOTH reuse
+	// the current draft row in place while it is uncheckpointed, and
+	// NEITHER checkpoints on save — only CheckpointCurrentVersion does
+	// that, and only at a REAL successful deploy. This used to special-
+	// case createdBy == CreatedByAgent, with a customer save checkpointed
+	// immediately instead — meaning History showed a new entry on every
+	// keystroke-adjacent save, whether or not it was ever deployed, and
+	// the "current" version frequently pointed at something that had
+	// never actually shipped. Found live 2026-08-31: a customer asked for
+	// History to mean "was this deployed", not "was this saved" — this
+	// unification is what makes that true for both write paths, not just
+	// the agent's.
+	var currentVersion sql.NullInt64
+	var isCheckpoint sql.NullBool
+	var currentFileCount sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT v.version, v.is_checkpoint, v.file_count
+		FROM billing.inference_sessions s
+		LEFT JOIN billing.kumbha_workspace_versions v
+		    ON v.session_id = s.id AND v.version = s.current_workspace_version
+		WHERE s.id = $1
+	`, sessionID).Scan(&currentVersion, &isCheckpoint, &currentFileCount); err != nil {
+		return 0, fmt.Errorf("failed to check current draft version: %w", err)
+	}
+	if currentVersion.Valid && !isCheckpoint.Bool {
+		// Never let an empty save overwrite a draft that had real
+		// content — run.py calls upload_workspace() unconditionally at
+		// the end of EVERY run, including one that never touched a
+		// file (e.g. a relaunch that just inspected an already-empty
+		// PVC and did nothing else). Before this guard, that automatic
+		// final save silently clobbered the only saved copy of a real,
+		// already-deployed build with zero files — a live 2026-08-31
+		// incident: the PVC-wipe bug emptied the filesystem, then this
+		// path faithfully (and destructively) recorded that emptiness
+		// over the actual site source, which by then existed nowhere
+		// else. A customer explicitly clearing their own workspace is
+		// not something this automatic background path does — that
+		// would be a deliberate action of its own — so refusing an
+		// empty overwrite here has no legitimate case to break.
+		if len(files) == 0 && currentFileCount.Valid && currentFileCount.Int64 > 0 {
 			if err := tx.Commit(); err != nil {
 				return 0, fmt.Errorf("failed to commit workspace version: %w", err)
 			}
 			return int(currentVersion.Int64), nil
 		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE billing.kumbha_workspace_versions
+			SET files = $1, skipped = $2, file_count = $3, byte_size = $4, created_by = $7, created_at = NOW()
+			WHERE session_id = $5 AND version = $6
+		`, filesJSON, skippedJSON, len(files), total, sessionID, currentVersion.Int64, string(createdBy)); err != nil {
+			return 0, fmt.Errorf("failed to update draft workspace version: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return 0, fmt.Errorf("failed to commit workspace version: %w", err)
+		}
+		return int(currentVersion.Int64), nil
 	}
 
 	var existingVersions, nextVersion int
@@ -286,16 +304,17 @@ func (s *Store) SaveVersion(ctx context.Context, sessionID uuid.UUID, files []Wo
 	}
 	nextVersion = existingVersions + 1
 
-	// A customer save is checkpointed immediately; a fresh agent draft
-	// (no current row yet, or the current one was just checkpointed) is
-	// not — it becomes visible in history only via CheckpointCurrentVersion.
-	isCheckpoint := createdBy == CreatedByCustomer
-
+	// A fresh draft (no current row yet, or the current one was already
+	// checkpointed by a real deploy) is never itself a checkpoint — agent
+	// or customer, it becomes visible in History only via
+	// CheckpointCurrentVersion, i.e. only once something is actually
+	// deployed. See this function's own top comment for why customer and
+	// agent saves are no longer treated differently here.
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO billing.kumbha_workspace_versions
 		            (session_id, version, files, skipped, file_count, byte_size, created_by, is_checkpoint, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
-	`, sessionID, nextVersion, filesJSON, skippedJSON, len(files), total, string(createdBy), isCheckpoint); err != nil {
+		VALUES ($1, $2, $3, $4, $5, $6, $7, false, NOW())
+	`, sessionID, nextVersion, filesJSON, skippedJSON, len(files), total, string(createdBy)); err != nil {
 		return 0, fmt.Errorf("failed to save workspace version: %w", err)
 	}
 

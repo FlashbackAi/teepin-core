@@ -136,7 +136,7 @@ func TestSaveVersion_InsertsVersionOneWhenNoneExistAndMovesPointer(t *testing.T)
 		WithArgs(sessionID).
 		WillReturnRows(sqlmock.NewRows([]string{"coalesce"}).AddRow(0))
 	mock.ExpectExec(`INSERT INTO billing\.kumbha_workspace_versions`).
-		WithArgs(sessionID, 1, sqlmock.AnyArg(), sqlmock.AnyArg(), 2, int64(len("hello")+len("world")), string(CreatedByAgent), false).
+		WithArgs(sessionID, 1, sqlmock.AnyArg(), sqlmock.AnyArg(), 2, int64(len("hello")+len("world")), string(CreatedByAgent)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`UPDATE billing\.inference_sessions SET current_workspace_version`).
 		WithArgs(1, sessionID).
@@ -158,16 +158,88 @@ func TestSaveVersion_InsertsVersionOneWhenNoneExistAndMovesPointer(t *testing.T)
 	}
 }
 
+// TestSaveVersion_CustomerSaveIsNotCheckpointedImmediately is the
+// regression test for a live 2026-08-31 product change: a customer's own
+// edit-and-save used to be checkpointed the instant it was saved,
+// showing up in "Version history" whether or not it was ever deployed.
+// It must now behave exactly like the agent's own auto-save — an
+// uncheckpointed draft — so History only ever shows real, deployed
+// versions. CheckpointCurrentVersion (called at a REAL deploy) is the
+// only thing that still flips is_checkpoint.
+func TestSaveVersion_CustomerSaveIsNotCheckpointedImmediately(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessionID := uuid.New()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT v\.version, v\.is_checkpoint, v\.file_count`).
+		WithArgs(sessionID).
+		WillReturnRows(sqlmock.NewRows([]string{"version", "is_checkpoint", "file_count"}).AddRow(nil, nil, nil))
+	mock.ExpectQuery(`SELECT COALESCE\(MAX\(version\), 0\) FROM billing\.kumbha_workspace_versions`).
+		WithArgs(sessionID).
+		WillReturnRows(sqlmock.NewRows([]string{"coalesce"}).AddRow(0))
+	mock.ExpectExec(`INSERT INTO billing\.kumbha_workspace_versions`).
+		WithArgs(sessionID, 1, sqlmock.AnyArg(), sqlmock.AnyArg(), 1, int64(len("hi")), string(CreatedByCustomer)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE billing\.inference_sessions SET current_workspace_version`).
+		WithArgs(1, sessionID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	if _, err := store.SaveVersion(context.Background(), sessionID,
+		[]WorkspaceFile{{Path: "a.txt", Content: "hi"}}, nil, CreatedByCustomer); err != nil {
+		t.Fatalf("SaveVersion: %v", err)
+	}
+	// The INSERT's own hardcoded `false` for is_checkpoint (verified by
+	// the exact arg list above having no 8th bool argument) is the actual
+	// assertion here — mock.ExpectExec would fail to match otherwise.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+// TestSaveVersion_CustomerSaveReusesUncheckpointedDraftInPlace proves a
+// SECOND customer save against a still-undeployed draft updates the SAME
+// row (like the agent's own repeated auto-saves) rather than piling up a
+// new History-eligible entry per save.
+func TestSaveVersion_CustomerSaveReusesUncheckpointedDraftInPlace(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessionID := uuid.New()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT v\.version, v\.is_checkpoint, v\.file_count`).
+		WithArgs(sessionID).
+		WillReturnRows(sqlmock.NewRows([]string{"version", "is_checkpoint", "file_count"}).AddRow(3, false, 1))
+	mock.ExpectExec(`UPDATE billing\.kumbha_workspace_versions`).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), 1, int64(len("hi again")), sessionID, int64(3), string(CreatedByCustomer)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	version, err := store.SaveVersion(context.Background(), sessionID,
+		[]WorkspaceFile{{Path: "a.txt", Content: "hi again"}}, nil, CreatedByCustomer)
+	if err != nil {
+		t.Fatalf("SaveVersion: %v", err)
+	}
+	if version != 3 {
+		t.Errorf("got version %d, want the reused draft version 3", version)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
 func TestSaveVersion_IncrementsFromExistingMax(t *testing.T) {
 	store, mock := newMockStore(t)
 	sessionID := uuid.New()
 
 	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT v\.version, v\.is_checkpoint, v\.file_count`).
+		WithArgs(sessionID).
+		WillReturnRows(sqlmock.NewRows([]string{"version", "is_checkpoint", "file_count"}).AddRow(4, true, 1))
 	mock.ExpectQuery(`SELECT COALESCE\(MAX\(version\), 0\) FROM billing\.kumbha_workspace_versions`).
 		WithArgs(sessionID).
 		WillReturnRows(sqlmock.NewRows([]string{"coalesce"}).AddRow(4))
 	mock.ExpectExec(`INSERT INTO billing\.kumbha_workspace_versions`).
-		WithArgs(sessionID, 5, sqlmock.AnyArg(), sqlmock.AnyArg(), 1, int64(len("hi")), string(CreatedByCustomer), true).
+		WithArgs(sessionID, 5, sqlmock.AnyArg(), sqlmock.AnyArg(), 1, int64(len("hi")), string(CreatedByCustomer)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`UPDATE billing\.inference_sessions SET current_workspace_version`).
 		WithArgs(5, sessionID).
@@ -215,7 +287,7 @@ func TestSaveVersion_AgentReusesUncheckpointedDraftInPlace(t *testing.T) {
 		WithArgs(sessionID).
 		WillReturnRows(sqlmock.NewRows([]string{"version", "is_checkpoint", "file_count"}).AddRow(3, false, 1))
 	mock.ExpectExec(`UPDATE billing\.kumbha_workspace_versions`).
-		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), 1, int64(len("hi")), sessionID, int64(3)).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), 1, int64(len("hi")), sessionID, int64(3), string(CreatedByAgent)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
@@ -279,7 +351,7 @@ func TestSaveVersion_EmptyAgentSaveOverEmptyDraftIsFine(t *testing.T) {
 		WithArgs(sessionID).
 		WillReturnRows(sqlmock.NewRows([]string{"version", "is_checkpoint", "file_count"}).AddRow(3, false, 0))
 	mock.ExpectExec(`UPDATE billing\.kumbha_workspace_versions`).
-		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), 0, int64(0), sessionID, int64(3)).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), 0, int64(0), sessionID, int64(3), string(CreatedByAgent)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
@@ -307,7 +379,7 @@ func TestSaveVersion_AgentStartsNewDraftAfterCurrentIsCheckpointed(t *testing.T)
 		WithArgs(sessionID).
 		WillReturnRows(sqlmock.NewRows([]string{"coalesce"}).AddRow(3))
 	mock.ExpectExec(`INSERT INTO billing\.kumbha_workspace_versions`).
-		WithArgs(sessionID, 4, sqlmock.AnyArg(), sqlmock.AnyArg(), 1, int64(len("hi")), string(CreatedByAgent), false).
+		WithArgs(sessionID, 4, sqlmock.AnyArg(), sqlmock.AnyArg(), 1, int64(len("hi")), string(CreatedByAgent)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`UPDATE billing\.inference_sessions SET current_workspace_version`).
 		WithArgs(4, sessionID).
