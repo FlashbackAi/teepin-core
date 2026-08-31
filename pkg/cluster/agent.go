@@ -44,15 +44,32 @@ type AgentClient struct {
 	// bug from before a second provider (a home node) ever connected.
 	// Set at create time; cleared in ForgetInstance.
 	providers map[string]string
+
+	// startedAt is when THIS AgentClient — one per control-plane process —
+	// was constructed. See statusCacheGracePeriod's own doc comment: it
+	// bounds how long an empty statuses cache is treated as "not
+	// populated yet" rather than "genuinely nothing running".
+	startedAt time.Time
 }
 
 var _ Client = (*AgentClient)(nil)
+
+// statusCacheGracePeriod bounds how long after this control-plane process
+// starts an empty statuses cache is treated as untrustworthy rather than
+// a genuine answer — see ListInstanceStatuses' own doc comment for the
+// race this closes. Set comfortably past pkg/agentrunner's statusInterval
+// (15s: the home node's OWN periodic status-report cadence, which has no
+// immediate first fire on connect) plus real gRPC reconnect time, the
+// same "comfortably past X" margin reasoning used for screenshotTokenTTL
+// vs captureTimeoutDefault elsewhere in this codebase.
+const statusCacheGracePeriod = 45 * time.Second
 
 func NewAgentClient(registry *Registry) *AgentClient {
 	return &AgentClient{
 		registry:  registry,
 		statuses:  make(map[string]InstanceStatus),
 		providers: make(map[string]string),
+		startedAt: time.Now(),
 	}
 }
 
@@ -411,6 +428,33 @@ func (c *AgentClient) ListInstanceStatuses(_ context.Context, scope Scope) ([]In
 
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+
+	// A second, narrower way the guard above can be defeated: a home node
+	// can be freshly (re)connected — registry.Count() > 0 — while THIS
+	// control-plane process's own cache is still completely empty,
+	// because it was just constructed (a control-plane restart/redeploy)
+	// and pkg/agentrunner's statusLoop only reports on a plain ticker with
+	// no immediate first fire — it waits a full statusInterval (15s)
+	// after connecting before its first report ever reaches here. The
+	// reconciler's own "reconcile immediately on startup" has no such
+	// wait, so every control-plane restart races this exact window: read
+	// naively, a clean empty statuses list looks identical to "every
+	// instance vanished simultaneously", which the reconciler cannot
+	// distinguish from a truly empty answer on its own (both look like
+	// zero live statuses against however many the database expects) — so
+	// the distinction has to be made HERE, the one place that actually
+	// knows whether this is early-post-startup or not. Found live
+	// 2026-08-31: exactly this mass-terminated a real, healthy,
+	// currently-serving instance (inst-5ed29952) more than once during a
+	// single evening of routine control-plane redeploys, each one
+	// silently breaking a working deployment for a reason that had
+	// nothing to do with anything actually wrong with it. Bounded by
+	// statusCacheGracePeriod so a deployment with genuinely zero
+	// instances, ever, does not return this error forever — only during
+	// the narrow window right after this process started.
+	if len(c.statuses) == 0 && time.Since(c.startedAt) < statusCacheGracePeriod {
+		return nil, ErrClusterUnavailable
+	}
 
 	out := make([]InstanceStatus, 0, len(c.statuses))
 	for _, status := range c.statuses {

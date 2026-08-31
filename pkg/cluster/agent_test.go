@@ -794,6 +794,46 @@ func TestAgentClient_ListInstanceStatuses_HidesByIDPrefixEvenWithoutTheFlag(t *t
 	}
 }
 
+// TestAgentClient_ListInstanceStatuses_EmptyCacheJustAfterStartupIsUnavailable
+// guards the live incident from 2026-08-31: a home node can be
+// (re)connected — registry.Count() > 0, the existing guard's own
+// condition — while this control-plane process's OWN statuses cache is
+// still completely empty, because the process was just restarted and
+// pkg/agentrunner's statusLoop has no immediate first report (a plain
+// 15s ticker). The reconciler's own "reconcile immediately on startup"
+// has no such wait either, so a clean empty result here — indistinguishable
+// from a real mass-vanishing — mass-terminated a real, healthy instance
+// more than once during routine control-plane redeploys. Right after
+// construction, an empty cache must be reported as unavailable, not
+// trusted as "nothing is running".
+func TestAgentClient_ListInstanceStatuses_EmptyCacheJustAfterStartupIsUnavailable(t *testing.T) {
+	c := NewAgentClient(registryWith(newFakeAgent(&agentpb.CommandResult{Success: true}).session))
+
+	_, err := c.ListInstanceStatuses(context.Background(), AllTenants())
+	if !errors.Is(err, ErrClusterUnavailable) {
+		t.Fatalf("err = %v, want ErrClusterUnavailable for an empty cache right after startup", err)
+	}
+}
+
+// TestAgentClient_ListInstanceStatuses_EmptyCacheAfterGracePeriodIsTrusted
+// is the other half of the guard above: the protection must not become
+// permanent. A deployment with genuinely zero instances, ever, must
+// eventually get a normal empty list back — a customer's own "list my
+// instances" call must not error forever just because the control plane
+// happens to have nothing to report.
+func TestAgentClient_ListInstanceStatuses_EmptyCacheAfterGracePeriodIsTrusted(t *testing.T) {
+	c := NewAgentClient(registryWith(newFakeAgent(&agentpb.CommandResult{Success: true}).session))
+	c.startedAt = time.Now().Add(-statusCacheGracePeriod - time.Second)
+
+	statuses, err := c.ListInstanceStatuses(context.Background(), AllTenants())
+	if err != nil {
+		t.Fatalf("ListInstanceStatuses: %v, want a trusted empty list once the grace period has elapsed", err)
+	}
+	if len(statuses) != 0 {
+		t.Fatalf("got %+v, want an empty list", statuses)
+	}
+}
+
 // TestAgentClient_RecordStatus_PreservesHiddenAcrossUpdate is the
 // regression test for a live 2026-08-31 incident that directly followed
 // the fix above: making the home-node's own reportStatuses sweep finally
