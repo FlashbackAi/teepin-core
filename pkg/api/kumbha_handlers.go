@@ -481,6 +481,14 @@ func (s *Server) buildKumbhaImage(ctx context.Context, sess *kumbha.Session, acc
 	return result.ImageRef, 0, nil
 }
 
+// errNoResolvablePort is returned when a deploy has no explicit port, no
+// image-declared EXPOSE port, and (on a redeploy) no previously-known
+// port to fall back to either — see the two call sites' own doc comments
+// for the live incident this closes. Worded for BOTH readers: a human in
+// the console and the Kumbha agent itself reading this same text back as
+// an MCP tool-result error it needs to act on.
+const errNoResolvablePort = "could not determine which port your app listens on: the built image declares no EXPOSE port and none was specified explicitly. Add an EXPOSE line to the Dockerfile for the port your app listens on (e.g. \"EXPOSE 3000\"), or pass it explicitly as \"ports\" in the deploy request."
+
 // detectKumbhaPorts reads imageRef's own manifest (the image just built
 // and pushed) for its declared EXPOSE ports, so a deploy that didn't
 // explicitly ask for any still ends up with a real public endpoint —
@@ -511,6 +519,21 @@ func (s *Server) detectKumbhaPorts(ctx context.Context, projectID uuid.UUID, ima
 	if err != nil || len(found) == 0 {
 		if err != nil {
 			log.Printf("WARN: could not auto-detect deploy ports for %s: %v", imageRef, err)
+		} else {
+			// resolveConfigPorts (pkg/imageinfo) deliberately collapses
+			// "pulled fine, zero EXPOSE ports declared" and "pull itself
+			// failed" into the same silent (nil, nil) — correct for its
+			// OTHER caller (an arbitrary customer-typed image string,
+			// where neither outcome is noteworthy), but for a Kumbha
+			// deploy this image was built by OUR OWN pipeline seconds
+			// ago, so a failed pull here would be a real, unexpected
+			// problem worth seeing. Found live 2026-08-31 while chasing a
+			// silently-broken screenshot capture back to a deploy with no
+			// resolvable port at all and NOTHING in the logs to explain
+			// why — the caller (DeployKumbhaSession/redeployKumbhaInstance)
+			// now turns this into a real error reaching the customer/agent,
+			// but an operator watching logs should see it happened too.
+			log.Printf("WARN: auto-detect found no EXPOSE ports for %s (either the image declares none, or the pull itself failed silently)", imageRef)
 		}
 		return nil
 	}
@@ -660,6 +683,26 @@ func (s *Server) DeployKumbhaSession(c *gin.Context) {
 
 	if sess.AppInstanceID != "" {
 		s.redeployKumbhaInstance(ctx, c, sessionID, sess, projectID, accountID, imageRef, ports, req.Env)
+		return
+	}
+
+	// A first deploy with zero resolvable ports used to succeed silently,
+	// producing an instance with no endpoint at all — unreachable, with
+	// nothing in the response or the logs to say why (detectKumbhaPorts
+	// degrades a "pulled the image fine, it just declares no EXPOSE" case
+	// to an empty result with NO log line at all, indistinguishable from
+	// every other best-effort no-op it also swallows). Root-caused live
+	// 2026-08-31 chasing a silently-broken screenshot capture back to
+	// exactly this: an instance deployed with no endpoint, no error, no
+	// trace of why. Erroring out here, in the SAME call the deploy MCP
+	// tool makes, reaches the agent as a real tool-result error it can
+	// act on directly (add an EXPOSE line to the Dockerfile, or pass an
+	// explicit port) — far more reliable than trying to prompt the model
+	// into always remembering EXPOSE, and it stops a human customer's
+	// deploy from ever producing an unreachable app silently, too.
+	if len(ports) == 0 {
+		s.recordDeployOutcome(ctx, sessionID, errNoResolvablePort)
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": errNoResolvablePort})
 		return
 	}
 
@@ -813,6 +856,23 @@ func (s *Server) redeployKumbhaInstance(ctx context.Context, c *gin.Context, ses
 	// (and risking the loss of) an endpoint that already exists.
 	if len(ports) == 0 && existing.ContainerPort > 0 {
 		ports = []models.PortMapping{{Container: existing.ContainerPort, Protocol: "tcp"}}
+	}
+
+	// Neither a fresh detection NOR the existing instance's own record has
+	// a port to offer — silently proceeding here would redeploy with no
+	// endpoint at all, exactly the incident this function's fix above
+	// closes for the common case. This is the case that fix cannot cover
+	// on its own: an instance that never had a known-good port to fall
+	// back to in the first place (e.g. one whose compute.instances row was
+	// reconstructed by hand after going missing, rather than through a
+	// normal deploy). Surfacing this as a real error — reaching the Kumbha
+	// agent verbatim as its own deploy tool's result — is what actually
+	// lets it get fixed (an EXPOSE line, or an explicit port), rather than
+	// silently repeating the same unreachable deploy forever.
+	if len(ports) == 0 {
+		s.recordDeployOutcome(ctx, sessionID, errNoResolvablePort)
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": errNoResolvablePort})
+		return
 	}
 
 	req := models.CreateInstanceRequest{

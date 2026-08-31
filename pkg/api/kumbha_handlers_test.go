@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -739,6 +740,53 @@ func TestRedeployKumbhaInstance_EmptyPortsFallsBackToExistingContainerPort(t *te
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet DB expectations: %v", err)
+	}
+}
+
+// TestRedeployKumbhaInstance_NoResolvablePortIs422 guards the deeper,
+// permanent fix for the same 2026-08-31 incident: the fallback to
+// existing.ContainerPort only helps when the instance already has a known
+// port. inst-5ed29952 itself did not (its compute.instances row had been
+// reconstructed by hand earlier in the same incident, after its code went
+// missing, with no port to record) — for exactly that case, a redeploy
+// must refuse with a clear, actionable error instead of silently
+// proceeding with no endpoint again. This is what actually closes the
+// loop: the same text reaches the Kumbha agent verbatim as its own
+// "deploy" MCP tool's error result, so it can add an EXPOSE line to the
+// Dockerfile and retry, rather than the deploy silently "succeeding" into
+// an unreachable instance with nothing anywhere to explain why.
+func TestRedeployKumbhaInstance_NoResolvablePortIs422(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+
+	projectID, sessionID := uuid.New(), uuid.New()
+	existingID := "inst-existing3"
+	fc := newFakeCluster()
+	fc.add(existingID, projectID.String(), compute.StatusRunning)
+	server := (&Server{store: cStore, cluster: fc}).WithKumbha(gw)
+
+	// container_port = 0: no known-good port to fall back to, matching
+	// inst-5ed29952's own hand-reconstructed record.
+	mock.ExpectQuery(`SELECT .+ FROM compute\.instances`).
+		WithArgs(existingID).
+		WillReturnRows(instanceRecordRow(existingID, testAccountID, projectID, "kumbha-abc123", "old-image:v1", 1, 1, 0, 0, "https://inst-existing3.teepin.com"))
+
+	sess := &kumbha.Session{ID: sessionID, AccountID: testAccountID, ProjectID: projectID, AppInstanceID: existingID}
+	c, w := newRedeployTestContext(projectID)
+	// ports == nil: simulates detectKumbhaPorts coming back empty too.
+	server.redeployKumbhaInstance(context.Background(), c, sessionID, sess, projectID, testAccountID, "new-image:v4", nil, nil)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body: %s)", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if errMsg, _ := resp["error"].(string); !strings.Contains(errMsg, "EXPOSE") {
+		t.Errorf("error message = %q, want actionable guidance mentioning EXPOSE", errMsg)
+	}
+	// The cluster must never be asked to redeploy with no ports at all.
+	if fc.lastSpec.InstanceID != "" {
+		t.Errorf("UpdateInstance was called (spec: %+v), want no cluster call when no port could be resolved", fc.lastSpec)
 	}
 }
 
