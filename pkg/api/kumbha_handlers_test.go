@@ -691,6 +691,74 @@ func TestRedeployKumbhaInstance_UpdatesExistingInstanceInPlace(t *testing.T) {
 	}
 }
 
+// TestRedeployKumbhaInstance_ThreadsHomeNodeClassAndProviderOntoSpec
+// guards the deepest root cause of the whole inst-5ed29952 endpoint saga,
+// found live 2026-08-31 AFTER the port and endpoint-fallback fixes above
+// were already deployed and the symptom persisted: CreateInstance's own
+// handler sets spec.NodeClass/NodeName/ProviderID from a FRESH placement
+// decision (server.go), immediately after calling the same instanceSpec
+// this function also calls — but redeployKumbhaInstance never set any of
+// the three. cluster.AgentClient.createOrReplace's home-class endpoint
+// synthesis is gated on spec.NodeClass == "home", so it was structurally
+// UNREACHABLE from every Kumbha redeploy regardless of whether ports
+// resolved correctly — result.EndpointURL was unconditionally empty on
+// this path, making the existing.Endpoint/result.EndpointURL fallback
+// unable to ever actually help. The pod-replace command itself still
+// worked (ProviderID empty just falls back to registry.Any(), harmless
+// with one connected provider) — which is exactly why this stayed
+// invisible until an instance's own endpoint needed to be RECOVERED by a
+// redeploy, rather than merely left unchanged.
+func TestRedeployKumbhaInstance_ThreadsHomeNodeClassAndProviderOntoSpec(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+
+	projectID, sessionID := uuid.New(), uuid.New()
+	existingID := "inst-existing5"
+	fc := newFakeCluster()
+	fc.add(existingID, projectID.String(), compute.StatusRunning)
+	server := (&Server{store: cStore, cluster: fc}).WithKumbha(gw)
+
+	// provider_id / node_name non-empty, matching a real home-class
+	// instance's persisted record.
+	mock.ExpectQuery(`SELECT .+ FROM compute\.instances`).
+		WithArgs(existingID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "account_id", "project_id", "user_id", "name", "image",
+			"instance_type_id", "status", "gpu_vram_gb", "cpu_units", "memory_gb", "endpoint",
+			"k8s_pod_name", "k8s_namespace", "provider_id", "dns_name", "public_ip",
+			"tls_enabled", "tls_ready", "container_port", "storage_gb",
+			"created_at", "updated_at", "started_at", "terminated_at", "kumbha_session_id",
+		}).AddRow(existingID, testAccountID, projectID, uuid.Nil, "kumbha-abc123", "old-image:v1",
+			"", compute.StatusRunning, 0, 1, 1, "https://inst-existing5.teepin.com",
+			existingID+"-pod", "default", "provider-srialla", existingID+".teepin.com", "",
+			true, true, 80, 0,
+			nowStub(), nowStub(), nil, nil, uuid.Nil))
+	mock.ExpectExec(`UPDATE compute\.instances`).
+		WithArgs("new-image:v6", existingID+"-pod", 80, compute.StatusPending, existingID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE billing\.kumbha_workspace_versions`).
+		WithArgs(sessionID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE billing\.inference_sessions\s+SET last_deployed_version = current_workspace_version`).
+		WithArgs(sessionID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	sess := &kumbha.Session{ID: sessionID, AccountID: testAccountID, ProjectID: projectID, AppInstanceID: existingID}
+	c, w := newRedeployTestContext(projectID)
+	server.redeployKumbhaInstance(context.Background(), c, sessionID, sess, projectID, testAccountID, "new-image:v6",
+		[]models.PortMapping{{Container: 80, Protocol: "tcp"}}, nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	if fc.lastSpec.NodeClass != "home" {
+		t.Errorf("spec.NodeClass = %q, want \"home\" — without it, createOrReplace's endpoint synthesis is unreachable regardless of ports", fc.lastSpec.NodeClass)
+	}
+	if fc.lastSpec.ProviderID != "provider-srialla" {
+		t.Errorf("spec.ProviderID = %q, want the existing instance's own persisted provider (\"provider-srialla\")", fc.lastSpec.ProviderID)
+	}
+}
+
 // TestRedeployKumbhaInstance_EmptyPortsFallsBackToExistingContainerPort
 // guards the live incident from 2026-08-31: detectKumbhaPorts is
 // best-effort and DeployKumbhaSession re-runs it on every redeploy, not

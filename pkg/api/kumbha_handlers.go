@@ -886,6 +886,50 @@ func (s *Server) redeployKumbhaInstance(ctx context.Context, c *gin.Context, ses
 	}
 	spec := s.instanceSpec(existing.ID, endpointUUIDFor(existing.ID), projectID, accountID, &req, nil)
 
+	// instanceSpec alone never sets NodeClass/NodeName/ProviderID — on a
+	// FIRST deploy, CreateInstance's own handler sets all three itself
+	// from a fresh placement decision (server.go: "if homePlacement != nil
+	// { spec.NodeClass = "home"; spec.NodeName = ...; spec.ProviderID =
+	// ... }"), immediately after calling this same instanceSpec. A
+	// redeploy must NOT re-run placement — the instance stays on the SAME
+	// node/provider it already lives on — so instead of a fresh decision,
+	// this reads the already-persisted values back from the existing
+	// record (compute.instances.provider_id/node_name, populated at the
+	// original create). Without this, EVERY Kumbha redeploy sent
+	// spec.NodeClass == "" (the zero value) — meaning createOrReplace's
+	// home-class endpoint-synthesis gate (agent.go: "if spec.NodeClass ==
+	// "home" && len(spec.Ports) > 0") was structurally UNREACHABLE from
+	// this function, regardless of whether ports resolved correctly. The
+	// underlying pod-replace command still dispatched fine (ProviderID
+	// empty just falls back to registry.Any(), harmless with a single
+	// connected provider), which is exactly why this was invisible until
+	// an instance's own database endpoint needed to be RECOVERED by a
+	// redeploy rather than merely left unchanged — result.EndpointURL was
+	// unconditionally empty on every redeploy, making the existing.
+	// Endpoint/result.EndpointURL fallback above unable to ever actually
+	// help until this is fixed too. Found live 2026-08-31, the true root
+	// of the whole inst-5ed29952 endpoint saga: home-class placement is
+	// (deliberately, per CreateInstance's own comment) opt-in only and
+	// unreachable without it, so ProviderID != "" is the same signal
+	// ResolveProvider (cmd/api-server/adapters.go) already uses elsewhere
+	// to mean "this is a home-class instance".
+	if existing.ProviderID != "" {
+		spec.NodeClass = "home"
+		spec.ProviderID = existing.ProviderID
+		// spec.NodeName is deliberately NOT threaded through here:
+		// existing.NodeName is a separate, pre-existing gap (unrelated to
+		// this fix) — compute.instances has no plain node_name column at
+		// all (Create resolves it into a node_id FK via a sub-select), and
+		// nothing reads it back out, so existing.NodeName is always "".
+		// Harmless for THIS deployment (single home node — the scheduler
+		// has no other choice regardless) but worth fixing properly before
+		// a multi-node home provider exists, where a redeploy landing on a
+		// different node than the original create could break node-local
+		// storage affinity. createOrReplace's own dispatch only routes on
+		// ProviderID, never NodeName, so this does not affect the fix
+		// above.
+	}
+
 	result, err := s.cluster.UpdateInstance(ctx, scopeFor(projectID), spec)
 	if err != nil {
 		var errMsg string
