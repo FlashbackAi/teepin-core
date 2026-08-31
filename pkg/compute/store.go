@@ -214,18 +214,42 @@ func (s *Store) UpdateStatus(ctx context.Context, id, status string) error {
 // public_ip, tls_*) are untouched for the same reason UpdateInstance
 // never re-provisions them: they cannot have changed, since the
 // Service/Ingress they describe were never recreated.
+//
+// terminated_at is explicitly cleared, and the WHERE clause no longer
+// excludes an already-terminated row (it did, previously — see below).
+// UpdateImage's ONLY caller (redeployKumbhaInstance) reaches this line
+// having just gotten a SUCCESSFUL cluster.UpdateInstance back — positive,
+// first-hand confirmation that a real pod is running right now — so a
+// terminated_at from some earlier gap (the reconciler correctly marking
+// the instance gone during a transient window, an earlier failed
+// redeploy, anything) is now stale information, not a reason to refuse
+// the update. Found live 2026-08-31: exactly this happened to
+// inst-5ed29952 — the reconciler terminated it during an earlier broken
+// redeploy attempt, and every SUBSEQUENT redeploy silently created a
+// real, healthy, serving pod while this method's old guard clause
+// (`AND terminated_at IS NULL`) matched zero rows and left the database
+// row terminated forever. The caller only logged the failure as a WARN
+// and moved on ("the instance is still reachable... regardless" — true
+// for a transient DB error, false for this one), because
+// cluster.ProxyTarget.ResolveProvider (cmd/api-server/adapters.go) checks
+// terminated_at itself: the edge returned "this instance is not
+// currently reachable" on every request forever after, even though the
+// pod was genuinely up and serving, because the CUSTOMER-FACING routing
+// lookup and the pod's own liveness had silently diverged with nothing
+// anywhere surfacing that they had. A redeploy that just proved the
+// workload is alive must be able to say so.
 func (s *Store) UpdateImage(ctx context.Context, id, image, podName string, containerPort int) error {
 	query := `
 		UPDATE compute.instances
-		SET image = $1, k8s_pod_name = $2, container_port = $3, status = $4
-		WHERE id = $5 AND terminated_at IS NULL
+		SET image = $1, k8s_pod_name = $2, container_port = $3, status = $4, terminated_at = NULL
+		WHERE id = $5
 	`
 	res, err := s.db.ExecContext(ctx, query, image, podName, containerPort, StatusPending, id)
 	if err != nil {
 		return fmt.Errorf("failed to update image for %s: %w", id, err)
 	}
 	if n, err := res.RowsAffected(); err == nil && n == 0 {
-		return fmt.Errorf("instance %s not found or already terminated", id)
+		return fmt.Errorf("instance %s not found", id)
 	}
 	return nil
 }

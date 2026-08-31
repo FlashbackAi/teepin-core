@@ -918,8 +918,11 @@ func (s *Server) redeployKumbhaInstance(ctx context.Context, c *gin.Context, ses
 		// The pod is real and running the new code; only OUR record of
 		// which image/pod it is now on failed to update. Not worth
 		// failing the customer's redeploy over — logged so an operator
-		// can reconcile — the instance is still reachable at its
-		// unchanged hostname regardless.
+		// can reconcile. UpdateImage itself now clears terminated_at as
+		// part of this same call (see its own doc comment) precisely so
+		// this really is just a record-keeping failure and not, as it
+		// used to be, the reason the instance stays permanently
+		// unreachable at the edge despite a genuinely live pod.
 		log.Printf("WARN: redeployed instance %s for Kumbha session %s but failed to update its record: %v", existing.ID, sessionID, err)
 	}
 

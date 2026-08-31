@@ -188,15 +188,47 @@ func TestUpdateImage(t *testing.T) {
 		t.Fatalf("UpdateImage failed: %v", err)
 	}
 
-	// Unknown or already-terminated instance is an error — same contract
-	// as UpdateStatus, so a redeploy targeting a vanished instance fails
-	// loudly rather than silently doing nothing.
+	// Unknown instance is an error — so a redeploy targeting a vanished
+	// instance fails loudly rather than silently doing nothing. A
+	// TERMINATED instance is deliberately NOT this case any more — see
+	// TestUpdateImage_RevivesTerminatedInstance below.
 	mock.ExpectExec(`UPDATE compute\.instances`).
 		WithArgs("new-image:v2", "inst-missing0-pod", 8080, StatusPending, "inst-missing0").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 
 	if err := store.UpdateImage(context.Background(), "inst-missing0", "new-image:v2", "inst-missing0-pod", 8080); err == nil {
 		t.Error("expected error for missing instance")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+// TestUpdateImage_RevivesTerminatedInstance guards the live incident from
+// 2026-08-31: inst-5ed29952 was marked terminated by the reconciler
+// during an earlier broken redeploy, and every subsequent redeploy
+// silently created a real, healthy pod while UpdateImage's OLD guard
+// clause (`AND terminated_at IS NULL`) matched zero rows — leaving the
+// database permanently out of sync with a genuinely running workload.
+// cluster.ProxyTarget.ResolveProvider checks terminated_at directly, so
+// the customer-facing edge kept returning "this instance is not
+// currently reachable" forever, on an instance that was actually up.
+// UpdateImage's only caller (redeployKumbhaInstance) reaches this call
+// having just gotten a successful cluster.UpdateInstance back — positive
+// proof the pod is alive — so this must succeed and clear terminated_at
+// even when the row was previously terminated, not silently no-op.
+func TestUpdateImage_RevivesTerminatedInstance(t *testing.T) {
+	store, mock := newMockStore(t)
+
+	// The query itself no longer excludes a terminated row: only the
+	// bound args (unchanged) are asserted here, matching the rest of this
+	// file's convention of not asserting exact SQL text.
+	mock.ExpectExec(`UPDATE compute\.instances`).
+		WithArgs("new-image:v3", "inst-revived-pod", 80, StatusPending, "inst-revived").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := store.UpdateImage(context.Background(), "inst-revived", "new-image:v3", "inst-revived-pod", 80); err != nil {
+		t.Fatalf("UpdateImage on a previously-terminated instance failed: %v — a redeploy that just proved the workload is alive must be able to revive its record", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Error(err)
