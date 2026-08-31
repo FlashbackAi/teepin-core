@@ -766,6 +766,81 @@ func TestAgentClient_CreateInstance_HidesLabeledPodFromListImmediately(t *testin
 	}
 }
 
+// TestAgentClient_ListInstanceStatuses_HidesByIDPrefixEvenWithoutTheFlag
+// is the regression test for a live 2026-08-31 follow-up: preserving
+// Hidden across updates (see the test below) only stops FUTURE
+// corruption — a pod whose cache entry was ALREADY wrong before that fix
+// shipped (a 5-day-old agent pod, in the live incident) kept showing in
+// the customer's Compute list even after the fix was deployed, since
+// there was nothing to retroactively correct it. Filtering by the
+// instance ID's own well-known prefix has no such gap: it is recomputed
+// fresh on every read, with no stored state to have ever gone wrong in
+// the first place. This proves the fallback alone, with Hidden left at
+// its Go zero value (false), the exact state the live incident found.
+func TestAgentClient_ListInstanceStatuses_HidesByIDPrefixEvenWithoutTheFlag(t *testing.T) {
+	c := NewAgentClient(registryWith(newFakeAgent(&agentpb.CommandResult{Success: true}).session))
+
+	for _, id := range []string{"kumbha-agent-4ab155f0", "kaniko-build-43368ae2", "kumbha-shot-43368ae2"} {
+		c.RecordStatus(InstanceStatus{InstanceID: id, Status: "running", ProjectID: "project-alice"})
+	}
+	c.RecordStatus(InstanceStatus{InstanceID: "inst-real0001", Status: "running", ProjectID: "project-alice"})
+
+	statuses, err := c.ListInstanceStatuses(context.Background(), AllTenants())
+	if err != nil {
+		t.Fatalf("ListInstanceStatuses: %v", err)
+	}
+	if len(statuses) != 1 || statuses[0].InstanceID != "inst-real0001" {
+		t.Fatalf("got %+v, want only inst-real0001 — the three internal-tooling pods should all be hidden by their ID prefix alone", statuses)
+	}
+}
+
+// TestAgentClient_RecordStatus_PreservesHiddenAcrossUpdate is the
+// regression test for a live 2026-08-31 incident that directly followed
+// the fix above: making the home-node's own reportStatuses sweep finally
+// include Kaniko/Kumbha-agent pods (so their status could ever reach this
+// cache at all — see Scope.IncludeHidden) meant RecordStatus started
+// being called for them via a real status push for the first time. The
+// wire message that arrives on that path (agentpb.InstanceStatus, via
+// grpcserver.go's handleMessage) has no Hidden field, so a naive
+// overwrite reset Hidden to false on the very first push after creation
+// — both pod types started appearing in the customer's own Compute list
+// within seconds. Hidden must survive an update exactly like the
+// endpoint fields already do, since it is a fixed fact about which pod
+// this is (set once, at CreateInstance), not runtime state a later
+// report could legitimately change.
+func TestAgentClient_RecordStatus_PreservesHiddenAcrossUpdate(t *testing.T) {
+	fake := newFakeAgent(&agentpb.CommandResult{Success: true, PodName: "kaniko-build-pod"})
+	c := NewAgentClient(registryWith(fake.session))
+
+	if _, err := c.CreateInstance(context.Background(), InstanceSpec{
+		InstanceID: "kaniko-build-y",
+		ProjectID:  "project-alice",
+		Image:      "gcr.io/kaniko-project/executor:v1.23.2-debug",
+		Labels:     map[string]string{"teepin.io/kumbha-agent": "true"},
+	}); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	// Simulate the home-node's own periodic status push — exactly what
+	// grpcserver.go's handleMessage does on an AgentMessage_InstanceStatus,
+	// with no Hidden field on the wire to carry forward.
+	c.RecordStatus(InstanceStatus{
+		InstanceID: "kaniko-build-y",
+		Status:     "terminated",
+		ProjectID:  "project-alice",
+	})
+
+	statuses, err := c.ListInstanceStatuses(context.Background(), AllTenants())
+	if err != nil {
+		t.Fatalf("ListInstanceStatuses: %v", err)
+	}
+	for _, st := range statuses {
+		if st.InstanceID == "kaniko-build-y" {
+			t.Fatalf("kaniko-build-y appeared in ListInstanceStatuses after a status update reset Hidden to false: %+v", st)
+		}
+	}
+}
+
 // TestAgentClient_CreateInstance_OrdinaryInstanceStillListed is the
 // non-regression companion: an instance with no hide-from-Compute-list
 // label must appear in ListInstanceStatuses exactly as before — the

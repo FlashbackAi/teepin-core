@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -118,6 +119,23 @@ func (c *AgentClient) RecordStatus(status InstanceStatus) {
 			status.TLSEnabled = existing.TLSEnabled
 			status.TLSReady = existing.TLSReady
 		}
+
+		// Hidden is set ONCE, at CreateInstance's own seed, from the
+		// creating spec's labels (see that call site's own doc comment) —
+		// it is a fixed fact about which POD this is, not runtime state a
+		// later report could legitimately change. The wire message this
+		// method is fed from (agentpb.InstanceStatus, via grpcserver.go's
+		// handleMessage) has no Hidden field at all, so status.Hidden is
+		// always the Go zero value (false) here — blindly overwriting
+		// would un-hide a Kaniko build or Kumbha agent pod the moment its
+		// FIRST status report arrived after creation. Found live
+		// 2026-08-31: fixing reportStatuses to finally include these pods
+		// (AllTenantsIncludingHidden, needed so their status ever reaches
+		// this cache at all) immediately regressed this — every push
+		// reset Hidden to false, and both pod types started appearing in
+		// the customer's own Compute list within seconds of being
+		// created.
+		status.Hidden = existing.Hidden
 	}
 
 	c.statuses[status.InstanceID] = status
@@ -353,6 +371,35 @@ func (c *AgentClient) GetInstanceStatus(_ context.Context, scope Scope, instance
 	return &status, nil
 }
 
+// hiddenInstanceIDPrefixes are Kumbha's own naming conventions for
+// internal-tooling pods (pkg/kumbha's agent/screenshot pods, pkg/build's
+// Kaniko pods) — duplicated here as plain strings, not imported, since
+// those packages already import pkg/cluster and importing back would
+// cycle. Checked as a FALLBACK alongside InstanceStatus.Hidden in
+// ListInstanceStatuses below, not a replacement for it: Hidden (set at
+// CreateInstance's own seed from the real spec.Labels) is the precise,
+// authoritative signal for a pod created after this existed. This prefix
+// check exists because Hidden is CACHED, MUTABLE state that a status
+// update can corrupt (see RecordStatus's own doc comment) or that a
+// cache-clearing event (a control-plane restart) loses entirely for an
+// already-running pod — found live 2026-08-31: a 5-day-old agent pod's
+// cache entry, corrupted by an update from before RecordStatus preserved
+// Hidden, kept showing in a customer's Compute list even after that fix
+// shipped, because the fix only stops FUTURE corruption, it cannot heal
+// an already-wrong cached value. A prefix check has no state to
+// corrupt — it is recomputed fresh on every read from the one thing that
+// is always present and immutable: the instance's own ID.
+var hiddenInstanceIDPrefixes = []string{"kumbha-agent-", "kaniko-build-", "kumbha-shot-"}
+
+func isHiddenInstanceID(instanceID string) bool {
+	for _, prefix := range hiddenInstanceIDPrefixes {
+		if strings.HasPrefix(instanceID, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *AgentClient) ListInstanceStatuses(_ context.Context, scope Scope) ([]InstanceStatus, error) {
 	// CRITICAL: with no agent connected this must fail rather than return
 	// an empty list. The reconciler marks instances terminated when they
@@ -367,7 +414,7 @@ func (c *AgentClient) ListInstanceStatuses(_ context.Context, scope Scope) ([]In
 
 	out := make([]InstanceStatus, 0, len(c.statuses))
 	for _, status := range c.statuses {
-		if status.Hidden {
+		if status.Hidden || isHiddenInstanceID(status.InstanceID) {
 			continue
 		}
 		if scopeAllows(scope, status) {

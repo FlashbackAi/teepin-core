@@ -1024,9 +1024,17 @@ func (r *Runner) reportInventory(ctx context.Context, s stream) {
 	})
 }
 
-// reportStatuses pushes changed instance statuses.
+// reportStatuses pushes changed instance statuses. Uses
+// AllTenantsIncludingHidden, not AllTenants — see Scope.IncludeHidden's
+// own doc comment: this is the ONLY thing that ever refreshes the
+// control plane's cached status for Kumbha's own agent/build pods
+// (AgentClient.GetInstanceStatus is a pure cache read), and excluding
+// them here — even though that exclusion is correct for a customer-
+// facing list — left their cached status frozen at its initial "pending"
+// seed forever, with no way to ever observe a Kaniko build actually
+// finishing. Found live 2026-08-31.
 func (r *Runner) reportStatuses(ctx context.Context, s stream) {
-	statuses, err := r.cfg.Cluster.ListInstanceStatuses(ctx, cluster.AllTenants())
+	statuses, err := r.cfg.Cluster.ListInstanceStatuses(ctx, cluster.AllTenantsIncludingHidden())
 	if err != nil {
 		log.Printf("Status sweep failed: %v", err)
 		return

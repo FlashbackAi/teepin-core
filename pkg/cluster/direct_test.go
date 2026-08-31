@@ -454,6 +454,63 @@ func TestPodStatus_RunningIsRunning(t *testing.T) {
 	}
 }
 
+// TestListInstanceStatuses_IncludeHiddenSeesKumbhaAgentAndBuildPods is
+// the regression test for a live 2026-08-31 incident: a Kaniko build pod
+// completed and pushed its image successfully in 11 seconds, but the
+// control plane never learned it finished — waitForCompletion polled
+// AgentClient.GetInstanceStatus (a pure cache read) forever, and the
+// ONLY thing that ever refreshes that cache is the home-node agent's own
+// reportStatuses sweep, which discovers instances via
+// ListInstanceStatuses(AllTenants()) — a selector that (correctly, for a
+// customer-facing list) excludes every teepin.io/kumbha-agent pod,
+// Kaniko builds included. The cached status stayed frozen at its initial
+// "pending" seed forever, and every deploy eventually reported "context
+// deadline exceeded" for a build that had, in fact, already succeeded.
+// AllTenantsIncludingHidden is the fix: the ONE caller (reportStatuses)
+// that needs these pods to keep the cache honest, without touching what
+// a customer's own Compute list shows.
+func TestListInstanceStatuses_IncludeHiddenSeesKumbhaAgentAndBuildPods(t *testing.T) {
+	c := newTestClient()
+	ctx := context.Background()
+
+	if _, err := c.CreateInstance(ctx, InstanceSpec{
+		InstanceID: "kaniko-build-abcd1234",
+		Image:      "gcr.io/kaniko-project/executor:latest",
+		CPUUnits:   2,
+		MemoryGB:   4,
+		Labels:     map[string]string{labelKumbhaAgent: "true"},
+	}); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	// Default scope (what a customer-facing list uses): still excluded.
+	statuses, err := c.ListInstanceStatuses(ctx, AllTenants())
+	if err != nil {
+		t.Fatalf("ListInstanceStatuses(AllTenants): %v", err)
+	}
+	for _, st := range statuses {
+		if st.InstanceID == "kaniko-build-abcd1234" {
+			t.Error("AllTenants() found the Kaniko build pod — it must stay hidden from a customer-facing list")
+		}
+	}
+
+	// IncludeHidden (what reportStatuses uses): found, so its status can
+	// actually reach the control plane's cache.
+	statuses, err = c.ListInstanceStatuses(ctx, AllTenantsIncludingHidden())
+	if err != nil {
+		t.Fatalf("ListInstanceStatuses(AllTenantsIncludingHidden): %v", err)
+	}
+	found := false
+	for _, st := range statuses {
+		if st.InstanceID == "kaniko-build-abcd1234" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("AllTenantsIncludingHidden() did not find the Kaniko build pod — its status can never reach the control plane's cache this way")
+	}
+}
+
 func TestListInstanceStatuses_OnlyManagedPods(t *testing.T) {
 	c := NewDirectClient(fake.NewSimpleClientset(
 		&corev1.Pod{

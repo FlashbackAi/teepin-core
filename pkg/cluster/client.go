@@ -277,12 +277,39 @@ type Scope struct {
 
 	// AccountID restricts to one account. Nil means unrestricted.
 	AccountID string
+
+	// IncludeHidden includes pods carrying labelKumbhaAgent — Kumbha's own
+	// agent pods AND Kaniko build pods, both deliberately excluded from
+	// DirectClient.ListInstanceStatuses' default selector (managedSelector)
+	// so a customer's Compute list never shows Teepin's own tooling. That
+	// exclusion is correct for a customer-facing list, but WRONG for the
+	// home-node agent's own status-reporting sweep (reportStatuses in
+	// pkg/agentrunner) — which is the ONLY thing that ever refreshes the
+	// control plane's cached status for those pods (AgentClient.
+	// GetInstanceStatus is a pure cache read, never a live query). Found
+	// live 2026-08-31: a Kaniko build that completed and pushed
+	// successfully in 11 seconds was NEVER reported as done, because the
+	// sweep that would have told the control plane never saw it in the
+	// first place — the control plane's cache stayed frozen at its
+	// initial "pending" seed until the OUTER deploy timeout gave up and
+	// reported a "build timed out" error for a build that had, in fact,
+	// already succeeded. This field is how reportStatuses gets a
+	// selector that still finds these pods, without touching the
+	// customer-facing list's own filtering at all — see
+	// AllTenantsIncludingHidden, its only caller.
+	IncludeHidden bool
 }
 
 // AllTenants is the explicit unrestricted scope, for the reconciler and
 // billing collector. Named so that an unscoped query is a visible
 // decision at the call site rather than an empty struct literal.
 func AllTenants() Scope { return Scope{} }
+
+// AllTenantsIncludingHidden is AllTenants but also includes Kumbha's own
+// agent/build pods — see Scope.IncludeHidden's own doc comment. Only ever
+// used by the home-node agent's own status-reporting sweep
+// (pkg/agentrunner's reportStatuses), never by anything customer-facing.
+func AllTenantsIncludingHidden() Scope { return Scope{IncludeHidden: true} }
 
 // ProjectScope restricts to a single project — the normal case for any
 // customer-facing request.

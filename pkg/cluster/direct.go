@@ -392,12 +392,18 @@ func instanceSelector(scope Scope, instanceID string) string {
 }
 
 // managedSelector matches every TEEPIN-managed instance in a scope, for
-// LISTING — excludes Kumbha's own agent pods (see labelKumbhaAgent),
-// unlike instanceSelector: a caller that already knows a pod's exact
-// instance ID (CloseSession's teardown, the event relay's StreamLogs)
-// must still find it. Only the customer-facing list must not.
+// LISTING — excludes Kumbha's own agent pods (see labelKumbhaAgent) by
+// default, unlike instanceSelector: a caller that already knows a pod's
+// exact instance ID (CloseSession's teardown, the event relay's
+// StreamLogs) must still find it. Only the customer-facing list must
+// not — see Scope.IncludeHidden's own doc comment for the one caller
+// (the home-node agent's own status-reporting sweep) that needs these
+// pods included, not excluded.
 func managedSelector(scope Scope) string {
-	selector := fmt.Sprintf("%s=true,%s!=true", labelManaged, labelKumbhaAgent)
+	selector := fmt.Sprintf("%s=true", labelManaged)
+	if !scope.IncludeHidden {
+		selector += fmt.Sprintf(",%s!=true", labelKumbhaAgent)
+	}
 	return appendScope(selector, scope)
 }
 
