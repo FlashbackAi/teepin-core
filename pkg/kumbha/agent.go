@@ -224,14 +224,41 @@ const (
 	screenshotMemoryGB = 1
 )
 
-// captureTimeoutDefault bounds how long CaptureScreenshot waits for the
+// CaptureTimeoutDefault bounds how long CaptureScreenshot waits for the
 // pod to finish before giving up and cleaning it up — a hung headless
 // browser (a page that never reaches load, a broken navigation) must not
 // leak a pod forever.
-const captureTimeoutDefault = 45 * time.Second
+//
+// Was 45s, far too short: the capture pod runs the SAME image the Kumbha
+// agent pod does (see this method's own doc comment) with
+// AlwaysPullImage: true, forcing a fresh pull every single launch — a
+// multi-GB image containing Chromium, Python, and the whole OpenHands
+// SDK. Found live 2026-08-31: `kubectl describe pod` on a real capture
+// pod showed a "Pulling image" event still in progress, with no
+// "Pulled"/"Started" event ever following, when the control plane's own
+// 45s budget expired and began tearing it down — the pod was killed
+// mid-pull, every single time, on a home node's ordinary internet
+// connection. 4 minutes leaves a full minute of margin under
+// screenshotTokenTTL below (which was ALREADY sized for a multi-minute
+// capture — its own doc comment says "comfortably past
+// CaptureTimeoutDefault" — this constant was simply never raised to
+// match that intent).
+//
+// Exported (was lowercase) because pkg/api's triggerScreenshotCapture
+// wraps this call in its own outer context.WithTimeout, on its own
+// SEPARATE hardcoded value — and a nested context.WithTimeout always
+// resolves to the EARLIER of the two deadlines, so that outer value
+// silently capped this one no matter how high it was raised. Found in
+// the same incident: the outer timeout was hardcoded to 90s, itself
+// already shorter than the observed pull time (over 157s). Two
+// independent copies of "how long can a capture take" that are supposed
+// to agree but do not is exactly the shape of bug this was — exporting
+// this constant so pkg/api derives its own bound FROM it, rather than
+// keeping a second number in sync by hand, is what actually closes it.
+const CaptureTimeoutDefault = 4 * time.Minute
 
 // screenshotTokenTTL bounds the capture pod's own upload credential —
-// comfortably past captureTimeoutDefault, so the server's own timeout
+// comfortably past CaptureTimeoutDefault, so the server's own timeout
 // governs a stuck capture rather than the token itself expiring mid-
 // upload and turning into a confusing 401 instead of a clear timeout.
 const screenshotTokenTTL = 5 * time.Minute
@@ -256,7 +283,7 @@ const screenshotBinaryPath = "/usr/local/bin/kumbha-screenshot"
 // entrypoint. Reuses the exact same TokenMinter and APIBaseURL WithAgent
 // already configured, same trust boundary as MintWorkspaceFetchToken.
 //
-// Synchronous: waits for the pod to finish (or captureTimeoutDefault to
+// Synchronous: waits for the pod to finish (or CaptureTimeoutDefault to
 // elapse) and deletes it before returning, success or failure — the pod's
 // own result is entirely the SIDE EFFECT of it calling the upload
 // endpoint, not this method's return value, so there is nothing
@@ -279,7 +306,7 @@ func (g *Gateway) CaptureScreenshot(ctx context.Context, sess *Session, targetUR
 	uploadURL := strings.TrimRight(g.agentConfig.APIBaseURL, "/") +
 		"/v1/kumbha/sessions/" + sess.ID.String() + "/screenshot"
 
-	ctx, cancel := context.WithTimeout(ctx, captureTimeoutDefault)
+	ctx, cancel := context.WithTimeout(ctx, CaptureTimeoutDefault)
 	defer cancel()
 
 	podID := "kumbha-shot-" + sess.ID.String()[:8]

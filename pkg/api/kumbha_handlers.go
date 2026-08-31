@@ -715,6 +715,32 @@ func (s *Server) DeployKumbhaSession(c *gin.Context) {
 		Ports:     ports,
 		Env:       req.Env,
 	}
+	// The actual root of the whole endpoint saga, one level deeper than
+	// redeployKumbhaInstance's own NodeClass/ProviderID fix above: THIS
+	// first-deploy request never set node_class either, so CreateInstance's
+	// handler (server.go) never entered its home-placement branch — meaning
+	// spec.ProviderID/spec.NodeClass were never set on the ORIGINAL create,
+	// and compute.instances.provider_id was persisted empty from day one,
+	// for every Kumbha app ever deployed, not just this one instance.
+	// Confirmed directly from this incident's own earlier diagnostic query
+	// (`provider_id` came back blank for inst-5ed29952) — which is exactly
+	// why the redeploy fix above, correct on its own terms, could never
+	// fire: existing.ProviderID had nothing to read. The pod-placement
+	// itself still landed on the home node regardless (createOrReplace's
+	// dispatch falls back to registry.Any() with an empty ProviderID,
+	// harmless with exactly one connected provider) — same reason this
+	// stayed invisible: it broke endpoint SYNTHESIS, never the deploy
+	// itself. Kumbha's own agent-pod launch (pkg/kumbha/agent.go's
+	// LaunchAgent) has this identical gap and relies on the same Any()
+	// fallback — nothing in Kumbha's code has ever explicitly requested
+	// home placement. Guarded on s.nodePlacer != nil (the same guard
+	// CreateInstance's own handler already enforces) so this cannot turn
+	// into a NEW failure mode on a deployment without home compute
+	// configured — it only starts requesting what was always the de facto
+	// reality everywhere home compute already exists.
+	if s.nodePlacer != nil {
+		createReq.NodeClass = "home"
+	}
 	createStatus, createBody := s.invokeInternally(s.CreateInstance, http.MethodPost, "/v1/compute/instances", nil, accountID, projectID, userID, sessionID, createReq)
 	if createStatus != http.StatusCreated {
 		s.recordDeployOutcome(ctx, sessionID, errorFromJSONBody(createBody))
@@ -781,7 +807,18 @@ func (s *Server) triggerScreenshotCapture(sessionID uuid.UUID, sess *kumbha.Sess
 		return
 	}
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		// Was a separate hardcoded 90*time.Second, itself already shorter
+		// than kumbha.CaptureTimeoutDefault's OWN prior 45s value would
+		// suggest was intended — and since a nested context.WithTimeout
+		// always resolves to the earlier deadline, this outer value
+		// silently capped CaptureScreenshot's own internal timeout no
+		// matter how high that one was raised. Found live 2026-08-31: a
+		// real capture pod was still pulling its image at 157s, past BOTH
+		// the old 45s inner bound and this old 90s outer one. Deriving
+		// from the exported constant (plus a margin for this goroutine's
+		// own dispatch/scheduling overhead) means there is exactly one
+		// number to reason about, not two that can silently drift apart.
+		ctx, cancel := context.WithTimeout(context.Background(), kumbha.CaptureTimeoutDefault+10*time.Second)
 		defer cancel()
 		if err := s.kumbha.CaptureScreenshot(ctx, sess, targetURL); err != nil {
 			log.Printf("WARN: screenshot capture failed for Kumbha session %s: %v", sessionID, err)
