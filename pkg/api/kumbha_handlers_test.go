@@ -790,6 +790,58 @@ func TestRedeployKumbhaInstance_NoResolvablePortIs422(t *testing.T) {
 	}
 }
 
+// TestRedeployKumbhaInstance_FallsBackToFreshEndpointWhenExistingIsEmpty
+// guards the live incident from 2026-08-31, the last piece of it: even
+// after container_port and terminated_at were both fixed and the
+// instance was genuinely reachable again, this response — and, via the
+// exact same value, triggerScreenshotCapture's targetURL — still
+// reported an empty endpoint. existing.Endpoint is read from the
+// database BEFORE cluster.UpdateInstance runs, so on the FIRST redeploy
+// after recovering from a corrupted (empty) endpoint, it cannot possibly
+// reflect what THIS SAME call's own createOrReplace just freshly
+// synthesized — but result.EndpointURL, returned by that same call,
+// already has it. A redeploy must fall back to that fresh value rather
+// than reporting a stale empty one it could see was wrong.
+func TestRedeployKumbhaInstance_FallsBackToFreshEndpointWhenExistingIsEmpty(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+
+	projectID, sessionID := uuid.New(), uuid.New()
+	existingID := "inst-existing4"
+	fc := newFakeCluster()
+	fc.add(existingID, projectID.String(), compute.StatusRunning)
+	fc.nextResult = &cluster.InstanceResult{EndpointURL: "https://inst-existing4.dev.teepin.com"}
+	server := (&Server{store: cStore, cluster: fc}).WithKumbha(gw)
+
+	// endpoint == "" in the stored record: the corrupted-state case.
+	mock.ExpectQuery(`SELECT .+ FROM compute\.instances`).
+		WithArgs(existingID).
+		WillReturnRows(instanceRecordRow(existingID, testAccountID, projectID, "kumbha-abc123", "old-image:v1", 1, 1, 0, 80, ""))
+	mock.ExpectExec(`UPDATE compute\.instances`).
+		WithArgs("new-image:v5", existingID+"-pod", 80, compute.StatusPending, existingID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE billing\.kumbha_workspace_versions`).
+		WithArgs(sessionID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE billing\.inference_sessions\s+SET last_deployed_version = current_workspace_version`).
+		WithArgs(sessionID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	sess := &kumbha.Session{ID: sessionID, AccountID: testAccountID, ProjectID: projectID, AppInstanceID: existingID}
+	c, w := newRedeployTestContext(projectID)
+	server.redeployKumbhaInstance(context.Background(), c, sessionID, sess, projectID, testAccountID, "new-image:v5",
+		[]models.PortMapping{{Container: 80, Protocol: "tcp"}}, nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["endpoint"] != "https://inst-existing4.dev.teepin.com" {
+		t.Errorf("endpoint = %v, want the FRESH endpoint this same redeploy just synthesized, not a stale empty value", resp["endpoint"])
+	}
+}
+
 func TestRedeployKumbhaInstance_InstanceGoneIs404(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
 	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})

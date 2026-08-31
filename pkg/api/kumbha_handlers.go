@@ -930,17 +930,40 @@ func (s *Server) redeployKumbhaInstance(ctx context.Context, c *gin.Context, ses
 		log.Printf("WARN: redeployed Kumbha session %s but failed to checkpoint its workspace version: %v", sessionID, err)
 	}
 
-	s.triggerScreenshotCapture(sessionID, sess, existing.Endpoint)
+	// The endpoint is normally UNCHANGED by a redeploy — same Service/
+	// Ingress, same hostname — so existing.Endpoint (read from the
+	// database before this redeploy even started) is the right source in
+	// the common case, not `result` (which, being a pod-only replace,
+	// never re-provisions anything). But existing.Endpoint can genuinely
+	// be empty here — exactly the state inst-5ed29952's row was in for
+	// this whole incident — and in THAT case `result.EndpointUrl` is not
+	// nothing: createOrReplace (agent.go) synthesizes it fresh, in this
+	// SAME call, the instant spec.Ports is non-empty (which it now always
+	// is, given the port-resolution fixes above). Found live 2026-08-31:
+	// even after container_port and terminated_at were both fixed and the
+	// instance was genuinely reachable again, this response — and, via
+	// the exact same stale value, triggerScreenshotCapture's targetURL —
+	// still reported an empty endpoint, because existing.Endpoint had been
+	// read into a local variable BEFORE this redeploy's own cluster call
+	// had a chance to fix it, and nothing here ever looked at what that
+	// call actually returned. The reconciler will eventually converge
+	// compute.instances.endpoint to the same value on its next pass (up to
+	// a minute later) regardless — this just stops the SAME request that
+	// fixed it from reporting the stale answer back, and stops the
+	// screenshot from missing its own trigger for another full redeploy
+	// cycle.
+	redeployedEndpoint := existing.Endpoint
+	if redeployedEndpoint == "" {
+		redeployedEndpoint = result.EndpointURL
+	}
+
+	s.triggerScreenshotCapture(sessionID, sess, redeployedEndpoint)
 	s.recordDeployOutcome(ctx, sessionID, "")
 
 	c.JSON(http.StatusOK, gin.H{
-		"image_ref":   imageRef,
-		"instance_id": existing.ID,
-		// The endpoint is UNCHANGED by a redeploy — same Service/Ingress,
-		// same hostname — so it is read back from the existing record
-		// rather than from `result`, which (being a pod-only replace)
-		// never re-provisions or re-reports it.
-		"endpoint":       existing.Endpoint,
+		"image_ref":      imageRef,
+		"instance_id":    existing.ID,
+		"endpoint":       redeployedEndpoint,
 		"status":         compute.StatusPending,
 		"price_per_hour": 0.0, // Kumbha apps are CPU-only; see CreateInstance's own note that this is only ever non-zero for a GPU allocation.
 	})
