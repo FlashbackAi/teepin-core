@@ -116,11 +116,29 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		// ("running" before and after). A status-only comparison would
 		// skip this instance every single pass and the certificate
 		// becoming ready would never reach the database (Stage 3 plan A6).
-		endpointChanged := observed.EndpointURL != inst.Endpoint ||
+		//
+		// An observed endpoint that is entirely empty is never treated as
+		// a change when the database already has one: AgentClient.
+		// RecordStatus preserves a cached endpoint across an all-empty
+		// wire report (see that method's own comment), but that
+		// protection only applies once a cache entry already exists. A
+		// cold cache — the control plane restarted, or this is the first
+		// status this process has seen for the instance — has nothing to
+		// preserve, so a legitimately-empty first report (e.g. a redeploy
+		// whose port auto-detection failed transiently) would otherwise
+		// reach here as a real "change" and get persisted, erasing a
+		// working endpoint the instance already had. Found live
+		// 2026-08-31 alongside the redeployKumbhaInstance port-detection
+		// fix (kumbha_handlers.go) — this is the same failure one layer
+		// further down, and closes it for every producer of
+		// InstanceStatus, not just that one call site.
+		observedEndpointEmpty := observed.EndpointURL == "" && observed.DNSName == "" &&
+			observed.PublicIP == "" && !observed.TLSEnabled && !observed.TLSReady
+		endpointChanged := !observedEndpointEmpty && (observed.EndpointURL != inst.Endpoint ||
 			observed.DNSName != inst.DNSName ||
 			observed.PublicIP != inst.PublicIP ||
 			observed.TLSEnabled != inst.TLSEnabled ||
-			observed.TLSReady != inst.TLSReady
+			observed.TLSReady != inst.TLSReady)
 
 		if observed.Status == inst.Status && !endpointChanged {
 			continue

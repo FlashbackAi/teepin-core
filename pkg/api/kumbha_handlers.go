@@ -794,6 +794,27 @@ func (s *Server) redeployKumbhaInstance(ctx context.Context, c *gin.Context, ses
 		return
 	}
 
+	// A redeploy's own doc comment above promises "same instance ID, same
+	// hostname, same TLS cert ... only the running code changes" — but
+	// detectKumbhaPorts is best-effort (registry auth hiccup, image not
+	// yet fully propagated, any transient failure silently returns nil,
+	// see its own doc comment) and DeployKumbhaSession re-runs it on
+	// EVERY redeploy, not just the first. An empty result here reaches
+	// cluster.UpdateInstance as spec.Ports == nil, which skips endpoint
+	// synthesis entirely (agent.go's createOrReplace, home-class path)
+	// and seeds the status cache with an all-empty endpoint — which the
+	// reconciler then persists over the instance's previously-correct
+	// endpoint/dns_name in compute.instances. Found live 2026-08-31:
+	// inst-5ed29952 lost its endpoint this way after a routine redeploy,
+	// silently breaking the screenshot service (triggerScreenshotCapture
+	// no-ops on an empty target URL) with no error surfaced anywhere.
+	// Falling back to the instance's own already-known port when
+	// detection comes back empty keeps a redeploy from ever re-deriving
+	// (and risking the loss of) an endpoint that already exists.
+	if len(ports) == 0 && existing.ContainerPort > 0 {
+		ports = []models.PortMapping{{Container: existing.ContainerPort, Protocol: "tcp"}}
+	}
+
 	req := models.CreateInstanceRequest{
 		Name:      existing.Name,
 		Image:     imageRef,

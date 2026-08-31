@@ -690,6 +690,58 @@ func TestRedeployKumbhaInstance_UpdatesExistingInstanceInPlace(t *testing.T) {
 	}
 }
 
+// TestRedeployKumbhaInstance_EmptyPortsFallsBackToExistingContainerPort
+// guards the live incident from 2026-08-31: detectKumbhaPorts is
+// best-effort and DeployKumbhaSession re-runs it on every redeploy, not
+// just the first — a transient failure (registry auth hiccup, image not
+// yet fully propagated) silently returns nil ports. Passed straight
+// through to cluster.UpdateInstance, empty Ports skips endpoint synthesis
+// on the home-class path (agent.go's createOrReplace) and seeds the
+// status cache with an all-empty endpoint, which the reconciler then
+// persists over the instance's previously-working endpoint — this is
+// exactly what happened to inst-5ed29952, silently breaking the
+// screenshot service. A redeploy must fall back to the instance's own
+// already-known container port when detection comes back empty, rather
+// than ever asking the cluster to redeploy with no ports at all.
+func TestRedeployKumbhaInstance_EmptyPortsFallsBackToExistingContainerPort(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+
+	projectID, sessionID := uuid.New(), uuid.New()
+	existingID := "inst-existing2"
+	fc := newFakeCluster()
+	fc.add(existingID, projectID.String(), compute.StatusRunning)
+	server := (&Server{store: cStore, cluster: fc}).WithKumbha(gw)
+
+	mock.ExpectQuery(`SELECT .+ FROM compute\.instances`).
+		WithArgs(existingID).
+		WillReturnRows(instanceRecordRow(existingID, testAccountID, projectID, "kumbha-abc123", "old-image:v1", 1, 1, 0, 8080, "https://inst-existing2.teepin.com"))
+	mock.ExpectExec(`UPDATE compute\.instances`).
+		WithArgs("new-image:v3", existingID+"-pod", 8080, compute.StatusPending, existingID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE billing\.kumbha_workspace_versions`).
+		WithArgs(sessionID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE billing\.inference_sessions\s+SET last_deployed_version = current_workspace_version`).
+		WithArgs(sessionID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	sess := &kumbha.Session{ID: sessionID, AccountID: testAccountID, ProjectID: projectID, AppInstanceID: existingID}
+	c, w := newRedeployTestContext(projectID)
+	// ports == nil: simulates detectKumbhaPorts coming back empty.
+	server.redeployKumbhaInstance(context.Background(), c, sessionID, sess, projectID, testAccountID, "new-image:v3", nil, nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	if len(fc.lastSpec.Ports) != 1 || fc.lastSpec.Ports[0].Container != 8080 {
+		t.Errorf("UpdateInstance spec Ports = %+v, want a fallback to the existing container port (8080) instead of empty", fc.lastSpec.Ports)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet DB expectations: %v", err)
+	}
+}
+
 func TestRedeployKumbhaInstance_InstanceGoneIs404(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
 	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})

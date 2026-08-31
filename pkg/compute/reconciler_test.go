@@ -205,3 +205,47 @@ func TestReconcile_NoChangeNoWrites(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+// TestReconcile_AllEmptyObservedEndpointNeverErasesKnownEndpoint guards the
+// exact live incident from 2026-08-31: inst-5ed29952 had a working
+// endpoint/dns_name in the database, a redeploy's port auto-detection
+// failed transiently, and the resulting all-empty InstanceStatus reached
+// the reconciler as a cold-cache first report (nothing in AgentClient's
+// in-memory cache yet to preserve it, e.g. right after a control-plane
+// restart) — which the pre-fix code read as "the endpoint changed to
+// empty" and persisted via UpdateEndpoint, silently breaking the
+// screenshot service. An observed status with every endpoint field empty
+// must never be treated as a change when the database already has one.
+func TestReconcile_AllEmptyObservedEndpointNeverErasesKnownEndpoint(t *testing.T) {
+	store, mock := newMockStore(t)
+	accountID, projectID, userID := uuid.New(), uuid.New(), uuid.New()
+	mock.ExpectQuery(`SELECT .+ FROM compute\.instances WHERE terminated_at IS NULL`).
+		WillReturnRows(instanceRows().AddRow(
+			"inst-5ed29952", accountID, projectID, userID, "app", "nginx:latest",
+			"gpu.h100.2g.20gb", StatusRunning, 20, 8, 32,
+			"https://inst-5ed29952.dev.teepin.com",
+			"inst-5ed29952-pod", "default", "",
+			"inst-5ed29952.dev.teepin.com", "", true, true, 8080,
+			0,
+			time.Now(), time.Now(), nil, nil, nil,
+		))
+	// No UPDATE expected at all: status is unchanged and the all-empty
+	// observed endpoint must be ignored rather than persisted.
+
+	stub := &stubCluster{statuses: []cluster.InstanceStatus{
+		{
+			InstanceID: "inst-5ed29952",
+			Status:     StatusRunning,
+			ObservedAt: time.Now().UTC(),
+			// Every endpoint field zero-valued: the cold-cache report.
+		},
+	}}
+	r := NewReconciler(store, stub)
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
