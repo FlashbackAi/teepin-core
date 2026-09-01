@@ -321,9 +321,26 @@ func (r *Runner) handleCreate(ctx context.Context, s stream, requestID string, c
 	// issued BECAUSE the instance already exists and must be swapped —
 	// treating its existence as "already done, nothing to do" would make
 	// a replace a permanent no-op.
+	//
+	// existing.Status must also be checked, not just existence: a bare
+	// Pod object is never garbage-collected by Kubernetes on its own, so
+	// a one-shot instance (Kumbha's own agent/build pods, which exit
+	// intentionally when finished — see LaunchAgent's NeverRestart doc
+	// comment) leaves a Completed pod sitting in the cluster
+	// indefinitely under the same instance ID. Before this check, that
+	// stale pod made every later relaunch of the SAME session silently
+	// no-op forever: this idempotency guard saw "a pod with this
+	// instance ID exists" and reported fake success without ever
+	// creating a fresh pod, leaving the customer's message queued with
+	// nothing left running to read it. Found live 2026-09-01 — a
+	// session's agent pod had been Completed for over two hours, and
+	// every subsequent chat message silently went nowhere. "pending"/
+	// "running" mirrors isAgentRunning's own definition of "still alive"
+	// on the control-plane side (pkg/kumbha/agent.go).
 	if !cmd.ReplaceExisting {
 		if existing, err := r.cfg.Cluster.GetInstanceStatus(
-			ctx, cluster.AllTenants(), cmd.InstanceId); err == nil && existing != nil {
+			ctx, cluster.AllTenants(), cmd.InstanceId); err == nil && existing != nil &&
+			(existing.Status == "pending" || existing.Status == "running") {
 			log.Printf("Instance %s already exists - treating redelivered command as success", cmd.InstanceId)
 			_ = r.send(s, &agentpb.AgentMessage{
 				RequestId: requestID,
