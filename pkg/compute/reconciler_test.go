@@ -72,6 +72,20 @@ func expectListActive(mock sqlmock.Sqlmock, id, status string) {
 			0,
 			time.Now(), time.Now(), nil, nil, nil,
 		))
+	// Every Reconcile pass also checks for a recently-terminated instance
+	// worth reviving (see Reconciler's own doc comment) — empty by
+	// default; a test that exercises revival calls expectRecentlyTerminated
+	// again itself, with real rows, before its own Reconcile call.
+	expectRecentlyTerminated(mock, instanceRows())
+}
+
+// expectRecentlyTerminated mocks Reconcile's ListRecentlyTerminated call.
+// Call with instanceRows() (zero rows) for the common case that doesn't
+// exercise revival, or with a populated *sqlmock.Rows (built the same way
+// expectListActive itself does) for a test that does.
+func expectRecentlyTerminated(mock sqlmock.Sqlmock, rows *sqlmock.Rows) {
+	mock.ExpectQuery(`SELECT .+ FROM compute\.instances\s+WHERE terminated_at IS NOT NULL AND terminated_at > `).
+		WillReturnRows(rows)
 }
 
 func TestReconcile_UpdatesStatusFromClusterStatus(t *testing.T) {
@@ -188,6 +202,103 @@ func TestReconcile_CompletedInstanceTerminatesBilling(t *testing.T) {
 	}
 }
 
+// TestReconcile_RevivesTerminatedInstanceReportingHealthy guards the live
+// incident from 2026-09-01: a slow pod replacement during a redeploy
+// outlasted the reconciler's own patience, got marked terminated, then
+// came up healthy seconds later with nothing left to ever notice —
+// ListActive's own WHERE clause permanently excludes a terminated row
+// from every future reconcile pass. A recently-terminated instance whose
+// workload is reporting "running" again must be revived: terminated_at
+// cleared, status set from the observed report.
+func TestReconcile_RevivesTerminatedInstanceReportingHealthy(t *testing.T) {
+	store, mock := newMockStore(t)
+	mock.ExpectQuery(`SELECT .+ FROM compute\.instances WHERE terminated_at IS NULL`).
+		WillReturnRows(instanceRows())
+	mock.ExpectQuery(`SELECT .+ FROM compute\.instances\s+WHERE terminated_at IS NOT NULL AND terminated_at > `).
+		WillReturnRows(instanceRows().AddRow(
+			"inst-revived1", uuid.New(), uuid.New(), uuid.New(), "app", "nginx:latest",
+			"", StatusTerminated, 0, 1, 1, "",
+			"inst-revived1-pod", "default", "", "", "", false, false, 80,
+			0,
+			time.Now(), time.Now(), nil, time.Now(), nil,
+		))
+	mock.ExpectExec(`UPDATE compute\.instances`).
+		WithArgs(StatusRunning, "inst-revived1").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	stub := &stubCluster{statuses: []cluster.InstanceStatus{
+		liveInstance("inst-revived1", StatusRunning),
+	}}
+	r := NewReconciler(store, stub)
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+// TestReconcile_DoesNotReviveTerminatedInstanceStillGone proves the other
+// half: a recently-terminated instance the cluster still has no report
+// for at all stays terminated — reviving on absence would defeat the
+// entire point of MarkTerminated.
+func TestReconcile_DoesNotReviveTerminatedInstanceStillGone(t *testing.T) {
+	store, mock := newMockStore(t)
+	mock.ExpectQuery(`SELECT .+ FROM compute\.instances WHERE terminated_at IS NULL`).
+		WillReturnRows(instanceRows())
+	mock.ExpectQuery(`SELECT .+ FROM compute\.instances\s+WHERE terminated_at IS NOT NULL AND terminated_at > `).
+		WillReturnRows(instanceRows().AddRow(
+			"inst-stillgone", uuid.New(), uuid.New(), uuid.New(), "app", "nginx:latest",
+			"", StatusTerminated, 0, 1, 1, "",
+			"inst-stillgone-pod", "default", "", "", "", false, false, 80,
+			0,
+			time.Now(), time.Now(), nil, time.Now(), nil,
+		))
+	// Deliberately no ExpectExec: any write here is a failure.
+
+	stub := &stubCluster{} // reports nothing for inst-stillgone
+	r := NewReconciler(store, stub)
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("a terminated instance the cluster still has no report for must not be revived: %v", err)
+	}
+}
+
+// TestReconcile_DoesNotReviveOnUnhealthyStatus proves a terminated
+// instance reporting "failed" is not revival-worthy — the cluster
+// agreeing the workload is unhealthy is not a reason to bring the
+// database record back.
+func TestReconcile_DoesNotReviveOnUnhealthyStatus(t *testing.T) {
+	store, mock := newMockStore(t)
+	mock.ExpectQuery(`SELECT .+ FROM compute\.instances WHERE terminated_at IS NULL`).
+		WillReturnRows(instanceRows())
+	mock.ExpectQuery(`SELECT .+ FROM compute\.instances\s+WHERE terminated_at IS NOT NULL AND terminated_at > `).
+		WillReturnRows(instanceRows().AddRow(
+			"inst-unhealthy", uuid.New(), uuid.New(), uuid.New(), "app", "nginx:latest",
+			"", StatusTerminated, 0, 1, 1, "",
+			"inst-unhealthy-pod", "default", "", "", "", false, false, 80,
+			0,
+			time.Now(), time.Now(), nil, time.Now(), nil,
+		))
+	// Deliberately no ExpectExec.
+
+	stub := &stubCluster{statuses: []cluster.InstanceStatus{
+		liveInstance("inst-unhealthy", StatusFailed),
+	}}
+	r := NewReconciler(store, stub)
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("a terminated instance reporting an unhealthy status must not be revived: %v", err)
+	}
+}
+
 func TestReconcile_NoChangeNoWrites(t *testing.T) {
 	store, mock := newMockStore(t)
 	expectListActive(mock, "inst-dddd4444", StatusRunning)
@@ -229,6 +340,7 @@ func TestReconcile_AllEmptyObservedEndpointNeverErasesKnownEndpoint(t *testing.T
 			0,
 			time.Now(), time.Now(), nil, nil, nil,
 		))
+	expectRecentlyTerminated(mock, instanceRows())
 	// No UPDATE expected at all: status is unchanged and the all-empty
 	// observed endpoint must be ignored rather than persisted.
 

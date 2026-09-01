@@ -493,6 +493,35 @@ func (s *Server) CreateInstance(c *gin.Context) {
 	// (found live 2026-08-30/31 — see migration 032's own doc comment).
 	kumbhaSessionID, _ := auth.GetSessionID(c)
 
+	// A Kumbha session that already has a deployed app instance must
+	// redeploy it (the "deploy" MCP tool, redeployKumbhaInstance) rather
+	// than create a second one via this endpoint directly. Enforced here,
+	// server-side, not left to the agent's own good judgment or the MCP
+	// tool description alone — same "never trusted from the agent process
+	// itself" posture as the deploy-approval gate. Found live 2026-09-01:
+	// an agent, working around what looked like a stuck redeploy (the
+	// stale-image-cache bug fixed earlier tonight), called create_instance
+	// directly — twice — producing two extra, fully-billed CPU instances
+	// alongside the original, all serving the same site, none of which the
+	// customer asked for or knew to look for. A same-session self-inflicted
+	// double-instance situation like that must be structurally impossible,
+	// not just something an agent is trusted to avoid.
+	if s.kumbha != nil && kumbhaSessionID != uuid.Nil {
+		sess, err := s.kumbha.GetSession(c.Request.Context(), kumbhaSessionID, accountID)
+		if err == nil && sess.AppInstanceID != "" {
+			c.JSON(http.StatusConflict, gin.H{
+				"error": "this session already has a deployed instance (" + sess.AppInstanceID + "); use the deploy tool to redeploy it in place instead of creating a new one",
+				"code":  "instance_already_exists",
+			})
+			return
+		}
+		// A lookup failure here (session not found, DB blip) is not a
+		// reason to block a create outright — it degrades to the
+		// pre-existing behavior rather than failing closed on an
+		// unrelated error, matching every other best-effort Kumbha check
+		// in this file.
+	}
+
 	// Payment gate: no validated payment method (or a non-active account),
 	// no resources. Checked here — after identity is resolved, before any
 	// GPU is allocated or any side effect occurs — so a blocked account
@@ -590,6 +619,27 @@ func (s *Server) CreateInstance(c *gin.Context) {
 		spec.NodeClass = "home"
 		spec.NodeName = homePlacement.nodeName
 		spec.ProviderID = homePlacement.providerID
+	}
+	// Kumbha's own build pipeline tags every image within one session with
+	// the SAME tag (the session ID prefix — see build.Service/Kaniko's own
+	// destination), not a content hash or version number, so "same tag,
+	// different content" is a routine, expected situation for these
+	// instances specifically — unlike a regular customer's own image,
+	// which is reasonably assumed to be immutable per tag. Kubernetes
+	// defaults ImagePullPolicy to IfNotPresent for any non-":latest" tag
+	// (spec.AlwaysPullImage unset — see cluster.DirectClient's own pod
+	// spec), so without this, a node that already pulled this tag once
+	// silently reuses the stale, cached image on every later
+	// redeploy — the exact same risk the Kumbha agent/screenshot pods
+	// already guard against (see LaunchAgent/CaptureScreenshot's own
+	// AlwaysPullImage: true and doc comments), just never extended to the
+	// customer-facing app instance itself. Found live 2026-09-01: a
+	// redeploy adding new pages built and pushed successfully, but the
+	// live site kept serving the previous version indefinitely, with no
+	// error anywhere — the new pod started fine, it just never had the
+	// new content.
+	if kumbhaSessionID != uuid.Nil {
+		spec.AlwaysPullImage = true
 	}
 
 	scope := scopeFor(projectID)

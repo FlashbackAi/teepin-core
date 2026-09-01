@@ -542,3 +542,64 @@ func TestStore_SetGithubRepo_UnknownSessionIsNotFound(t *testing.T) {
 		t.Errorf("got %v, want ErrSessionNotFound", err)
 	}
 }
+
+// TestStore_AcquireDeployLock_SucceedsWhenUnlocked and its siblings guard
+// migration 035's deploy_lock_acquired_at column — see AcquireDeployLock's
+// own doc comment for the live incident (two overlapping deploy calls for
+// one session racing SetLastDeployStatus's own last-write-wins update).
+func TestStore_AcquireDeployLock_SucceedsWhenUnlocked(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessID := uuid.New()
+
+	// RowsAffected == 1: the WHERE clause matched (was NULL or stale).
+	mock.ExpectExec(`UPDATE billing\.inference_sessions\s+SET deploy_lock_acquired_at = NOW\(\)`).
+		WithArgs(sessID, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	acquired, err := store.AcquireDeployLock(context.Background(), sessID, time.Hour)
+	if err != nil {
+		t.Fatalf("AcquireDeployLock: %v", err)
+	}
+	if !acquired {
+		t.Error("got false, want true for an unlocked session")
+	}
+}
+
+// TestStore_AcquireDeployLock_FailsWhenAlreadyLocked guards the actual
+// contract: a fresh, currently-held lock must NOT be acquirable by a
+// second caller — this is what stops two overlapping deploys from ever
+// running concurrently in the first place.
+func TestStore_AcquireDeployLock_FailsWhenAlreadyLocked(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessID := uuid.New()
+
+	// RowsAffected == 0: the WHERE clause matched nothing — a fresh lock
+	// is already held, so this UPDATE touched zero rows.
+	mock.ExpectExec(`UPDATE billing\.inference_sessions\s+SET deploy_lock_acquired_at = NOW\(\)`).
+		WithArgs(sessID, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	acquired, err := store.AcquireDeployLock(context.Background(), sessID, time.Hour)
+	if err != nil {
+		t.Fatalf("AcquireDeployLock: %v", err)
+	}
+	if acquired {
+		t.Error("got true, want false — a fresh, already-held lock must not be acquirable by a second caller")
+	}
+}
+
+func TestStore_ReleaseDeployLock_ClearsLock(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessID := uuid.New()
+
+	mock.ExpectExec(`UPDATE billing\.inference_sessions SET deploy_lock_acquired_at = NULL`).
+		WithArgs(sessID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := store.ReleaseDeployLock(context.Background(), sessID); err != nil {
+		t.Fatalf("ReleaseDeployLock: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}

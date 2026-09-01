@@ -244,6 +244,18 @@ func (g *Gateway) SetAppInstanceID(ctx context.Context, sessionID uuid.UUID, ins
 	return g.store.SetAppInstanceID(ctx, sessionID, instanceID)
 }
 
+// AcquireDeployLock/ReleaseDeployLock expose Store's own methods of the
+// same name — see AcquireDeployLock's own doc comment for the incident
+// this closes (two overlapping deploy calls for one session racing each
+// other's outcome).
+func (g *Gateway) AcquireDeployLock(ctx context.Context, sessionID uuid.UUID, staleAfter time.Duration) (bool, error) {
+	return g.store.AcquireDeployLock(ctx, sessionID, staleAfter)
+}
+
+func (g *Gateway) ReleaseDeployLock(ctx context.Context, sessionID uuid.UUID) error {
+	return g.store.ReleaseDeployLock(ctx, sessionID)
+}
+
 // GetGithubRepo/SetGithubRepo expose Store's own methods of the same
 // name — see their doc comments (pkg/kumbha/session.go) for why this is
 // deliberately not a Session field.

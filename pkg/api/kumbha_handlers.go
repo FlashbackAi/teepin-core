@@ -587,6 +587,13 @@ type deployKumbhaSessionRequest struct {
 // cmd/kumbha-mcp-server's own deployHTTPTimeout.
 const deployFlowTimeout = 18 * time.Minute
 
+// deployLockStaleAfter bounds how long a held deploy lock
+// (kumbha.Store.AcquireDeployLock) is trusted before the next caller may
+// reclaim it — comfortably past deployFlowTimeout itself, so the lock's
+// own timeout never fires before the flow it is guarding could have
+// legitimately still been running.
+const deployLockStaleAfter = deployFlowTimeout + 2*time.Minute
+
 func (s *Server) DeployKumbhaSession(c *gin.Context) {
 	if s.kumbha == nil || s.kumbhaBuild == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha build pipeline is not available on this deployment"})
@@ -658,6 +665,33 @@ func (s *Server) DeployKumbhaSession(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "the customer has not approved the deployment plan yet", "code": "not_approved"})
 		return
 	}
+
+	// Claimed for the ENTIRE flow below (build + create/redeploy +
+	// checkpoint), released via defer regardless of how this function
+	// returns — see AcquireDeployLock's own doc comment for the incident
+	// this closes: two overlapping deploy calls for the same session
+	// racing SetLastDeployStatus's own last-write-wins update, leaving a
+	// genuinely successful redeploy showing "Last deploy failed" purely
+	// because of completion order. A caller that loses this race gets a
+	// clear, actionable 409 instead of silently starting a second build
+	// alongside the first.
+	acquired, err := s.kumbha.AcquireDeployLock(ctx, sessionID, deployLockStaleAfter)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if !acquired {
+		c.JSON(http.StatusConflict, gin.H{
+			"error": kumbha.ErrDeployInProgress.Error(),
+			"code":  "deploy_in_progress",
+		})
+		return
+	}
+	defer func() {
+		if err := s.kumbha.ReleaseDeployLock(context.Background(), sessionID); err != nil {
+			log.Printf("WARN: could not release deploy lock for Kumbha session %s: %v", sessionID, err)
+		}
+	}()
 
 	imageRef, status, body := s.buildKumbhaImage(ctx, sess, accountID, req.DockerfilePath)
 	if status != 0 {
@@ -1018,6 +1052,23 @@ func (s *Server) redeployKumbhaInstance(ctx context.Context, c *gin.Context, ses
 		// ProviderID, never NodeName, so this does not affect the fix
 		// above.
 	}
+
+	// Every Kumbha redeploy within one session reuses the SAME image tag
+	// (the session ID prefix — see build.Service/Kaniko's own destination),
+	// not a content hash or version number. Kubernetes defaults
+	// ImagePullPolicy to IfNotPresent for any non-":latest" tag
+	// (spec.AlwaysPullImage otherwise unset — see cluster.DirectClient's
+	// own pod spec), so a node that already pulled this tag once would
+	// silently keep reusing the stale, cached image on every later
+	// redeploy — the exact same risk LaunchAgent/CaptureScreenshot already
+	// guard against for the agent/screenshot pods, just never extended to
+	// the customer-facing app instance itself. Found live 2026-09-01: a
+	// redeploy adding new pages built and pushed successfully (confirmed
+	// via the deploy tool's own "Built ... and deployed" response and a
+	// clean Kaniko log), but the live site kept serving the previous
+	// version indefinitely — the new pod started fine, it just never had
+	// the new content, because it never actually pulled it.
+	spec.AlwaysPullImage = true
 
 	result, err := s.cluster.UpdateInstance(ctx, scopeFor(projectID), spec)
 	if err != nil {

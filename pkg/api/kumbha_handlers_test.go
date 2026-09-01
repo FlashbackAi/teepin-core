@@ -116,6 +116,26 @@ func newMockKumbhaDB(t *testing.T) (sqlmock.Sqlmock, *kumbha.Store, *compute.Sto
 	return mock, kumbha.NewStore(db), compute.NewStore(db)
 }
 
+// expectDeployLockAcquired/expectDeployLockReleased mock
+// AcquireDeployLock/ReleaseDeployLock's own SQL — every DeployKumbhaSession
+// call now claims the lock right after resolving the session, and
+// releases it via defer right before returning, regardless of which path
+// the function took. Call Acquired right after the test's own session
+// query, and Released as the LAST expectation before the test's own
+// assertions — sqlmock's default ordered mode requires expectations to be
+// consumed in the exact order the code actually runs them.
+func expectDeployLockAcquired(mock sqlmock.Sqlmock, sessionID uuid.UUID) {
+	mock.ExpectExec(`UPDATE billing\.inference_sessions\s+SET deploy_lock_acquired_at = NOW\(\)`).
+		WithArgs(sessionID, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+}
+
+func expectDeployLockReleased(mock sqlmock.Sqlmock, sessionID uuid.UUID) {
+	mock.ExpectExec(`UPDATE billing\.inference_sessions SET deploy_lock_acquired_at = NULL`).
+		WithArgs(sessionID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+}
+
 type fakeKPricing struct{ in, out float64 }
 
 func (f *fakeKPricing) LLMPriceInputPerMillion(context.Context) float64  { return f.in }
@@ -542,6 +562,53 @@ func TestBuildKumbhaSession_SessionNotFoundIs404(t *testing.T) {
 // buildPod/waitForCompletion in isolation, never Build() end-to-end) —
 // so it is not re-attempted here.
 
+// TestCreateInstance_RefusesSecondInstanceForSessionThatAlreadyHasOne
+// guards a live incident from 2026-09-01: an agent, working around what
+// looked like a stuck redeploy (the stale-image-cache bug fixed the same
+// night), called create_instance directly — twice — producing two extra,
+// fully-billed CPU instances alongside the original, all serving the same
+// site, none of which the customer asked for. A Kumbha session that
+// already has app_instance_id set must be refused a second create,
+// enforced server-side (never trusted to the agent's own judgment or the
+// MCP tool description alone), same posture as the deploy-approval gate.
+func TestCreateInstance_RefusesSecondInstanceForSessionThatAlreadyHasOne(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	fc := newFakeCluster()
+	server := (&Server{store: cStore, cluster: fc}).WithKumbha(gw)
+
+	sessionID := uuid.New()
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "account_id", "project_id", "budget", "spent", "status", "label",
+			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
+			"last_deploy_failed", "last_deploy_error", "last_deploy_at",
+		}).AddRow(sessionID, testAccountID, uuid.New(), 5.0, 1.0, "open", nil,
+			nil, "inst-existing", true, nowStub(), nil, false, nil, nil))
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/",
+		strings.NewReader(`{"name":"t","image":"nginx","cpu_units":1,"memory":"1GB"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set(string(auth.ProjectIDKey), uuid.New())
+	c.Set(string(auth.AccountIDKey), testAccountID)
+	c.Set(string(auth.SessionIDKey), sessionID)
+
+	server.CreateInstance(c)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body: %s)", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "instance_already_exists") {
+		t.Errorf("body missing machine-readable code: %s", w.Body.String())
+	}
+	if fc.lastSpec.InstanceID != "" {
+		t.Error("cluster.CreateInstance must never be reached when the session already has an instance")
+	}
+}
+
 func TestDeployKumbhaSession_NoBuildServiceIs404(t *testing.T) {
 	_, kStore, cStore := newMockKumbhaDB(t)
 	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
@@ -598,14 +665,55 @@ func TestDeployKumbhaSession_NoWorkspaceIs409(t *testing.T) {
 	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
 		WithArgs(sessionID, testAccountID).
 		WillReturnRows(deployApprovedSessionRow(sessionID))
+	expectDeployLockAcquired(mock, sessionID)
 	mock.ExpectQuery(`SELECT current_workspace_version FROM billing\.inference_sessions`).
 		WithArgs(sessionID, testAccountID).
 		WillReturnRows(sqlmock.NewRows([]string{"current_workspace_version"}).AddRow(nil))
+	expectDeployLockReleased(mock, sessionID)
 
 	w := kumbhaRequest(server.DeployKumbhaSession, http.MethodPost, "/v1/kumbha/sessions/"+sessionID.String()+"/deploy",
 		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, map[string]string{}, nil)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+// TestDeployKumbhaSession_ConcurrentDeployIsRefused guards the live
+// incident from 2026-09-01: an agent facing what looked like a stuck
+// redeploy called deploy again before the first attempt had finished —
+// both ran concurrently, each independently recorded its own outcome on
+// completion, and whichever one finished LAST won regardless of which one
+// actually matched the live pod. A second deploy call for a session whose
+// lock is already held (AcquireDeployLock returning false — another
+// deploy is genuinely in flight) must be refused immediately, before any
+// build starts, rather than letting two attempts race each other.
+func TestDeployKumbhaSession_ConcurrentDeployIsRefused(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	server := (&Server{store: cStore}).WithKumbha(gw).WithKumbhaBuild(newTestBuildService())
+
+	sessionID, projectID := uuid.New(), uuid.New()
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnRows(deployApprovedSessionRow(sessionID))
+	// RowsAffected == 0: another deploy already holds a fresh lock.
+	mock.ExpectExec(`UPDATE billing\.inference_sessions\s+SET deploy_lock_acquired_at = NOW\(\)`).
+		WithArgs(sessionID, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	// Deliberately no further expectations: a refused lock must return
+	// immediately, never reaching buildKumbhaImage, ReleaseDeployLock
+	// (nothing to release — it was never acquired), or any other query.
+
+	w := kumbhaRequest(server.DeployKumbhaSession, http.MethodPost, "/v1/kumbha/sessions/"+sessionID.String()+"/deploy",
+		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, map[string]string{}, nil)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body: %s)", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "deploy_in_progress") {
+		t.Errorf("body missing machine-readable code: %s", w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("a refused lock must not touch anything beyond the acquire attempt itself: %v", err)
 	}
 }
 
@@ -774,6 +882,54 @@ func TestRedeployKumbhaInstance_ThreadsHomeNodeClassAndProviderOntoSpec(t *testi
 	}
 	if fc.lastSpec.ProviderID != "provider-srialla" {
 		t.Errorf("spec.ProviderID = %q, want the existing instance's own persisted provider (\"provider-srialla\")", fc.lastSpec.ProviderID)
+	}
+}
+
+// TestRedeployKumbhaInstance_AlwaysForcesFreshImagePull guards a live
+// incident from 2026-09-01: Kumbha tags every image built within one
+// session with the SAME tag (the session ID prefix, not a content hash or
+// version number), so a redeploy pushes NEW content under an UNCHANGED
+// tag string. Kubernetes defaults ImagePullPolicy to IfNotPresent for any
+// non-":latest" tag, so without spec.AlwaysPullImage set, a node that
+// already pulled this tag once for an earlier build in the same session
+// silently keeps serving that stale, cached image forever — a customer
+// added two new pages, the build and deploy both reported success, and
+// the live site kept serving the previous version with no error anywhere.
+// A redeploy must unconditionally force a fresh pull, the same posture
+// LaunchAgent/CaptureScreenshot already use for their own pods.
+func TestRedeployKumbhaInstance_AlwaysForcesFreshImagePull(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+
+	projectID, sessionID := uuid.New(), uuid.New()
+	existingID := "inst-existing7"
+	fc := newFakeCluster()
+	fc.add(existingID, projectID.String(), compute.StatusRunning)
+	server := (&Server{store: cStore, cluster: fc}).WithKumbha(gw)
+
+	mock.ExpectQuery(`SELECT .+ FROM compute\.instances`).
+		WithArgs(existingID).
+		WillReturnRows(instanceRecordRow(existingID, testAccountID, projectID, "kumbha-abc123", "old-image:v1", 1, 1, 0, 80, "https://inst-existing7.teepin.com"))
+	mock.ExpectExec(`UPDATE compute\.instances`).
+		WithArgs("new-image:v8", existingID+"-pod", 80, compute.StatusPending, existingID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE billing\.kumbha_workspace_versions`).
+		WithArgs(sessionID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE billing\.inference_sessions\s+SET last_deployed_version = current_workspace_version`).
+		WithArgs(sessionID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	sess := &kumbha.Session{ID: sessionID, AccountID: testAccountID, ProjectID: projectID, AppInstanceID: existingID}
+	c, w := newRedeployTestContext(projectID)
+	server.redeployKumbhaInstance(context.Background(), c, sessionID, sess, projectID, testAccountID, "new-image:v8",
+		[]models.PortMapping{{Container: 80, Protocol: "tcp"}}, nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	if !fc.lastSpec.AlwaysPullImage {
+		t.Error("spec.AlwaysPullImage = false, want true — a redeploy under Kumbha's session-scoped image tag must always force a fresh pull, or a stale cached image gets served silently forever")
 	}
 }
 

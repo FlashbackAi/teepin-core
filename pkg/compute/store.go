@@ -271,6 +271,29 @@ func (s *Store) MarkTerminated(ctx context.Context, id string) error {
 	return nil
 }
 
+// Revive clears terminated_at and sets status on an instance the
+// reconciler previously marked terminated but whose workload has since
+// reappeared reporting a live, healthy status — see Reconciler.Reconcile's
+// own doc comment for why this exists (found live 2026-09-01: a slow pod
+// replacement outlasted the reconciler's own patience, got marked
+// terminated, then came up healthy seconds later with nothing left to
+// ever notice — ListActive's own WHERE clause permanently excludes a
+// terminated row from every future reconcile pass). Unconditional on the
+// current status (no "already terminated" guard, unlike MarkTerminated):
+// the caller has already confirmed liveness against the cluster before
+// calling this, so there is nothing here left to double-check.
+func (s *Store) Revive(ctx context.Context, id, status string) error {
+	query := `
+		UPDATE compute.instances
+		SET status = $1, terminated_at = NULL
+		WHERE id = $2
+	`
+	if _, err := s.db.ExecContext(ctx, query, status, id); err != nil {
+		return fmt.Errorf("failed to revive %s: %w", id, err)
+	}
+	return nil
+}
+
 // Get returns one instance by ID, or nil when it does not exist.
 func (s *Store) Get(ctx context.Context, id string) (*InstanceRecord, error) {
 	rows, err := s.query(ctx, "WHERE id = $1", id)
@@ -287,6 +310,20 @@ func (s *Store) Get(ctx context.Context, id string) (*InstanceRecord, error) {
 // used by the reconciler.
 func (s *Store) ListActive(ctx context.Context) ([]InstanceRecord, error) {
 	return s.query(ctx, "WHERE terminated_at IS NULL")
+}
+
+// ListRecentlyTerminated returns instances terminated within the last
+// `since` duration (all projects) — the reconciler's own candidate list
+// for Revive (see that method's doc comment). Bounded deliberately, not
+// "every terminated instance ever": this runs on every reconcile pass, an
+// unbounded scan over the platform's full historical termination record
+// would only get more expensive over time, and anything terminated
+// longer ago than a genuinely slow pod replacement could plausibly
+// explain is overwhelmingly more likely a deliberate deletion than a
+// stuck rollout — reviving THAT would be a real, surprising bug, not a
+// fix.
+func (s *Store) ListRecentlyTerminated(ctx context.Context, since time.Duration) ([]InstanceRecord, error) {
+	return s.query(ctx, "WHERE terminated_at IS NOT NULL AND terminated_at > $1", time.Now().Add(-since))
 }
 
 // ListActiveByAccount returns an account's non-terminated instances

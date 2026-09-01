@@ -46,6 +46,11 @@ var (
 	// overwrite; a customer cannot use this to accidentally (or
 	// deliberately) shrink their own already-authorised spend cap.
 	ErrBudgetNotIncreased = errors.New("new budget must be higher than the current budget")
+	// ErrDeployInProgress means AcquireDeployLock could not claim the
+	// lock — another deploy for this same session is already running (or
+	// its lock has not yet gone stale). Maps to 409 at the HTTP layer; see
+	// AcquireDeployLock's own doc comment for the incident this closes.
+	ErrDeployInProgress = errors.New("a deploy is already in progress for this session")
 )
 
 // Session mirrors one billing.inference_sessions row.
@@ -328,6 +333,62 @@ func (s *Store) SetAppInstanceID(ctx context.Context, sessionID uuid.UUID, appIn
 	}
 	if affected, _ := result.RowsAffected(); affected == 0 {
 		return ErrSessionNotFound
+	}
+	return nil
+}
+
+// AcquireDeployLock atomically claims the deploy lock for sessionID,
+// returning (true, nil) if claimed. Returns (false, nil) — not an error —
+// if another deploy already holds it and that lock is still fresh; the
+// caller (DeployKumbhaSession) turns that into ErrDeployInProgress at the
+// call site, matching the "not exists" vs "exists but I couldn't get it"
+// distinction other Store methods already make.
+//
+// Guards against two overlapping "deploy" calls for the SAME session
+// racing each other. Found live 2026-09-01: an agent facing what looked
+// like a stuck redeploy called deploy again before the first attempt had
+// finished; both ran concurrently, each independently called
+// SetLastDeployStatus on its own completion, and whichever one finished
+// LAST won — regardless of which one was actually reflected in the live
+// pod. A genuinely successful, verified-live redeploy was left showing
+// "Last deploy failed" purely because of completion order, not because
+// anything was actually wrong.
+//
+// staleAfter bounds how long a held lock is trusted: a control-plane
+// process that crashed or was killed mid-deploy must not leave a session
+// permanently undeployable — a lock older than staleAfter is reclaimed by
+// the next caller rather than honoured forever. Compared as a Go-computed
+// cutoff timestamp rather than a SQL INTERVAL parameter, the same
+// approach ListRecentlyTerminated already uses, since passing a
+// time.Duration through database/sql as an INTERVAL is driver-fragile.
+func (s *Store) AcquireDeployLock(ctx context.Context, sessionID uuid.UUID, staleAfter time.Duration) (bool, error) {
+	cutoff := time.Now().Add(-staleAfter)
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE billing.inference_sessions
+		SET deploy_lock_acquired_at = NOW()
+		WHERE id = $1 AND (deploy_lock_acquired_at IS NULL OR deploy_lock_acquired_at < $2)
+	`, sessionID, cutoff)
+	if err != nil {
+		return false, fmt.Errorf("failed to acquire deploy lock: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("failed to check deploy lock acquisition: %w", err)
+	}
+	return affected > 0, nil
+}
+
+// ReleaseDeployLock clears the deploy lock. Callers use this via defer,
+// unconditionally — a completed (or failed) deploy must never leave the
+// NEXT one artificially blocked. Best-effort by design at the call site:
+// a failure to release here is logged, not propagated as the deploy's own
+// error, since staleAfter above already guarantees the lock cannot block
+// forever even if this never runs at all (a crash, a panic).
+func (s *Store) ReleaseDeployLock(ctx context.Context, sessionID uuid.UUID) error {
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE billing.inference_sessions SET deploy_lock_acquired_at = NULL WHERE id = $1
+	`, sessionID); err != nil {
+		return fmt.Errorf("failed to release deploy lock: %w", err)
 	}
 	return nil
 }

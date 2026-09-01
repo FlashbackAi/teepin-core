@@ -13,10 +13,28 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/cluster"
 )
 
+// reviveWindow bounds how far back Reconcile looks for a terminated
+// instance worth reviving — see ListRecentlyTerminated's own doc comment
+// for why this is bounded rather than scanning every terminated instance
+// ever.
+const reviveWindow = time.Hour
+
 // Reconciler keeps compute.instances in sync with the live cluster:
-// status changes update the stored record, and instances that have
-// disappeared are marked terminated so billing stops. This makes the
-// database resilient to API-server restarts and out-of-band deletions.
+// status changes update the stored record, instances that have
+// disappeared are marked terminated so billing stops, and — the other
+// direction — a recently-terminated instance whose workload turns out to
+// still be reporting a live, healthy status gets revived. Bidirectional
+// by deliberate design, not just the disappearance half: found live
+// 2026-09-01, a redeploy's pod replacement took long enough that the
+// reconciler concluded the instance was gone and marked it terminated,
+// then the new pod came up healthy seconds later — and because
+// ListActive's own WHERE clause permanently excludes a terminated row,
+// nothing would ever have noticed on its own; the instance would have
+// stayed marked terminated (customer-facing edge returning "not
+// reachable", billing stopped) despite being genuinely up, until an
+// unrelated NEW deploy action happened to revive it as a side effect
+// (Store.UpdateImage). This makes the database resilient to API-server
+// restarts and out-of-band deletions in both directions, not just one.
 type Reconciler struct {
 	store    *Store
 	cluster  cluster.Client
@@ -64,7 +82,13 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to list active instances: %w", err)
 	}
-	if len(instances) == 0 {
+
+	recentlyTerminated, err := r.store.ListRecentlyTerminated(ctx, reviveWindow)
+	if err != nil {
+		return fmt.Errorf("failed to list recently terminated instances: %w", err)
+	}
+
+	if len(instances) == 0 && len(recentlyTerminated) == 0 {
 		return nil
 	}
 
@@ -170,6 +194,25 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 			}); err != nil {
 				log.Printf("Failed to update endpoint for %s: %v", inst.ID, err)
 			}
+		}
+	}
+
+	// The other direction: a recently-terminated instance whose workload
+	// is reporting a live status again gets revived — see this type's own
+	// doc comment for the live incident this closes. Only "pending" or
+	// "running" count as revival-worthy; a report of "failed" or
+	// "terminated" for an already-terminated instance is not a reason to
+	// bring it back; it means the cluster agrees it is gone, same as
+	// before.
+	for i := range recentlyTerminated {
+		inst := &recentlyTerminated[i]
+		observed, exists := live[inst.ID]
+		if !exists || (observed.Status != StatusPending && observed.Status != StatusRunning) {
+			continue
+		}
+		log.Printf("Instance %s: terminated -> %s (workload is reporting healthy again, reviving)", inst.ID, observed.Status)
+		if err := r.store.Revive(ctx, inst.ID, observed.Status); err != nil {
+			log.Printf("Failed to revive %s: %v", inst.ID, err)
 		}
 	}
 
