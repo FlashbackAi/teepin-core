@@ -332,6 +332,46 @@ func (s *Store) SetAppInstanceID(ctx context.Context, sessionID uuid.UUID, appIn
 	return nil
 }
 
+// GetGithubRepo returns the Teepin-owned GitHub repo (migration 034)
+// already provisioned for this session's checkpoint pushes, or "" if
+// none has been created yet. Deliberately NOT a field on Session/Get —
+// this is internal bookkeeping the customer must never see, and keeping
+// it out of the shared struct means no existing SELECT that scans a
+// Session needs to change, and no existing response-building code
+// (kumbhaSessionResponse and friends, pkg/api/kumbha_handlers.go) can
+// accidentally start returning it.
+func (s *Store) GetGithubRepo(ctx context.Context, sessionID uuid.UUID) (string, error) {
+	var repo sql.NullString
+	err := s.db.QueryRowContext(ctx, `
+		SELECT github_repo FROM billing.inference_sessions WHERE id = $1
+	`, sessionID).Scan(&repo)
+	if err == sql.ErrNoRows {
+		return "", ErrSessionNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to load github repo: %w", err)
+	}
+	return repo.String, nil
+}
+
+// SetGithubRepo records the repo ProvisionRepo just created for this
+// session — called once, the first time a checkpoint push happens; every
+// later push reuses the value GetGithubRepo returns instead of
+// re-provisioning. See GetGithubRepo's own doc comment for why this is a
+// dedicated method rather than a Session field.
+func (s *Store) SetGithubRepo(ctx context.Context, sessionID uuid.UUID, repo string) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE billing.inference_sessions SET github_repo = $2 WHERE id = $1
+	`, sessionID, repo)
+	if err != nil {
+		return fmt.Errorf("failed to record github repo: %w", err)
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return ErrSessionNotFound
+	}
+	return nil
+}
+
 // SetLastDeployStatus records the outcome of a session's most recent
 // build/deploy attempt (see migration 030) — errMsg empty means the
 // attempt SUCCEEDED, clearing any earlier failure so a stale "Failed"

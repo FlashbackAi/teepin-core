@@ -37,6 +37,7 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/compute"
 	"github.com/FlashbackAi/teepin-core/pkg/database"
 	"github.com/FlashbackAi/teepin-core/pkg/ecrregistry"
+	"github.com/FlashbackAi/teepin-core/pkg/githubstore"
 	"github.com/FlashbackAi/teepin-core/pkg/gpu"
 	"github.com/FlashbackAi/teepin-core/pkg/harbor"
 	"github.com/FlashbackAi/teepin-core/pkg/inference"
@@ -673,6 +674,30 @@ func main() {
 					log.Println("✅ Kumbha build pipeline enabled (Kaniko -> registry)")
 				} else {
 					log.Println("Kumbha build pipeline not configured (no registry available — set HARBOR_ADMIN_PASSWORD or TEEPIN_ECR_BUILD_REPOSITORY) — the deploy MCP verb stays a stub")
+				}
+
+				// GitHub-backed code storage (pkg/githubstore): pushes each
+				// checkpointed deploy to a Teepin-owned repo, invisible to
+				// the customer — see that package's own doc comment.
+				// Optional, same fully-off-when-unconfigured posture as
+				// every other Kumbha capability above.
+				githubAppID := getEnvInt("TEEPIN_GITHUB_APP_ID", 0)
+				githubInstallationID := getEnvInt("TEEPIN_GITHUB_APP_INSTALLATION_ID", 0)
+				githubPrivateKey := getEnv("TEEPIN_GITHUB_APP_PRIVATE_KEY", "")
+				if githubAppID != 0 && githubInstallationID != 0 && githubPrivateKey != "" {
+					githubStoreService, err := githubstore.NewService(
+						int64(githubAppID), int64(githubInstallationID),
+						[]byte(githubPrivateKey),
+						getEnv("TEEPIN_GITHUB_STORAGE_ORG", "TeepinWebServices"),
+					)
+					if err != nil {
+						log.Printf("⚠️  GitHub code storage initialization failed: %v", err)
+					} else {
+						apiServer = apiServer.WithGithubStore(githubStoreService)
+						log.Println("✅ GitHub code storage enabled (checkpoint pushes -> TeepinWebServices)")
+					}
+				} else {
+					log.Println("GitHub code storage not configured (set TEEPIN_GITHUB_APP_ID, TEEPIN_GITHUB_APP_INSTALLATION_ID, TEEPIN_GITHUB_APP_PRIVATE_KEY) — deploys are not backed up to GitHub")
 				}
 
 				log.Printf("✅ Kumbha Gateway enabled (teepin/fast -> vLLM at %s)", vllmBaseURL)

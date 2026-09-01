@@ -244,6 +244,17 @@ func (g *Gateway) SetAppInstanceID(ctx context.Context, sessionID uuid.UUID, ins
 	return g.store.SetAppInstanceID(ctx, sessionID, instanceID)
 }
 
+// GetGithubRepo/SetGithubRepo expose Store's own methods of the same
+// name — see their doc comments (pkg/kumbha/session.go) for why this is
+// deliberately not a Session field.
+func (g *Gateway) GetGithubRepo(ctx context.Context, sessionID uuid.UUID) (string, error) {
+	return g.store.GetGithubRepo(ctx, sessionID)
+}
+
+func (g *Gateway) SetGithubRepo(ctx context.Context, sessionID uuid.UUID, repo string) error {
+	return g.store.SetGithubRepo(ctx, sessionID, repo)
+}
+
 // SaveScreenshot records the deployed app's most recently captured
 // screenshot — called only by the screenshot pod's own upload endpoint,
 // see Store.SaveScreenshot.

@@ -459,3 +459,86 @@ func TestStore_SetLastDeployStatus_UnknownSessionIsNotFound(t *testing.T) {
 		t.Errorf("got %v, want ErrSessionNotFound", err)
 	}
 }
+
+// TestStore_GetGithubRepo_ReturnsEmptyWhenNeverProvisioned and its
+// siblings guard migration 034's github_repo column — deliberately read
+// through a narrow, dedicated method rather than the shared Session
+// struct/Get, so kumbhaSessionResponse (pkg/api/kumbha_handlers.go) has
+// no field to accidentally expose this to the customer.
+func TestStore_GetGithubRepo_ReturnsEmptyWhenNeverProvisioned(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessID := uuid.New()
+
+	mock.ExpectQuery(`SELECT github_repo FROM billing\.inference_sessions`).
+		WithArgs(sessID).
+		WillReturnRows(sqlmock.NewRows([]string{"github_repo"}).AddRow(nil))
+
+	repo, err := store.GetGithubRepo(context.Background(), sessID)
+	if err != nil {
+		t.Fatalf("GetGithubRepo: %v", err)
+	}
+	if repo != "" {
+		t.Errorf("got %q, want empty string for a never-provisioned session", repo)
+	}
+}
+
+func TestStore_GetGithubRepo_ReturnsStoredValue(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessID := uuid.New()
+
+	mock.ExpectQuery(`SELECT github_repo FROM billing\.inference_sessions`).
+		WithArgs(sessID).
+		WillReturnRows(sqlmock.NewRows([]string{"github_repo"}).AddRow("kumbha-abc12345"))
+
+	repo, err := store.GetGithubRepo(context.Background(), sessID)
+	if err != nil {
+		t.Fatalf("GetGithubRepo: %v", err)
+	}
+	if repo != "kumbha-abc12345" {
+		t.Errorf("got %q, want %q", repo, "kumbha-abc12345")
+	}
+}
+
+func TestStore_GetGithubRepo_UnknownSessionIsNotFound(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessID := uuid.New()
+
+	mock.ExpectQuery(`SELECT github_repo FROM billing\.inference_sessions`).
+		WithArgs(sessID).
+		WillReturnError(sql.ErrNoRows)
+
+	_, err := store.GetGithubRepo(context.Background(), sessID)
+	if !errors.Is(err, ErrSessionNotFound) {
+		t.Errorf("got %v, want ErrSessionNotFound", err)
+	}
+}
+
+func TestStore_SetGithubRepo_UpdatesColumn(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessID := uuid.New()
+
+	mock.ExpectExec(`UPDATE billing\.inference_sessions SET github_repo`).
+		WithArgs(sessID, "kumbha-abc12345").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := store.SetGithubRepo(context.Background(), sessID, "kumbha-abc12345"); err != nil {
+		t.Fatalf("SetGithubRepo: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestStore_SetGithubRepo_UnknownSessionIsNotFound(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessID := uuid.New()
+
+	mock.ExpectExec(`UPDATE billing\.inference_sessions SET github_repo`).
+		WithArgs(sessID, "kumbha-abc12345").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	err := store.SetGithubRepo(context.Background(), sessID, "kumbha-abc12345")
+	if !errors.Is(err, ErrSessionNotFound) {
+		t.Errorf("got %v, want ErrSessionNotFound", err)
+	}
+}

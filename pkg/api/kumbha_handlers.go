@@ -781,6 +781,7 @@ func (s *Server) DeployKumbhaSession(c *gin.Context) {
 		log.Printf("WARN: deployed Kumbha session %s but failed to checkpoint its workspace version: %v", sessionID, err)
 	}
 
+	s.triggerGithubPush(sessionID, accountID, imageRef)
 	s.triggerScreenshotCapture(sessionID, sess, created.Endpoint)
 	s.recordDeployOutcome(ctx, sessionID, "")
 
@@ -822,6 +823,57 @@ func (s *Server) triggerScreenshotCapture(sessionID uuid.UUID, sess *kumbha.Sess
 		defer cancel()
 		if err := s.kumbha.CaptureScreenshot(ctx, sess, targetURL); err != nil {
 			log.Printf("WARN: screenshot capture failed for Kumbha session %s: %v", sessionID, err)
+		}
+	}()
+}
+
+// triggerGithubPush kicks off a best-effort push of the session's current
+// workspace snapshot to its Teepin-owned GitHub repo (pkg/githubstore) —
+// called right after a deploy or redeploy succeeds, mirroring
+// triggerScreenshotCapture's own shape and reasoning: a slow or
+// unreachable third-party API call must never add latency to the
+// deploy response itself, and a failure here is cosmetic (a missing
+// backup copy, not a failed deployment) — same posture
+// CheckpointWorkspace's own call sites already use for their bookkeeping
+// failures. A no-op when s.githubStore is nil (feature not configured).
+//
+// Provisions the repo lazily, on the session's FIRST push, and persists
+// it (kumbha.SetGithubRepo) so every later push reuses it rather than
+// re-checking with GitHub every time — see pkg/githubstore.ProvisionRepo
+// and Store.GetGithubRepo/SetGithubRepo's own doc comments for why this
+// is deliberately not a Session field.
+func (s *Server) triggerGithubPush(sessionID, accountID uuid.UUID, imageRef string) {
+	if s.githubStore == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		snap, err := s.kumbha.CurrentWorkspace(ctx, sessionID, accountID)
+		if err != nil {
+			log.Printf("WARN: could not load workspace to push to GitHub storage for Kumbha session %s: %v", sessionID, err)
+			return
+		}
+
+		repo, err := s.kumbha.GetGithubRepo(ctx, sessionID)
+		if err != nil {
+			log.Printf("WARN: could not check GitHub storage repo for Kumbha session %s: %v", sessionID, err)
+			return
+		}
+		if repo == "" {
+			repo, err = s.githubStore.ProvisionRepo(ctx, sessionID)
+			if err != nil {
+				log.Printf("WARN: could not provision GitHub storage repo for Kumbha session %s: %v", sessionID, err)
+				return
+			}
+			if err := s.kumbha.SetGithubRepo(ctx, sessionID, repo); err != nil {
+				log.Printf("WARN: provisioned GitHub storage repo for Kumbha session %s but failed to record it: %v", sessionID, err)
+			}
+		}
+
+		if err := s.githubStore.PushSnapshot(ctx, sessionID, snap.Files, "Deploy: "+imageRef); err != nil {
+			log.Printf("WARN: could not push Kumbha session %s to GitHub storage: %v", sessionID, err)
 		}
 	}()
 }
@@ -1038,6 +1090,7 @@ func (s *Server) redeployKumbhaInstance(ctx context.Context, c *gin.Context, ses
 		redeployedEndpoint = result.EndpointURL
 	}
 
+	s.triggerGithubPush(sessionID, accountID, imageRef)
 	s.triggerScreenshotCapture(sessionID, sess, redeployedEndpoint)
 	s.recordDeployOutcome(ctx, sessionID, "")
 

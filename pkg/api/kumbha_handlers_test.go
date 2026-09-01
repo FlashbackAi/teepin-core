@@ -8,6 +8,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -119,6 +120,23 @@ type fakeKPricing struct{ in, out float64 }
 
 func (f *fakeKPricing) LLMPriceInputPerMillion(context.Context) float64  { return f.in }
 func (f *fakeKPricing) LLMPriceOutputPerMillion(context.Context) float64 { return f.out }
+
+// fakeGithubStore satisfies api.GithubStore for tests that only need to
+// prove triggerGithubPush's fire-and-forget call doesn't affect the
+// synchronous redeploy/deploy response — it is never actually reached in
+// those tests (the goroutine's own DB calls hit unmocked sqlmock queries
+// first and log a WARN, the same already-established, harmless pattern
+// triggerScreenshotCapture's own untested async path already has in this
+// file), so these methods exist only to satisfy the interface.
+type fakeGithubStore struct{}
+
+func (fakeGithubStore) ProvisionRepo(context.Context, uuid.UUID) (string, error) {
+	return "", errors.New("fakeGithubStore: not configured for this test")
+}
+
+func (fakeGithubStore) PushSnapshot(context.Context, uuid.UUID, []kumbha.WorkspaceFile, string) error {
+	return errors.New("fakeGithubStore: not configured for this test")
+}
 
 // newTestServerWithKumbha builds a Server with a non-nil store (so
 // requireScope actually resolves tenancy from the gin context instead of
@@ -756,6 +774,52 @@ func TestRedeployKumbhaInstance_ThreadsHomeNodeClassAndProviderOntoSpec(t *testi
 	}
 	if fc.lastSpec.ProviderID != "provider-srialla" {
 		t.Errorf("spec.ProviderID = %q, want the existing instance's own persisted provider (\"provider-srialla\")", fc.lastSpec.ProviderID)
+	}
+}
+
+// TestRedeployKumbhaInstance_GithubPushFailureDoesNotBlockRedeploy proves
+// triggerGithubPush's best-effort contract: redeployKumbhaInstance calls
+// it fire-and-forget (a bare goroutine, no error returned to the caller,
+// same shape as triggerScreenshotCapture) — a redeploy must still return
+// 200 with the same fields regardless of whether GitHub storage is
+// configured, reachable, or failing. s.githubStore is set to a fake that
+// always errors specifically so this is exercised (a nil githubStore
+// would already trivially skip the whole code path, proving nothing).
+func TestRedeployKumbhaInstance_GithubPushFailureDoesNotBlockRedeploy(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+
+	projectID, sessionID := uuid.New(), uuid.New()
+	existingID := "inst-existing6"
+	fc := newFakeCluster()
+	fc.add(existingID, projectID.String(), compute.StatusRunning)
+	server := (&Server{store: cStore, cluster: fc}).WithKumbha(gw).WithGithubStore(fakeGithubStore{})
+
+	mock.ExpectQuery(`SELECT .+ FROM compute\.instances`).
+		WithArgs(existingID).
+		WillReturnRows(instanceRecordRow(existingID, testAccountID, projectID, "kumbha-abc123", "old-image:v1", 1, 1, 0, 80, "https://inst-existing6.teepin.com"))
+	mock.ExpectExec(`UPDATE compute\.instances`).
+		WithArgs("new-image:v7", existingID+"-pod", 80, compute.StatusPending, existingID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE billing\.kumbha_workspace_versions`).
+		WithArgs(sessionID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE billing\.inference_sessions\s+SET last_deployed_version = current_workspace_version`).
+		WithArgs(sessionID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	sess := &kumbha.Session{ID: sessionID, AccountID: testAccountID, ProjectID: projectID, AppInstanceID: existingID}
+	c, w := newRedeployTestContext(projectID)
+	server.redeployKumbhaInstance(context.Background(), c, sessionID, sess, projectID, testAccountID, "new-image:v7",
+		[]models.PortMapping{{Container: 80, Protocol: "tcp"}}, nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["instance_id"] != existingID {
+		t.Errorf("instance_id = %v, want %s — an always-failing GitHub push must not change the redeploy's own response", resp["instance_id"], existingID)
 	}
 }
 

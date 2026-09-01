@@ -45,6 +45,21 @@ type ProvisionGate interface {
 	AccountCanProvision(ctx context.Context, accountID uuid.UUID) (bool, string, error)
 }
 
+// GithubStore pushes each Kumbha checkpoint to a Teepin-owned GitHub repo
+// — implemented by pkg/githubstore.Service. Defined here (the consumer),
+// not there, same pattern as build.RegistryProvider: pkg/api depends on
+// this narrow surface, never the concrete client, which is what lets a
+// test inject a lightweight fake instead of a real GitHub-backed service
+// pointed at a mock HTTP server.
+type GithubStore interface {
+	// ProvisionRepo creates (or finds, idempotently) sessionID's repo.
+	ProvisionRepo(ctx context.Context, sessionID uuid.UUID) (string, error)
+	// PushSnapshot commits files to sessionID's repo. Returns only error —
+	// deliberately no repo name/URL, so pkg/api has nothing to
+	// accidentally leak into a customer-facing response.
+	PushSnapshot(ctx context.Context, sessionID uuid.UUID, files []kumbha.WorkspaceFile, message string) error
+}
+
 type Server struct {
 	// cluster is the only route to GPU capacity. The API server holds no
 	// Kubernetes client of its own: that is what lets the control plane
@@ -116,6 +131,13 @@ type Server struct {
 	// NOT a customer-facing request field.
 	kumbhaBuildImageRegistryPrefix string
 	kumbhaBuildImagePullSecret     string
+
+	// githubStore pushes each Kumbha session's checkpointed workspace to a
+	// Teepin-owned repo (pkg/githubstore) — invisible to the customer, who
+	// only ever gets the existing ZIP download. Nil disables the feature
+	// cleanly: a checkpoint just skips the push, same best-effort posture
+	// as CheckpointWorkspace/UpdateImage's own failure handling.
+	githubStore GithubStore
 }
 
 // WithExecTickets enables interactive exec's REST half (ticket issuance).
@@ -153,6 +175,15 @@ func (s *Server) WithKumbhaEventTickets(tickets *kumbha.EventTicketStore) *Serve
 // BuildKumbhaSession returning 404.
 func (s *Server) WithKumbhaBuild(b *build.Service) *Server {
 	s.kumbhaBuild = b
+	return s
+}
+
+// WithGithubStore enables pushing each Kumbha checkpoint to a Teepin-owned
+// GitHub repo (pkg/githubstore). Returns the same *Server for chaining —
+// a server built without this call simply never pushes, same posture as
+// every other optional Kumbha capability.
+func (s *Server) WithGithubStore(gs GithubStore) *Server {
+	s.githubStore = gs
 	return s
 }
 
