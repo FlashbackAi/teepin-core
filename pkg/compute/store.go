@@ -294,6 +294,38 @@ func (s *Store) Revive(ctx context.Context, id, status string) error {
 	return nil
 }
 
+// PurgeFullyBilledTerminated permanently deletes terminated instance rows
+// that are both older than retentionWindow and fully billed — the exact
+// inverse of billing/collector.go's getBillableInstances "still owes an
+// unbilled tail" condition (terminated_at > COALESCE(last usage_records
+// end_time, created_at) + 1 minute). Deleting a row billing still expects
+// to find would silently write off that final stretch of usage, so this
+// only ever removes a row once the billing collector has already
+// produced a usage_record covering it (or the instance never lived long
+// enough to owe anything at all). Never touches a row with
+// terminated_at IS NULL. See RetentionSweeper, which calls this on a
+// schedule.
+func (s *Store) PurgeFullyBilledTerminated(ctx context.Context, retentionWindow time.Duration) (int64, error) {
+	query := `
+		DELETE FROM compute.instances i
+		WHERE i.terminated_at IS NOT NULL
+		  AND i.terminated_at < $1
+		  AND i.terminated_at <= COALESCE(
+		      (SELECT MAX(ur.end_time) FROM billing.usage_records ur WHERE ur.instance_id = i.id),
+		      i.created_at
+		  ) + interval '1 minute'
+	`
+	result, err := s.db.ExecContext(ctx, query, time.Now().Add(-retentionWindow))
+	if err != nil {
+		return 0, fmt.Errorf("failed to purge fully-billed terminated instances: %w", err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("failed to count purged instances: %w", err)
+	}
+	return n, nil
+}
+
 // Get returns one instance by ID, or nil when it does not exist.
 func (s *Store) Get(ctx context.Context, id string) (*InstanceRecord, error) {
 	rows, err := s.query(ctx, "WHERE id = $1", id)

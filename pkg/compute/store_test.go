@@ -5,6 +5,7 @@ package compute
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 	"time"
 
@@ -265,6 +266,38 @@ func instanceRows() *sqlmock.Rows {
 		"storage_gb",
 		"created_at", "updated_at", "started_at", "terminated_at", "kumbha_session_id",
 	})
+}
+
+func TestPurgeFullyBilledTerminated(t *testing.T) {
+	store, mock := newMockStore(t)
+
+	mock.ExpectExec(`DELETE FROM compute\.instances`).
+		WillReturnResult(sqlmock.NewResult(0, 3))
+
+	n, err := store.PurgeFullyBilledTerminated(context.Background(), 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("PurgeFullyBilledTerminated failed: %v", err)
+	}
+	if n != 3 {
+		t.Errorf("got %d purged, want 3", n)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestPurgeFullyBilledTerminated_PropagatesError(t *testing.T) {
+	store, mock := newMockStore(t)
+
+	mock.ExpectExec(`DELETE FROM compute\.instances`).
+		WillReturnError(sql.ErrConnDone)
+
+	if _, err := store.PurgeFullyBilledTerminated(context.Background(), 30*24*time.Hour); err == nil {
+		t.Fatal("expected an error to propagate")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
 }
 
 func TestListActive(t *testing.T) {

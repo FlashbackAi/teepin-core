@@ -112,24 +112,42 @@ func TestPushSnapshot_FirstCommitToEmptyRepo(t *testing.T) {
 	sessionID := uuid.New()
 	name := repoName(sessionID)
 	var sawBaseTree *string
-	var sawParents int
-	refCreated := false
+	var sawParentSHA string
+	bootstrapCalled := false
 	refUpdated := false
+	const bootstrapCommitSHA = "bootstrap-commit-sha"
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(fmt.Sprintf("/api/v3/repos/test-org/%s/git/ref/heads/main", name), func(w http.ResponseWriter, r *http.Request) {
 		// GitHub returns 409 for a ref lookup against a repo with zero
-		// commits — the exact quirk PushSnapshot's emptyRepo detection
+		// commits — the exact quirk PushSnapshot's empty-repo detection
 		// handles.
 		writeJSON(t, w, http.StatusConflict, &github.ErrorResponse{Message: "Git Repository is empty."})
 	})
+	// Real GitHub also refuses CreateTree itself on a genuinely virgin
+	// repo (same 409) — this handler proves PushSnapshot never even
+	// tries it before bootstrapping, since it's registered but the test
+	// fails via bootstrapCalled/sawBaseTree if it's ever hit before the
+	// Contents-API bootstrap below.
 	mux.HandleFunc(fmt.Sprintf("/api/v3/repos/test-org/%s/git/trees", name), func(w http.ResponseWriter, r *http.Request) {
+		if !bootstrapCalled {
+			t.Error("CreateTree was called before the Contents-API bootstrap — real GitHub 409s here on an empty repo")
+		}
 		var body struct {
 			BaseTree *string `json:"base_tree"`
 		}
 		json.NewDecoder(r.Body).Decode(&body)
 		sawBaseTree = body.BaseTree
 		writeJSON(t, w, http.StatusCreated, &github.Tree{SHA: github.String("tree-sha-1")})
+	})
+	mux.HandleFunc(fmt.Sprintf("/api/v3/repos/test-org/%s/contents/index.html", name), func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("bootstrap request method = %s, want PUT", r.Method)
+		}
+		bootstrapCalled = true
+		writeJSON(t, w, http.StatusCreated, &github.RepositoryContentResponse{
+			Commit: github.Commit{SHA: github.String(bootstrapCommitSHA)},
+		})
 	})
 	mux.HandleFunc(fmt.Sprintf("/api/v3/repos/test-org/%s/git/commits", name), func(w http.ResponseWriter, r *http.Request) {
 		// CreateCommit's wire format flattens Parents into a plain SHA
@@ -139,12 +157,10 @@ func TestPushSnapshot_FirstCommitToEmptyRepo(t *testing.T) {
 			Parents []string `json:"parents"`
 		}
 		json.NewDecoder(r.Body).Decode(&body)
-		sawParents = len(body.Parents)
+		if len(body.Parents) == 1 {
+			sawParentSHA = body.Parents[0]
+		}
 		writeJSON(t, w, http.StatusCreated, &github.Commit{SHA: github.String("commit-sha-1")})
-	})
-	mux.HandleFunc(fmt.Sprintf("/api/v3/repos/test-org/%s/git/refs", name), func(w http.ResponseWriter, r *http.Request) {
-		refCreated = true
-		writeJSON(t, w, http.StatusCreated, &github.Reference{Ref: github.String("refs/heads/main")})
 	})
 	mux.HandleFunc(fmt.Sprintf("/api/v3/repos/test-org/%s/git/refs/heads/main", name), func(w http.ResponseWriter, r *http.Request) {
 		refUpdated = true
@@ -157,17 +173,17 @@ func TestPushSnapshot_FirstCommitToEmptyRepo(t *testing.T) {
 		t.Fatalf("PushSnapshot: %v", err)
 	}
 
-	if sawBaseTree != nil {
-		t.Errorf("CreateTree called with base_tree = %v, want nil for a first commit to an empty repo", *sawBaseTree)
+	if !bootstrapCalled {
+		t.Error("expected the Contents-API bootstrap (CreateFile) to be called for an empty repo's first commit")
 	}
-	if sawParents != 0 {
-		t.Errorf("commit had %d parents, want 0 for the first commit", sawParents)
+	if sawBaseTree == nil || *sawBaseTree != bootstrapCommitSHA {
+		t.Errorf("CreateTree base_tree = %v, want %q (the bootstrap commit's SHA)", sawBaseTree, bootstrapCommitSHA)
 	}
-	if !refCreated {
-		t.Error("expected CreateRef to be called for an empty repo's first commit")
+	if sawParentSHA != bootstrapCommitSHA {
+		t.Errorf("commit parent SHA = %q, want %q", sawParentSHA, bootstrapCommitSHA)
 	}
-	if refUpdated {
-		t.Error("UpdateRef must not be called for an empty repo's first commit")
+	if !refUpdated {
+		t.Error("expected UpdateRef to be called to move the branch to the full-snapshot commit")
 	}
 }
 
@@ -177,7 +193,6 @@ func TestPushSnapshot_CommitOnTopOfHistory(t *testing.T) {
 	const existingSHA = "existing-head-sha"
 	var sawBaseTree *string
 	var sawParentSHA string
-	refCreated := false
 	refUpdated := false
 
 	mux := http.NewServeMux()
@@ -208,10 +223,6 @@ func TestPushSnapshot_CommitOnTopOfHistory(t *testing.T) {
 		}
 		writeJSON(t, w, http.StatusCreated, &github.Commit{SHA: github.String("commit-sha-2")})
 	})
-	mux.HandleFunc(fmt.Sprintf("/api/v3/repos/test-org/%s/git/refs", name), func(w http.ResponseWriter, r *http.Request) {
-		refCreated = true
-		writeJSON(t, w, http.StatusCreated, &github.Reference{})
-	})
 	mux.HandleFunc(fmt.Sprintf("/api/v3/repos/test-org/%s/git/refs/heads/main", name), func(w http.ResponseWriter, r *http.Request) {
 		refUpdated = true
 		writeJSON(t, w, http.StatusOK, &github.Reference{})
@@ -228,9 +239,6 @@ func TestPushSnapshot_CommitOnTopOfHistory(t *testing.T) {
 	}
 	if sawParentSHA != existingSHA {
 		t.Errorf("commit parent SHA = %q, want %q", sawParentSHA, existingSHA)
-	}
-	if refCreated {
-		t.Error("CreateRef must not be called when the branch already has history")
 	}
 	if !refUpdated {
 		t.Error("expected UpdateRef to be called to move the branch forward")

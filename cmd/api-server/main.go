@@ -420,6 +420,18 @@ func main() {
 		log.Println("Instance reconciler started")
 	}
 
+	// Retention sweeper: purges terminated compute.instances rows once
+	// they are fully billed and past RetentionWindow, so the table does
+	// not grow unbounded forever. Independent of billing being enabled —
+	// see PurgeFullyBilledTerminated's own doc comment for why an
+	// instance is still safely purgeable when there is no billing system
+	// to owe anything to.
+	if instanceStore != nil {
+		retentionSweeper := compute.NewRetentionSweeper(instanceStore)
+		go retentionSweeper.Start(context.Background())
+		log.Println("Instance retention sweeper started")
+	}
+
 	// Suspension sweeper: suspends accounts whose 24h payment grace period
 	// has elapsed and tears down their resources. Inert until something
 	// sets accounts.payment_failed_at (a card removed at Stripe today; a

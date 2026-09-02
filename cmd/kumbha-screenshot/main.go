@@ -45,6 +45,23 @@ const (
 	viewportHeight = 800
 )
 
+// settleTimeout bounds how long capture waits, beyond ordinary page load
+// (chromedp.Navigate already blocks for the load event), for web fonts to
+// finish and the document to report itself complete. A page that never
+// settles in time (a blocked font, a long-polling script) is not treated
+// as a capture failure — an imperfect screenshot beats none — so this
+// only trims how long the wait can run, not whether capture proceeds.
+const settleTimeout = 5 * time.Second
+
+// paintSettleDelay is a short buffer after the settle condition becomes
+// true, so a CSS transition still animating at that instant (e.g. a
+// fade-in keyed off the same load/fonts-ready event this waits on) has a
+// moment to finish before the shot is taken. Replaces the old flat
+// pre-settle sleep — see capture's own comment on why a fixed delay alone
+// produced "in-between" shots: it had no relationship to when the page
+// actually finished rendering. Found live 2026-09-02.
+const paintSettleDelay = 500 * time.Millisecond
+
 func main() {
 	if err := run(); err != nil {
 		log.Fatalf("kumbha-screenshot: %v", err)
@@ -106,19 +123,46 @@ func capture(targetURL string) ([]byte, error) {
 	err := chromedp.Run(ctx,
 		chromedp.EmulateViewport(viewportWidth, viewportHeight),
 		chromedp.Navigate(targetURL),
-		// A fixed settle delay rather than waiting for a specific selector:
+		// Poll a readiness condition rather than sleeping a fixed amount:
 		// this runs against an arbitrary customer-built app whose markup
 		// this process has no knowledge of, so there is no DOM element it
-		// could reliably wait for. Long enough for a typical static site
-		// or client-rendered SPA's initial paint to settle, short enough
-		// to keep total capture time well under navigateTimeout.
-		chromedp.Sleep(2*time.Second),
+		// could reliably wait for — but "document complete and any web
+		// fonts loaded" is a real, generic signal, unlike a flat sleep
+		// that has no relationship to when the page actually finished
+		// rendering. Previously a flat 2s sleep here produced visibly
+		// "in-between" captures (mid font-swap or mid CSS-transition) on
+		// pages that took longer than 2s to settle — found live
+		// 2026-09-02.
+		waitForSettle(),
+		chromedp.Sleep(paintSettleDelay),
 		chromedp.CaptureScreenshot(&png),
 	)
 	if err != nil {
 		return nil, err
 	}
 	return png, nil
+}
+
+// waitForSettle polls until the document reports itself complete and any
+// web fonts have finished loading, using chromedp.Poll's default
+// requestAnimationFrame-driven polling — the tightest mode, suited to
+// observing exactly this kind of styling/rendering change. A timeout
+// (settleTimeout) deliberately does not fail the capture: the predicate
+// never becoming true (a blocked font, a page that never reaches
+// "complete") should still get a best-effort screenshot rather than none
+// at all. Only a genuinely dead context (navigateTimeout already
+// expired, or Navigate itself failed further up the chain) aborts the
+// capture, and that propagates on its own at the next action.
+func waitForSettle() chromedp.Action {
+	return chromedp.ActionFunc(func(ctx context.Context) error {
+		var ready bool
+		_ = chromedp.Poll(
+			`document.readyState === 'complete' && (!document.fonts || document.fonts.status === 'loaded')`,
+			&ready,
+			chromedp.WithPollingTimeout(settleTimeout),
+		).Do(ctx)
+		return nil
+	})
 }
 
 // upload POSTs png to uploadURL with token as a bearer credential — the

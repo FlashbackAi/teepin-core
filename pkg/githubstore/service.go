@@ -111,12 +111,23 @@ func (s *Service) ProvisionRepo(ctx context.Context, sessionID uuid.UUID) (strin
 
 // PushSnapshot commits files to sessionID's repo (see ProvisionRepo) as
 // one new commit on the default branch — the git data API's tree-based
-// commit flow (create a tree, create a commit, move the branch ref),
-// not a local clone: the control plane has no git binary and no working
+// commit flow (create a tree, create a commit, move the branch ref), not
+// a local clone: the control plane has no git binary and no working
 // filesystem state to manage, and this needs neither. Handles both "first
-// commit to an empty repo" (GitHub returns 409 for a ref lookup against a
-// repo with zero commits — a well-documented API quirk, not treated as a
-// real error) and "commit on top of existing history".
+// commit to an empty repo" and "commit on top of existing history".
+//
+// The empty-repo case needs a real bootstrap step, not just an omitted
+// base_tree: GitHub's Git Data API (blobs/trees/commits) refuses to
+// operate at all on a genuinely virgin repo (zero commits, zero git
+// objects) — CreateTree itself returns 409 "Git Repository is empty",
+// same as the ref lookup that detects the case in the first place. Found
+// live 2026-09-02 (the fake test server didn't reproduce this — it had no
+// reason to reject an empty base_tree the way real GitHub does). The
+// standard, documented workaround is bootstrapping the very first commit
+// through the Contents API (CreateFile) instead, which DOES work on an
+// empty repo and creates the default branch as a side effect — every
+// push after that, including the rest of THIS snapshot, goes through the
+// ordinary tree-based flow against that bootstrap commit as its parent.
 //
 // files is exactly the []kumbha.WorkspaceFile shape SaveVersion already
 // builds — plain decoded text, no encoding step needed here. Binary files
@@ -127,17 +138,27 @@ func (s *Service) PushSnapshot(ctx context.Context, sessionID uuid.UUID, files [
 	name := repoName(sessionID)
 
 	ref, resp, err := s.client.Git.GetRef(ctx, s.org, name, "refs/heads/"+defaultBranch)
-	emptyRepo := false
+	var parentSHA string
 	switch {
 	case err == nil:
-		// Existing history — proceed with ref.Object.SHA as the parent.
-	case resp != nil && resp.StatusCode == http.StatusConflict:
-		// "Git Repository is empty." — no commits yet, nothing to branch from.
-		emptyRepo = true
-	case resp != nil && resp.StatusCode == http.StatusNotFound:
-		// No such ref (e.g. the org's default branch name differs from
-		// "main") — treated the same as empty: this call creates it.
-		emptyRepo = true
+		parentSHA = ref.GetObject().GetSHA()
+	case resp != nil && (resp.StatusCode == http.StatusConflict || resp.StatusCode == http.StatusNotFound):
+		// 409 ("Git Repository is empty.") for zero commits, or 404 if the
+		// org's default branch name ever differs from "main" — both mean
+		// there is no ref to branch from yet.
+		if len(files) == 0 {
+			return nil // nothing to push, and nothing to bootstrap with either
+		}
+		first := files[0]
+		bootstrap, _, bootstrapErr := s.client.Repositories.CreateFile(ctx, s.org, name, first.Path, &github.RepositoryContentFileOptions{
+			Message: github.String(message),
+			Content: []byte(first.Content),
+			Branch:  github.String(defaultBranch),
+		})
+		if bootstrapErr != nil {
+			return fmt.Errorf("githubstore: bootstrap first commit: %w", bootstrapErr)
+		}
+		parentSHA = bootstrap.GetSHA()
 	default:
 		return fmt.Errorf("githubstore: get ref: %w", err)
 	}
@@ -152,11 +173,7 @@ func (s *Service) PushSnapshot(ctx context.Context, sessionID uuid.UUID, files [
 		})
 	}
 
-	baseTree := ""
-	if !emptyRepo {
-		baseTree = ref.GetObject().GetSHA()
-	}
-	newTree, _, err := s.client.Git.CreateTree(ctx, s.org, name, baseTree, entries)
+	newTree, _, err := s.client.Git.CreateTree(ctx, s.org, name, parentSHA, entries)
 	if err != nil {
 		return fmt.Errorf("githubstore: create tree: %w", err)
 	}
@@ -164,24 +181,13 @@ func (s *Service) PushSnapshot(ctx context.Context, sessionID uuid.UUID, files [
 	commit := github.Commit{
 		Message: github.String(message),
 		Tree:    newTree,
-	}
-	if !emptyRepo {
-		commit.Parents = []*github.Commit{{SHA: github.String(ref.GetObject().GetSHA())}}
+		Parents: []*github.Commit{{SHA: github.String(parentSHA)}},
 	}
 	newCommit, _, err := s.client.Git.CreateCommit(ctx, s.org, name, commit, nil)
 	if err != nil {
 		return fmt.Errorf("githubstore: create commit: %w", err)
 	}
 
-	if emptyRepo {
-		if _, _, err := s.client.Git.CreateRef(ctx, s.org, name, github.CreateRef{
-			Ref: "refs/heads/" + defaultBranch,
-			SHA: newCommit.GetSHA(),
-		}); err != nil {
-			return fmt.Errorf("githubstore: create ref: %w", err)
-		}
-		return nil
-	}
 	if _, _, err := s.client.Git.UpdateRef(ctx, s.org, name, "heads/"+defaultBranch, github.UpdateRef{
 		SHA: newCommit.GetSHA(),
 	}); err != nil {
