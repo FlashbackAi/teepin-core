@@ -199,8 +199,8 @@ func homeClusterClient() cluster.Client {
 	log.Println("Kubernetes reachable: workloads will run via k3s")
 	return cluster.NewDirectClient(
 		k8s,
-		nil, // networking: public endpoints are Stage 3
-		nil, // inventory: CPU-only, no GPU
+		nil,                                    // networking: public endpoints are Stage 3
+		nil,                                    // inventory: CPU-only, no GPU
 		getEnv("TEEPIN_GPU_RUNTIME_CLASS", ""), // no GPU runtime class on a home node
 	).WithRESTConfig(restConfig)
 }

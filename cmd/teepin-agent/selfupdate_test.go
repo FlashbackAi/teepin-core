@@ -22,7 +22,7 @@ import (
 func TestIsNewerVersion(t *testing.T) {
 	cases := []struct {
 		latest, current string
-		want             bool
+		want            bool
 	}{
 		{"agent-v1.2.3", "agent-v1.2.2", true},
 		{"agent-v1.2.3", "agent-v1.2.3", false},

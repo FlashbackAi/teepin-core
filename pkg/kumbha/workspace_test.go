@@ -217,7 +217,7 @@ func TestStripInternalScratchFiles_Cases(t *testing.T) {
 	out := stripInternalScratchFiles(in)
 
 	wantPaths := map[string]bool{
-		"index.html":                          true,
+		"index.html": true,
 		"src/" + InternalScratchDir + "/not-at-root.md": true,
 	}
 	if len(out) != len(wantPaths) {

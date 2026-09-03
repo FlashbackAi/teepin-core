@@ -4,8 +4,12 @@
 package nodes
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"os"
+	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -79,8 +83,8 @@ func TestEnroll_ClassComesFromToken(t *testing.T) {
 		WithArgs("node-a", "prov-a", "datacenter", sqlmock.AnyArg(), sqlmock.AnyArg(),
 			sqlmock.AnyArg(), sqlmock.AnyArg(), 0, false, sqlmock.AnyArg(), sqlmock.AnyArg(),
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at", "updated_at"}).
-			AddRow(nodeID, time.Now(), time.Now()))
+		WillReturnRows(sqlmock.NewRows([]string{"id", "node_name", "created_at", "updated_at"}).
+			AddRow(nodeID, "node-a", time.Now(), time.Now()))
 	mock.ExpectExec(`UPDATE compute\.node_enrollment_tokens\s+SET consumed_at = NOW\(\), node_id`).
 		WithArgs(nodeID, tokenID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -92,6 +96,9 @@ func TestEnroll_ClassComesFromToken(t *testing.T) {
 	}
 	if node.Class != "datacenter" {
 		t.Errorf("node class = %q, want datacenter (from token)", node.Class)
+	}
+	if node.NodeName != "node-a" {
+		t.Errorf("node name = %q, want node-a (from the RETURNING clause, not blindly echoing the input)", node.NodeName)
 	}
 	if cred[:4] != credentialPrefix {
 		t.Errorf("credential %q lacks cred prefix", cred)
@@ -231,7 +238,7 @@ func TestUpsertSeen(t *testing.T) {
 	s, mock, done := newMock(t)
 	defer done()
 
-	mock.ExpectExec(`(?s)INSERT INTO compute\.nodes.*ON CONFLICT \(node_name\) DO UPDATE`).
+	mock.ExpectExec(`(?s)INSERT INTO compute\.nodes.*ON CONFLICT \(provider_id\) DO UPDATE`).
 		WithArgs("gpu-node-1", "dc-provider", "datacenter", sqlmock.AnyArg(),
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), 8, true,
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), true).
@@ -246,6 +253,80 @@ func TestUpsertSeen(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet: %v", err)
+	}
+}
+
+// TestUpsertSeen_KeyedByProviderIDNotNodeName is the regression test for a
+// real duplicate-row bug found live 2026-09-03: RenameNode only ever
+// changes node_name, but the agent's own heartbeat re-identifies itself by
+// its ORIGINAL name (it has no way to learn about a console-side rename).
+// Keying this upsert's ON CONFLICT on node_name meant the very next
+// heartbeat after a rename found no row under the agent's stale name and
+// inserted a duplicate instead of updating the renamed row. provider_id is
+// the actual stable identity (set once at enroll, never touched by a
+// rename) — this asserts the conflict target AND that node_name is absent
+// from the UPDATE SET clause, so even a genuinely conflicting heartbeat can
+// never silently undo an operator's rename.
+func TestUpsertSeen_KeyedByProviderIDNotNodeName(t *testing.T) {
+	s, mock, done := newMock(t)
+	defer done()
+
+	// Proves the conflict target: sqlmock fails this test if UpsertSeen's
+	// actual query no longer matches ON CONFLICT (provider_id).
+	mock.ExpectExec(`(?s)INSERT INTO compute\.nodes.*ON CONFLICT \(provider_id\) DO UPDATE`).
+		WithArgs("stale-agent-reported-name", "stable-provider-id", "home", sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), 0, false,
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), true).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	err := s.UpsertSeen(context.Background(), "home", NodeSpecs{
+		NodeName: "stale-agent-reported-name", ProviderID: "stable-provider-id", K8sReady: true,
+	})
+	if err != nil {
+		t.Fatalf("UpsertSeen: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
+	}
+}
+
+// TestUpsertSeenQuery_NeverReassignsNodeName is a direct, static check on
+// the query text itself (not a mock round trip): a rename is only safe
+// from being undone by the next heartbeat if node_name never appears on
+// the left side of an assignment in UpsertSeen's UPDATE SET clause. Reads
+// the source file directly rather than trying to express "this substring
+// is absent" as a regex passed through sqlmock (Go's RE2-based regexp has
+// no lookahead, so that isn't expressible as one ExpectExec pattern).
+func TestUpsertSeenQuery_NeverReassignsNodeName(t *testing.T) {
+	src, err := os.ReadFile("service.go")
+	if err != nil {
+		t.Fatalf("read service.go: %v", err)
+	}
+	fnStart := bytes.Index(src, []byte("func (s *Service) UpsertSeen"))
+	if fnStart == -1 {
+		t.Fatal("UpsertSeen not found in service.go")
+	}
+	fnEnd := bytes.Index(src[fnStart:], []byte("\nfunc "))
+	if fnEnd == -1 {
+		fnEnd = len(src) - fnStart
+	}
+	body := string(src[fnStart : fnStart+fnEnd])
+
+	if regexp.MustCompile(`node_name\s*=\s*EXCLUDED`).MatchString(body) {
+		t.Error("UpsertSeen's SET clause must never reassign node_name — that would silently undo a rename on the next heartbeat")
+	}
+	if !strings.Contains(body, "ON CONFLICT (provider_id)") {
+		t.Error("UpsertSeen must key its ON CONFLICT on provider_id, not node_name")
+	}
+}
+
+func TestUpsertSeen_RequiresProviderID(t *testing.T) {
+	s, _, done := newMock(t)
+	defer done()
+
+	err := s.UpsertSeen(context.Background(), "home", NodeSpecs{NodeName: "n"})
+	if err == nil {
+		t.Error("expected an error when provider_id is empty")
 	}
 }
 

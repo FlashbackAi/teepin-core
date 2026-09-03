@@ -16,21 +16,21 @@ type Instance struct {
 	// reason for a container that will not start. Without it a failed
 	// instance is just the word "failed", and the customer opens a
 	// support ticket to learn what the cluster already knew.
-	StatusMessage  string            `json:"status_message,omitempty"`
-	InstanceType   string            `json:"instance_type,omitempty"` // derived from hardware, e.g. "gpu.h100.2g.20gb"
-	PricePerHour   float64           `json:"price_per_hour,omitempty"`
-	GPUVRAM        string            `json:"gpu_vram,omitempty"`        // what was requested
-	AllocatedVRAM  string            `json:"allocated_vram,omitempty"`  // what was reserved and billed
-	AllocationNote string            `json:"allocation_note,omitempty"` // set when allocated > requested
-	CPUUnits       int               `json:"cpu_units"`
-	Memory         string            `json:"memory"`
-	Endpoint       string            `json:"endpoint,omitempty"`       // HTTPS endpoint URL
-	PublicIP       string            `json:"public_ip,omitempty"`      // LoadBalancer IP
-	DNSName        string            `json:"dns_name,omitempty"`       // DNS hostname
-	TLSEnabled     bool              `json:"tls_enabled,omitempty"`    // SSL/TLS configured
-	TLSReady       bool              `json:"tls_ready,omitempty"`      // SSL certificate provisioned
-	ContainerPort  int               `json:"container_port,omitempty"` // the customer's exposed port; 0 when no port was requested
-	StorageGB      int               `json:"storage_gb,omitempty"`     // persistent volume size; 0 means no volume
+	StatusMessage  string  `json:"status_message,omitempty"`
+	InstanceType   string  `json:"instance_type,omitempty"` // derived from hardware, e.g. "gpu.h100.2g.20gb"
+	PricePerHour   float64 `json:"price_per_hour,omitempty"`
+	GPUVRAM        string  `json:"gpu_vram,omitempty"`        // what was requested
+	AllocatedVRAM  string  `json:"allocated_vram,omitempty"`  // what was reserved and billed
+	AllocationNote string  `json:"allocation_note,omitempty"` // set when allocated > requested
+	CPUUnits       int     `json:"cpu_units"`
+	Memory         string  `json:"memory"`
+	Endpoint       string  `json:"endpoint,omitempty"`       // HTTPS endpoint URL
+	PublicIP       string  `json:"public_ip,omitempty"`      // LoadBalancer IP
+	DNSName        string  `json:"dns_name,omitempty"`       // DNS hostname
+	TLSEnabled     bool    `json:"tls_enabled,omitempty"`    // SSL/TLS configured
+	TLSReady       bool    `json:"tls_ready,omitempty"`      // SSL certificate provisioned
+	ContainerPort  int     `json:"container_port,omitempty"` // the customer's exposed port; 0 when no port was requested
+	StorageGB      int     `json:"storage_gb,omitempty"`     // persistent volume size; 0 means no volume
 	// StorageWarning is set only for a home-class instance with a
 	// persistent volume: on a home node the volume is k3s's local-path
 	// provisioner, so the data lives on that one consumer machine's own

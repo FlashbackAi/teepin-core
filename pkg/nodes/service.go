@@ -159,25 +159,33 @@ func (s *Service) Enroll(ctx context.Context, token string, specs NodeSpecs) (cr
 	}
 
 	var (
-		nodeID  uuid.UUID
-		created time.Time
-		updated time.Time
+		nodeID     uuid.UUID
+		actualName string
+		created    time.Time
+		updated    time.Time
 	)
-	// ON CONFLICT (node_name): re-enrolling an existing node is an UPDATE,
-	// not a hard error. node_name is UNIQUE, so without this a re-enroll
-	// (e.g. after a WSL rebuild, or to pick up newly-detected specs) would
-	// violate the constraint and 500. Re-enrollment legitimately re-issues
-	// the credential and refreshes specs; a fresh install must be able to
+	// ON CONFLICT (provider_id): re-enrolling an existing node is an
+	// UPDATE, not a hard error — e.g. after a WSL rebuild, or to pick up
+	// newly-detected specs. Re-enrollment legitimately re-issues the
+	// credential and refreshes specs; a fresh install must be able to
 	// reclaim its own node. It preserves the RENTABLE reservation (the
-	// operator's setting), only refreshing detected specs and the credential.
+	// operator's setting), only refreshing detected specs and the
+	// credential.
+	//
+	// Keyed by provider_id, not node_name: node_name is the operator's
+	// display label (RenameNode changes only that column) and provider_id
+	// is the stable identity that survives a rename — see UpsertSeen's own
+	// doc comment for the live duplicate-row bug this same key choice
+	// fixes there (found live 2026-09-03, migration 036 adds the
+	// uniqueness this requires). node_name is deliberately absent from
+	// the SET clause so a re-enroll after a rename cannot undo it.
 	err = tx.QueryRowContext(ctx, `
 		INSERT INTO compute.nodes
 		(node_name, provider_id, class, region, cpu_cores, memory_gb,
 		 gpu_model, gpu_count, mig_capable, os, arch, agent_version,
 		 status, credential_hash, credential_prefix)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'enrolled',$13,$14)
-		ON CONFLICT (node_name) DO UPDATE SET
-			provider_id = EXCLUDED.provider_id,
+		ON CONFLICT (provider_id) DO UPDATE SET
 			class = EXCLUDED.class,
 			region = COALESCE(EXCLUDED.region, compute.nodes.region),
 			cpu_cores = COALESCE(EXCLUDED.cpu_cores, compute.nodes.cpu_cores),
@@ -196,12 +204,12 @@ func (s *Service) Enroll(ctx context.Context, token string, specs NodeSpecs) (cr
 			credential_prefix = EXCLUDED.credential_prefix,
 			revoked_at = NULL,
 			updated_at = NOW()
-		RETURNING id, created_at, updated_at
+		RETURNING id, node_name, created_at, updated_at
 	`, specs.NodeName, specs.ProviderID, class, nullString(specs.Region),
 		nullInt(specs.CPUCores), nullInt(specs.MemoryGB), nullString(specs.GPUModel),
 		specs.GPUCount, specs.MIGCapable, nullString(specs.OS), nullString(specs.Arch),
 		nullString(specs.AgentVersion), credHash, credPrefix,
-	).Scan(&nodeID, &created, &updated)
+	).Scan(&nodeID, &actualName, &created, &updated)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to create node: %w", err)
 	}
@@ -220,7 +228,11 @@ func (s *Service) Enroll(ctx context.Context, token string, specs NodeSpecs) (cr
 	}
 
 	return cred, &Node{
-		ID: nodeID, NodeName: specs.NodeName, ProviderID: specs.ProviderID,
+		// NodeName comes back from the RETURNING clause, not specs.NodeName:
+		// a re-enroll of an already-renamed node must report the operator's
+		// current name, not the agent's own stale self-report, which the
+		// UPDATE branch above deliberately left untouched.
+		ID: nodeID, NodeName: actualName, ProviderID: specs.ProviderID,
 		Class: class, Region: specs.Region, CPUCores: specs.CPUCores,
 		MemoryGB: specs.MemoryGB, GPUModel: specs.GPUModel, GPUCount: specs.GPUCount,
 		MIGCapable: specs.MIGCapable, OS: specs.OS, Arch: specs.Arch,
@@ -302,7 +314,23 @@ func (s *Service) RecordHeartbeat(ctx context.Context, nodeID uuid.UUID, specs N
 // UpsertSeen records that a node is connected and reporting, creating a row
 // if none exists. This is the write-through path from the gRPC session: it
 // gives EVERY connected node a durable record (fixing the restart-amnesia
-// gap platform-wide), keyed by node_name.
+// gap platform-wide), keyed by provider_id.
+//
+// Keyed by provider_id, NOT node_name: node_name is the operator-facing
+// display label (RenameNode changes only that column), while provider_id is
+// set once at enrollment and never changes afterward — see enroll.go's own
+// "if provider == ” { provider = name }" default and RenameNode's doc
+// comment. The agent itself has no way to learn its display name changed
+// (it persists its own identity once, client-side, at enroll time), so it
+// keeps reporting under whatever name it always has. Keying this upsert on
+// node_name meant that very next heartbeat after a rename found no row
+// under the agent's own (now-stale) name and INSERTED A DUPLICATE instead
+// of updating the renamed row — and that duplicate was born with NULL
+// specs, since this heartbeat message never carries real cpu_cores/
+// memory_gb at all (only the one-time enroll HTTP call does). Found live
+// 2026-09-03; migration 036 adds the uniqueness this key change requires.
+// node_name is deliberately absent from the SET clause below so a rename
+// is never undone by the next heartbeat.
 //
 // It is deliberately NOT the placement source of truth — the allocator still
 // reads live session inventory. This table is an observability/identity
@@ -317,6 +345,9 @@ func (s *Service) UpsertSeen(ctx context.Context, class string, specs NodeSpecs)
 	if strings.TrimSpace(specs.NodeName) == "" {
 		return fmt.Errorf("node_name is required")
 	}
+	if strings.TrimSpace(specs.ProviderID) == "" {
+		return fmt.Errorf("provider_id is required")
+	}
 	if class != ClassHome && class != ClassDatacenter {
 		class = ClassDatacenter
 	}
@@ -326,12 +357,11 @@ func (s *Service) UpsertSeen(ctx context.Context, class string, specs NodeSpecs)
 		 gpu_model, gpu_count, mig_capable, os, arch, agent_version,
 		 status, last_seen_at, k8s_ready)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'online',NOW(),$13)
-		ON CONFLICT (node_name) DO UPDATE SET
+		ON CONFLICT (provider_id) DO UPDATE SET
 			-- Never resurrect a disabled node via a heartbeat.
 			status = CASE WHEN compute.nodes.status = 'disabled'
 			              THEN compute.nodes.status ELSE 'online' END,
 			last_seen_at = NOW(),
-			provider_id = EXCLUDED.provider_id,
 			region = COALESCE(EXCLUDED.region, compute.nodes.region),
 			cpu_cores = COALESCE(EXCLUDED.cpu_cores, compute.nodes.cpu_cores),
 			memory_gb = COALESCE(EXCLUDED.memory_gb, compute.nodes.memory_gb),
@@ -346,7 +376,10 @@ func (s *Service) UpsertSeen(ctx context.Context, class string, specs NodeSpecs)
 			k8s_ready = EXCLUDED.k8s_ready,
 			-- class is authoritative from enrollment; do NOT let a
 			-- write-through change it (a datacenter heartbeat must never flip
-			-- an enrolled home node, and vice versa).
+			-- an enrolled home node, and vice versa). node_name is likewise
+			-- deliberately absent: it is the operator's rename to keep, not
+			-- the agent's own stale self-report to reassert (see this
+			-- function's own doc comment above).
 			updated_at = NOW()
 	`, specs.NodeName, specs.ProviderID, class, nullString(specs.Region),
 		nullInt(specs.CPUCores), nullInt(specs.MemoryGB), nullString(specs.GPUModel),

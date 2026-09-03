@@ -65,6 +65,19 @@ func columnExists(t *testing.T, db *sql.DB, schema, table, col string) bool {
 	return exists
 }
 
+func constraintExists(t *testing.T, db *sql.DB, schema, table, constraint string) bool {
+	t.Helper()
+	var exists bool
+	err := db.QueryRow(`
+		SELECT EXISTS (SELECT 1 FROM information_schema.table_constraints
+		               WHERE table_schema = $1 AND table_name = $2 AND constraint_name = $3)
+	`, schema, table, constraint).Scan(&exists)
+	if err != nil {
+		t.Fatalf("check constraint %s.%s.%s: %v", schema, table, constraint, err)
+	}
+	return exists
+}
+
 func columnNullable(t *testing.T, db *sql.DB, schema, table, col string) bool {
 	t.Helper()
 	var nullable string
@@ -888,4 +901,38 @@ func TestArchivabilityDrill035(t *testing.T) {
 		t.Fatalf("re-up: %v", err)
 	}
 	t.Log("archivability drill passed: 035 applies, reverts cleanly, and re-applies")
+}
+
+func TestArchivabilityDrill036(t *testing.T) {
+	dsn := os.Getenv("TEEPIN_DRILL_DSN")
+	if dsn == "" {
+		t.Skip("set TEEPIN_DRILL_DSN to run the migration drill")
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("initial up: %v", err)
+	}
+	if !constraintExists(t, db, "compute", "nodes", "nodes_provider_id_key") {
+		t.Fatal("after up: compute.nodes.provider_id is not unique")
+	}
+
+	if err := migrator(t, db).Migrate(35); err != nil {
+		t.Fatalf("migrate down to 035: %v", err)
+	}
+	if constraintExists(t, db, "compute", "nodes", "nodes_provider_id_key") {
+		t.Error("after down: nodes_provider_id_key still present")
+	}
+	if !tableExists(t, db, "compute", "nodes") {
+		t.Error("after down: compute.nodes was wrongly removed")
+	}
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("re-up: %v", err)
+	}
+	t.Log("archivability drill passed: 036 applies, reverts cleanly, and re-applies")
 }
