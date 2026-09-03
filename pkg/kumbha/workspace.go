@@ -47,6 +47,40 @@ const (
 	MaxWorkspaceVersions = 500
 )
 
+// InternalScratchDir is the one workspace directory name SaveVersion
+// always strips from what actually gets persisted, checkpointed,
+// ZIP-exported, or shown in the console file browser — see LaunchAgent's
+// internalScratchPathInstruction for the agent-facing half of this (the
+// prompt telling it where to put its own working notes/memory instead of
+// the workspace root, which is the customer's actual deployed site).
+// This is the hard guarantee: even a prompt the agent ignores cannot
+// leak internal notes into a customer's ZIP download or version
+// history, matching this file's own "a limit only the caller enforces is
+// not a limit" reasoning above. Deferred 2026-09-01 ("why is the agent
+// writing its own AGENTS.md in the app codebase instead of keeping it
+// hidden in the backend"), addressed 2026-09-02. Does not by itself keep
+// it out of the BUILT image — that still depends on the agent's own
+// Dockerfile not copying it in (same as the AGENTS.md-at-root case
+// tonight), which the prompt instruction also covers.
+const InternalScratchDir = ".teepin-internal"
+
+// stripInternalScratchFiles removes anything under InternalScratchDir
+// from files before SaveVersion ever validates, counts, or persists it —
+// internal notes should not eat into a customer's own workspace
+// size/file-count budget either.
+func stripInternalScratchFiles(files []WorkspaceFile) []WorkspaceFile {
+	prefix := InternalScratchDir + "/"
+	out := make([]WorkspaceFile, 0, len(files))
+	for _, f := range files {
+		p := strings.TrimPrefix(f.Path, "./")
+		if p == InternalScratchDir || strings.HasPrefix(p, prefix) {
+			continue
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
 // WorkspaceFile is one text file from the agent's or customer's edit of
 // the workspace.
 type WorkspaceFile struct {
@@ -209,6 +243,7 @@ func validateWorkspaceFiles(files []WorkspaceFile) (int64, error) {
 // inside the same transaction that inserts it and updates the pointer, so
 // two concurrent saves for one session cannot race onto the same number.
 func (s *Store) SaveVersion(ctx context.Context, sessionID uuid.UUID, files []WorkspaceFile, skipped []SkippedFile, createdBy CreatedBy) (int, error) {
+	files = stripInternalScratchFiles(files)
 	total, err := validateWorkspaceFiles(files)
 	if err != nil {
 		return 0, err

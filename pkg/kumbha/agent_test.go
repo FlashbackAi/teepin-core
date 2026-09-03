@@ -154,8 +154,11 @@ func TestGateway_LaunchAgent_Success(t *testing.T) {
 	if spec.Env["TEEPIN_SESSION_TOKEN"] != "fake-agent-token" {
 		t.Errorf("agent pod did not receive its session token: %+v", spec.Env)
 	}
-	if spec.Env["TEEPIN_PROMPT"] != "build me a booking app" {
+	if !strings.HasSuffix(spec.Env["TEEPIN_PROMPT"], "build me a booking app") {
 		t.Errorf("agent pod did not receive the prompt: %+v", spec.Env)
+	}
+	if !strings.Contains(spec.Env["TEEPIN_PROMPT"], InternalScratchDir) {
+		t.Error("agent pod's prompt did not carry the internal scratch-path instruction")
 	}
 	if spec.AccountID != accountID.String() || spec.ProjectID != projectID.String() {
 		t.Errorf("agent pod not scoped to the session's account/project: %+v", spec)

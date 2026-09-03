@@ -391,12 +391,27 @@ func (s *Store) ListByKumbhaSession(ctx context.Context, sessionID uuid.UUID) ([
 // selectColumns previously omitted provider_id even though Create wrote
 // it — every GET/LIST saw an empty ProviderID regardless of what was
 // stored (Stage 3 defect 8). Now selected and scanned below.
+//
+// node_name has the exact same class of gap, found live 2026-09-02: Create
+// resolves it to node_id (a compute.nodes FK, see that INSERT's own
+// sub-select) and this SELECT never read it back, so every GET/LIST saw
+// an empty NodeName regardless of what was stored. Fixed the same way as
+// provider_id, but as a correlated SUBQUERY rather than a JOIN: a JOIN
+// against compute.nodes would put a second table's columns in scope for
+// this same query text, and compute.nodes has its OWN id/status/
+// created_at/updated_at columns — every caller's WHERE-clause fragment
+// concatenated onto this string (Get's "WHERE id = $1" in particular)
+// would become ambiguous and break. A subquery keeps compute.instances
+// the only table in FROM/WHERE scope, so nothing downstream needs to
+// change.
 const selectColumns = `
 	SELECT id, account_id, project_id, user_id, name, image,
 	       COALESCE(instance_type_id, ''), status, COALESCE(gpu_vram_gb, 0),
 	       cpu_units, memory_gb, COALESCE(endpoint, ''),
 	       COALESCE(k8s_pod_name, ''), COALESCE(k8s_namespace, ''),
-	       COALESCE(provider_id, ''), COALESCE(dns_name, ''), COALESCE(public_ip, ''),
+	       COALESCE(provider_id, ''),
+	       COALESCE((SELECT node_name FROM compute.nodes WHERE compute.nodes.id = compute.instances.node_id), ''),
+	       COALESCE(dns_name, ''), COALESCE(public_ip, ''),
 	       tls_enabled, tls_ready, COALESCE(container_port, 0), storage_gb,
 	       created_at, updated_at, started_at, terminated_at, kumbha_session_id
 	FROM compute.instances
@@ -417,7 +432,7 @@ func (s *Store) query(ctx context.Context, where string, args ...interface{}) ([
 			&rec.InstanceType, &rec.Status, &rec.GPUVRAMGB,
 			&rec.CPUUnits, &rec.MemoryGB, &rec.Endpoint,
 			&rec.K8sPodName, &rec.K8sNamespace,
-			&rec.ProviderID, &rec.DNSName, &rec.PublicIP, &rec.TLSEnabled, &rec.TLSReady,
+			&rec.ProviderID, &rec.NodeName, &rec.DNSName, &rec.PublicIP, &rec.TLSEnabled, &rec.TLSReady,
 			&rec.ContainerPort, &rec.StorageGB,
 			&rec.CreatedAt, &rec.UpdatedAt, &rec.StartedAt, &rec.TerminatedAt, &rec.KumbhaSessionID,
 		); err != nil {

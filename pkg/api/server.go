@@ -554,7 +554,12 @@ func (s *Server) CreateInstance(c *gin.Context) {
 	// persist or look up, so its endpoint-provisioning call lands on the
 	// SAME already-existing Service/Ingress instead of creating a second,
 	// differently-named pair alongside them.
-	instanceID := fmt.Sprintf("inst-%s", uuid.New().String()[:8])
+	//
+	// generateInstanceID's own doc comment covers the "<adjective>-<noun>-
+	// <hex>" format itself and why replacing the old "inst-<hex>" scheme
+	// here is safe — this IS the real ID, not a cosmetic alias, and
+	// nothing downstream depends on its old prefix or shape.
+	instanceID := generateInstanceID()
 	instanceUUID := endpointUUIDFor(instanceID)
 
 	// Home-class placement — OPT-IN ONLY. This branch is entered solely
@@ -1252,6 +1257,15 @@ func statusToInstance(st cluster.InstanceStatus, record *compute.InstanceRecord,
 
 	instance.Name = record.Name
 	instance.Image = record.Image
+	// A Kumbha-built image is Teepin's own internal build artifact — the
+	// customer never chose it or interacts with the registry — so it gets
+	// the same redaction the Kumbha-specific endpoints already apply (see
+	// redactImageRef's own doc comment). A customer's own bring-your-own
+	// image on an ordinary compute instance is legitimately theirs to see
+	// verbatim, so this must stay conditional, not blanket.
+	if record.KumbhaSessionID != uuid.Nil {
+		instance.Image = redactImageRef(record.Image)
+	}
 	instance.CreatedAt = record.CreatedAt
 	instance.CPUUnits = record.CPUUnits
 	instance.Memory = fmt.Sprintf("%dGB", record.MemoryGB)

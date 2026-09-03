@@ -158,6 +158,78 @@ func TestSaveVersion_InsertsVersionOneWhenNoneExistAndMovesPointer(t *testing.T)
 	}
 }
 
+// TestSaveVersion_StripsInternalScratchFiles is the regression test for
+// the AGENTS.md-at-workspace-root gap flagged 2026-09-01 ("why is the
+// agent writing its own AGENTS.md in the app codebase instead of keeping
+// it hidden in the backend"): anything the agent (or, in principle, a
+// customer save) submits under InternalScratchDir must never reach the
+// database at all — not just be hidden by the console later. The
+// INSERT's own expected file_count (2, not 3) and byte total (excluding
+// the scratch file's content) are the actual assertion: the mock would
+// simply not match if stripping did not happen before validation/counting.
+func TestSaveVersion_StripsInternalScratchFiles(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessionID := uuid.New()
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT v\.version, v\.is_checkpoint, v\.file_count`).
+		WithArgs(sessionID).
+		WillReturnRows(sqlmock.NewRows([]string{"version", "is_checkpoint", "file_count"}).AddRow(nil, nil, nil))
+	mock.ExpectQuery(`SELECT COALESCE\(MAX\(version\), 0\) FROM billing\.kumbha_workspace_versions`).
+		WithArgs(sessionID).
+		WillReturnRows(sqlmock.NewRows([]string{"coalesce"}).AddRow(0))
+	mock.ExpectExec(`INSERT INTO billing\.kumbha_workspace_versions`).
+		WithArgs(sessionID, 1, sqlmock.AnyArg(), sqlmock.AnyArg(), 2, int64(len("hello")+len("world")), string(CreatedByAgent)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE billing\.inference_sessions SET current_workspace_version`).
+		WithArgs(1, sessionID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	version, err := store.SaveVersion(context.Background(), sessionID, []WorkspaceFile{
+		{Path: "a.txt", Content: "hello"},
+		{Path: "b.txt", Content: "world"},
+		{Path: InternalScratchDir + "/AGENTS.md", Content: "private notes the agent should never publish"},
+	}, nil, CreatedByAgent)
+	if err != nil {
+		t.Fatalf("SaveVersion: %v", err)
+	}
+	if version != 1 {
+		t.Errorf("got version %d, want 1", version)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+// TestStripInternalScratchFiles_Cases exercises the filter directly for
+// path-matching edge cases the store-level test above cannot cheaply
+// cover on its own.
+func TestStripInternalScratchFiles_Cases(t *testing.T) {
+	in := []WorkspaceFile{
+		{Path: "index.html", Content: "kept"},
+		{Path: InternalScratchDir + "/AGENTS.md", Content: "stripped: direct child"},
+		{Path: InternalScratchDir + "/notes/scratch.txt", Content: "stripped: nested"},
+		{Path: "./" + InternalScratchDir + "/leading-dot-slash.md", Content: "stripped: leading ./"},
+		{Path: "src/" + InternalScratchDir + "/not-at-root.md", Content: "kept: not workspace-root-anchored"},
+		{Path: InternalScratchDir, Content: "stripped: bare dir entry, no trailing slash"},
+	}
+	out := stripInternalScratchFiles(in)
+
+	wantPaths := map[string]bool{
+		"index.html":                          true,
+		"src/" + InternalScratchDir + "/not-at-root.md": true,
+	}
+	if len(out) != len(wantPaths) {
+		t.Fatalf("got %d files after stripping, want %d: %+v", len(out), len(wantPaths), out)
+	}
+	for _, f := range out {
+		if !wantPaths[f.Path] {
+			t.Errorf("unexpected file survived stripping: %q", f.Path)
+		}
+	}
+}
+
 // TestSaveVersion_CustomerSaveIsNotCheckpointedImmediately is the
 // regression test for a live 2026-08-31 product change: a customer's own
 // edit-and-save used to be checkpointed the instant it was saved,

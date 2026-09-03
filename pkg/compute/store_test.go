@@ -130,12 +130,12 @@ func TestListByKumbhaSession_ReturnsOnlyThatSessionsInstances(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "account_id", "project_id", "user_id", "name", "image",
 			"instance_type_id", "status", "gpu_vram_gb", "cpu_units", "memory_gb", "endpoint",
-			"k8s_pod_name", "k8s_namespace", "provider_id", "dns_name", "public_ip",
+			"k8s_pod_name", "k8s_namespace", "provider_id", "node_name", "dns_name", "public_ip",
 			"tls_enabled", "tls_ready", "container_port", "storage_gb",
 			"created_at", "updated_at", "started_at", "terminated_at", "kumbha_session_id",
 		}).AddRow("inst-broken01", accountID, projectID, uuid.Nil, "web", "nginx:1.27-alpine",
 			"", StatusRunning, 0, 1, 1, "https://inst-broken01.teepin.com",
-			"inst-broken01-pod", "default", "", "", "",
+			"inst-broken01-pod", "default", "", "", "", "",
 			true, true, 80, 0,
 			time.Now(), time.Now(), nil, nil, sessionID))
 
@@ -262,7 +262,7 @@ func instanceRows() *sqlmock.Rows {
 		"instance_type_id", "status", "gpu_vram_gb",
 		"cpu_units", "memory_gb", "endpoint",
 		"k8s_pod_name", "k8s_namespace",
-		"provider_id", "dns_name", "public_ip", "tls_enabled", "tls_ready", "container_port",
+		"provider_id", "node_name", "dns_name", "public_ip", "tls_enabled", "tls_ready", "container_port",
 		"storage_gb",
 		"created_at", "updated_at", "started_at", "terminated_at", "kumbha_session_id",
 	})
@@ -310,7 +310,7 @@ func TestListActive(t *testing.T) {
 			"gpu.h100.custom-25gb", StatusRunning, 25,
 			8, 32, "https://inst-abc12345.teepin.io",
 			"my-app-x1y2z", "default",
-			"", "", "", false, false, 0,
+			"", "", "", "", false, false, 0,
 			0,
 			time.Now(), time.Now(), time.Now(), nil, nil,
 		))
@@ -329,6 +329,41 @@ func TestListActive(t *testing.T) {
 	}
 	if inst.TerminatedAt != nil {
 		t.Error("TerminatedAt should be nil for active instance")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+// TestListActive_ReadsBackNodeName is the regression test for the same
+// class of bug provider_id already had (Stage 3 defect 8): Create
+// resolves NodeName to a node_id FK via a sub-select, but selectColumns
+// never read it back, so every GET/LIST saw an empty NodeName regardless
+// of what was stored. Found live 2026-09-02.
+func TestListActive_ReadsBackNodeName(t *testing.T) {
+	store, mock := newMockStore(t)
+	accountID, projectID, userID := uuid.New(), uuid.New(), uuid.New()
+
+	mock.ExpectQuery(`SELECT .+ FROM compute\.instances WHERE terminated_at IS NULL`).
+		WillReturnRows(instanceRows().AddRow(
+			"inst-home0001", accountID, projectID, userID, "my-app", "nginx:latest",
+			"cpu.home", StatusRunning, 0,
+			2, 4, "https://inst-home0001.teepin.io",
+			"my-app-x1y2z", "default",
+			"", "srialla", "", "", false, false, 0,
+			0,
+			time.Now(), time.Now(), time.Now(), nil, nil,
+		))
+
+	instances, err := store.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive failed: %v", err)
+	}
+	if len(instances) != 1 {
+		t.Fatalf("expected 1 instance, got %d", len(instances))
+	}
+	if instances[0].NodeName != "srialla" {
+		t.Errorf("NodeName = %q, want %q", instances[0].NodeName, "srialla")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Error(err)

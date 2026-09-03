@@ -112,6 +112,27 @@ func (g *Gateway) WithAgent(client cluster.Client, mintToken TokenMinter, cfg Ag
 // finished app the agent creates via the real API once deploy is
 // approved — that one lands in compute.instances exactly like any
 // customer-created instance always has.
+// internalScratchPathInstruction tells the agent where to keep its own
+// working notes/memory instead of the workspace root, which IS the
+// customer's actual deployed site and ZIP download. Prepended to every
+// launch prompt — first build and every resume alike — since it is a
+// standing behavioral instruction, not part of any one customer's
+// specific request. This is the only lever teepin-core actually has over
+// the agent's own behavior: the agent image's own system prompt is built
+// and baked in elsewhere, a separate build this package has no access
+// to. Deferred 2026-09-01 ("why is the agent writing its own AGENTS.md
+// in the app codebase instead of keeping it hidden in the backend"),
+// addressed 2026-09-02 — paired with a hard server-side filter
+// (SaveKumbhaWorkspace's own doc comment) that strips anything under
+// this path from what actually gets persisted, so a prompt the agent
+// ignores still cannot leak internal notes into the customer's ZIP or
+// version history.
+const internalScratchPathInstruction = "Keep any of your own internal working notes, memory, or scratch " +
+	"files in a \"" + InternalScratchDir + "/\" directory at the workspace root — never at the workspace " +
+	"root itself, and never inside any directory your Dockerfile copies into the built image. Nothing under " +
+	"\"" + InternalScratchDir + "/\" is ever shown to the customer, deployed, or included in their downloads " +
+	"— it exists purely for your own use across relaunches of this same session.\n\n"
+
 func (g *Gateway) LaunchAgent(ctx context.Context, sess *Session, prompt string) error {
 	if g.cluster == nil || g.mintToken == nil {
 		return ErrAgentNotConfigured
@@ -139,7 +160,7 @@ func (g *Gateway) LaunchAgent(ctx context.Context, sess *Session, prompt string)
 			// TokenMinter's doc comment and MintSessionToken).
 			"TEEPIN_SESSION_TOKEN":  token,
 			"TEEPIN_SESSION_ID":     sess.ID.String(),
-			"TEEPIN_PROMPT":         prompt,
+			"TEEPIN_PROMPT":         internalScratchPathInstruction + prompt,
 			"TEEPIN_API_BASE_URL":   g.agentConfig.APIBaseURL,
 			"TEEPIN_VISION_CAPABLE": strconv.FormatBool(g.agentConfig.VisionCapable),
 		},

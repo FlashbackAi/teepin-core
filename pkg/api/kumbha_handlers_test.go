@@ -752,12 +752,12 @@ func instanceRecordRow(id string, accountID, projectID uuid.UUID, name, image st
 	return sqlmock.NewRows([]string{
 		"id", "account_id", "project_id", "user_id", "name", "image",
 		"instance_type_id", "status", "gpu_vram_gb", "cpu_units", "memory_gb", "endpoint",
-		"k8s_pod_name", "k8s_namespace", "provider_id", "dns_name", "public_ip",
+		"k8s_pod_name", "k8s_namespace", "provider_id", "node_name", "dns_name", "public_ip",
 		"tls_enabled", "tls_ready", "container_port", "storage_gb",
 		"created_at", "updated_at", "started_at", "terminated_at", "kumbha_session_id",
 	}).AddRow(id, accountID, projectID, uuid.Nil, name, image,
 		"", compute.StatusRunning, 0, cpuUnits, memoryGB, endpoint,
-		id+"-pod", "default", "", id+".teepin.com", "",
+		id+"-pod", "default", "", "", id+".teepin.com", "",
 		true, true, containerPort, storageGB,
 		nowStub(), nowStub(), nil, nil, uuid.Nil)
 }
@@ -851,12 +851,12 @@ func TestRedeployKumbhaInstance_ThreadsHomeNodeClassAndProviderOntoSpec(t *testi
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "account_id", "project_id", "user_id", "name", "image",
 			"instance_type_id", "status", "gpu_vram_gb", "cpu_units", "memory_gb", "endpoint",
-			"k8s_pod_name", "k8s_namespace", "provider_id", "dns_name", "public_ip",
+			"k8s_pod_name", "k8s_namespace", "provider_id", "node_name", "dns_name", "public_ip",
 			"tls_enabled", "tls_ready", "container_port", "storage_gb",
 			"created_at", "updated_at", "started_at", "terminated_at", "kumbha_session_id",
 		}).AddRow(existingID, testAccountID, projectID, uuid.Nil, "kumbha-abc123", "old-image:v1",
 			"", compute.StatusRunning, 0, 1, 1, "https://inst-existing5.teepin.com",
-			existingID+"-pod", "default", "provider-srialla", existingID+".teepin.com", "",
+			existingID+"-pod", "default", "provider-srialla", "srialla", existingID+".teepin.com", "",
 			true, true, 80, 0,
 			nowStub(), nowStub(), nil, nil, uuid.Nil))
 	mock.ExpectExec(`UPDATE compute\.instances`).
@@ -1142,7 +1142,7 @@ func TestRedeployKumbhaInstance_InstanceGoneIs404(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "account_id", "project_id", "user_id", "name", "image",
 			"instance_type_id", "status", "gpu_vram_gb", "cpu_units", "memory_gb", "endpoint",
-			"k8s_pod_name", "k8s_namespace", "provider_id", "dns_name", "public_ip",
+			"k8s_pod_name", "k8s_namespace", "provider_id", "node_name", "dns_name", "public_ip",
 			"tls_enabled", "tls_ready", "container_port", "storage_gb",
 			"created_at", "updated_at", "started_at", "terminated_at",
 		})) // no rows
@@ -2023,5 +2023,45 @@ func TestStopKumbhaAgent_NothingRunningIs409(t *testing.T) {
 		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, nil, nil)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409 (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+// TestRedactImageRef is the regression test for the AWS/ECR leak flagged
+// in ROADMAP.md 2026-08-31 and fixed 2026-09-02: a Kumbha-built image
+// reference must never reach a customer response with the registry host,
+// AWS account ID, or internal repo path intact — only the trailing
+// session-scoped tag should survive, under an opaque prefix.
+func TestRedactImageRef(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "full ECR reference",
+			input: "880254196251.dkr.ecr.us-east-1.amazonaws.com/teepin/kumbha-builds-dev:43368ae2",
+			want:  "teepin-build-43368ae2",
+		},
+		{
+			name:  "empty",
+			input: "",
+			want:  "",
+		},
+		{
+			name:  "no colon at all",
+			input: "justatag",
+			want:  "teepin-build-justatag",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := redactImageRef(tc.input)
+			if got != tc.want {
+				t.Errorf("redactImageRef(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+			if strings.Contains(got, "dkr.ecr") || strings.Contains(got, "amazonaws.com") || strings.Contains(got, "880254196251") {
+				t.Errorf("redactImageRef(%q) = %q still leaks registry/account details", tc.input, got)
+			}
+		})
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -379,7 +380,7 @@ func (s *Server) BuildKumbhaSession(c *gin.Context) {
 		return
 	}
 	s.recordDeployOutcome(c.Request.Context(), sessionID, "")
-	c.JSON(http.StatusOK, gin.H{"image_ref": imageRef})
+	c.JSON(http.StatusOK, gin.H{"image_ref": redactImageRef(imageRef)})
 }
 
 // recordDeployOutcome persists the outcome of a build/deploy attempt on
@@ -820,12 +821,46 @@ func (s *Server) DeployKumbhaSession(c *gin.Context) {
 	s.recordDeployOutcome(ctx, sessionID, "")
 
 	c.JSON(http.StatusOK, gin.H{
-		"image_ref":      imageRef,
+		"image_ref":      redactImageRef(imageRef),
 		"instance_id":    created.ID,
 		"endpoint":       created.Endpoint,
 		"status":         created.Status,
 		"price_per_hour": created.PricePerHour,
 	})
+}
+
+// redactImageRef strips the registry host, AWS account ID, and internal
+// ECR repository path from a Kumbha-built image reference before it can
+// reach a customer-facing response — flagged in ROADMAP.md 2026-08-31
+// (found live while debugging the screenshot endpoint: a browser's
+// Network tab showed
+// "880254196251.dkr.ecr.us-east-1.amazonaws.com/teepin/kumbha-builds-dev:..."
+// verbatim), fixed 2026-09-02. The customer never chose this image or
+// interacts with the registry directly — it is Teepin's own internal
+// build artifact — so nothing about seeing it is a legitimate need, only
+// infrastructure leakage (TWS's own positioning is "not just a GPU
+// cloud"; a specific vendor's account ID and repo layout is exactly the
+// kind of implementation detail that should never surface).
+//
+// Replaces the value with an opaque identifier built from the same
+// per-session tag the real reference already carries (kumbha-builds-dev
+// tags are session-scoped — see pkg/build's own tagging comment), so a
+// customer still sees a STABLE identifier across their own repeated
+// deploys, correlatable in their own support conversations, but nothing
+// about the registry backing it. Deliberately keeps the field's name and
+// type (a non-empty string) unchanged at every call site, only ever
+// changing the value, so nothing downstream that merely stores/logs/
+// displays this string (the console, the agent's own tool-call bookkeeping)
+// needs to change.
+func redactImageRef(imageRef string) string {
+	if imageRef == "" {
+		return ""
+	}
+	tag := imageRef
+	if i := strings.LastIndex(imageRef, ":"); i != -1 {
+		tag = imageRef[i+1:]
+	}
+	return "teepin-build-" + tag
 }
 
 // triggerScreenshotCapture kicks off a best-effort deployment thumbnail
@@ -853,12 +888,66 @@ func (s *Server) triggerScreenshotCapture(sessionID uuid.UUID, sess *kumbha.Sess
 		// from the exported constant (plus a margin for this goroutine's
 		// own dispatch/scheduling overhead) means there is exactly one
 		// number to reason about, not two that can silently drift apart.
-		ctx, cancel := context.WithTimeout(context.Background(), kumbha.CaptureTimeoutDefault+10*time.Second)
+		// Widened by endpointReadyMaxWait too, now that this goroutine
+		// waits for the endpoint before capturing — see waitForEndpointReady.
+		ctx, cancel := context.WithTimeout(context.Background(), endpointReadyMaxWait+kumbha.CaptureTimeoutDefault+10*time.Second)
 		defer cancel()
+		// A deploy/redeploy's response has JUST come back when this fires:
+		// the new (or swapped) pod has not necessarily started serving yet
+		// — scheduling, image pull, container start, and, for a home-class
+		// instance, the Stage 3 tunnel's own live pod-address resolution
+		// all take real time. Capturing immediately screenshots the
+		// tunnel's own "instance not reachable" error page instead of the
+		// actual app — found live 2026-09-02, an uploaded thumbnail was
+		// literally that error text rendered as a page. Wait for the
+		// endpoint to actually answer before spending a capture pod on it.
+		waitForEndpointReady(ctx, targetURL)
 		if err := s.kumbha.CaptureScreenshot(ctx, sess, targetURL); err != nil {
 			log.Printf("WARN: screenshot capture failed for Kumbha session %s: %v", sessionID, err)
 		}
 	}()
+}
+
+// endpointReadyPollInterval/endpointReadyMaxWait bound
+// waitForEndpointReady's polling below.
+const (
+	endpointReadyPollInterval = 3 * time.Second
+	endpointReadyMaxWait      = 60 * time.Second
+)
+
+// waitForEndpointReady polls targetURL until it returns a response that
+// is not one of the Stage 3 tunnel's own "pod not resolvable yet" status
+// codes (502/503/504 — see pkg/cluster/proxy.go's relayResponse, which
+// turns a ResolveInstanceAddress failure into exactly one of these), or
+// endpointReadyMaxWait elapses. Never errors and always returns: a
+// timeout here still falls through to capturing on a best-effort basis —
+// a slightly-early thumbnail beats skipping it entirely — this only
+// trims how often that early capture happens to land on the tunnel's own
+// error page instead of the real app.
+func waitForEndpointReady(ctx context.Context, targetURL string) {
+	waitCtx, cancel := context.WithTimeout(ctx, endpointReadyMaxWait)
+	defer cancel()
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	ticker := time.NewTicker(endpointReadyPollInterval)
+	defer ticker.Stop()
+
+	for {
+		req, err := http.NewRequestWithContext(waitCtx, http.MethodGet, targetURL, nil)
+		if err == nil {
+			if resp, doErr := client.Do(req); doErr == nil {
+				resp.Body.Close()
+				if resp.StatusCode < 502 || resp.StatusCode > 504 {
+					return
+				}
+			}
+		}
+		select {
+		case <-waitCtx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 // triggerGithubPush kicks off a best-effort push of the session's current
@@ -1146,7 +1235,7 @@ func (s *Server) redeployKumbhaInstance(ctx context.Context, c *gin.Context, ses
 	s.recordDeployOutcome(ctx, sessionID, "")
 
 	c.JSON(http.StatusOK, gin.H{
-		"image_ref":      imageRef,
+		"image_ref":      redactImageRef(imageRef),
 		"instance_id":    existing.ID,
 		"endpoint":       redeployedEndpoint,
 		"status":         compute.StatusPending,
@@ -1392,7 +1481,7 @@ func (s *Server) ListKumbhaSessionInstances(c *gin.Context) {
 		out = append(out, kumbhaSessionInstance{
 			ID:           r.ID,
 			Name:         r.Name,
-			Image:        r.Image,
+			Image:        redactImageRef(r.Image),
 			Status:       r.Status,
 			Endpoint:     r.Endpoint,
 			IsApp:        r.ID == sess.AppInstanceID,
