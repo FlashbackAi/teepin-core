@@ -165,6 +165,11 @@ func runEnrolledAgent(cfg *nodeConfig) {
 	ctx, cancel := shutdownContext()
 	defer cancel()
 
+	// Home nodes only — see startSelfUpdateLoop's own doc comment for why
+	// this must never run on the datacenter path (its own operator-
+	// controlled image pipeline, not a curl-a-binary model).
+	go startSelfUpdateLoop(ctx)
+
 	// The credential travels in the SAME metadata slot as the shared token;
 	// the control plane tries the shared token first, then resolves this as
 	// a per-node credential.

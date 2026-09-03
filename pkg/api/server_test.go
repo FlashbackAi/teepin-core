@@ -459,6 +459,44 @@ func TestStatusToInstance_UsesRecordForCommercialFields(t *testing.T) {
 	}
 }
 
+// TestStatusToInstance_HomeStorageGetsDurabilityWarning is the
+// regression test for the gap pkg/cluster/direct.go's buildPod comment
+// already flagged ("the console must say so") but nothing implemented:
+// a home-class instance with a persistent volume must carry a warning
+// that its data lives on one consumer node's own disk, unlike datacenter
+// network storage. Found live 2026-09-02.
+func TestStatusToInstance_HomeStorageGetsDurabilityWarning(t *testing.T) {
+	st := cluster.InstanceStatus{InstanceID: "inst-home0001", Status: compute.StatusRunning, ObservedAt: time.Now().UTC()}
+	record := &compute.InstanceRecord{
+		ID: "inst-home0001", Name: "scraper", Image: "python:3.12-slim",
+		InstanceType: "cpu.home", CPUUnits: 2, MemoryGB: 4, StorageGB: 20,
+	}
+
+	inst := statusToInstance(st, record, gpu.DefaultPricePerGBHour, "")
+
+	if inst.StorageWarning == "" {
+		t.Error("a home-class instance with storage_gb > 0 must carry StorageWarning, got empty")
+	}
+}
+
+// TestStatusToInstance_DatacenterStorageGetsNoWarning proves the warning
+// is conditional, not blanket: a datacenter instance's storage is real
+// network storage, not tied to one physical machine's uptime, so it must
+// never carry the home-specific warning text.
+func TestStatusToInstance_DatacenterStorageGetsNoWarning(t *testing.T) {
+	st := cluster.InstanceStatus{InstanceID: "inst-dc000001", Status: compute.StatusRunning, ObservedAt: time.Now().UTC()}
+	record := &compute.InstanceRecord{
+		ID: "inst-dc000001", Name: "trainer", Image: "nginx:latest",
+		InstanceType: "gpu.h100.custom-25gb", GPUVRAMGB: 25, CPUUnits: 8, MemoryGB: 32, StorageGB: 100,
+	}
+
+	inst := statusToInstance(st, record, gpu.DefaultPricePerGBHour, "")
+
+	if inst.StorageWarning != "" {
+		t.Errorf("a datacenter instance must never carry the home storage warning, got %q", inst.StorageWarning)
+	}
+}
+
 func TestStatusToInstance_SurfacesFailureReason(t *testing.T) {
 	st := cluster.InstanceStatus{
 		InstanceID: "inst-badimage",

@@ -19,6 +19,24 @@ In the control centre → **Nodes** → **Generate enrollment token**. Choose th
 class **home** and copy the `tne_…` token — it is shown once and expires. The
 class is fixed on the token: the node cannot make itself a datacenter node.
 
+## 0.5. Get the install package (no Go, no git checkout needed)
+
+Download and extract the latest release from
+[github.com/FlashbackAi/teepin-core/releases](https://github.com/FlashbackAi/teepin-core/releases)
+(tag `agent-v*`) — pick the tarball for your architecture:
+
+```bash
+curl -LO https://github.com/FlashbackAi/teepin-core/releases/latest/download/teepin-agent-linux-amd64.tar.gz
+tar xzf teepin-agent-linux-amd64.tar.gz
+cd teepin-agent-linux-amd64  # install.sh and the teepin-agent binary are both here
+```
+
+(`arm64` in place of `amd64` on ARM hardware — Apple-Silicon Macs via
+`bootstrap-macos.sh` need this one.) `install.sh` already looks for a
+`teepin-agent` binary sitting next to itself, so nothing else is needed —
+this is the same install.sh referenced below, just run from inside the
+extracted tarball instead of a git checkout.
+
 ## Linux
 
 ```bash
@@ -59,6 +77,28 @@ it. The VM is set to start on login. Apple-Silicon Macs report `arm64`; only
   **metered**. CPU rates default to `$0` — a home instance bills nothing until
   an operator sets a rate (control centre → Pricing → Home compute). Public
   HTTPS access to the workload is **Stage 3** (tunnel + wildcard TLS).
+
+## Updates
+
+An already-enrolled node **updates itself automatically** — no per-node
+manual step. Once a day (with a randomized startup delay so a fleet does not
+all check at once), the agent checks
+[the latest GitHub release](https://github.com/FlashbackAi/teepin-core/releases)
+and, if it is genuinely newer than the running binary, downloads it,
+verifies it against the release's published `SHA256SUMS`, swaps it into
+place, and exits — `systemd`'s `Restart=always` brings it straight back up
+running the new version. A brief (~5s) reconnect is the only visible effect,
+the same kind of interruption a control-plane restart already causes.
+
+This only applies to a binary built from a tagged release (`-ldflags
+"-X main.Version=..."`, which the release workflow sets) — a `go build`
+from source (`Version = "dev"`) never self-updates, so a developer running
+from a checkout is never silently replaced.
+
+To update manually instead (skip the wait, or roll back to an older
+release), just re-run `install.sh` on the node — it detects the existing
+enrollment and swaps the binary in place without touching k3s or the
+credential (see the Notes section below on `--binary`).
 
 ## Removing a node
 

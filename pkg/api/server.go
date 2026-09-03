@@ -796,6 +796,12 @@ func (s *Server) CreateInstance(c *gin.Context) {
 	if len(req.Ports) > 0 {
 		instance.ContainerPort = req.Ports[0].Container
 	}
+	if req.StorageGB > 0 {
+		instance.StorageGB = req.StorageGB
+		if homePlacement != nil {
+			instance.StorageWarning = homeStorageWarning
+		}
+	}
 
 	c.JSON(http.StatusCreated, instance)
 }
@@ -1238,6 +1244,15 @@ func (s *Server) instanceSpec(instanceID string, instanceUUID, projectID, accoun
 // record may be nil in standalone mode (no database), in which case the
 // commercial fields are simply absent rather than guessed.
 //
+// homeStorageWarning is what pkg/cluster/direct.go's buildPod comment
+// meant by "the console must say so" — the volume-mount code wires the
+// PVC correctly either way, but nothing ever surfaced the durability
+// difference to a customer choosing storage on a home-class instance
+// until now. Found live 2026-09-02.
+const homeStorageWarning = "This instance's persistent storage lives on a single home compute node's own disk " +
+	"(not shared datacenter network storage). Your data is unreachable whenever that node is offline, and is " +
+	"lost if the node is removed from the platform."
+
 // domain is s.endpointDomain, passed in because statusToInstance is a
 // package-level function with no Server access of its own — needed for
 // the endpoint-derivation fallback below.
@@ -1273,6 +1288,9 @@ func statusToInstance(st cluster.InstanceStatus, record *compute.InstanceRecord,
 	instance.PublicIP = record.PublicIP
 	instance.ContainerPort = record.ContainerPort
 	instance.StorageGB = record.StorageGB
+	if record.StorageGB > 0 && record.InstanceType == "cpu.home" {
+		instance.StorageWarning = homeStorageWarning
+	}
 
 	instance.Endpoint, instance.DNSName, instance.TLSEnabled, instance.TLSReady =
 		resolveEndpoint(record, domain)

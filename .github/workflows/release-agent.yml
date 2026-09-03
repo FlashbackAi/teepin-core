@@ -1,0 +1,86 @@
+# Copyright 2026 TEEPIN Project
+# Licensed under the Apache License, Version 2.0
+#
+# Publishes a home-node teepin-agent release: prebuilt linux/amd64 and
+# linux/arm64 binaries bundled with the install scripts, as GitHub Release
+# assets. This is what closes the "no Go, no git checkout needed on a node"
+# gap — see deploy/agent/README.md and install.sh's own "installing agent
+# bundled next to this script" fallback, which this exists to feed.
+#
+# Also what cmd/teepin-agent/selfupdate.go polls (GitHub's public,
+# unauthenticated "latest release" API — safe with no credential since this
+# repo is public) — the asset names and SHA256SUMS format here are a
+# contract with that code; changing either needs both sides updated
+# together.
+#
+# Triggered by pushing a tag matching agent-v* (e.g. agent-v1.0.0) — kept
+# under its own prefix, distinct from any future non-agent release type in
+# this repo.
+
+name: Release agent
+
+on:
+  push:
+    tags:
+      - "agent-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # CGO_ENABLED=0 for a static binary — this runs on whatever Linux a
+      # node's WSL2/Lima VM happens to ship, and must not depend on a
+      # specific glibc version being present there.
+      - name: Build binaries
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          for arch in amd64 arm64; do
+            outdir="dist/teepin-agent-linux-${arch}"
+            mkdir -p "$outdir"
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build \
+              -ldflags "-X main.Version=${VERSION}" \
+              -o "$outdir/teepin-agent" \
+              ./cmd/teepin-agent
+          done
+
+      # Bundled alongside the binary so a fresh install never needs a
+      # separate download — install.sh already looks for a teepin-agent
+      # binary sitting next to itself. refresh-ecr-pull-secret.sh rides
+      # along too: today it is an entirely separate, undocumented-in-the-
+      # README manual step: bundling it here does not wire it into
+      # install.sh's own flow (that is separate follow-up work), but it
+      # does mean the script an operator needs is never missing from what
+      # they downloaded.
+      - name: Package tarballs
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            outdir="dist/teepin-agent-linux-${arch}"
+            cp deploy/agent/install.sh "$outdir/"
+            cp deploy/agent/refresh-ecr-pull-secret.sh "$outdir/"
+            cp deploy/agent/README.md "$outdir/"
+            chmod +x "$outdir/teepin-agent" "$outdir/install.sh" "$outdir/refresh-ecr-pull-secret.sh"
+            tar -czf "teepin-agent-linux-${arch}.tar.gz" -C "$outdir" .
+          done
+          sha256sum teepin-agent-linux-amd64.tar.gz teepin-agent-linux-arm64.tar.gz > SHA256SUMS
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            teepin-agent-linux-amd64.tar.gz
+            teepin-agent-linux-arm64.tar.gz
+            SHA256SUMS
+          generate_release_notes: true

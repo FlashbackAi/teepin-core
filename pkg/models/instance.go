@@ -31,6 +31,15 @@ type Instance struct {
 	TLSReady       bool              `json:"tls_ready,omitempty"`      // SSL certificate provisioned
 	ContainerPort  int               `json:"container_port,omitempty"` // the customer's exposed port; 0 when no port was requested
 	StorageGB      int               `json:"storage_gb,omitempty"`     // persistent volume size; 0 means no volume
+	// StorageWarning is set only for a home-class instance with a
+	// persistent volume: on a home node the volume is k3s's local-path
+	// provisioner, so the data lives on that one consumer machine's own
+	// disk and is unreachable whenever that node is offline — a
+	// materially different durability story than datacenter network
+	// storage. Found live 2026-09-02: pkg/cluster/direct.go's own
+	// buildPod comment already said "the console must say so", but
+	// nothing ever did.
+	StorageWarning string            `json:"storage_warning,omitempty"`
 	InternalIP     string            `json:"internal_ip,omitempty"`
 	CreatedAt      time.Time         `json:"created_at"`
 	UpdatedAt      time.Time         `json:"updated_at"`
