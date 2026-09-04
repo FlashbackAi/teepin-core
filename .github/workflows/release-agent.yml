@@ -16,6 +16,17 @@
 # Triggered by pushing a tag matching agent-v* (e.g. agent-v1.0.0) — kept
 # under its own prefix, distinct from any future non-agent release type in
 # this repo.
+#
+# A tag carrying a SemVer pre-release suffix (agent-v1.0.0-rc1,
+# agent-v1.0.0-beta.2, ...) publishes as a GitHub pre-release. This
+# matters beyond a UI label: selfupdate.go polls the public "latest
+# release" API, which excludes pre-releases by GitHub's own definition —
+# so a pre-release tag lets an operator manually install and verify a
+# build on one node BEFORE it becomes visible to the fleet-wide
+# self-update mechanism. Promoting it later means cutting a follow-up tag
+# without the suffix (e.g. agent-v1.0.0), not editing this release in
+# place — tags are immutable identifiers for exactly this class of
+# "what did the fleet actually run" question.
 
 name: Release agent
 
@@ -76,6 +87,21 @@ jobs:
           done
           sha256sum teepin-agent-linux-amd64.tar.gz teepin-agent-linux-arm64.tar.gz > SHA256SUMS
 
+      # softprops/action-gh-release does NOT infer prerelease from the tag
+      # name on its own — every tag would otherwise publish as a full
+      # release regardless of a -rc/-beta suffix, silently defeating the
+      # whole point of tagging one. This step is the only thing that
+      # actually reads the tag's shape.
+      - name: Detect pre-release tag
+        id: prerelease
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_NAME}" =~ ^agent-v[0-9]+\.[0-9]+\.[0-9]+-.+ ]]; then
+            echo "value=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
@@ -84,3 +110,4 @@ jobs:
             teepin-agent-linux-arm64.tar.gz
             SHA256SUMS
           generate_release_notes: true
+          prerelease: ${{ steps.prerelease.outputs.value }}
