@@ -285,3 +285,44 @@ func (h *NodeHandler) DisableNode(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "node disabled", "id": id})
 }
+
+// GetNodeMetrics is GET /v1/admin/nodes/:id/metrics — a node's raw
+// utilization history, oldest first. The foundation read path for
+// telemetry consumers (internal stats/graphs, the status page, a
+// marketing-site globe — ROADMAP.md's 2026-09-03 entry); none of those
+// are built yet, this is just what they would call.
+//
+// ?since=<Go duration, e.g. "1h", "24h"> bounds how far back to look.
+// Omitted or unparseable falls back to nodes.DefaultMetricsWindow (1h) —
+// see that const's own doc comment for why this is deliberately NOT the
+// max window (a mistyped/omitted param should degrade to a small, sane
+// default, not silently cost the largest possible query). An explicit
+// value past nodes.MaxMetricsWindow is still honored, clamped down to
+// it, rather than rejected — a caller who explicitly asked for more than
+// the max gets the max, not a 400, on a read-only endpoint like this.
+func (h *NodeHandler) GetNodeMetrics(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid node id"})
+		return
+	}
+	exists, err := h.nodes.NodeExists(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to look up node"})
+		return
+	}
+	if !exists {
+		c.JSON(http.StatusNotFound, gin.H{"error": "node not found"})
+		return
+	}
+	var since time.Duration
+	if s := c.Query("since"); s != "" {
+		since, _ = time.ParseDuration(s) // zero on failure -> ListMetrics' own default
+	}
+	samples, err := h.nodes.ListMetrics(c.Request.Context(), id, since)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list node metrics"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"node_id": id, "samples": samples})
+}

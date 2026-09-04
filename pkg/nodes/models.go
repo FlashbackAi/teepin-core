@@ -83,6 +83,29 @@ type Node struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// MetricSample is one compute.node_metrics row — a single utilization
+// reading at a point in time. What ListMetrics returns; the raw series a
+// graph, status page, or marketing globe would plot.
+type MetricSample struct {
+	RecordedAt     time.Time `json:"recorded_at"`
+	CPUUsedPercent float64   `json:"cpu_used_percent"`
+	MemoryUsedGB   float64   `json:"memory_used_gb"`
+	// GPUUsedVRAMGB is 0 for a CPU-only home node's samples, same
+	// "check compute.nodes.gpu_count to disambiguate from idle" caveat
+	// as NodeSpecs.GPUUsedVRAMGB — see that field's own doc comment.
+	GPUUsedVRAMGB int `json:"gpu_used_vram_gb"`
+	// NetworkRxMbps/NetworkTxMbps/StorageReadMbps/StorageWriteMbps are
+	// throughput RATES in MB/s at this reading's instant, same
+	// session-level/host-wide shape as CPUUsedPercent/MemoryUsedGB above
+	// — see NodeSpecs' own doc comment on the pair for the full
+	// reasoning, and GPUInventory's proto comment for why these are
+	// rates, not cumulative counters.
+	NetworkRxMbps    float64 `json:"network_rx_mbps"`
+	NetworkTxMbps    float64 `json:"network_tx_mbps"`
+	StorageReadMbps  float64 `json:"storage_read_mbps"`
+	StorageWriteMbps float64 `json:"storage_write_mbps"`
+}
+
 // NodeSpecs is what an enrolling agent reports about its host, and (via
 // UpsertSeen) what a connected session reports on each inventory sweep. The
 // class is deliberately ABSENT: it is not the agent's to choose.
@@ -103,6 +126,20 @@ type NodeSpecs struct {
 	// yet, so it leaves this false — the correct, conservative default for
 	// a node that has not yet proven it can run anything.
 	K8sReady bool
+	// CPUUsedPercent/MemoryUsedGB/GPUUsedVRAMGB/NetworkRxMbps/
+	// NetworkTxMbps/StorageReadMbps/StorageWriteMbps are only meaningful
+	// from UpsertSeen, same as K8sReady — current utilization, not
+	// static capacity (see UpsertSeen's own doc comment). Enroll leaves
+	// all seven at zero, which is indistinguishable from "genuinely
+	// idle" — callers reading compute.node_metrics should key off
+	// recorded_at, not treat a zero reading as authoritative on its own.
+	CPUUsedPercent   float64
+	MemoryUsedGB     float64
+	GPUUsedVRAMGB    int
+	NetworkRxMbps    float64
+	NetworkTxMbps    float64
+	StorageReadMbps  float64
+	StorageWriteMbps float64
 }
 
 // EnrollmentToken is an operator-minted, one-time, expiring credential that

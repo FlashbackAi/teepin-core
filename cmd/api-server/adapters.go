@@ -153,16 +153,23 @@ func newNodeReporterAdapter(svc *nodes.Service) *nodeReporterAdapter {
 func (a *nodeReporterAdapter) ReportSeen(seen cluster.NodeSeen) {
 	go func() {
 		if err := a.svc.UpsertSeen(context.Background(), seen.Class, nodes.NodeSpecs{
-			NodeName:     seen.NodeName,
-			ProviderID:   seen.ProviderID,
-			Region:       seen.Region,
-			CPUCores:     seen.CPUCores,
-			MemoryGB:     seen.MemoryGB,
-			GPUModel:     seen.GPUModel,
-			GPUCount:     seen.GPUCount,
-			MIGCapable:   seen.MIGCapable,
-			AgentVersion: seen.AgentVersion,
-			K8sReady:     seen.K8sReady,
+			NodeName:         seen.NodeName,
+			ProviderID:       seen.ProviderID,
+			Region:           seen.Region,
+			CPUCores:         seen.CPUCores,
+			MemoryGB:         seen.MemoryGB,
+			GPUModel:         seen.GPUModel,
+			GPUCount:         seen.GPUCount,
+			MIGCapable:       seen.MIGCapable,
+			AgentVersion:     seen.AgentVersion,
+			K8sReady:         seen.K8sReady,
+			CPUUsedPercent:   seen.CPUUsedPercent,
+			MemoryUsedGB:     seen.MemoryUsedGB,
+			GPUUsedVRAMGB:    seen.GPUUsedVRAMGB,
+			NetworkRxMbps:    seen.NetworkRxMbps,
+			NetworkTxMbps:    seen.NetworkTxMbps,
+			StorageReadMbps:  seen.StorageReadMbps,
+			StorageWriteMbps: seen.StorageWriteMbps,
 		}); err != nil {
 			log.Printf("WARN: node write-through failed for %s: %v", seen.NodeName, err)
 		}

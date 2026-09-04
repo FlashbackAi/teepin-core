@@ -194,6 +194,13 @@ func main() {
 				}
 			}
 		}()
+
+		// Purges compute.node_metrics history past MetricsRetentionWindow —
+		// see nodes.MetricsRetentionSweeper's own doc comment. Independent
+		// of the stale-node sweep above: this trims history regardless of
+		// whether any node is currently stale.
+		metricsSweeper := nodes.NewMetricsRetentionSweeper(nodeService)
+		go metricsSweeper.Start(context.Background())
 	}
 
 	// Initialize Kubernetes client (optional for standalone mode)
@@ -1317,6 +1324,7 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 					admin.PATCH("/nodes/:id", nodeHandler.RenameNode)
 					admin.DELETE("/nodes/:id", nodeHandler.DeleteNode)
 					admin.POST("/nodes/:id/disable", nodeHandler.DisableNode)
+					admin.GET("/nodes/:id/metrics", nodeHandler.GetNodeMetrics)
 				}
 			}
 		}

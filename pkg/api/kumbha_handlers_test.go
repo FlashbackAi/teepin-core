@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -42,6 +43,21 @@ import (
 // calls repeated at every call site.
 func nowStub() time.Time { return time.Now() }
 func sqlNoRows() error   { return sql.ErrNoRows }
+
+// TestMain shrinks waitForEndpointReady's polling window for the whole
+// package's test run. DeployKumbhaSession/redeployKumbhaInstance now call
+// it synchronously before responding (2026-09-03), and every fixture in
+// this file uses a fake, never-resolving test hostname
+// (inst-existing5.teepin.com and friends) — at the real 60s/3s
+// production values, any test exercising that path would genuinely block
+// for a minute rather than failing fast. The values themselves are never
+// asserted on, only their effect (tests complete quickly instead of
+// timing out).
+func TestMain(m *testing.M) {
+	endpointReadyMaxWait = 20 * time.Millisecond
+	endpointReadyPollInterval = 5 * time.Millisecond
+	os.Exit(m.Run())
+}
 
 // noopUsageRecorder satisfies kumbha.UsageRecorder for handler tests that
 // never reach session close (settlement is covered at the pkg/kumbha

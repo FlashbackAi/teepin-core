@@ -242,6 +242,34 @@ message GPUInventory {
   // whether ITS k3s can schedule anything. True for the in-process
   // datacenter client in practice.
   bool cluster_ready = 3;
+  // cpu_used_percent/memory_used_gb: the reporting HOST's own current
+  // utilization (not any one workload's) — session-level, like
+  // cluster_ready, since one agent process reports for one machine.
+  // Added 2026-09-04 as the foundation for real node telemetry (stats/
+  // graphs/status page/marketing globe — see ROADMAP.md's 2026-09-03
+  // entry): a home node's cpu_cores/memory_gb (RegisterRequest,
+  // registered once at enroll) are static CAPACITY, never current USE.
+  // 0/0.0 (the proto zero value) is indistinguishable from "genuinely
+  // idle" — callers needing to tell "no report yet" apart from "idle"
+  // should key off observed_at instead.
+  float  cpu_used_percent = 4;
+  double memory_used_gb   = 5;
+  // network_rx_mbps/network_tx_mbps/storage_read_mbps/storage_write_mbps:
+  // same session-level, host-wide, current-not-capacity shape as the pair
+  // above, added the same day. Throughput RATES in MB/s (binary
+  // megabytes, bytes/1024/1024 — matching memory_used_gb's own GB unit
+  // convention), not cumulative byte counters: /proc/net/dev and
+  // /proc/diskstats both report monotonic totals since boot, meaningless
+  // as a point-in-time reading without a delta over a known wall-clock
+  // window, the same reason cpu_used_percent is a delta rather than a raw
+  // jiffy count. 0.0 has the same "indistinguishable from idle" caveat as
+  // above, plus one more: it is also what the agent's FIRST report after
+  // (re)connect sends, since a rate needs two samples and there is no
+  // prior one yet.
+  double network_rx_mbps     = 6;
+  double network_tx_mbps     = 7;
+  double storage_read_mbps   = 8;
+  double storage_write_mbps  = 9;
 }
 
 message GPUNode {

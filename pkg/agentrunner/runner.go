@@ -117,6 +117,37 @@ type Runner struct {
 	// dispatched ControlMessages.
 	execInputs   map[string]chan *agentpb.ExecInput
 	execInputsMu sync.Mutex
+
+	// lastCPUSample/haveLastCPUSample hold the previous reportInventory
+	// call's /proc/stat reading, so cpuPercentSince can compute a delta
+	// on the NEXT call — see hostmetrics.go's own doc comment on why a
+	// single sample cannot yield a percentage. lastNetSample/lastDiskSample
+	// are the same idea for /proc/net/dev and /proc/diskstats, turning
+	// their byte-count deltas into MB/s rates against wall-clock elapsed
+	// time (lastNetSampleAt/lastDiskSampleAt) — unlike CPU, which needs no
+	// such timestamp because jiffies are already self-normalizing. Each
+	// metric keeps its OWN have-flag and OWN timestamp rather than sharing
+	// one: /proc/net/dev and /proc/diskstats are read independently and can
+	// fail independently (e.g. one file briefly unreadable), and sharing
+	// state would let a successful read of one corrupt the other's next
+	// delta against a stale or zero-value baseline — the same class of bug
+	// cpuPercentFromSamples' own doc comment describes and this file's
+	// tests guard against for CPU specifically. Guarded by its own mutex
+	// for the same reason lastReported has statusMu: matches this struct's
+	// existing pattern for state shared across ticker-driven report calls,
+	// rather than assuming single-goroutine access.
+	lastCPUSample     cpuSample
+	haveLastCPUSample bool
+
+	lastNetSample     netSample
+	haveLastNetSample bool
+	lastNetSampleAt   time.Time
+
+	lastDiskSample     diskSample
+	haveLastDiskSample bool
+	lastDiskSampleAt   time.Time
+
+	hostMetricsMu sync.Mutex
 }
 
 func New(cfg Config) *Runner {
@@ -1028,6 +1059,8 @@ func (r *Runner) reportInventory(ctx context.Context, s stream) {
 		pbNodes = append(pbNodes, node)
 	}
 
+	cpuPercent, memUsedGB, netRx, netTx, diskRead, diskWrite := r.hostUtilization()
+
 	_ = r.send(s, &agentpb.AgentMessage{
 		Payload: &agentpb.AgentMessage_Inventory{Inventory: &agentpb.GPUInventory{
 			Nodes:      pbNodes,
@@ -1036,9 +1069,76 @@ func (r *Runner) reportInventory(ctx context.Context, s stream) {
 			// — checked fresh on every report so a home node's k3s crashing
 			// after connect is reflected within one inventoryInterval, not
 			// frozen at whatever it was when the agent started.
-			ClusterReady: r.cfg.Cluster.Healthy(ctx),
+			ClusterReady:     r.cfg.Cluster.Healthy(ctx),
+			CpuUsedPercent:   float32(cpuPercent),
+			MemoryUsedGb:     memUsedGB,
+			NetworkRxMbps:    netRx,
+			NetworkTxMbps:    netTx,
+			StorageReadMbps:  diskRead,
+			StorageWriteMbps: diskWrite,
 		}},
 	})
+}
+
+// hostUtilization reads this machine's current CPU%/memory-used-GB/
+// network-MBps/storage-MBps via /proc — see hostmetrics.go. All
+// zero-value on any read failure (no /proc, an unreadable file, or — for
+// the three delta-based readings (CPU, network, disk) — no PRIOR sample
+// to diff against yet, true only on this Runner's very first inventory
+// report). That is indistinguishable from "genuinely idle" on the wire;
+// a caller needing to tell the two apart has the report's own
+// observed_at to key off instead. Session-level, like ClusterReady: one
+// agent process reports for one machine, not per-GPU-node.
+func (r *Runner) hostUtilization() (cpuPercent, memUsedGB, netRxMBps, netTxMBps, diskReadMBps, diskWriteMBps float64) {
+	r.hostMetricsMu.Lock()
+	defer r.hostMetricsMu.Unlock()
+
+	now := time.Now()
+
+	// lastCPUSample is only ever overwritten when THIS read genuinely
+	// succeeds — a failed read leaves the previous good sample in place
+	// rather than replacing it with a bogus zero value that would corrupt
+	// the NEXT call's delta (see cpuPercentFromSamples' own doc comment).
+	if sample, ok := readCPUSample(); ok {
+		if r.haveLastCPUSample {
+			if percent, ok := cpuPercentFromSamples(r.lastCPUSample, sample); ok {
+				cpuPercent = percent
+			}
+		}
+		r.lastCPUSample = sample
+		r.haveLastCPUSample = true
+	}
+
+	if used, ok := readMemoryUsedGB(); ok {
+		memUsedGB = used
+	}
+
+	// Same "only advance state on genuine success" discipline as CPU
+	// above, applied independently to network and disk — see this
+	// struct's field comment on why they do not share one flag/timestamp.
+	if sample, ok := readNetSample(); ok {
+		if r.haveLastNetSample {
+			if rx, tx, ok := netRatesFromSamples(r.lastNetSample, sample, now.Sub(r.lastNetSampleAt)); ok {
+				netRxMBps, netTxMBps = rx, tx
+			}
+		}
+		r.lastNetSample = sample
+		r.lastNetSampleAt = now
+		r.haveLastNetSample = true
+	}
+
+	if sample, ok := readDiskSample(); ok {
+		if r.haveLastDiskSample {
+			if read, write, ok := diskRatesFromSamples(r.lastDiskSample, sample, now.Sub(r.lastDiskSampleAt)); ok {
+				diskReadMBps, diskWriteMBps = read, write
+			}
+		}
+		r.lastDiskSample = sample
+		r.lastDiskSampleAt = now
+		r.haveLastDiskSample = true
+	}
+
+	return cpuPercent, memUsedGB, netRxMBps, netTxMBps, diskReadMBps, diskWriteMBps
 }
 
 // reportStatuses pushes changed instance statuses. Uses

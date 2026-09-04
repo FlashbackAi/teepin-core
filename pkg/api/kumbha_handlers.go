@@ -818,6 +818,21 @@ func (s *Server) DeployKumbhaSession(c *gin.Context) {
 
 	s.triggerGithubPush(sessionID, accountID, imageRef)
 	s.triggerScreenshotCapture(sessionID, sess, created.Endpoint)
+
+	// Wait for the endpoint to actually answer before telling the customer
+	// "deployed" — the same readiness check the screenshot capture already
+	// uses (waitForEndpointReady), just applied synchronously here instead
+	// of from a background goroutine. Without this, a customer clicking
+	// "Open" the instant the response arrives can hit the Stage 3 tunnel's
+	// own "instance not reachable" page for the same 10-30s window the
+	// screenshot bug came from — this closes that gap for the response
+	// itself, not just the thumbnail. Uses the SAME detached ctx the rest
+	// of this handler already runs on (bounded by deployFlowTimeout, 18
+	// minutes — comfortably past waitForEndpointReady's own 60s cap), not
+	// the request context, so a customer closing their browser mid-deploy
+	// does not cut this short either.
+	waitForEndpointReady(ctx, created.Endpoint)
+
 	s.recordDeployOutcome(ctx, sessionID, "")
 
 	c.JSON(http.StatusOK, gin.H{
@@ -909,8 +924,11 @@ func (s *Server) triggerScreenshotCapture(sessionID uuid.UUID, sess *kumbha.Sess
 }
 
 // endpointReadyPollInterval/endpointReadyMaxWait bound
-// waitForEndpointReady's polling below.
-const (
+// waitForEndpointReady's polling below. Vars, not consts: the test package
+// shrinks both to near-zero in TestMain so a deploy/redeploy test hitting
+// this path against a fake, never-resolving test URL does not actually
+// burn endpointReadyMaxWait in real wall-clock time.
+var (
 	endpointReadyPollInterval = 3 * time.Second
 	endpointReadyMaxWait      = 60 * time.Second
 )
@@ -925,6 +943,17 @@ const (
 // trims how often that early capture happens to land on the tunnel's own
 // error page instead of the real app.
 func waitForEndpointReady(ctx context.Context, targetURL string) {
+	if targetURL == "" {
+		// http.NewRequestWithContext errors on an empty URL, so the loop
+		// below would just burn the full endpointReadyMaxWait doing
+		// nothing — return immediately instead. Both call sites can reach
+		// here with one (triggerScreenshotCapture's own no-op guard covers
+		// its call; the two synchronous deploy-response call sites added
+		// 2026-09-03 have no equivalent guard of their own, so this one
+		// covers all callers uniformly rather than duplicating it at each
+		// call site).
+		return
+	}
 	waitCtx, cancel := context.WithTimeout(ctx, endpointReadyMaxWait)
 	defer cancel()
 
@@ -1232,6 +1261,14 @@ func (s *Server) redeployKumbhaInstance(ctx context.Context, c *gin.Context, ses
 
 	s.triggerGithubPush(sessionID, accountID, imageRef)
 	s.triggerScreenshotCapture(sessionID, sess, redeployedEndpoint)
+
+	// See DeployKumbhaSession's own comment on this same call: wait for the
+	// endpoint to actually answer before telling the customer "deployed",
+	// so clicking "Open" the instant the response arrives does not hit the
+	// Stage 3 tunnel's own "instance not reachable" page during the pod
+	// swap's own startup window.
+	waitForEndpointReady(ctx, redeployedEndpoint)
+
 	s.recordDeployOutcome(ctx, sessionID, "")
 
 	c.JSON(http.StatusOK, gin.H{

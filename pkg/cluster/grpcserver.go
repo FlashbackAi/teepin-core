@@ -59,6 +59,37 @@ type NodeSeen struct {
 	// node) is unreachable reports false here, so placement can tell the
 	// two states apart instead of treating both as "online".
 	K8sReady bool
+	// CPUUsedPercent/MemoryUsedGB are the reporting HOST's own current
+	// utilization (not any one workload's) — see GPUInventory's own proto
+	// comment. Unlike CPUCores/MemoryGB (static capacity, set once at
+	// enroll and never refreshed — see UpsertSeen's own doc comment on
+	// why that gap exists for those two), these ARE refreshed on every
+	// report, since that is the whole point of a utilization reading.
+	// Added 2026-09-04 as the foundation for node telemetry (stats/
+	// graphs/status page/marketing globe — ROADMAP.md's 2026-09-03 entry).
+	CPUUsedPercent float64
+	MemoryUsedGB   float64
+	// GPUUsedVRAMGB is the CURRENT VRAM in use on a GPU node row — only
+	// ever set on the per-GPU-node branch of reportInventorySeen (a
+	// CPU-only home node's single ReportSeen call leaves it at zero,
+	// which compute.nodes.gpu_count already disambiguates from "GPU
+	// present but idle" for anything reading the history back). Sourced
+	// from GPUNode.used_vram_gb — a field the allocator already consumes
+	// live; this is that SAME already-reported number, finally also
+	// persisted with history instead of only ever living in memory.
+	// Added 2026-09-04, closing a gap in the SAME day's own telemetry
+	// foundation work — found live while auditing it for solidity.
+	GPUUsedVRAMGB int
+	// NetworkRxMbps/NetworkTxMbps/StorageReadMbps/StorageWriteMbps are the
+	// same session-level, host-wide, current-not-capacity shape as
+	// CPUUsedPercent/MemoryUsedGB above — throughput RATES in MB/s, not
+	// cumulative counters, for the same reason those two are refreshed
+	// on every report. Added the same day the customer explicitly asked
+	// "does this cover network/storage too?" after CPU/mem/VRAM shipped.
+	NetworkRxMbps    float64
+	NetworkTxMbps    float64
+	StorageReadMbps  float64
+	StorageWriteMbps float64
 }
 
 // NodeReporter persists node liveness/specs from the gRPC session — the
@@ -224,7 +255,10 @@ func (s *AgentServer) handleMessage(session *AgentSession, msg *agentpb.AgentMes
 		// pump or drop the live inventory the allocator depends on. This does
 		// not feed placement; it is the durable identity/liveness record.
 		if s.nodeReporter != nil {
-			s.reportInventorySeen(session, inv, payload.Inventory.ClusterReady)
+			s.reportInventorySeen(session, inv, payload.Inventory.ClusterReady,
+				float64(payload.Inventory.CpuUsedPercent), payload.Inventory.MemoryUsedGb,
+				payload.Inventory.NetworkRxMbps, payload.Inventory.NetworkTxMbps,
+				payload.Inventory.StorageReadMbps, payload.Inventory.StorageWriteMbps)
 		}
 
 	case *agentpb.AgentMessage_Pong:
@@ -263,18 +297,24 @@ func (s *AgentServer) handleMessage(session *AgentSession, msg *agentpb.AgentMes
 // on the inventory report (GPUInventory.cluster_ready) — the same value
 // applies to every node in this report, since they all share one agent
 // process and one cluster client.
-func (s *AgentServer) reportInventorySeen(session *AgentSession, inv []NodeInventory, k8sReady bool) {
+func (s *AgentServer) reportInventorySeen(session *AgentSession, inv []NodeInventory, k8sReady bool, cpuUsedPercent, memoryUsedGB, netRxMbps, netTxMbps, storageReadMbps, storageWriteMbps float64) {
 	if len(inv) == 0 {
 		// CPU-only / home node: no GPU inventory to enumerate. Record the
 		// node under the session's own identity (provider id doubles as node
 		// name for a single-node home provider).
 		s.nodeReporter.ReportSeen(NodeSeen{
-			NodeName:     session.ProviderID,
-			ProviderID:   session.ProviderID,
-			Class:        session.Class,
-			Region:       session.Region,
-			AgentVersion: session.Version,
-			K8sReady:     k8sReady,
+			NodeName:         session.ProviderID,
+			ProviderID:       session.ProviderID,
+			Class:            session.Class,
+			Region:           session.Region,
+			AgentVersion:     session.Version,
+			K8sReady:         k8sReady,
+			CPUUsedPercent:   cpuUsedPercent,
+			MemoryUsedGB:     memoryUsedGB,
+			NetworkRxMbps:    netRxMbps,
+			NetworkTxMbps:    netTxMbps,
+			StorageReadMbps:  storageReadMbps,
+			StorageWriteMbps: storageWriteMbps,
 		})
 		return
 	}
@@ -290,6 +330,21 @@ func (s *AgentServer) reportInventorySeen(session *AgentSession, inv []NodeInven
 			MemoryGB:     n.MemoryGBPerGPU * n.GPUCount,
 			AgentVersion: session.Version,
 			K8sReady:     k8sReady,
+			// Session-level utilization, same reading attached to every
+			// GPU node this session reports (one host, one utilization
+			// figure) — matches how ClusterReady is already handled above.
+			CPUUsedPercent:   cpuUsedPercent,
+			MemoryUsedGB:     memoryUsedGB,
+			NetworkRxMbps:    netRxMbps,
+			NetworkTxMbps:    netTxMbps,
+			StorageReadMbps:  storageReadMbps,
+			StorageWriteMbps: storageWriteMbps,
+			// Per-GPU, unlike the two above: n.UsedVRAMGB is THIS specific
+			// device's own current usage, already reported live for the
+			// allocator's own use (pkg/cluster/direct.go,
+			// pkg/cluster/snapshotter.go) — this is that same number,
+			// finally also threaded to persisted history.
+			GPUUsedVRAMGB: n.UsedVRAMGB,
 		})
 	}
 }

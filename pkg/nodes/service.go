@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -319,7 +320,7 @@ func (s *Service) RecordHeartbeat(ctx context.Context, nodeID uuid.UUID, specs N
 // Keyed by provider_id, NOT node_name: node_name is the operator-facing
 // display label (RenameNode changes only that column), while provider_id is
 // set once at enrollment and never changes afterward — see enroll.go's own
-// "if provider == ” { provider = name }" default and RenameNode's doc
+// "if provider == \"\" { provider = name }" default and RenameNode's doc
 // comment. The agent itself has no way to learn its display name changed
 // (it persists its own identity once, client-side, at enroll time), so it
 // keeps reporting under whatever name it always has. Keying this upsert on
@@ -351,7 +352,8 @@ func (s *Service) UpsertSeen(ctx context.Context, class string, specs NodeSpecs)
 	if class != ClassHome && class != ClassDatacenter {
 		class = ClassDatacenter
 	}
-	_, err := s.db.ExecContext(ctx, `
+	var nodeID uuid.UUID
+	err := s.db.QueryRowContext(ctx, `
 		INSERT INTO compute.nodes
 		(node_name, provider_id, class, region, cpu_cores, memory_gb,
 		 gpu_model, gpu_count, mig_capable, os, arch, agent_version,
@@ -381,12 +383,30 @@ func (s *Service) UpsertSeen(ctx context.Context, class string, specs NodeSpecs)
 			-- the agent's own stale self-report to reassert (see this
 			-- function's own doc comment above).
 			updated_at = NOW()
+		RETURNING id
 	`, specs.NodeName, specs.ProviderID, class, nullString(specs.Region),
 		nullInt(specs.CPUCores), nullInt(specs.MemoryGB), nullString(specs.GPUModel),
 		specs.GPUCount, specs.MIGCapable, nullString(specs.OS), nullString(specs.Arch),
-		nullString(specs.AgentVersion), specs.K8sReady)
+		nullString(specs.AgentVersion), specs.K8sReady,
+	).Scan(&nodeID)
 	if err != nil {
 		return fmt.Errorf("failed to upsert node: %w", err)
+	}
+
+	// Best-effort, deliberately not folded into the same statement or a
+	// shared transaction: this is observability history, not a fact the
+	// rest of the platform depends on being consistent with compute.nodes
+	// itself. A failure here must never turn an otherwise-successful
+	// heartbeat into an error (that would risk MarkStaleOffline flipping a
+	// genuinely-alive node offline over a metrics-history write hiccup).
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO compute.node_metrics
+		(node_id, cpu_used_percent, memory_used_gb, gpu_vram_used_gb,
+		 network_rx_mbps, network_tx_mbps, storage_read_mbps, storage_write_mbps)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+	`, nodeID, specs.CPUUsedPercent, specs.MemoryUsedGB, specs.GPUUsedVRAMGB,
+		specs.NetworkRxMbps, specs.NetworkTxMbps, specs.StorageReadMbps, specs.StorageWriteMbps); err != nil {
+		log.Printf("WARN: failed to record utilization history for node %s: %v", specs.ProviderID, err)
 	}
 	return nil
 }
@@ -405,6 +425,75 @@ func (s *Service) MarkStaleOffline(ctx context.Context, threshold time.Duration)
 	}
 	n, _ := res.RowsAffected()
 	return int(n), nil
+}
+
+// MaxMetricsWindow caps how far back ListMetrics will look — comfortably
+// inside MetricsRetentionWindow (rows older than that are gone anyway),
+// and bounds how large a single response can get at the agent's ~30s
+// report cadence (inventoryInterval, pkg/agentrunner) — a caller
+// explicitly asking for the full window still gets a request that costs
+// something bounded, not an unbounded scan.
+const MaxMetricsWindow = 7 * 24 * time.Hour
+
+// DefaultMetricsWindow is what ListMetrics uses when since is omitted or
+// invalid (<= 0) — deliberately NOT MaxMetricsWindow. At the ~30s report
+// cadence, silently defaulting an omitted query param to 7 days would
+// mean an ordinary "just show me the graph" call with no explicit window
+// returns up to ~20,000 rows by default. An explicit since value is
+// still honored up to MaxMetricsWindow; only the "nothing specified"
+// case gets this smaller, saner default.
+const DefaultMetricsWindow = time.Hour
+
+// NodeExists reports whether nodeID names a real node — the check
+// GetNodeMetrics uses to return 404 for a bad/nonexistent ID instead of
+// a 200 with an empty samples array, which would be indistinguishable
+// from "valid node, no data reported yet". Deliberately a bare
+// existence check (SELECT 1), not a full Node fetch — cheaper, and the
+// caller does not need the row.
+func (s *Service) NodeExists(ctx context.Context, nodeID uuid.UUID) (bool, error) {
+	var exists bool
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT EXISTS (SELECT 1 FROM compute.nodes WHERE id = $1)
+	`, nodeID).Scan(&exists); err != nil {
+		return false, fmt.Errorf("failed to check node existence: %w", err)
+	}
+	return exists, nil
+}
+
+// ListMetrics returns a node's utilization history over the last `since`
+// duration, oldest first (the natural order for plotting a line graph).
+// since <= 0 (omitted or invalid) uses DefaultMetricsWindow; an explicit
+// since past MaxMetricsWindow is clamped down to it — see both consts'
+// own doc comments for why the two thresholds differ.
+func (s *Service) ListMetrics(ctx context.Context, nodeID uuid.UUID, since time.Duration) ([]MetricSample, error) {
+	switch {
+	case since <= 0:
+		since = DefaultMetricsWindow
+	case since > MaxMetricsWindow:
+		since = MaxMetricsWindow
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT recorded_at, cpu_used_percent, memory_used_gb, gpu_vram_used_gb,
+		       network_rx_mbps, network_tx_mbps, storage_read_mbps, storage_write_mbps
+		FROM compute.node_metrics
+		WHERE node_id = $1 AND recorded_at > $2
+		ORDER BY recorded_at ASC
+	`, nodeID, time.Now().Add(-since))
+	if err != nil {
+		return nil, fmt.Errorf("failed to list node metrics: %w", err)
+	}
+	defer rows.Close()
+
+	var samples []MetricSample
+	for rows.Next() {
+		var m MetricSample
+		if err := rows.Scan(&m.RecordedAt, &m.CPUUsedPercent, &m.MemoryUsedGB, &m.GPUUsedVRAMGB,
+			&m.NetworkRxMbps, &m.NetworkTxMbps, &m.StorageReadMbps, &m.StorageWriteMbps); err != nil {
+			return nil, fmt.Errorf("failed to scan node metric: %w", err)
+		}
+		samples = append(samples, m)
+	}
+	return samples, rows.Err()
 }
 
 // ListNodes returns all nodes, newest first, for the control centre.
