@@ -392,6 +392,14 @@ func main() {
 			log.Println("Agent channel: per-node credentials accepted, node persistence on (home compute)")
 		}
 
+		// Per-instance utilization persistence — independent of home
+		// compute (datacenter instances get this too), gated only on a
+		// database actually being configured, same as instanceStore itself.
+		if instanceStore != nil {
+			agentServer = agentServer.WithInstanceMetricsReporter(newInstanceMetricsReporterAdapter(instanceStore))
+			log.Println("Agent channel: instance metrics persistence on")
+		}
+
 		clusterClient = agentClient
 
 		log.Println("Cluster mode: agent (gRPC control channel, no Kubernetes credentials held)")

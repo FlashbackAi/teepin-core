@@ -102,6 +102,30 @@ type NodeReporter interface {
 	ReportSeen(seen NodeSeen)
 }
 
+// InstanceMetricSeen is a write-through record of one customer instance's
+// current utilization, from an InstanceMetricsReport. Deliberately
+// separate from NodeSeen: an instance is not a node (many instances share
+// one node), and this carries no class/region/specs fields a node record
+// needs — just the identity (InstanceID) and the same six-shaped
+// utilization already familiar from NodeSeen's own fields.
+type InstanceMetricSeen struct {
+	InstanceID string
+
+	CPUUsedPercent float64
+	MemoryUsedGB   float64
+	NetworkRxMbps  float64
+	NetworkTxMbps  float64
+	StorageUsedGB  float64
+}
+
+// InstanceMetricsReporter persists per-instance utilization from the gRPC
+// session — the customer-facing analogue of NodeReporter. Interface, for
+// the same no-import-cycle reason as NodeReporter. Nil disables
+// persistence.
+type InstanceMetricsReporter interface {
+	ReportInstanceMetricsSeen(seen []InstanceMetricSeen)
+}
+
 // AgentServer implements the gRPC service agents dial into.
 //
 // It owns no cluster logic: it authenticates the agent, registers a
@@ -126,6 +150,12 @@ type AgentServer struct {
 	// nodeReporter persists node liveness on each inventory report. Nil
 	// disables persistence (pre-home-compute behaviour).
 	nodeReporter NodeReporter
+
+	// instanceMetricsReporter persists per-instance utilization on each
+	// InstanceMetricsReport. Nil disables persistence — the feature this
+	// session added; every existing deployment before it is wired up
+	// simply drops these messages on the floor, harmlessly.
+	instanceMetricsReporter InstanceMetricsReporter
 }
 
 func NewAgentServer(registry *Registry, client *AgentClient, token string) *AgentServer {
@@ -143,6 +173,13 @@ func (s *AgentServer) WithNodeAuthenticator(a NodeAuthenticator) *AgentServer {
 // reports. Returns the same server for chaining.
 func (s *AgentServer) WithNodeReporter(r NodeReporter) *AgentServer {
 	s.nodeReporter = r
+	return s
+}
+
+// WithInstanceMetricsReporter enables write-through per-instance
+// utilization persistence. Returns the same server for chaining.
+func (s *AgentServer) WithInstanceMetricsReporter(r InstanceMetricsReporter) *AgentServer {
+	s.instanceMetricsReporter = r
 	return s
 }
 
@@ -281,6 +318,29 @@ func (s *AgentServer) handleMessage(session *AgentSession, msg *agentpb.AgentMes
 
 	case *agentpb.AgentMessage_ExecEnd:
 		session.deliverExecEnd(msg.RequestId, payload.ExecEnd)
+
+	case *agentpb.AgentMessage_InstanceMetrics:
+		// Same write-through posture as Inventory just above: async,
+		// best-effort, never blocks the message pump. Only entries the
+		// agent actually reported are here (see InstanceMetric's own doc
+		// comment) — no zero-filling for instances it could not measure
+		// this sweep.
+		if s.instanceMetricsReporter != nil {
+			seen := make([]InstanceMetricSeen, 0, len(payload.InstanceMetrics.Instances))
+			for _, m := range payload.InstanceMetrics.Instances {
+				seen = append(seen, InstanceMetricSeen{
+					InstanceID:     m.InstanceId,
+					CPUUsedPercent: float64(m.CpuUsedPercent),
+					MemoryUsedGB:   m.MemoryUsedGb,
+					NetworkRxMbps:  m.NetworkRxMbps,
+					NetworkTxMbps:  m.NetworkTxMbps,
+					StorageUsedGB:  m.StorageUsedGb,
+				})
+			}
+			if len(seen) > 0 {
+				s.instanceMetricsReporter.ReportInstanceMetricsSeen(seen)
+			}
+		}
 
 	default:
 		log.Printf("Agent sent unknown message type from provider=%s", session.ProviderID)

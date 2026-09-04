@@ -248,6 +248,101 @@ func TestHandleMessage_Inventory_ThreadsUtilization(t *testing.T) {
 	})
 }
 
+// fakeInstanceMetricsReporter records every ReportInstanceMetricsSeen
+// call, mirroring fakeNodeReporter above.
+type fakeInstanceMetricsReporter struct {
+	calls [][]InstanceMetricSeen
+}
+
+func (f *fakeInstanceMetricsReporter) ReportInstanceMetricsSeen(seen []InstanceMetricSeen) {
+	f.calls = append(f.calls, seen)
+}
+
+// TestHandleMessage_InstanceMetrics_ThreadsAllFields proves every field
+// on the wire reaches ReportInstanceMetricsSeen unchanged — the
+// per-instance analogue of TestHandleMessage_Inventory_ThreadsUtilization
+// above, for the customer-facing metrics pipeline this session added
+// after the host-level one.
+func TestHandleMessage_InstanceMetrics_ThreadsAllFields(t *testing.T) {
+	reporter := &fakeInstanceMetricsReporter{}
+	s := NewAgentServer(nil, nil, "shared-secret").WithInstanceMetricsReporter(reporter)
+	session := NewAgentSession("home-sreek", "home", "v1", "home", func(*agentpb.ControlMessage) error { return nil })
+
+	s.handleMessage(session, &agentpb.AgentMessage{
+		Payload: &agentpb.AgentMessage_InstanceMetrics{InstanceMetrics: &agentpb.InstanceMetricsReport{
+			Instances: []*agentpb.InstanceMetric{
+				{
+					InstanceId:     "inst-abc123",
+					CpuUsedPercent: 42.5,
+					MemoryUsedGb:   1.75,
+					NetworkRxMbps:  3.5,
+					NetworkTxMbps:  1.25,
+					StorageUsedGb:  8.0,
+				},
+			},
+			ObservedAt: timestamppb.Now(),
+		}},
+	})
+
+	if len(reporter.calls) != 1 {
+		t.Fatalf("got %d ReportInstanceMetricsSeen calls, want 1", len(reporter.calls))
+	}
+	seen := reporter.calls[0]
+	if len(seen) != 1 {
+		t.Fatalf("got %d instances in the call, want 1", len(seen))
+	}
+	got := seen[0]
+	if got.InstanceID != "inst-abc123" {
+		t.Errorf("InstanceID = %q, want inst-abc123", got.InstanceID)
+	}
+	if got.CPUUsedPercent != 42.5 || got.MemoryUsedGB != 1.75 {
+		t.Errorf("cpu/mem = (%v,%v), want (42.5,1.75)", got.CPUUsedPercent, got.MemoryUsedGB)
+	}
+	if got.NetworkRxMbps != 3.5 || got.NetworkTxMbps != 1.25 {
+		t.Errorf("network = (%v,%v), want (3.5,1.25)", got.NetworkRxMbps, got.NetworkTxMbps)
+	}
+	if got.StorageUsedGB != 8.0 {
+		t.Errorf("StorageUsedGB = %v, want 8.0", got.StorageUsedGB)
+	}
+}
+
+// An empty InstanceMetricsReport (agent had nothing to report this
+// sweep) must not call the reporter at all — an empty slice reported as
+// "seen" would be indistinguishable from a real zero-instance sweep on
+// the reporter's own side, so handleMessage filters it here instead.
+func TestHandleMessage_InstanceMetrics_EmptyReportSkipsReporter(t *testing.T) {
+	reporter := &fakeInstanceMetricsReporter{}
+	s := NewAgentServer(nil, nil, "shared-secret").WithInstanceMetricsReporter(reporter)
+	session := NewAgentSession("home-sreek", "home", "v1", "home", func(*agentpb.ControlMessage) error { return nil })
+
+	s.handleMessage(session, &agentpb.AgentMessage{
+		Payload: &agentpb.AgentMessage_InstanceMetrics{InstanceMetrics: &agentpb.InstanceMetricsReport{
+			Instances:  nil,
+			ObservedAt: timestamppb.Now(),
+		}},
+	})
+
+	if len(reporter.calls) != 0 {
+		t.Errorf("got %d ReportInstanceMetricsSeen calls, want 0 (empty report)", len(reporter.calls))
+	}
+}
+
+// A nil InstanceMetricsReporter (write-through disabled) means the
+// InstanceMetrics case must not attempt to call it — same nil-safety
+// contract as NodeReporter below.
+func TestHandleMessage_InstanceMetrics_NoReporterConfigured(t *testing.T) {
+	s := NewAgentServer(nil, nil, "shared-secret") // no WithInstanceMetricsReporter
+	session := NewAgentSession("home-sreek", "home", "v1", "home", func(*agentpb.ControlMessage) error { return nil })
+
+	s.handleMessage(session, &agentpb.AgentMessage{
+		Payload: &agentpb.AgentMessage_InstanceMetrics{InstanceMetrics: &agentpb.InstanceMetricsReport{
+			Instances:  []*agentpb.InstanceMetric{{InstanceId: "inst-abc123"}},
+			ObservedAt: timestamppb.Now(),
+		}},
+	})
+	// No assertion beyond "did not panic".
+}
+
 // A nil NodeReporter (home compute / write-through disabled) means the
 // Inventory case must not attempt to call it — handleMessage should simply
 // skip persistence, not panic.

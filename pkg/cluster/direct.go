@@ -11,6 +11,7 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -24,6 +25,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/remotecommand"
 	clientexec "k8s.io/client-go/util/exec"
+	metricsclientset "k8s.io/metrics/pkg/client/clientset/versioned"
 
 	"github.com/google/uuid"
 
@@ -142,6 +144,25 @@ type DirectClient struct {
 	// k3s's own default — every home node runs k3s today — overridable
 	// via WithPodCIDR for a cluster configured differently.
 	podCIDR string
+
+	// metricsClient reads metrics.k8s.io (metrics-server) for per-pod
+	// CPU/memory usage. Built alongside rest in WithRESTConfig — same
+	// gate as ExecAttach: nil until a REST config is supplied, in which
+	// case InstanceMetrics returns no data rather than a nil-deref.
+	metricsClient metricsclientset.Interface
+
+	// lastInstanceIO holds the previous sweep's network byte counters per
+	// instance, so InstanceMetrics can compute a wall-clock RATE the same
+	// way host-level network metrics do (see pkg/agentrunner/hostmetrics.go)
+	// — /stats/summary reports cumulative counters, not a rate. Keyed by
+	// instance ID rather than pod name/UID: a replaced pod (redeploy) is
+	// the SAME instance to a customer, and starting its rate over from a
+	// fresh pod's zero baseline for one cycle is correct, whereas keeping
+	// a stale UID-keyed entry around after the old pod is gone would leak
+	// unboundedly. Entries for instances no longer seen in a sweep are
+	// pruned that same sweep — see pruneInstanceIOCache.
+	lastInstanceIO   map[string]instanceIOSample
+	lastInstanceIOMu sync.Mutex
 }
 
 const defaultPodCIDR = "10.42.0.0/16"
@@ -176,6 +197,15 @@ func NewDirectClient(k8s kubernetes.Interface, networkingService EndpointProvisi
 // to give) compile unchanged. Returns the same *DirectClient.
 func (c *DirectClient) WithRESTConfig(cfg *rest.Config) *DirectClient {
 	c.rest = cfg
+	// Best-effort: a failure here (malformed config) leaves metricsClient
+	// nil, and InstanceMetrics degrades to "no data" rather than this
+	// constructor-time call failing the whole agent startup over a
+	// secondary, non-critical capability.
+	if mc, err := metricsclientset.NewForConfig(cfg); err == nil {
+		c.metricsClient = mc
+	} else {
+		log.Printf("WARN: metrics.k8s.io client unavailable, instance metrics disabled: %v", err)
+	}
 	return c
 }
 

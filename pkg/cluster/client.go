@@ -250,6 +250,41 @@ type MIGResource struct {
 	Used         int
 }
 
+// InstanceMetric is one customer instance's current utilization — the
+// per-instance analogue of NodeInventory's host-level fields, but
+// reported relative to what the CUSTOMER is allocated (cpu_units), not
+// host capacity: "am I using what I'm paying for" is the question a
+// customer asks, not "what fraction of a shared host is this".
+//
+// Only entries that were actually read successfully this sweep appear
+// in InstanceMetrics' result — an instance whose metrics could not be
+// fetched (metrics-server not yet scraped it, kubelet proxy briefly
+// unreachable) is simply absent, not zero-filled, so a caller never
+// confuses "no data this cycle" with "genuinely idle".
+type InstanceMetric struct {
+	InstanceID string
+
+	// CPUUsedPercent is relative to the instance's own CPU limit (equal
+	// to its request in this platform's fixed-allocation model — see
+	// DirectClient's pod-spec construction). Sourced from metrics.k8s.io
+	// (metrics-server), installed by default on every k3s node.
+	CPUUsedPercent float64
+	MemoryUsedGB   float64
+
+	// NetworkRxMbps/NetworkTxMbps are throughput RATES in MB/s, sourced
+	// from the kubelet's cAdvisor-backed /stats/summary — metrics-server
+	// does not report network at all.
+	NetworkRxMbps float64
+	NetworkTxMbps float64
+
+	// StorageUsedGB is a SNAPSHOT of ephemeral storage usage
+	// (/stats/summary's ephemeral-storage.usedBytes), NOT a throughput
+	// rate — a different KIND of measurement from the host pipeline's
+	// storage read/write MB/s. Per-pod disk I/O RATE lives in cAdvisor's
+	// Prometheus /metrics/cadvisor endpoint, out of scope for this pass.
+	StorageUsedGB float64
+}
+
 // LogOptions controls log retrieval.
 type LogOptions struct {
 	TailLines int
@@ -374,6 +409,14 @@ type Client interface {
 	// Inventory returns current GPU capacity, which the allocator
 	// reasons over.
 	Inventory(ctx context.Context) ([]NodeInventory, error)
+
+	// InstanceMetrics returns current utilization for every locally-
+	// running, successfully-measured instance — see InstanceMetric's own
+	// doc comment on why an unreadable instance is simply absent rather
+	// than zero-filled. Best-effort by nature: implementations should
+	// return a partial result rather than fail the whole call over one
+	// bad pod.
+	InstanceMetrics(ctx context.Context) ([]InstanceMetric, error)
 
 	// Healthy reports whether cluster operations can currently succeed.
 	// False means new instances are refused while account, billing and

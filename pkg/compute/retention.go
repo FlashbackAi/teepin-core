@@ -50,10 +50,18 @@ func (r *RetentionSweeper) Start(ctx context.Context) {
 		n, err := r.store.PurgeFullyBilledTerminated(ctx, RetentionWindow)
 		if err != nil {
 			log.Printf("WARN: instance retention sweep failed: %v", err)
-			return
-		}
-		if n > 0 {
+		} else if n > 0 {
 			log.Printf("Instance retention sweep purged %d fully-billed terminated instance(s)", n)
+		}
+
+		// Same window, same cadence, same "log and retry next tick"
+		// posture — instance_metrics rows have no billing/audit weight
+		// (see migration 038's own comment), so this purge is independent
+		// of whether the instance itself is still active.
+		if n, err := r.store.PurgeOldInstanceMetrics(ctx, RetentionWindow); err != nil {
+			log.Printf("WARN: instance metrics retention sweep failed: %v", err)
+		} else if n > 0 {
+			log.Printf("Instance metrics retention sweep purged %d old row(s)", n)
 		}
 	}
 

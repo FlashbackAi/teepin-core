@@ -20,6 +20,9 @@ type stubCluster struct {
 func (s stubCluster) Inventory(context.Context) ([]cluster.NodeInventory, error) {
 	return s.nodes, s.err
 }
+func (stubCluster) InstanceMetrics(context.Context) ([]cluster.InstanceMetric, error) {
+	return nil, nil
+}
 func (stubCluster) CreateInstance(context.Context, cluster.InstanceSpec) (*cluster.InstanceResult, error) {
 	return nil, nil
 }

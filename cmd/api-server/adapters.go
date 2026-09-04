@@ -176,6 +176,38 @@ func (a *nodeReporterAdapter) ReportSeen(seen cluster.NodeSeen) {
 	}()
 }
 
+// instanceMetricsReporterAdapter makes *compute.Store satisfy
+// cluster.InstanceMetricsReporter. Same posture as nodeReporterAdapter:
+// writes asynchronously with a background context so a slow DB never
+// stalls the gRPC message pump, best-effort (a failed persist is logged,
+// not retried — the next sweep, ~30s later, will try again).
+type instanceMetricsReporterAdapter struct {
+	store *compute.Store
+}
+
+func newInstanceMetricsReporterAdapter(store *compute.Store) *instanceMetricsReporterAdapter {
+	return &instanceMetricsReporterAdapter{store: store}
+}
+
+func (a *instanceMetricsReporterAdapter) ReportInstanceMetricsSeen(seen []cluster.InstanceMetricSeen) {
+	go func() {
+		writes := make([]compute.InstanceMetricWrite, len(seen))
+		for i, s := range seen {
+			writes[i] = compute.InstanceMetricWrite{
+				InstanceID:     s.InstanceID,
+				CPUUsedPercent: s.CPUUsedPercent,
+				MemoryUsedGB:   s.MemoryUsedGB,
+				NetworkRxMbps:  s.NetworkRxMbps,
+				NetworkTxMbps:  s.NetworkTxMbps,
+				StorageUsedGB:  s.StorageUsedGB,
+			}
+		}
+		if err := a.store.RecordInstanceMetrics(context.Background(), writes); err != nil {
+			log.Printf("WARN: instance metrics write-through failed for %d instance(s): %v", len(writes), err)
+		}
+	}()
+}
+
 // nodePlacerAdapter makes *nodes.Service satisfy api.NodePlacer, translating
 // the nodes package's Placement/errors into the neutral shapes the api
 // package expects — so api never imports pkg/nodes.

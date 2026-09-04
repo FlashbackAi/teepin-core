@@ -50,6 +50,9 @@ func (s *stubCluster) StreamLogs(context.Context, cluster.Scope, string, cluster
 func (s *stubCluster) Inventory(context.Context) ([]cluster.NodeInventory, error) {
 	return nil, s.err
 }
+func (s *stubCluster) InstanceMetrics(context.Context) ([]cluster.InstanceMetric, error) {
+	return nil, s.err
+}
 func (s *stubCluster) Healthy(context.Context) bool { return s.err == nil }
 func (s *stubCluster) ResolveInstanceAddress(context.Context, string, int32) (string, error) {
 	return "", s.err

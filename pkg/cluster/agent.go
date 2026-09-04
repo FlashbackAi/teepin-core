@@ -566,6 +566,17 @@ func (c *AgentClient) Healthy(context.Context) bool {
 	return c.registry.Count() > 0
 }
 
+// InstanceMetrics is not meaningful on AgentClient: unlike Inventory
+// (which the allocator pulls live, per placement decision), instance
+// utilization reaches the control plane as a PUSH — the agent sends
+// InstanceMetricsReport, handleMessage's write-through persists it
+// straight to compute.instance_metrics — the same shape node metrics
+// already use (see grpcserver.go's reportInventorySeen). Nothing calls
+// this method today; implemented only to satisfy the Client interface.
+func (c *AgentClient) InstanceMetrics(context.Context) ([]InstanceMetric, error) {
+	return nil, nil
+}
+
 // ResolveInstanceAddress is not meaningful on AgentClient: the control
 // plane holds no Kubernetes credentials in agent mode and never resolves a
 // pod address itself — that is exactly what the Stage 3 tunnel

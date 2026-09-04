@@ -1006,10 +1006,17 @@ func (s *Server) GetInstanceLogs(c *gin.Context) {
 	})
 }
 
-// GetInstanceMetrics gets metrics from an instance.
-// Not implemented yet: returning made-up numbers to customers is worse
-// than admitting the gap. Real metrics arrive with the Prometheus/DCGM
-// integration milestone.
+// GetInstanceMetrics returns one instance's utilization history — CPU%
+// (relative to the instance's own allocation, not host capacity),
+// memory GB, network RX/TX MB/s, and ephemeral storage used GB — oldest
+// first. The read side of the per-instance telemetry pipeline (see
+// cluster.InstanceMetric's own doc comment for the full architecture:
+// metrics.k8s.io for CPU/memory, the kubelet's /stats/summary for
+// network/storage, written through on each ~30s agent sweep).
+//
+// ?since=<Go duration, e.g. "1h", "24h"> bounds how far back to look,
+// same default/max clamping as the control centre's node metrics
+// endpoint — see compute.DefaultInstanceMetricsWindow's own doc comment.
 func (s *Server) GetInstanceMetrics(c *gin.Context) {
 	instanceID := c.Param("id")
 
@@ -1018,9 +1025,11 @@ func (s *Server) GetInstanceMetrics(c *gin.Context) {
 		return
 	}
 
-	// Confirm the instance exists and belongs to the caller before
-	// admitting the feature is missing: a 501 for an instance the caller
-	// does not own would still confirm it exists.
+	// Confirm the instance exists and belongs to the caller BEFORE
+	// touching the metrics table — this is the only tenancy check on this
+	// endpoint, the same trust boundary GetInstanceLogs already uses for
+	// StreamLogs: compute.Store.ListInstanceMetrics itself does not
+	// verify ownership.
 	if _, err := s.cluster.GetInstanceStatus(
 		c.Request.Context(), scopeFor(projectID), instanceID); err != nil {
 		if errors.Is(err, cluster.ErrNotFound) {
@@ -1031,10 +1040,27 @@ func (s *Server) GetInstanceMetrics(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusNotImplemented, gin.H{
-		"error":       "instance metrics are not available yet (Prometheus/DCGM integration is planned before GA)",
-		"instance_id": instanceID,
-	})
+	if s.store == nil {
+		// Standalone mode (no database): there is no history to read,
+		// full stop — not a feature gap, an environment one.
+		c.JSON(http.StatusNotImplemented, gin.H{
+			"error":       "instance metrics require a database (standalone mode has none)",
+			"instance_id": instanceID,
+		})
+		return
+	}
+
+	var since time.Duration
+	if v := c.Query("since"); v != "" {
+		since, _ = time.ParseDuration(v) // zero on failure -> ListInstanceMetrics' own default
+	}
+
+	samples, err := s.store.ListInstanceMetrics(c.Request.Context(), instanceID, since)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list instance metrics"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"instance_id": instanceID, "samples": samples})
 }
 
 // DeploySDL deploys from SDL template

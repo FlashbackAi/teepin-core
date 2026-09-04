@@ -199,6 +199,10 @@ func (f *fakeCluster) Inventory(context.Context) ([]cluster.NodeInventory, error
 	return nil, f.failWith
 }
 
+func (f *fakeCluster) InstanceMetrics(context.Context) ([]cluster.InstanceMetric, error) {
+	return nil, f.failWith
+}
+
 func (f *fakeCluster) Healthy(context.Context) bool { return f.failWith == nil }
 
 func (f *fakeCluster) ResolveInstanceAddress(context.Context, string, int32) (string, error) {
@@ -398,6 +402,93 @@ func TestGetInstanceLogs_OwnerGetsContent(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "log line one") {
 		t.Errorf("owner should receive log content, got %s", w.Body.String())
+	}
+}
+
+// GetInstanceMetrics is scoped the SAME way GetInstanceLogs already is —
+// a cross-tenant request never learns an instance exists.
+func TestGetInstanceMetrics_CrossTenantIs404(t *testing.T) {
+	tenantA, tenantB := uuid.New(), uuid.New()
+
+	fc := newFakeCluster()
+	fc.add("inst-aaaa1111", tenantA.String(), compute.StatusRunning)
+	server := newTenantServer(t, fc)
+
+	params := gin.Params{{Key: "id", Value: "inst-aaaa1111"}}
+	w := doRequest(server.GetInstanceMetrics, http.MethodGet, "/", params, tenantB)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("cross-tenant metrics status = %d, want 404", w.Code)
+	}
+}
+
+func TestGetInstanceMetrics_UnknownInstanceIs404(t *testing.T) {
+	server := newTenantServer(t, newFakeCluster())
+
+	params := gin.Params{{Key: "id", Value: "inst-nope0000"}}
+	w := doRequest(server.GetInstanceMetrics, http.MethodGet, "/", params, uuid.New())
+	if w.Code != http.StatusNotFound {
+		t.Errorf("unknown instance status = %d, want 404", w.Code)
+	}
+}
+
+// Standalone mode (no database — store is nil) has no history to read at
+// all, which is an honest 501, not a 200 with an empty/fabricated list.
+func TestGetInstanceMetrics_StandaloneModeIs501(t *testing.T) {
+	fc := newFakeCluster()
+	fc.add("inst-aaaa1111", "", compute.StatusRunning)
+	server := NewServer(fc, nil, nil, nil, allowGate{})
+
+	params := gin.Params{{Key: "id", Value: "inst-aaaa1111"}}
+	w := doRequest(server.GetInstanceMetrics, http.MethodGet, "/", params, uuid.New())
+	if w.Code != http.StatusNotImplemented {
+		t.Errorf("standalone mode status = %d, want 501", w.Code)
+	}
+}
+
+// The owner gets their instance's real samples, oldest first.
+func TestGetInstanceMetrics_OwnerGetsSamples(t *testing.T) {
+	tenant := uuid.New()
+
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	fc := newFakeCluster()
+	fc.add("inst-aaaa1111", tenant.String(), compute.StatusRunning)
+	server := NewServer(fc, nil, compute.NewStore(db), nil, allowGate{})
+
+	recordedAt := time.Now().Add(-5 * time.Minute)
+	mock.ExpectQuery(`SELECT recorded_at, cpu_used_percent, memory_used_gb, network_rx_mbps, network_tx_mbps, storage_used_gb`).
+		WithArgs("inst-aaaa1111", sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"recorded_at", "cpu_used_percent", "memory_used_gb", "network_rx_mbps", "network_tx_mbps", "storage_used_gb"}).
+			AddRow(recordedAt, 55.5, 2.25, 4.0, 1.0, 3.5))
+
+	params := gin.Params{{Key: "id", Value: "inst-aaaa1111"}}
+	w := doRequest(server.GetInstanceMetrics, http.MethodGet, "/?since=1h", params, tenant)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("owner metrics status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	var resp struct {
+		InstanceID string                        `json:"instance_id"`
+		Samples    []compute.InstanceMetricSample `json:"samples"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if resp.InstanceID != "inst-aaaa1111" {
+		t.Errorf("instance_id = %q, want inst-aaaa1111", resp.InstanceID)
+	}
+	if len(resp.Samples) != 1 {
+		t.Fatalf("got %d samples, want 1", len(resp.Samples))
+	}
+	if resp.Samples[0].CPUUsedPercent != 55.5 || resp.Samples[0].StorageUsedGB != 3.5 {
+		t.Errorf("sample = %+v, want {55.5 ... 3.5}", resp.Samples[0])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
 	}
 }
 

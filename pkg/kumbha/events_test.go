@@ -246,6 +246,9 @@ func (f *streamRetryCluster) ListInstanceStatuses(context.Context, cluster.Scope
 func (f *streamRetryCluster) Inventory(context.Context) ([]cluster.NodeInventory, error) {
 	return nil, nil
 }
+func (f *streamRetryCluster) InstanceMetrics(context.Context) ([]cluster.InstanceMetric, error) {
+	return nil, nil
+}
 func (f *streamRetryCluster) Healthy(context.Context) bool { return true }
 func (f *streamRetryCluster) ResolveInstanceAddress(context.Context, string, int32) (string, error) {
 	return "", cluster.ErrNotFound

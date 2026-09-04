@@ -84,6 +84,9 @@ func (nullCluster) StreamLogs(context.Context, cluster.Scope, string, cluster.Lo
 	return nil
 }
 func (nullCluster) Inventory(context.Context) ([]cluster.NodeInventory, error) { return nil, nil }
+func (nullCluster) InstanceMetrics(context.Context) ([]cluster.InstanceMetric, error) {
+	return nil, nil
+}
 func (nullCluster) Healthy(context.Context) bool                               { return true }
 func (nullCluster) ResolveInstanceAddress(context.Context, string, int32) (string, error) {
 	return "", cluster.ErrNotFound
@@ -462,6 +465,120 @@ func TestReportInventory_ReportsClusterReady(t *testing.T) {
 		if inv.ClusterReady != healthy {
 			t.Errorf("healthy=%v: ClusterReady = %v, want %v", healthy, inv.ClusterReady, healthy)
 		}
+	}
+}
+
+// instanceMetricsCluster returns a fixed set of instance metrics, or an
+// error, for testing reportInstanceMetrics without a real Kubernetes API.
+type instanceMetricsCluster struct {
+	nullCluster
+	metrics []cluster.InstanceMetric
+	err     error
+}
+
+func (c instanceMetricsCluster) InstanceMetrics(context.Context) ([]cluster.InstanceMetric, error) {
+	return c.metrics, c.err
+}
+
+// reportInstanceMetrics must thread every field from cluster.InstanceMetric
+// onto the wire unchanged — the same "prove the actual values, not just
+// that a message was sent" bar the node telemetry pipeline's own tests
+// hold CPU/memory/network/storage to.
+func TestReportInstanceMetrics_SendsAllFields(t *testing.T) {
+	r := New(Config{
+		ProviderID: "home-sreek",
+		Region:     "home",
+		Version:    "test",
+		Cluster: instanceMetricsCluster{metrics: []cluster.InstanceMetric{
+			{
+				InstanceID:     "inst-abc123",
+				CPUUsedPercent: 42.5,
+				MemoryUsedGB:   1.75,
+				NetworkRxMbps:  3.5,
+				NetworkTxMbps:  1.25,
+				StorageUsedGB:  8.0,
+			},
+			{
+				InstanceID:     "inst-def456",
+				CPUUsedPercent: 10.0,
+				MemoryUsedGB:   0.5,
+			},
+		}},
+	})
+	s := newStubStream()
+
+	r.reportInstanceMetrics(context.Background(), s)
+
+	if s.sentCount() != 1 {
+		t.Fatalf("got %d sent messages, want 1", s.sentCount())
+	}
+	report := s.sent[0].GetInstanceMetrics()
+	if report == nil {
+		t.Fatalf("first message was %T, want InstanceMetricsReport", s.sent[0].Payload)
+	}
+	if len(report.Instances) != 2 {
+		t.Fatalf("got %d instances, want 2", len(report.Instances))
+	}
+
+	first := report.Instances[0]
+	if first.InstanceId != "inst-abc123" {
+		t.Errorf("InstanceId = %q, want inst-abc123", first.InstanceId)
+	}
+	if first.CpuUsedPercent != 42.5 {
+		t.Errorf("CpuUsedPercent = %v, want 42.5", first.CpuUsedPercent)
+	}
+	if first.MemoryUsedGb != 1.75 {
+		t.Errorf("MemoryUsedGb = %v, want 1.75", first.MemoryUsedGb)
+	}
+	if first.NetworkRxMbps != 3.5 || first.NetworkTxMbps != 1.25 {
+		t.Errorf("network = (%v,%v), want (3.5,1.25)", first.NetworkRxMbps, first.NetworkTxMbps)
+	}
+	if first.StorageUsedGb != 8.0 {
+		t.Errorf("StorageUsedGb = %v, want 8.0", first.StorageUsedGb)
+	}
+
+	second := report.Instances[1]
+	if second.InstanceId != "inst-def456" || second.CpuUsedPercent != 10.0 {
+		t.Errorf("second instance = %+v, want inst-def456/10.0", second)
+	}
+}
+
+// An empty result (no instances running, or none measurable this sweep)
+// must send NOTHING — an empty InstanceMetricsReport would be a
+// perfectly valid message, but there is no point spending a write on it
+// every 30s when nothing changed.
+func TestReportInstanceMetrics_EmptyResultSendsNothing(t *testing.T) {
+	r := New(Config{
+		ProviderID: "home-sreek",
+		Region:     "home",
+		Version:    "test",
+		Cluster:    instanceMetricsCluster{metrics: nil},
+	})
+	s := newStubStream()
+
+	r.reportInstanceMetrics(context.Background(), s)
+
+	if s.sentCount() != 0 {
+		t.Errorf("got %d sent messages, want 0 (empty result)", s.sentCount())
+	}
+}
+
+// A cluster.InstanceMetrics error must not panic or send a malformed
+// report — it is logged and skipped, same as reportInventory's failure
+// handling.
+func TestReportInstanceMetrics_ErrorDoesNotSend(t *testing.T) {
+	r := New(Config{
+		ProviderID: "home-sreek",
+		Region:     "home",
+		Version:    "test",
+		Cluster:    instanceMetricsCluster{err: errors.New("k8s api unreachable")},
+	})
+	s := newStubStream()
+
+	r.reportInstanceMetrics(context.Background(), s)
+
+	if s.sentCount() != 0 {
+		t.Errorf("got %d sent messages, want 0 (InstanceMetrics failed)", s.sentCount())
 	}
 }
 

@@ -42,6 +42,13 @@ const inventoryInterval = 30 * time.Second
 // is well inside the billing granularity that consumes it.
 const statusInterval = 15 * time.Second
 
+// instanceMetricsInterval is how often per-instance utilization is
+// reported. Same cadence as inventoryInterval (30s), on its own ticker
+// rather than piggybacking on either inventory or status: inventory is
+// host/GPU-scoped and status only sends on a CHANGE, whereas utilization
+// needs a steady sample regardless of whether anything changed.
+const instanceMetricsInterval = 30 * time.Second
+
 // sendTimeout bounds a single write to the control plane.
 //
 // This is the liveness check that matters. gRPC's transport keepalive
@@ -213,10 +220,11 @@ func (r *Runner) Run(ctx context.Context, s stream) error {
 	r.reportStatuses(ctx, s)
 
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(4)
 	go func() { defer wg.Done(); r.inventoryLoop(ctx, s) }()
 	go func() { defer wg.Done(); r.statusLoop(ctx, s) }()
 	go func() { defer wg.Done(); r.heartbeatLoop(ctx, s) }()
+	go func() { defer wg.Done(); r.instanceMetricsLoop(ctx, s) }()
 
 	// Reverse defer order: wait runs last, cancel first. Both are needed
 	// — cancel alone would let goroutines outlive the connection and
@@ -1009,6 +1017,55 @@ func (r *Runner) inventoryLoop(ctx context.Context, s stream) {
 			return
 		}
 	}
+}
+
+func (r *Runner) instanceMetricsLoop(ctx context.Context, s stream) {
+	ticker := time.NewTicker(instanceMetricsInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			r.reportInstanceMetrics(ctx, s)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// reportInstanceMetrics sends the current sweep's per-instance
+// utilization. Absent from the report entirely if the cluster returned
+// none (a CPU-only/home-Stage-1 client, a metrics-server not yet ready,
+// or genuinely zero instances) — an empty InstanceMetricsReport is a
+// normal, valid message, not an error.
+func (r *Runner) reportInstanceMetrics(ctx context.Context, s stream) {
+	metrics, err := r.cfg.Cluster.InstanceMetrics(ctx)
+	if err != nil {
+		log.Printf("InstanceMetrics failed: %v", err)
+		return
+	}
+	if len(metrics) == 0 {
+		return
+	}
+
+	pbMetrics := make([]*agentpb.InstanceMetric, 0, len(metrics))
+	for _, m := range metrics {
+		pbMetrics = append(pbMetrics, &agentpb.InstanceMetric{
+			InstanceId:     m.InstanceID,
+			CpuUsedPercent: float32(m.CPUUsedPercent),
+			MemoryUsedGb:   m.MemoryUsedGB,
+			NetworkRxMbps:  m.NetworkRxMbps,
+			NetworkTxMbps:  m.NetworkTxMbps,
+			StorageUsedGb:  m.StorageUsedGB,
+		})
+	}
+
+	_ = r.send(s, &agentpb.AgentMessage{
+		Payload: &agentpb.AgentMessage_InstanceMetrics{InstanceMetrics: &agentpb.InstanceMetricsReport{
+			Instances:  pbMetrics,
+			ObservedAt: timestamppb.Now(),
+		}},
+	})
 }
 
 func (r *Runner) statusLoop(ctx context.Context, s stream) {

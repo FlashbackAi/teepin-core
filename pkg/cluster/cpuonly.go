@@ -61,6 +61,13 @@ func (c *CPUOnly) Inventory(context.Context) ([]NodeInventory, error) {
 	return []NodeInventory{}, nil
 }
 
+// InstanceMetrics: no k3s-backed DirectClient is present in this Stage 1
+// shape, so there is nothing to measure — an empty success, same
+// "genuinely nothing here, not a failure" posture as Inventory above.
+func (c *CPUOnly) InstanceMetrics(context.Context) ([]InstanceMetric, error) {
+	return nil, nil
+}
+
 func (c *CPUOnly) Healthy(context.Context) bool { return true }
 
 func (c *CPUOnly) ResolveInstanceAddress(context.Context, string, int32) (string, error) {

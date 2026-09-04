@@ -215,6 +215,7 @@ message AgentMessage {
     ExecOpen        exec_open       = 10; // interactive exec: attached ack, once per request_id
     ExecOutput      exec_output     = 11; // interactive exec: stdout/stderr bytes
     ExecEnd         exec_end        = 12; // interactive exec: terminal state, once per request_id
+    InstanceMetricsReport instance_metrics = 13; // per-customer-instance utilization, periodic
   }
 }
 
@@ -270,6 +271,55 @@ message GPUInventory {
   double network_tx_mbps     = 7;
   double storage_read_mbps   = 8;
   double storage_write_mbps  = 9;
+}
+
+// InstanceMetricsReport is one periodic sweep of every locally-running
+// customer instance's current utilization — the per-instance analogue of
+// GPUInventory's host-level cpu_used_percent/memory_used_gb, added the
+// same week once the customer asked whether instance-level (not just
+// node-level) metrics were covered. Sent on its own cadence, independent
+// of GPUInventory and InstanceStatus (which only sends on a STATUS
+// change, not periodically — utilization needs a steady sample
+// regardless of whether anything changed).
+message InstanceMetricsReport {
+  repeated InstanceMetric instances = 1;
+  google.protobuf.Timestamp observed_at = 2;
+}
+
+// InstanceMetric is one instance's current utilization. Absent from a
+// report (not a zero-valued entry) when it could not be read this sweep
+// — e.g. metrics-server has not scraped this pod yet, or the kubelet
+// proxy was briefly unreachable — so a caller can tell "no data this
+// cycle" apart from "genuinely idle" the same way GPUInventory's own
+// doc comment describes for the host-level fields.
+message InstanceMetric {
+  string instance_id = 1;
+
+  // cpu_used_percent is relative to the INSTANCE'S OWN cpu_units
+  // (request == limit in this platform's fixed-allocation model), not
+  // host capacity — a customer wants "am I using what I provisioned",
+  // not "what fraction of a shared host is this". Sourced from
+  // metrics.k8s.io (metrics-server), already installed by default on
+  // every k3s node.
+  float  cpu_used_percent = 2;
+  double memory_used_gb   = 3;
+
+  // network_rx_mbps/network_tx_mbps: throughput RATES in MB/s, same
+  // delta-over-wall-clock shape as the host-level fields — sourced from
+  // the kubelet's cAdvisor-backed /stats/summary (metrics-server does
+  // not report network at all).
+  double network_rx_mbps = 4;
+  double network_tx_mbps = 5;
+
+  // storage_used_gb is a SNAPSHOT of ephemeral storage usage
+  // (/stats/summary's ephemeral-storage.usedBytes), NOT a throughput
+  // rate — deliberately a different KIND of measurement from the host
+  // pipeline's storage_read_mbps/storage_write_mbps. /stats/summary has
+  // no per-pod disk I/O RATE; that lives in cAdvisor's Prometheus
+  // /metrics/cadvisor endpoint, out of scope for this pass (see
+  // ROADMAP.md) — reporting a fabricated rate here would be actively
+  // misleading, so this reports the usage gauge honestly instead.
+  double storage_used_gb = 6;
 }
 
 message GPUNode {

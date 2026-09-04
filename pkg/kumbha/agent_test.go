@@ -72,6 +72,9 @@ func (f *fakeCluster) StreamLogs(context.Context, cluster.Scope, string, cluster
 	return nil
 }
 func (f *fakeCluster) Inventory(context.Context) ([]cluster.NodeInventory, error) { return nil, nil }
+func (f *fakeCluster) InstanceMetrics(context.Context) ([]cluster.InstanceMetric, error) {
+	return nil, nil
+}
 func (f *fakeCluster) Healthy(context.Context) bool                               { return true }
 func (f *fakeCluster) ResolveInstanceAddress(context.Context, string, int32) (string, error) {
 	return "", cluster.ErrNotFound
