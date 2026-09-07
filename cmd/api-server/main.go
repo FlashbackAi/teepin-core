@@ -502,6 +502,24 @@ func main() {
 	if nodeService != nil {
 		apiServer = apiServer.WithNodePlacer(newNodePlacerAdapter(nodeService))
 	}
+	// Hidden-workload capacity accounting: without this, an active Kumbha
+	// agent/screenshot/build pod's CPU/memory is invisible to
+	// ListNodeCapacity's used-count (see nodes.HiddenWorkloadCounter's own
+	// doc comment) — a node running one could report more free capacity
+	// than it actually has. Sizes are read from the SAME env vars
+	// WithAgent configures further down (duplicated here rather than
+	// reordering the whole Kumbha wiring block earlier in this function —
+	// same env var, same default, so the two reads cannot disagree); the
+	// Kaniko build size comes straight from build.DefaultConfig(), which
+	// nothing in this file overrides.
+	if nodeService != nil {
+		buildDefaults := build.DefaultConfig()
+		nodeService = nodeService.WithHiddenWorkloadCounter(newHiddenWorkloadAdapter(
+			clusterClient,
+			getEnvInt("TEEPIN_KUMBHA_AGENT_CPU_UNITS", 2), getEnvInt("TEEPIN_KUMBHA_AGENT_MEMORY_GB", 4),
+			buildDefaults.CPUUnits, buildDefaults.MemoryGB,
+		))
+	}
 	// Enable the per-project on-demand/reserved capacity toggle.
 	// *auth.Service implements api.ProjectPolicy directly (see
 	// AllowsOnDemand there) — no adapter needed. Absent this (standalone

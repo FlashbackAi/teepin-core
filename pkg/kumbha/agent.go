@@ -86,6 +86,15 @@ type TokenMinter func(accountID, projectID, sessionID uuid.UUID, ttl time.Durati
 // LaunchAgent's doc comment).
 const agentLabel = "teepin.io/kumbha-agent"
 
+// AgentPodNamePrefix identifies a Kumbha agent pod by its instance ID —
+// used by pkg/nodes' hidden-workload capacity accounting (see
+// nodes.HiddenWorkloadCounter) to recognise one of these pods in a live
+// status list without pkg/nodes needing to know anything else about how
+// this package names things. Exported so this string is the only place
+// it is ever duplicated. Matches LaunchAgent's own podID construction
+// below.
+const AgentPodNamePrefix = "kumbha-agent-"
+
 // WithAgent enables LaunchAgent. Returns the same *Gateway for chaining,
 // so existing NewGateway call sites compile unchanged — without this,
 // LaunchAgent returns ErrAgentNotConfigured rather than launching
@@ -147,7 +156,7 @@ func (g *Gateway) LaunchAgent(ctx context.Context, sess *Session, prompt string)
 	// "inst-<short-uuid>" convention compute instances already use, so an
 	// operator recognises the shape immediately in kubectl/logs even
 	// though this pod is never customer-visible.
-	podID := "kumbha-agent-" + sess.ID.String()[:8]
+	podID := AgentPodNamePrefix + sess.ID.String()[:8]
 
 	spec := cluster.InstanceSpec{
 		InstanceID: podID,
@@ -234,16 +243,24 @@ func (g *Gateway) MintWorkspaceFetchToken(sess *Session, ttl time.Duration) (tok
 	return token, archiveURL, nil
 }
 
-// screenshotCPUUnits/screenshotMemoryGB size the capture pod — small and
+// ScreenshotCPUUnits/ScreenshotMemoryGB size the capture pod — small and
 // fixed, not operator-configurable. Deliberately much smaller than a real
 // agent session's own AgentConfig sizing: this launches the SAME image
 // LaunchAgent does (see CaptureScreenshot below), just with a different
 // Command and a request sized for "run one headless-Chromium capture and
-// exit" rather than "run an autonomous coding session."
+// exit" rather than "run an autonomous coding session." Exported so
+// nodes.HiddenWorkloadCounter can account for a running capture pod's
+// footprint without pkg/nodes hardcoding a second copy of this size.
 const (
-	screenshotCPUUnits = 1
-	screenshotMemoryGB = 1
+	ScreenshotCPUUnits = 1
+	ScreenshotMemoryGB = 1
 )
+
+// ScreenshotPodNamePrefix identifies a screenshot-capture pod by its
+// instance ID — see AgentPodNamePrefix's own doc comment; same reasoning,
+// a third hidden pod type nodes.HiddenWorkloadCounter must also
+// recognise. Matches CaptureScreenshot's own podID construction below.
+const ScreenshotPodNamePrefix = "kumbha-shot-"
 
 // CaptureTimeoutDefault bounds how long CaptureScreenshot waits for the
 // pod to finish before giving up and cleaning it up — a hung headless
@@ -345,8 +362,8 @@ func (g *Gateway) CaptureScreenshot(ctx context.Context, sess *Session, targetUR
 			"TEEPIN_TOKEN":      token,
 		},
 		Labels:          map[string]string{agentLabel: "true"},
-		CPUUnits:        screenshotCPUUnits,
-		MemoryGB:        screenshotMemoryGB,
+		CPUUnits:        ScreenshotCPUUnits,
+		MemoryGB:        ScreenshotMemoryGB,
 		NeverRestart:    true,
 		ImagePullSecret: g.agentConfig.ImagePullSecret,
 		// Same reasoning as LaunchAgent's own AlwaysPullImage: the image

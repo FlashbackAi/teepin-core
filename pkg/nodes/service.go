@@ -37,6 +37,11 @@ const maxTokenTTL = 24 * time.Hour
 // Service manages nodes and their credentials.
 type Service struct {
 	db *sql.DB
+
+	// hiddenCounter is optional — see HiddenWorkloadCounter's own doc
+	// comment (capacity.go). Nil unless WithHiddenWorkloadCounter is
+	// called.
+	hiddenCounter HiddenWorkloadCounter
 }
 
 // NewService constructs the node service.

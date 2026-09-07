@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
 
 	"github.com/google/uuid"
 )
@@ -72,11 +73,54 @@ type NodeCapacity struct {
 	FreeMemGB     int       `json:"free_memory_gb"`
 }
 
+// HiddenUsage is one node's total footprint from Teepin's own internal
+// workloads — see HiddenWorkloadCounter.
+type HiddenUsage struct {
+	CPUCores int
+	MemoryGB int
+}
+
+// HiddenWorkloadCounter reports how much of a node's rentable capacity is
+// currently held by Teepin's own internal workloads: the Kumbha agent
+// pod, its screenshot-capture pod, and Kaniko build pods. These are
+// deliberately never inserted into compute.instances (see
+// kumbha.LaunchAgent's own doc comment — a customer must never see a
+// mystery "kumbha-agent-xyz" entry in their Compute list), which also
+// makes them invisible to ListNodeCapacity's compute.instances-based sum.
+// Found live 2026-09-05: a node running an active Kaniko build reported
+// more free capacity than it actually had, because the build pod's own
+// 2 vCPU / 4 GB never counted against anything.
+//
+// Implemented in pkg/api (an adapter over cluster.Client — see
+// cmd/api-server/adapters.go) so this package does not depend on
+// pkg/cluster at all, mirroring NodePlacer/ProjectPolicy's own pattern.
+// Optional: nil (the default with no WithHiddenWorkloadCounter call)
+// leaves ListNodeCapacity exactly as it behaved before this existed.
+type HiddenWorkloadCounter interface {
+	// HiddenUsageByNode returns, for every node CURRENTLY running at
+	// least one hidden workload, the total CPU/memory those workloads
+	// hold — keyed by node NAME (compute.nodes.node_name), since that is
+	// what a live pod reports itself as running on.
+	HiddenUsageByNode(ctx context.Context) (map[string]HiddenUsage, error)
+}
+
+// WithHiddenWorkloadCounter enables hidden-workload accounting in
+// ListNodeCapacity. Returns the same *Service for chaining — a service
+// built without this call keeps computing "used" from compute.instances
+// alone, identical to today's behaviour.
+func (s *Service) WithHiddenWorkloadCounter(c HiddenWorkloadCounter) *Service {
+	s.hiddenCounter = c
+	return s
+}
+
 // ListNodeCapacity returns the capacity breakdown for every node. Used is
 // derived — summed from the node's ACTIVE instances (compute.instances joined
-// on node_id, not terminated) — so it can never drift from the real running
-// workloads. Free is clamped at 0 so a node whose reservation was lowered
-// below current usage reports 0 free, not a negative number.
+// on node_id, not terminated) plus, when a HiddenWorkloadCounter is
+// configured, whatever Teepin's own hidden pods currently hold on that
+// node (see HiddenWorkloadCounter's own doc comment for why the DB sum
+// alone is not the whole picture). Free is clamped at 0 so a node whose
+// reservation was lowered below current usage reports 0 free, not a
+// negative number.
 func (s *Service) ListNodeCapacity(ctx context.Context) ([]NodeCapacity, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT n.id, n.node_name, n.class, n.status,
@@ -107,11 +151,40 @@ func (s *Service) ListNodeCapacity(ctx context.Context) ([]NodeCapacity, error) 
 			&c.UsedCPU, &c.UsedMemGB); err != nil {
 			return nil, fmt.Errorf("failed to scan node capacity: %w", err)
 		}
-		c.FreeCPU = max0(c.RentableCPU - c.UsedCPU)
-		c.FreeMemGB = max0(c.RentableMemGB - c.UsedMemGB)
 		out = append(out, c)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	if s.hiddenCounter != nil {
+		hidden, err := s.hiddenCounter.HiddenUsageByNode(ctx)
+		if err != nil {
+			// Best-effort: a live-status lookup failing must not break the
+			// whole capacity view — degrade to DB-only accounting (today's
+			// behaviour, undercounting hidden pods) rather than fail the
+			// request outright over it.
+			log.Printf("WARN: could not resolve hidden-workload usage for node capacity: %v", err)
+		} else {
+			for i := range out {
+				h, ok := hidden[out[i].NodeName]
+				if !ok {
+					continue
+				}
+				out[i].UsedCPU += h.CPUCores
+				out[i].UsedMemGB += h.MemoryGB
+			}
+		}
+	}
+
+	// Free is derived last, from the final used figure (DB instances plus
+	// any hidden-workload addition above) — computing it earlier would
+	// silently ignore whatever the hidden counter added.
+	for i := range out {
+		out[i].FreeCPU = max0(out[i].RentableCPU - out[i].UsedCPU)
+		out[i].FreeMemGB = max0(out[i].RentableMemGB - out[i].UsedMemGB)
+	}
+	return out, nil
 }
 
 func max0(n int) int {

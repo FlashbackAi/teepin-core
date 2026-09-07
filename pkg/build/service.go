@@ -185,13 +185,21 @@ type Request struct {
 // only after the build finishes.
 type OnLogLine func(line string)
 
+// PodNamePrefix identifies a Kaniko build pod by its instance ID — used
+// by pkg/nodes' hidden-workload capacity accounting (see
+// nodes.HiddenWorkloadCounter) to recognise one of these pods in a live
+// status list without pkg/nodes needing to know anything else about how
+// pkg/build names things. Exported so that is the only place this string
+// is ever duplicated.
+const PodNamePrefix = "kaniko-build-"
+
 // buildInstanceID names the build instance, deterministic from the
 // requested tag so a retried/duplicate build call for the same tag
 // collides (fails fast on a still-running duplicate) rather than
 // silently launching two builds pushing the same destination
 // concurrently.
 func buildInstanceID(tag string) string {
-	return "kaniko-build-" + tag
+	return PodNamePrefix + tag
 }
 
 // ImageAuth exposes the registry credential a just-built image was

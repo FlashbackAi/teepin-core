@@ -7,13 +7,16 @@ import (
 	"context"
 	"errors"
 	"log"
+	"strings"
 
 	"github.com/google/uuid"
 
 	"github.com/FlashbackAi/teepin-core/pkg/api"
 	"github.com/FlashbackAi/teepin-core/pkg/billing"
+	"github.com/FlashbackAi/teepin-core/pkg/build"
 	"github.com/FlashbackAi/teepin-core/pkg/cluster"
 	"github.com/FlashbackAi/teepin-core/pkg/compute"
+	"github.com/FlashbackAi/teepin-core/pkg/kumbha"
 	"github.com/FlashbackAi/teepin-core/pkg/nodes"
 	"github.com/FlashbackAi/teepin-core/pkg/payments"
 )
@@ -237,6 +240,74 @@ func (a *nodePlacerAdapter) IsArchUnavailable(err error) bool {
 
 func (a *nodePlacerAdapter) IsInsufficientCapacity(err error) bool {
 	return errors.Is(err, nodes.ErrInsufficientCapacity)
+}
+
+// hiddenWorkloadAdapter makes cluster.Client satisfy
+// nodes.HiddenWorkloadCounter — see that interface's own doc comment for
+// why this exists. Knows the fixed CPU/memory footprint of each of
+// Teepin's three internal pod types (Kumbha agent, its screenshot-capture
+// pod, Kaniko builds) via their exported name-prefix constants, so
+// pkg/nodes never needs to import pkg/kumbha or pkg/build just to
+// recognise one.
+type hiddenWorkloadAdapter struct {
+	cluster                        cluster.Client
+	agentCPU, agentMemGB           int
+	screenshotCPU, screenshotMemGB int
+	buildCPU, buildMemGB           int
+}
+
+func newHiddenWorkloadAdapter(c cluster.Client, agentCPU, agentMemGB, buildCPU, buildMemGB int) *hiddenWorkloadAdapter {
+	return &hiddenWorkloadAdapter{
+		cluster:         c,
+		agentCPU:        agentCPU,
+		agentMemGB:      agentMemGB,
+		screenshotCPU:   kumbha.ScreenshotCPUUnits,
+		screenshotMemGB: kumbha.ScreenshotMemoryGB,
+		buildCPU:        buildCPU,
+		buildMemGB:      buildMemGB,
+	}
+}
+
+func (a *hiddenWorkloadAdapter) HiddenUsageByNode(ctx context.Context) (map[string]nodes.HiddenUsage, error) {
+	statuses, err := a.cluster.ListInstanceStatuses(ctx, cluster.AllTenantsIncludingHidden())
+	if err != nil {
+		return nil, err
+	}
+
+	out := map[string]nodes.HiddenUsage{}
+	for _, st := range statuses {
+		if !st.Hidden || st.NodeName == "" {
+			continue
+		}
+		// A pod already terminated or failed holds nothing — only a
+		// still-scheduled one (running, or pending while its image pulls)
+		// occupies the node. Matches podStatus's own phase mapping in
+		// pkg/cluster/direct.go: PodSucceeded/PodFailed both map here to
+		// something other than "running"/"pending".
+		if st.Status != compute.StatusRunning && st.Status != compute.StatusPending {
+			continue
+		}
+
+		var cpu, mem int
+		switch {
+		case strings.HasPrefix(st.PodName, build.PodNamePrefix):
+			cpu, mem = a.buildCPU, a.buildMemGB
+		case strings.HasPrefix(st.PodName, kumbha.ScreenshotPodNamePrefix):
+			cpu, mem = a.screenshotCPU, a.screenshotMemGB
+		case strings.HasPrefix(st.PodName, kumbha.AgentPodNamePrefix):
+			cpu, mem = a.agentCPU, a.agentMemGB
+		default:
+			// An unrecognised hidden pod (a future addition this adapter
+			// was never updated for) — count nothing rather than guess a
+			// size that could be wrong in either direction.
+			continue
+		}
+		u := out[st.NodeName]
+		u.CPUCores += cpu
+		u.MemoryGB += mem
+		out[st.NodeName] = u
+	}
+	return out, nil
 }
 
 // instanceProxyTarget makes *compute.Store (+ a *cluster.Registry for the
