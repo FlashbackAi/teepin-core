@@ -33,7 +33,17 @@ param(
     [int]$MemoryGB = 0,
     # GB of host RAM to keep for Windows when auto-sizing. Windows needs
     # headroom; starving it makes the whole machine sluggish.
-    [int]$WindowsReserveGB = 4
+    [int]$WindowsReserveGB = 4,
+    # How many logical processors to give WSL2's Linux. Unlike memory, WSL2
+    # does NOT cap this by default -- it hands Linux every logical core on
+    # the host, which is the opposite problem: without this, ALL of the
+    # host's CPU could end up rentable, leaving nothing reserved for
+    # Windows itself. 0 (the default) AUTO-SIZES to host logical processors
+    # minus WindowsReserveCpus. Pass a number to set it explicitly, or -1
+    # to leave WSL's processor config alone.
+    [int]$Cpus = 0,
+    # Logical processors to keep for Windows when auto-sizing.
+    [int]$WindowsReserveCpus = 2
 )
 
 $ErrorActionPreference = "Stop"
@@ -222,6 +232,55 @@ if ($MemoryGB -ge 0) {
     }
 }
 
+# --- 2a-cpu. cap WSL2's logical processors (Windows-side, machine-wide) --
+# WSL2 gives Linux EVERY logical core on the host by default -- unlike
+# memory, there is no built-in cap. Left alone, that means ALL of the
+# host's CPU could be reported as rentable, leaving nothing held back for
+# Windows itself while it also runs the operator's own work. Set an
+# explicit processors= in [wsl2], same machine-wide-setting caveat as
+# cgroup/memory above.
+#
+# -Cpus 0 (default): auto-size to (host logical processors - WindowsReserveCpus).
+# -Cpus N: set exactly N.  -Cpus -1: leave WSL's processor config alone.
+$needsRestartForCpu = $false
+if ($Cpus -ge 0) {
+    $targetCpus = $Cpus
+    if ($targetCpus -eq 0) {
+        $hostCpus = (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
+        $targetCpus = $hostCpus - $WindowsReserveCpus
+        if ($targetCpus -lt 1) { $targetCpus = [math]::Max(1, $hostCpus - 1) }
+        Info "auto-sizing WSL processors to ${targetCpus} (host ${hostCpus} minus ${WindowsReserveCpus} reserved for Windows)"
+    }
+
+    # Re-read the file (the cgroup/memory steps above may have created/edited it).
+    $existing = ""
+    if (Test-Path $wslConfig) { $existing = Get-Content $wslConfig -Raw }
+    $cpuLine = "processors=${targetCpus}"
+
+    if ($existing -match "(?m)^\s*processors\s*=\s*${targetCpus}\s*$") {
+        Info "WSL processors already set to ${targetCpus}"
+    } elseif ($existing -match "(?m)^\s*processors\s*=") {
+        # A processors= already exists with a different value -- replace only
+        # that line, leaving everything else untouched.
+        if (-not (Test-Path "$wslConfig.teepin-backup")) {
+            Copy-Item $wslConfig "$wslConfig.teepin-backup" -Force
+        }
+        $updated = $existing -replace "(?m)^\s*processors\s*=.*$", $cpuLine
+        Set-Content -Path $wslConfig -Value $updated -Encoding UTF8
+        Info "updated WSL processors to ${targetCpus}"
+        $needsRestartForCpu = $true
+    } elseif ($existing -match "(?m)^\s*\[wsl2\]") {
+        $updated = $existing -replace "(?m)^\s*\[wsl2\]", "[wsl2]`r`n$cpuLine"
+        Set-Content -Path $wslConfig -Value $updated -Encoding UTF8
+        Info "set WSL processors to ${targetCpus}"
+        $needsRestartForCpu = $true
+    } else {
+        Add-Content -Path $wslConfig -Value "`r`n[wsl2]`r`n$cpuLine"
+        Info "set WSL processors to ${targetCpus}"
+        $needsRestartForCpu = $true
+    }
+}
+
 # --- 2b. enable systemd in the distro -----------------------------------
 # WSL2 runs the agent as a systemd service; systemd must be turned on in
 # /etc/wsl.conf (a per-DISTRO file, not machine-wide). Without this the service
@@ -236,7 +295,7 @@ $needsRestartForSystemd = ($systemdResult -eq "added")
 
 # A restart is needed only if we actually changed something. This avoids a
 # gratuitous global shutdown when re-running an already-configured machine.
-if ($needsRestartForCgroup -or $needsRestartForMemory -or $needsRestartForSystemd) {
+if ($needsRestartForCgroup -or $needsRestartForMemory -or $needsRestartForCpu -or $needsRestartForSystemd) {
     # The shutdown is GLOBAL -- it stops every WSL distro, including Docker
     # Desktop's backend if present. Warn, and if other distros are running,
     # ask before pulling the rug out from under them.

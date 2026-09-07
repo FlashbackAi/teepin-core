@@ -211,9 +211,10 @@ func (h *AuthHandler) UpdateProject(c *gin.Context) {
 	}
 
 	var req struct {
-		Name        *string `json:"name"`
-		Description *string `json:"description"`
-		Environment *string `json:"environment"`
+		Name          *string `json:"name"`
+		Description   *string `json:"description"`
+		Environment   *string `json:"environment"`
+		AllowOnDemand *bool   `json:"allow_on_demand"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -222,9 +223,10 @@ func (h *AuthHandler) UpdateProject(c *gin.Context) {
 
 	project, err := h.authService.UpdateProject(c.Request.Context(), accountID, projectID,
 		auth.ProjectUpdate{
-			Name:        req.Name,
-			Description: req.Description,
-			Environment: req.Environment,
+			Name:          req.Name,
+			Description:   req.Description,
+			Environment:   req.Environment,
+			AllowOnDemand: req.AllowOnDemand,
 		})
 	if err != nil {
 		switch {

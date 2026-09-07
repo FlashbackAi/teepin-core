@@ -26,16 +26,16 @@ Download and extract the latest release from
 (tag `agent-v*`) — pick the tarball for your architecture:
 
 ```bash
+mkdir teepin-agent && cd teepin-agent
 curl -LO https://github.com/FlashbackAi/teepin-core/releases/latest/download/teepin-agent-linux-amd64.tar.gz
-tar xzf teepin-agent-linux-amd64.tar.gz
-cd teepin-agent-linux-amd64  # install.sh and the teepin-agent binary are both here
+tar xzf teepin-agent-linux-amd64.tar.gz  # extracts install.sh/teepin-agent/etc. directly into this directory, no nested folder
 ```
 
 (`arm64` in place of `amd64` on ARM hardware — Apple-Silicon Macs via
-`bootstrap-macos.sh` need this one.) `install.sh` already looks for a
-`teepin-agent` binary sitting next to itself, so nothing else is needed —
-this is the same install.sh referenced below, just run from inside the
-extracted tarball instead of a git checkout.
+`bootstrap-macos.sh` need this one.) The tarball contains `install.sh`,
+`bootstrap-macos.sh`, `bootstrap-windows.ps1`, `refresh-ecr-pull-secret.sh`
+and the `teepin-agent` binary together — whichever of these you run below,
+it is already sitting right next to what it needs, no separate download.
 
 ## Linux
 

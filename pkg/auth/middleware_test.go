@@ -44,8 +44,8 @@ func TestAuthenticate_JWTWithOwnedProjectHeader(t *testing.T) {
 	mock.ExpectQuery(`SELECT .+ FROM auth\.projects\s+WHERE id = \$1 AND account_id = \$2`).
 		WithArgs(projectID, user.AccountID).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "account_id", "owner_id", "name", "slug", "description", "environment", "created_at", "updated_at",
-		}).AddRow(projectID, user.AccountID, user.ID, "production", "production", "", "", nowUTC(), nowUTC()))
+			"id", "account_id", "owner_id", "name", "slug", "description", "environment", "allow_on_demand", "created_at", "updated_at",
+		}).AddRow(projectID, user.AccountID, user.ID, "production", "production", "", "", true, nowUTC(), nowUTC()))
 
 	c := newTestContext(t)
 	c.Request.Header.Set("Authorization", "Bearer "+access)

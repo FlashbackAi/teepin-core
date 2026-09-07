@@ -57,10 +57,15 @@ type Project struct {
 	// has not declared one. The console shows it as a badge next to the
 	// project name everywhere, so that a destructive action in production
 	// looks different from the same action in a scratch project.
-	Environment string     `json:"environment,omitempty"`
-	CreatedAt   time.Time  `json:"created_at"`
-	UpdatedAt   time.Time  `json:"updated_at"`
-	DeletedAt   *time.Time `json:"deleted_at,omitempty"`
+	Environment string `json:"environment,omitempty"`
+	// AllowOnDemand gates whether this project's workloads may land on
+	// on-demand (home-node) capacity, as opposed to reserved (datacenter)
+	// capacity only. Defaults true (see migration 039) — see
+	// pkg/api.ProjectPolicy, the read side this feeds.
+	AllowOnDemand bool       `json:"allow_on_demand"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
+	DeletedAt     *time.Time `json:"deleted_at,omitempty"`
 }
 
 // ValidEnvironments are the only accepted values, matching the CHECK

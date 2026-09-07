@@ -27,6 +27,17 @@ CONTROL_PLANE=""
 GRPC_ADDR=""
 VM_NAME="teepin"
 
+# Reserved for the HOST OS and the operator's own concurrent use of their
+# own machine — a FIXED amount, not a proportional split (e.g. half).
+# A proportional split wastes enormous headroom on a large machine (a
+# 64GB Mac keeping 32GB idle "just in case" makes no sense); a fixed
+# reservation is also the actual constraint here — this is not an AWS
+# EC2 host (dedicated, no other user, nearly the whole machine handed to
+# the guest by design), it is the operator's OWN daily computer, running
+# alongside their own use of it while it also rents out capacity.
+OS_RESERVED_MEM_GIB=4
+OS_RESERVED_CPUS=2
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --token)         TOKEN="$2"; shift 2 ;;
@@ -41,6 +52,15 @@ info() { echo "[bootstrap] $*"; }
 fail() { echo "[bootstrap] ERROR: $*" >&2; exit 1; }
 
 [ "$(uname -s)" = "Darwin" ] || fail "this bootstrap is for macOS. On Linux run install.sh directly; on Windows use bootstrap-windows.ps1."
+# Homebrew refuses outright to run as root (it manages an unprivileged,
+# user-owned install), and Lima manages its VM state under the invoking
+# user's own home directory — both need to run as your normal account, not
+# root. The one place this script genuinely needs root is INSIDE the VM,
+# already scoped correctly below via its own `sudo bash install.sh` call —
+# running the whole script as root does not grant that, it just breaks
+# Homebrew before getting there. A root shell here almost always means
+# `sudo -s`/`su` was run first; exit that and re-run as yourself.
+[ "$(id -u)" -ne 0 ] || fail "do not run this as root (or via sudo/sudo -s/su) — Homebrew and Lima must run as your normal user. install.sh's own sudo call, inside the VM, is already scoped correctly and needs no help from a root shell out here."
 # --token/--control-plane are only required for a first install. A re-run
 # against an already-enrolled VM is an update, and install.sh detects that
 # itself (existing /etc/teepin/agent.json + systemd unit) -- but whether
@@ -56,15 +76,44 @@ if ! command -v limactl >/dev/null 2>&1; then
 fi
 
 # --- 2. Linux VM ---------------------------------------------------------
+# Size the VM to the HOST's real capacity minus a fixed reservation for
+# the operator's own use (see OS_RESERVED_* above) — Lima's own
+# template://ubuntu default is a small, generic 4 CPUs/4GiB regardless of
+# the actual machine, which badly under-reports a real Mac's capacity
+# (confirmed live: an M4 Mac Mini showed as "4 vCPU · 4 GB" in the
+# control centre). sysctl reads the TRUE host values directly; nothing
+# here depends on what Lima's template happened to default to.
+total_mem_gib=$(( $(sysctl -n hw.memsize) / 1024 / 1024 / 1024 ))
+total_cpus=$(sysctl -n hw.ncpu)
+vm_mem_gib=$(( total_mem_gib - OS_RESERVED_MEM_GIB ))
+vm_cpus=$(( total_cpus - OS_RESERVED_CPUS ))
+# Floors guard a very small or unusual host from computing to zero/negative
+# — not expected on real Mac hardware, but a VM with 0 of either would
+# simply fail to start, which is a worse failure mode than a small floor.
+[ "$vm_mem_gib" -ge 2 ] || vm_mem_gib=2
+[ "$vm_cpus" -ge 1 ] || vm_cpus=1
+info "host: ${total_cpus} CPUs / ${total_mem_gib}GiB -> VM: ${vm_cpus} CPUs / ${vm_mem_gib}GiB (${OS_RESERVED_CPUS} CPUs / ${OS_RESERVED_MEM_GIB}GiB reserved for the OS)"
+
 # Start (or reuse) a VM that starts on login, so the node survives reboots as
 # long as the user logs in. Uses the default Ubuntu template.
 if limactl list --quiet 2>/dev/null | grep -qx "$VM_NAME"; then
     info "Lima VM '$VM_NAME' exists; ensuring it is running..."
+    # Best-effort resize of an ALREADY-EXISTING VM (e.g. one created before
+    # this sizing logic existed, still sitting at Lima's small default).
+    # `limactl edit` applies to the instance's stored config, taking effect
+    # on next start — requires the VM to be stopped first. Not fatal if the
+    # installed Lima version does not support this flag combination: the
+    # VM still starts at whatever size it already has, and the message
+    # below tells the operator how to force a resize.
+    limactl stop "$VM_NAME" >/dev/null 2>&1 || true
+    if ! limactl edit "$VM_NAME" --cpus "$vm_cpus" --memory "${vm_mem_gib}GiB" >/dev/null 2>&1; then
+        info "note: could not resize the existing VM automatically (older Lima version?)."
+        info "To apply the new sizing, run: limactl delete $VM_NAME   then re-run this script."
+    fi
     limactl start "$VM_NAME" || true
 else
     info "creating Lima VM '$VM_NAME'..."
-    # --plain keeps it a stock Linux; we install everything via install.sh.
-    limactl start --name "$VM_NAME" template://ubuntu
+    limactl start --name "$VM_NAME" --cpus "$vm_cpus" --memory "${vm_mem_gib}GiB" template://ubuntu
 fi
 
 # Register the VM to auto-start on login (best effort).

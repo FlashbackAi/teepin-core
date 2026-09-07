@@ -254,6 +254,30 @@ func (s *Store) UpdateImage(ctx context.Context, id, image, podName string, cont
 	return nil
 }
 
+// UpdateNodePlacement backfills provider_id/node_id on an EXISTING row whose
+// original create never set them (see kumbha_handlers.go's
+// redeployKumbhaInstance — a historical gap, not a current one: new
+// deploys already set these at create time). node_id is resolved by
+// provider_id, not node_name — provider_id is the STABLE identity that
+// survives an operator rename (see pkg/nodes' own RenameNode/UpsertSeen
+// doc comments); resolving by the renameable node_name here would
+// reintroduce the exact class of bug that keyed those tables on
+// provider_id in the first place.
+func (s *Store) UpdateNodePlacement(ctx context.Context, id, providerID string) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE compute.instances
+		SET provider_id = $1, node_id = (SELECT id FROM compute.nodes WHERE provider_id = $1)
+		WHERE id = $2
+	`, providerID, id)
+	if err != nil {
+		return fmt.Errorf("failed to update node placement for %s: %w", id, err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return fmt.Errorf("instance %s not found", id)
+	}
+	return nil
+}
+
 // MarkTerminated finalizes an instance: status becomes terminated and
 // terminated_at is stamped, which stops billing collection for it.
 // Idempotent: terminating an already-terminated instance is a no-op.

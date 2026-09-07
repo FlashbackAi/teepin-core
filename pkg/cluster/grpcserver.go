@@ -273,6 +273,7 @@ func (s *AgentServer) handleMessage(session *AgentSession, msg *agentpb.AgentMes
 			Status:      st.Status,
 			PodName:     st.PodName,
 			NodeName:    st.NodeName,
+			ProviderID:  session.ProviderID,
 			Message:     st.Message,
 			AccountID:   st.AccountId,
 			ProjectID:   st.ProjectId,

@@ -901,6 +901,137 @@ func TestRedeployKumbhaInstance_ThreadsHomeNodeClassAndProviderOntoSpec(t *testi
 	}
 }
 
+// TestRedeployKumbhaInstance_RecoversMissingProviderFromLiveStatus is the
+// regression test for the historical gap the fix above cannot self-heal:
+// an instance whose ORIGINAL create predated createReq.NodeClass = "home"
+// (kumbha_handlers.go:~777) has provider_id persisted EMPTY, so the
+// "existing.ProviderID != """ branch above never fires — leaving
+// spec.ProviderID empty, which createOrReplace's dispatch would send to
+// registry.Any(), risking the WRONG session entirely once more than one
+// home provider is connected. The pod's own status report already
+// carries the reporting home node's ProviderID (from the gRPC stream's
+// own authenticated session, not from any raw hostname the pod itself
+// claims) — this proves that ProviderID is threaded onto the spec, AND
+// persisted afterward so this never needs rediscovering.
+func TestRedeployKumbhaInstance_RecoversMissingProviderFromLiveStatus(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+
+	projectID, sessionID := uuid.New(), uuid.New()
+	existingID := "inst-existing5"
+	fc := newFakeCluster()
+	fc.add(existingID, projectID.String(), compute.StatusRunning)
+	fc.setProviderID(existingID, "provider-srialla") // the reporting agent connection's own verified identity
+	server := (&Server{store: cStore, cluster: fc}).WithKumbha(gw)
+
+	// provider_id / node_name BOTH empty — the exact historical gap.
+	mock.ExpectQuery(`SELECT .+ FROM compute\.instances`).
+		WithArgs(existingID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "account_id", "project_id", "user_id", "name", "image",
+			"instance_type_id", "status", "gpu_vram_gb", "cpu_units", "memory_gb", "endpoint",
+			"k8s_pod_name", "k8s_namespace", "provider_id", "node_name", "dns_name", "public_ip",
+			"tls_enabled", "tls_ready", "container_port", "storage_gb",
+			"created_at", "updated_at", "started_at", "terminated_at", "kumbha_session_id",
+		}).AddRow(existingID, testAccountID, projectID, uuid.Nil, "kumbha-abc123", "old-image:v1",
+			"", compute.StatusRunning, 0, 1, 1, "https://inst-existing5.teepin.com",
+			existingID+"-pod", "default", "", "", existingID+".teepin.com", "",
+			true, true, 80, 0,
+			nowStub(), nowStub(), nil, nil, uuid.Nil))
+	mock.ExpectExec(`UPDATE compute\.instances`).
+		WithArgs("new-image:v6", existingID+"-pod", 80, compute.StatusPending, existingID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// The recovery persistence — a SEPARATE UPDATE from the one above,
+	// matched in order (sqlmock's default) with its own distinct args.
+	mock.ExpectExec(`UPDATE compute\.instances`).
+		WithArgs("provider-srialla", existingID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE billing\.kumbha_workspace_versions`).
+		WithArgs(sessionID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE billing\.inference_sessions\s+SET last_deployed_version = current_workspace_version`).
+		WithArgs(sessionID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	sess := &kumbha.Session{ID: sessionID, AccountID: testAccountID, ProjectID: projectID, AppInstanceID: existingID}
+	c, w := newRedeployTestContext(projectID)
+	server.redeployKumbhaInstance(context.Background(), c, sessionID, sess, projectID, testAccountID, "new-image:v6",
+		[]models.PortMapping{{Container: 80, Protocol: "tcp"}}, nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	if fc.lastSpec.NodeClass != "home" {
+		t.Errorf("spec.NodeClass = %q, want \"home\" (recovered from the live node name)", fc.lastSpec.NodeClass)
+	}
+	if fc.lastSpec.ProviderID != "provider-srialla" {
+		t.Errorf("spec.ProviderID = %q, want the RECOVERED provider (\"provider-srialla\"), not empty", fc.lastSpec.ProviderID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations (recovery not persisted?): %v", err)
+	}
+}
+
+// TestRedeployKumbhaInstance_NoLiveProviderLeavesRecoveryOff proves the
+// recovery path degrades to today's exact prior behaviour (spec.ProviderID
+// stays empty, no persistence attempted) when the live status carries no
+// ProviderID at all (no agent has reported this instance's status yet, or
+// it never ran on a home node) — this must never become a NEW way for a
+// redeploy to fail.
+func TestRedeployKumbhaInstance_NoLiveProviderLeavesRecoveryOff(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+
+	projectID, sessionID := uuid.New(), uuid.New()
+	existingID := "inst-existing5"
+	fc := newFakeCluster()
+	fc.add(existingID, projectID.String(), compute.StatusRunning)
+	// Deliberately no setProviderID call — GetInstanceStatus reports an
+	// empty ProviderID, same as an instance with no home-agent status yet.
+	server := (&Server{store: cStore, cluster: fc}).WithKumbha(gw)
+
+	mock.ExpectQuery(`SELECT .+ FROM compute\.instances`).
+		WithArgs(existingID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "account_id", "project_id", "user_id", "name", "image",
+			"instance_type_id", "status", "gpu_vram_gb", "cpu_units", "memory_gb", "endpoint",
+			"k8s_pod_name", "k8s_namespace", "provider_id", "node_name", "dns_name", "public_ip",
+			"tls_enabled", "tls_ready", "container_port", "storage_gb",
+			"created_at", "updated_at", "started_at", "terminated_at", "kumbha_session_id",
+		}).AddRow(existingID, testAccountID, projectID, uuid.Nil, "kumbha-abc123", "old-image:v1",
+			"", compute.StatusRunning, 0, 1, 1, "https://inst-existing5.teepin.com",
+			existingID+"-pod", "default", "", "", existingID+".teepin.com", "",
+			true, true, 80, 0,
+			nowStub(), nowStub(), nil, nil, uuid.Nil))
+	mock.ExpectExec(`UPDATE compute\.instances`).
+		WithArgs("new-image:v6", existingID+"-pod", 80, compute.StatusPending, existingID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// Deliberately NO second `UPDATE compute.instances` expectation — if
+	// the code tried to persist a recovery here, ExpectationsWereMet
+	// below would fail on an unexpected extra call.
+	mock.ExpectExec(`UPDATE billing\.kumbha_workspace_versions`).
+		WithArgs(sessionID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE billing\.inference_sessions\s+SET last_deployed_version = current_workspace_version`).
+		WithArgs(sessionID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	sess := &kumbha.Session{ID: sessionID, AccountID: testAccountID, ProjectID: projectID, AppInstanceID: existingID}
+	c, w := newRedeployTestContext(projectID)
+	server.redeployKumbhaInstance(context.Background(), c, sessionID, sess, projectID, testAccountID, "new-image:v6",
+		[]models.PortMapping{{Container: 80, Protocol: "tcp"}}, nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	if fc.lastSpec.ProviderID != "" {
+		t.Errorf("spec.ProviderID = %q, want empty (no nodePlacer configured, same as before this fix)", fc.lastSpec.ProviderID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
 // TestRedeployKumbhaInstance_AlwaysForcesFreshImagePull guards a live
 // incident from 2026-09-01: Kumbha tags every image built within one
 // session with the SAME tag (the session ID prefix, not a content hash or

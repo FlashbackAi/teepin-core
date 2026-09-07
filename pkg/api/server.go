@@ -77,6 +77,12 @@ type Server struct {
 	// (400) rather than panicking. Set via WithNodePlacer.
 	nodePlacer NodePlacer
 
+	// projectPolicy gates whether a project may use on-demand (home-node)
+	// capacity. Nil means no policy is configured — every project is
+	// allowed, matching behaviour before this feature existed. Set via
+	// WithProjectPolicy.
+	projectPolicy ProjectPolicy
+
 	// endpointDomain/enableTLS/tlsIssuer are stamped onto every placement's
 	// InstanceSpec (see instanceSpec below) so the customer-visible hostname
 	// and TLS policy are a control-plane fact, not independently configured
@@ -255,6 +261,31 @@ type NodePlacer interface {
 	IsNoCapacity(err error) bool
 	IsArchUnavailable(err error) bool
 	IsInsufficientCapacity(err error) bool
+}
+
+// ProjectPolicy exposes per-project settings that gate placement
+// decisions. An interface so the api package does not depend on pkg/auth's
+// full Service at construction — mirrors NodePlacer/PricingProvider's own
+// pattern. Implemented directly by *auth.Service (see AllowsOnDemand
+// there), no adapter needed.
+type ProjectPolicy interface {
+	// AllowsOnDemand reports whether a project may use on-demand
+	// (home-node) capacity, as opposed to reserved (datacenter) capacity
+	// only. Checked only on the home-placement path (CreateInstance) —
+	// this is a placement-time policy, not a capability flag, so it never
+	// affects an instance already running.
+	AllowsOnDemand(ctx context.Context, accountID, projectID uuid.UUID) (bool, error)
+}
+
+// WithProjectPolicy enables the on-demand/reserved capacity toggle.
+// Returns the same *Server for chaining, so existing NewServer call sites
+// compile unchanged — a server built without this call leaves
+// s.projectPolicy nil, which CreateInstance's home-placement branch
+// treats as "no policy configured" and always allows, identical to
+// today's behaviour before this feature existed.
+func (s *Server) WithProjectPolicy(p ProjectPolicy) *Server {
+	s.projectPolicy = p
+	return s
 }
 
 // WithNodePlacer enables home-class placement. Returns the same *Server for
@@ -572,6 +603,34 @@ func (s *Server) CreateInstance(c *gin.Context) {
 		if s.nodePlacer == nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "home compute is not enabled on this platform"})
 			return
+		}
+		// Project-level on-demand policy. Checked here, not earlier: this
+		// is specifically about NEW home placement decisions, so it must
+		// never block a redeploy that only threads through an
+		// already-established placement (see redeployKumbhaInstance's own
+		// existing.ProviderID != "" branch, which never reaches this
+		// handler at all) — turning this off must only affect where a
+		// customer's NEXT instance can land, never an already-running one.
+		// Kumbha's own first-deploy path reaches this same check for free:
+		// it creates its instance through this exact handler (see
+		// DeployKumbhaSession's invokeInternally(s.CreateInstance, ...)),
+		// so there is deliberately only ONE enforcement point for both
+		// surfaces, not two that could drift out of sync.
+		if s.projectPolicy != nil {
+			allowed, err := s.projectPolicy.AllowsOnDemand(c.Request.Context(), accountID, projectID)
+			if err != nil {
+				// A policy-lookup failure is not a reason to block a
+				// create outright — fails OPEN, same posture as every
+				// other best-effort project-level check in this file
+				// (e.g. the Kumbha double-instance guard above).
+				log.Printf("WARN: could not check on-demand policy for project %s: %v — allowing", projectID, err)
+			} else if !allowed {
+				c.JSON(http.StatusServiceUnavailable, gin.H{
+					"error": "on-demand (home) capacity is turned off for this project, and no reserved capacity is available — enable on-demand in project settings to deploy here",
+					"code":  "on_demand_disabled",
+				})
+				return
+			}
 		}
 		// Size the request from the validated fields (which carry the chosen
 		// tier's cpu_units and memory). Placement refuses a node that cannot

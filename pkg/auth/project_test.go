@@ -16,7 +16,7 @@ import (
 func projectRows() *sqlmock.Rows {
 	return sqlmock.NewRows([]string{
 		"id", "account_id", "owner_id", "name", "slug",
-		"description", "environment", "created_at", "updated_at",
+		"description", "environment", "allow_on_demand", "created_at", "updated_at",
 	})
 }
 
@@ -30,10 +30,10 @@ func TestUpdateProject_FiltersByAccount(t *testing.T) {
 	name := "renamed"
 
 	mock.ExpectQuery(`UPDATE auth\.projects`).
-		WithArgs(projectID, accountID, &name, nil, nil).
+		WithArgs(projectID, accountID, &name, nil, nil, nil).
 		WillReturnRows(projectRows().AddRow(
 			projectID, accountID, uuid.New(), "renamed", "production",
-			"", "prod", time.Now(), time.Now(),
+			"", "prod", true, time.Now(), time.Now(),
 		))
 
 	project, err := service.UpdateProject(context.Background(), accountID, projectID,
@@ -62,10 +62,10 @@ func TestUpdateProject_SlugIsNotRenamed(t *testing.T) {
 	name := "new name"
 
 	mock.ExpectQuery(`UPDATE auth\.projects`).
-		WithArgs(projectID, accountID, &name, nil, nil).
+		WithArgs(projectID, accountID, &name, nil, nil, nil).
 		WillReturnRows(projectRows().AddRow(
 			projectID, accountID, uuid.New(), "new name", "original-slug",
-			"", "", time.Now(), time.Now(),
+			"", "", true, time.Now(), time.Now(),
 		))
 
 	project, err := service.UpdateProject(context.Background(), accountID, projectID,
@@ -102,7 +102,7 @@ func TestUpdateProject_AcceptsEmptyEnvironment(t *testing.T) {
 
 	mock.ExpectQuery(`UPDATE auth\.projects`).
 		WillReturnRows(projectRows().AddRow(
-			projectID, accountID, uuid.New(), "p", "p", "", "", time.Now(), time.Now(),
+			projectID, accountID, uuid.New(), "p", "p", "", "", true, time.Now(), time.Now(),
 		))
 
 	// "Not declared" is a legitimate state — a project need not be
@@ -127,7 +127,7 @@ func TestDeleteProject_RefusesWithRunningInstances(t *testing.T) {
 	mock.ExpectQuery(`SELECT .+ FROM auth\.projects`).
 		WillReturnRows(projectRows().AddRow(
 			projectID, accountID, uuid.New(), "production", "production",
-			"", "prod", time.Now(), time.Now(),
+			"", "prod", true, time.Now(), time.Now(),
 		))
 
 	// Two instances still running.
@@ -155,7 +155,7 @@ func TestDeleteProject_RevokesKeysAndSoftDeletes(t *testing.T) {
 	mock.ExpectQuery(`SELECT .+ FROM auth\.projects`).
 		WillReturnRows(projectRows().AddRow(
 			projectID, accountID, uuid.New(), "scratch", "scratch",
-			"", "dev", time.Now(), time.Now(),
+			"", "dev", true, time.Now(), time.Now(),
 		))
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM compute\.instances`).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))

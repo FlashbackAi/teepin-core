@@ -246,12 +246,12 @@ func isUniqueViolation(err error) bool {
 // projectColumns is the shared select list, so every project query
 // returns the same shape and scanning cannot drift between them.
 const projectColumns = `id, account_id, owner_id, name, slug,
-	COALESCE(description,''), COALESCE(environment,''), created_at, updated_at`
+	COALESCE(description,''), COALESCE(environment,''), allow_on_demand, created_at, updated_at`
 
 func scanProject(row interface{ Scan(...any) error }) (*Project, error) {
 	var p Project
 	if err := row.Scan(&p.ID, &p.AccountID, &p.OwnerID, &p.Name, &p.Slug,
-		&p.Description, &p.Environment, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		&p.Description, &p.Environment, &p.AllowOnDemand, &p.CreatedAt, &p.UpdatedAt); err != nil {
 		return nil, err
 	}
 	return &p, nil
@@ -318,6 +318,18 @@ func (s *Service) GetProject(ctx context.Context, accountID, projectID uuid.UUID
 	return p, nil
 }
 
+// AllowsOnDemand reports whether a project may use on-demand (home-node)
+// compute capacity. Implements pkg/api.ProjectPolicy directly — no
+// adapter needed, unlike NodePlacer/PricingProvider, since GetProject
+// already does everything this requires.
+func (s *Service) AllowsOnDemand(ctx context.Context, accountID, projectID uuid.UUID) (bool, error) {
+	p, err := s.GetProject(ctx, accountID, projectID)
+	if err != nil {
+		return false, err
+	}
+	return p.AllowOnDemand, nil
+}
+
 // ProjectUpdate carries the fields a customer may change. A nil field
 // means "leave unchanged", which is what distinguishes clearing a
 // description from not touching it.
@@ -325,6 +337,9 @@ type ProjectUpdate struct {
 	Name        *string
 	Description *string
 	Environment *string
+	// AllowOnDemand toggles this project's on-demand (home-node) capacity
+	// policy — see Project.AllowOnDemand's own doc comment.
+	AllowOnDemand *bool
 }
 
 // ErrProjectNameTaken is returned when a rename collides with another
@@ -355,13 +370,14 @@ func (s *Service) UpdateProject(ctx context.Context, accountID, projectID uuid.U
 
 	row := s.db.QueryRowContext(ctx, `
 		UPDATE auth.projects
-		SET name        = COALESCE($3, name),
-		    description = COALESCE($4, description),
-		    environment = COALESCE($5, environment),
-		    updated_at  = NOW()
+		SET name            = COALESCE($3, name),
+		    description     = COALESCE($4, description),
+		    environment     = COALESCE($5, environment),
+		    allow_on_demand = COALESCE($6, allow_on_demand),
+		    updated_at      = NOW()
 		WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL
 		RETURNING `+projectColumns,
-		projectID, accountID, update.Name, update.Description, update.Environment)
+		projectID, accountID, update.Name, update.Description, update.Environment, update.AllowOnDemand)
 
 	p, err := scanProject(row)
 	if err == sql.ErrNoRows {

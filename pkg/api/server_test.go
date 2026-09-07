@@ -6,6 +6,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -53,11 +54,12 @@ type fakeCluster struct {
 }
 
 type fakeInstance struct {
-	projectID string
-	status    string
-	message   string
-	logs      string
-	endpoint  string
+	projectID  string
+	status     string
+	message    string
+	logs       string
+	endpoint   string
+	providerID string
 }
 
 func newFakeCluster() *fakeCluster {
@@ -78,6 +80,16 @@ func (f *fakeCluster) add(instanceID, projectID, status string) {
 func (f *fakeCluster) setEndpoint(instanceID, url string) {
 	inst := f.instances[instanceID]
 	inst.endpoint = url
+	f.instances[instanceID] = inst
+}
+
+// setProviderID mutates an already-added instance's reported live
+// ProviderID — same pattern as setEndpoint, for tests that need
+// GetInstanceStatus to report which home node's agent connection last
+// reported this pod's status (see cluster.InstanceStatus.ProviderID).
+func (f *fakeCluster) setProviderID(instanceID, providerID string) {
+	inst := f.instances[instanceID]
+	inst.providerID = providerID
 	f.instances[instanceID] = inst
 }
 
@@ -160,6 +172,7 @@ func (f *fakeCluster) GetInstanceStatus(_ context.Context, scope cluster.Scope, 
 		Status:      inst.status,
 		Message:     inst.message,
 		EndpointURL: inst.endpoint,
+		ProviderID:  inst.providerID,
 		ObservedAt:  time.Now().UTC(),
 	}, nil
 }
@@ -766,6 +779,90 @@ func TestCreateInstance_HomeWithoutPlacerRefused(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 (home compute not enabled)", w.Code)
+	}
+}
+
+// fakeProjectPolicy is a canned api.ProjectPolicy for tests — records the
+// account/project it was asked about.
+type fakeProjectPolicy struct {
+	allow        bool
+	err          error
+	calledWith   uuid.UUID
+	calledWithOK bool
+}
+
+func (p *fakeProjectPolicy) AllowsOnDemand(_ context.Context, _, projectID uuid.UUID) (bool, error) {
+	p.calledWith = projectID
+	p.calledWithOK = true
+	if p.err != nil {
+		return false, p.err
+	}
+	return p.allow, nil
+}
+
+// The on-demand toggle's whole point: a project with it turned off must
+// never reach home placement, regardless of capacity — the placer is not
+// even consulted.
+func TestCreateInstance_HomeRefusedWhenProjectDisallowsOnDemand(t *testing.T) {
+	placer := &fakePlacer{nodeName: "home-1", provider: "p1"}
+	policy := &fakeProjectPolicy{allow: false}
+	server := newTenantServer(t, newFakeCluster()).WithNodePlacer(placer).WithProjectPolicy(policy)
+
+	w := createInstanceReqBody(server, uuid.New(),
+		`{"name":"t","image":"nginx","cpu_units":1,"memory":"1GB","node_class":"home"}`)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (on-demand disabled), body=%s", w.Code, w.Body.String())
+	}
+	if placer.called {
+		t.Error("placer was consulted despite the project disallowing on-demand capacity")
+	}
+	if !policy.calledWithOK {
+		t.Error("project policy was never checked")
+	}
+}
+
+// The mirror image: a project that explicitly allows on-demand still
+// places normally — the toggle must not accidentally break the common
+// (allowed) case.
+func TestCreateInstance_HomeAllowedWhenProjectAllowsOnDemand(t *testing.T) {
+	placer := &fakePlacer{nodeName: "home-1", provider: "prov-home", arch: "amd64"}
+	policy := &fakeProjectPolicy{allow: true}
+	fc := newFakeCluster()
+	// Standalone (store=nil), like TestCreateInstance_HomePlacesAndCarriesProvider:
+	// this test is purely about the policy gate letting placement through,
+	// not persistence.
+	server := NewServer(fc, nil, nil, nil, nil).WithNodePlacer(placer).WithProjectPolicy(policy)
+
+	w := createInstanceReqBody(server, uuid.New(),
+		`{"name":"t","image":"nginx","cpu_units":1,"memory":"1GB","node_class":"home"}`)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201, body=%s", w.Code, w.Body.String())
+	}
+	if !placer.called {
+		t.Error("placer was not consulted despite the project allowing on-demand capacity")
+	}
+}
+
+// A policy lookup failure must fail OPEN — a database blip on this check
+// must never be a new way to block every home-class create on the
+// platform, matching every other best-effort project-level check in this
+// file (e.g. the Kumbha double-instance guard).
+func TestCreateInstance_HomeProceedsWhenPolicyLookupErrors(t *testing.T) {
+	placer := &fakePlacer{nodeName: "home-1", provider: "prov-home", arch: "amd64"}
+	policy := &fakeProjectPolicy{err: errors.New("db unreachable")}
+	fc := newFakeCluster()
+	server := NewServer(fc, nil, nil, nil, nil).WithNodePlacer(placer).WithProjectPolicy(policy)
+
+	w := createInstanceReqBody(server, uuid.New(),
+		`{"name":"t","image":"nginx","cpu_units":1,"memory":"1GB","node_class":"home"}`)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (fail open on policy error), body=%s", w.Code, w.Body.String())
+	}
+	if !placer.called {
+		t.Error("placer was not consulted despite the policy error, which must fail open")
 	}
 }
 

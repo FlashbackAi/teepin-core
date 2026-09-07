@@ -502,6 +502,13 @@ func main() {
 	if nodeService != nil {
 		apiServer = apiServer.WithNodePlacer(newNodePlacerAdapter(nodeService))
 	}
+	// Enable the per-project on-demand/reserved capacity toggle.
+	// *auth.Service implements api.ProjectPolicy directly (see
+	// AllowsOnDemand there) — no adapter needed. Absent this (standalone
+	// mode, no database), every project is allowed, same as today.
+	if authService != nil {
+		apiServer = apiServer.WithProjectPolicy(authService)
+	}
 
 	// kumbhaEventTickets is set inside the Kumbha Gateway block below, but
 	// declared out here because kumbhaEventsHandler (the WS half) is built

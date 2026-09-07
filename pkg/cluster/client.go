@@ -183,6 +183,18 @@ type InstanceStatus struct {
 	Message    string
 	ObservedAt time.Time
 
+	// ProviderID identifies which home node actually reported this status,
+	// taken from the gRPC stream's own authenticated session
+	// (AgentSession.ProviderID in grpcserver.go), never from NodeName. Node
+	// names default to the host's OS hostname (see cmd/teepin-agent's
+	// enroll.go) and are not guaranteed unique across different operators'
+	// machines, so NodeName must never be used as a join key back to a
+	// provider — two unrelated home nodes can legitimately report the same
+	// NodeName. ProviderID is the connection's verified identity and is
+	// always safe to trust. Empty for statuses that did not come from a
+	// home-node agent connection (e.g. the direct/CPU-only client).
+	ProviderID string
+
 	// Tenancy, carried so the agent-backed client can apply Scope to
 	// statuses it holds in memory. The direct client filters with label
 	// selectors and does not need these, but an in-memory cache has no

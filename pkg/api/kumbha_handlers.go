@@ -1154,6 +1154,12 @@ func (s *Server) redeployKumbhaInstance(ctx context.Context, c *gin.Context, ses
 	// unreachable without it, so ProviderID != "" is the same signal
 	// ResolveProvider (cmd/api-server/adapters.go) already uses elsewhere
 	// to mean "this is a home-class instance".
+	// recoveredProviderID is set below ONLY when this redeploy just
+	// discovered a provider a stale record never had — persisted after a
+	// successful redeploy so this self-heals once and never needs to
+	// rediscover it again. Left empty on the ordinary path (existing
+	// already had one, or nothing could be recovered).
+	var recoveredProviderID string
 	if existing.ProviderID != "" {
 		spec.NodeClass = "home"
 		spec.ProviderID = existing.ProviderID
@@ -1169,6 +1175,44 @@ func (s *Server) redeployKumbhaInstance(ctx context.Context, c *gin.Context, ses
 		// storage affinity. createOrReplace's own dispatch only routes on
 		// ProviderID, never NodeName, so this does not affect the fix
 		// above.
+	} else {
+		// Recovery path for instances that predate the NodeClass fix above
+		// (createReq.NodeClass = "home" on the ORIGINAL create) — their
+		// provider_id was never persisted at all. Left as spec.ProviderID
+		// == "" here, createOrReplace's dispatch falls back to
+		// registry.Any(), which now that more than one home provider can
+		// be connected risks routing this redeploy to the WRONG session
+		// entirely (Any() has no reason to pick the session that actually
+		// holds this instance's pod) — silently misplacing or simply
+		// failing a real customer's redeploy. Recover the correct provider
+		// instead: the pod's own status report already carries the
+		// reporting home node's ProviderID (cluster.InstanceStatus.
+		// ProviderID, set in grpcserver.go from the gRPC stream's own
+		// authenticated session), entirely independent of whatever
+		// compute.instances itself has on file.
+		//
+		// This intentionally does NOT resolve via NodeName instead: node
+		// names default to the OS hostname (cmd/teepin-agent/enroll.go) and
+		// are not enforced unique across different operators' machines, so
+		// two unrelated home nodes could legitimately report the same
+		// NodeName — using it as a join key back to a provider would risk
+		// recovering the WRONG provider silently. ProviderID is the
+		// connection's verified identity and carries no such ambiguity.
+		//
+		// Found live 2026-09-05 for inst-55b4d443/inst-5ed29952, both
+		// landed on "srialla" from their very first (buggy) create and
+		// simply never had that recorded.
+		if status, err := s.cluster.GetInstanceStatus(ctx, scopeFor(projectID), existing.ID); err == nil && status.ProviderID != "" {
+			spec.NodeClass = "home"
+			spec.ProviderID = status.ProviderID
+			recoveredProviderID = status.ProviderID
+		}
+		// Any failure above (no live status yet, or it carries no
+		// ProviderID — e.g. not a home-node-backed instance at all) leaves
+		// spec.ProviderID == "" — identical to today's behaviour, not
+		// worse: this is a best-effort recovery layered on top of the
+		// existing fallback, never a new way for a redeploy to fail that
+		// could not fail before.
 	}
 
 	// Every Kumbha redeploy within one session reuses the SAME image tag
@@ -1226,6 +1270,18 @@ func (s *Server) redeployKumbhaInstance(ctx context.Context, c *gin.Context, ses
 		// used to be, the reason the instance stays permanently
 		// unreachable at the edge despite a genuinely live pod.
 		log.Printf("WARN: redeployed instance %s for Kumbha session %s but failed to update its record: %v", existing.ID, sessionID, err)
+	}
+
+	// The redeploy itself already succeeded against the RECOVERED provider
+	// above — this only persists that discovery so the NEXT redeploy (and
+	// ListNodeCapacity's used-count) never needs to rediscover it again.
+	// Best-effort, same posture as UpdateImage just above: a failure here
+	// leaves the instance exactly as it was before this redeploy attempt
+	// (still running, still missing provider_id), not worse.
+	if recoveredProviderID != "" {
+		if err := s.store.UpdateNodePlacement(ctx, existing.ID, recoveredProviderID); err != nil {
+			log.Printf("WARN: redeployed instance %s onto recovered provider %s but failed to persist it: %v", existing.ID, recoveredProviderID, err)
+		}
 	}
 
 	if err := s.kumbha.CheckpointWorkspace(ctx, sessionID); err != nil {
