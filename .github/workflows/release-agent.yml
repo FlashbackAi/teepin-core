@@ -69,11 +69,19 @@ jobs:
       # Bundled alongside the binary so a fresh install never needs a
       # separate download — install.sh already looks for a teepin-agent
       # binary sitting next to itself. refresh-ecr-pull-secret.sh rides
-      # along too: today it is an entirely separate, undocumented-in-the-
-      # README manual step: bundling it here does not wire it into
-      # install.sh's own flow (that is separate follow-up work), but it
-      # does mean the script an operator needs is never missing from what
-      # they downloaded.
+      # along too, same reasoning.
+      #
+      # bootstrap-macos.sh/bootstrap-windows.ps1 ride along in BOTH arch
+      # tarballs too (not split by target OS — Apple Silicon needs arm64,
+      # an Intel Mac or any Windows/WSL2 box needs amd64, and picking the
+      # wrong combination is exactly the mistake an operator would make if
+      # these were only in one tarball). Both scripts run install.sh
+      # FROM the same extracted directory (`$(dirname "$0")`), so bundling
+      # them here — rather than leaving an operator to separately curl
+      # them from the repo — is what makes "download one tarball, run one
+      # script" true on every platform, not just Linux. Found live
+      # 2026-09-04: a Mac install needed a second manual curl for
+      # bootstrap-macos.sh because it was missing from the tarball.
       - name: Package tarballs
         run: |
           set -euo pipefail
@@ -81,8 +89,10 @@ jobs:
             outdir="dist/teepin-agent-linux-${arch}"
             cp deploy/agent/install.sh "$outdir/"
             cp deploy/agent/refresh-ecr-pull-secret.sh "$outdir/"
+            cp deploy/agent/bootstrap-macos.sh "$outdir/"
+            cp deploy/agent/bootstrap-windows.ps1 "$outdir/"
             cp deploy/agent/README.md "$outdir/"
-            chmod +x "$outdir/teepin-agent" "$outdir/install.sh" "$outdir/refresh-ecr-pull-secret.sh"
+            chmod +x "$outdir/teepin-agent" "$outdir/install.sh" "$outdir/refresh-ecr-pull-secret.sh" "$outdir/bootstrap-macos.sh"
             tar -czf "teepin-agent-linux-${arch}.tar.gz" -C "$outdir" .
           done
           sha256sum teepin-agent-linux-amd64.tar.gz teepin-agent-linux-arm64.tar.gz > SHA256SUMS
