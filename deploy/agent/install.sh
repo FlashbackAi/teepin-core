@@ -18,10 +18,24 @@
 # environment (WSL2 / a Lima VM) by the matching bootstrap script — the agent
 # always runs inside Linux.
 #
+# Also (re)installs the ECR pull-secret refresh timer (refresh-ecr-pull-secret.sh,
+# bundled next to this script) on EVERY run, install or update alike — a
+# Kumbha deploy to this node pulls its built image from a private ECR
+# repository, which needs a token refreshed well inside its 12-hour expiry.
+# This is done here, unconditionally, rather than left as a separate step an
+# operator has to remember to run once and then forget about: found live
+# 2026-09-07, a node's pull secret was a single manual one-off from two
+# weeks earlier with no recurring refresh ever set up, and image pulls
+# started failing with a 403 the moment that token finally expired. The one
+# piece that stays manual is populating the AWS credential itself
+# (/etc/teepin/kumbha-ecr-puller.env) — this script prints exactly what to
+# run if that file is still empty.
+#
 # Usage:
 #   # First install:
 #   sudo bash install.sh --token <tne_...> --control-plane <https-api-url> \
-#        [--grpc <host:port>] [--binary <path>] [--node-name <name>]
+#        [--grpc <host:port>] [--binary <path>] [--node-name <name>] \
+#        [--ecr-account-id <id>] [--ecr-region <region>]
 #
 #   # Update an existing node (after a `go build`, or with --binary):
 #   sudo bash install.sh [--binary <path>]
@@ -37,6 +51,10 @@ CONTROL_PLANE=""       # https URL for enrollment (HTTP API)
 GRPC_ADDR=""           # host:port for the agent's gRPC channel
 BINARY=""              # path to a prebuilt teepin-agent; built from source if empty
 NODE_NAME=""
+# Only one AWS account/region has ever backed this platform's ECR registry,
+# so these default to it — override only if a future environment differs.
+ECR_ACCOUNT_ID="880254196251"
+ECR_REGION="us-east-1"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -45,12 +63,57 @@ while [ $# -gt 0 ]; do
         --grpc)          GRPC_ADDR="$2"; shift 2 ;;
         --binary)        BINARY="$2"; shift 2 ;;
         --node-name)     NODE_NAME="$2"; shift 2 ;;
+        --ecr-account-id) ECR_ACCOUNT_ID="$2"; shift 2 ;;
+        --ecr-region)     ECR_REGION="$2"; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
 
 info() { echo "[install] $*"; }
 fail() { echo "[install] ERROR: $*" >&2; exit 1; }
+
+# ensure_ecr_pull_secret (re)installs the ECR pull-secret refresh timer and,
+# if a credential is already on file, forces one immediate refresh. Called
+# on EVERY run of this script — fresh install and update mode alike — so
+# the timer can never again silently regress into a one-off nobody
+# remembers to make recurring. Found live 2026-09-07: srialla's pull secret
+# was a single manual `--once` run from 2026-08-23 with no timer ever
+# installed; it silently went stale after 12 hours and stayed that way for
+# two weeks before a real Kumbha deploy failed to pull its image with a 403.
+#
+# Best-effort throughout: a problem here must never fail the agent
+# install/update itself — the agent's OWN image pull (for the agent binary
+# this script just installed) does not depend on this secret at all, only a
+# LATER Kumbha deploy to this node does, so failing loudly-but-not-fatally
+# here is strictly better than either silently skipping it or blocking
+# everything else over a credential that can be fixed after the fact.
+ensure_ecr_pull_secret() {
+    local ecr_script
+    ecr_script="$(dirname "$0")/refresh-ecr-pull-secret.sh"
+    if [ ! -f "$ecr_script" ]; then
+        info "WARNING: refresh-ecr-pull-secret.sh not found next to this script — skipping ECR pull-secret setup. Kumbha deploys to this node may fail to pull images with a 403."
+        return
+    fi
+
+    info "ensuring the ECR pull-secret refresh timer is installed..."
+    if ! bash "$ecr_script" --install \
+        --account-id "$ECR_ACCOUNT_ID" --region "$ECR_REGION" \
+        --secret-name teepin-kumbha-ecr --namespace default; then
+        info "WARNING: ECR pull-secret timer setup failed (see the error above) — Kumbha deploys to this node may fail to pull images."
+        return
+    fi
+
+    local creds_file=/etc/teepin/kumbha-ecr-puller.env
+    if [ -s "$creds_file" ] && grep -q "^AWS_ACCESS_KEY_ID=.\+" "$creds_file" 2>/dev/null; then
+        info "credential file already populated — forcing an immediate refresh to confirm it works..."
+        systemctl start teepin-kumbha-ecr-refresh.service \
+            || info "WARNING: the ECR pull-secret refresh failed to run — check: journalctl -u teepin-kumbha-ecr-refresh.service -n 50"
+    else
+        info "IMPORTANT: $creds_file has no AWS credentials yet — Kumbha image pulls to this node WILL fail (403) until you populate it:"
+        info "  aws iam create-access-key --user-name teepin-kumbha-ecr-puller-<env>"
+        info "  sudo nano $creds_file   # then: sudo systemctl start teepin-kumbha-ecr-refresh.service"
+    fi
+}
 
 # --- preconditions -------------------------------------------------------
 [ "$(uname -s)" = "Linux" ] || fail "this installer runs on Linux only. On Windows use bootstrap-windows.ps1 (WSL2); on macOS use bootstrap-macos.sh (Lima VM)."
@@ -98,6 +161,8 @@ if [ -f "$CONFIG_FILE_DEFAULT" ] && [ -f "$UNIT_FILE" ]; then
 
     info "starting the agent..."
     systemctl start teepin-agent.service
+
+    ensure_ecr_pull_secret
 
     info "done. Check status with:  systemctl status teepin-agent"
     info "confirm the new binary took effect via the control centre (Nodes) within ~30s."
@@ -198,6 +263,8 @@ EOF
 info "starting the agent service..."
 systemctl daemon-reload
 systemctl enable --now teepin-agent.service
+
+ensure_ecr_pull_secret
 
 info "done. The node should appear in the control centre (Nodes) as online within a minute."
 info "check status with:  systemctl status teepin-agent"
