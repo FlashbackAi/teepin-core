@@ -11,6 +11,7 @@ package compute
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -263,12 +264,35 @@ func (s *Store) UpdateImage(ctx context.Context, id, image, podName string, cont
 // doc comments); resolving by the renameable node_name here would
 // reintroduce the exact class of bug that keyed those tables on
 // provider_id in the first place.
+// ErrNodeNotFoundForPlacement is returned when providerID names no row in
+// compute.nodes. Distinguished from a plain SQL error because the
+// original bug this guards against is NOT an error at all from
+// Postgres's perspective: `node_id = (SELECT id FROM compute.nodes WHERE
+// provider_id = $1)` silently sets node_id to NULL, and the UPDATE still
+// reports success (rows affected = 1), when the subselect matches
+// nothing — e.g. a case mismatch or trailing whitespace between the
+// caller's providerID and the stored value. Found live 2026-09-08: a
+// redeploy's own logs reported the recovered provider AND a successful
+// persist, yet ListNodeCapacity's used-count for that node stayed at
+// zero — this two-step lookup exists so a mismatch like that is a loud,
+// specific error instead of a silently-partial write.
+var ErrNodeNotFoundForPlacement = errors.New("no node found for the given provider_id")
+
 func (s *Store) UpdateNodePlacement(ctx context.Context, id, providerID string) error {
+	var nodeID string
+	err := s.db.QueryRowContext(ctx, `SELECT id FROM compute.nodes WHERE provider_id = $1`, providerID).Scan(&nodeID)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("%w: provider_id=%q", ErrNodeNotFoundForPlacement, providerID)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to resolve node for provider_id=%q: %w", providerID, err)
+	}
+
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE compute.instances
-		SET provider_id = $1, node_id = (SELECT id FROM compute.nodes WHERE provider_id = $1)
-		WHERE id = $2
-	`, providerID, id)
+		SET provider_id = $1, node_id = $2
+		WHERE id = $3
+	`, providerID, nodeID, id)
 	if err != nil {
 		return fmt.Errorf("failed to update node placement for %s: %w", id, err)
 	}

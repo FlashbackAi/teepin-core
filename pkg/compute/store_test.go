@@ -6,6 +6,7 @@ package compute
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"testing"
 	"time"
 
@@ -233,6 +234,57 @@ func TestUpdateImage_RevivesTerminatedInstance(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Error(err)
+	}
+}
+
+// TestUpdateNodePlacement_ResolvesNodeID proves the happy path: the
+// provider_id resolves to a real node, and BOTH provider_id and node_id
+// end up on the instance row — node_id is looked up first (a plain
+// SELECT), not embedded as a subselect in the UPDATE, which is exactly
+// what TestUpdateNodePlacement_UnknownProviderIsAnError below needs to be
+// able to fail loudly instead of silently.
+func TestUpdateNodePlacement_ResolvesNodeID(t *testing.T) {
+	store, mock := newMockStore(t)
+
+	mock.ExpectQuery(`SELECT id FROM compute\.nodes WHERE provider_id = \$1`).
+		WithArgs("srialla").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("node-uuid-1"))
+	mock.ExpectExec(`UPDATE compute\.instances`).
+		WithArgs("srialla", "node-uuid-1", "inst-abc12345").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := store.UpdateNodePlacement(context.Background(), "inst-abc12345", "srialla"); err != nil {
+		t.Fatalf("UpdateNodePlacement failed: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+// TestUpdateNodePlacement_UnknownProviderIsAnError is the regression test
+// for the live 2026-09-08 incident: the OLD query wrote `node_id =
+// (SELECT id FROM compute.nodes WHERE provider_id = $1)` directly inside
+// the UPDATE — when that subselect matched nothing, Postgres silently set
+// node_id to NULL and the UPDATE still reported one row affected, so
+// callers (redeployKumbhaInstance) logged a successful persist while
+// nodes.ListNodeCapacity's used-count for that node never moved. Resolving
+// the node id in its own SELECT first means an unmatched provider_id is a
+// distinct, loud error — and critically, NO UPDATE to compute.instances is
+// even attempted, so a bad provider_id can never partially or silently
+// corrupt the row's placement.
+func TestUpdateNodePlacement_UnknownProviderIsAnError(t *testing.T) {
+	store, mock := newMockStore(t)
+
+	mock.ExpectQuery(`SELECT id FROM compute\.nodes WHERE provider_id = \$1`).
+		WithArgs("provider-ghost").
+		WillReturnError(sql.ErrNoRows)
+
+	err := store.UpdateNodePlacement(context.Background(), "inst-abc12345", "provider-ghost")
+	if !errors.Is(err, ErrNodeNotFoundForPlacement) {
+		t.Fatalf("error = %v, want ErrNodeNotFoundForPlacement", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations (an UPDATE must never be attempted when the node lookup fails): %v", err)
 	}
 }
 

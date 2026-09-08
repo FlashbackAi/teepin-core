@@ -1160,6 +1160,7 @@ func (s *Server) redeployKumbhaInstance(ctx context.Context, c *gin.Context, ses
 	// rediscover it again. Left empty on the ordinary path (existing
 	// already had one, or nothing could be recovered).
 	var recoveredProviderID string
+	log.Printf("DEBUG: redeploy %s: existing.ProviderID=%q", existing.ID, existing.ProviderID)
 	if existing.ProviderID != "" {
 		spec.NodeClass = "home"
 		spec.ProviderID = existing.ProviderID
@@ -1202,7 +1203,14 @@ func (s *Server) redeployKumbhaInstance(ctx context.Context, c *gin.Context, ses
 		// Found live 2026-09-05 for inst-55b4d443/inst-5ed29952, both
 		// landed on "srialla" from their very first (buggy) create and
 		// simply never had that recorded.
-		if status, err := s.cluster.GetInstanceStatus(ctx, scopeFor(projectID), existing.ID); err == nil && status.ProviderID != "" {
+		status, statusErr := s.cluster.GetInstanceStatus(ctx, scopeFor(projectID), existing.ID)
+		if statusErr != nil {
+			log.Printf("DEBUG: redeploy %s: GetInstanceStatus failed: %v", existing.ID, statusErr)
+		} else {
+			log.Printf("DEBUG: redeploy %s: GetInstanceStatus ok, status.ProviderID=%q status.NodeName=%q status.Status=%q",
+				existing.ID, status.ProviderID, status.NodeName, status.Status)
+		}
+		if statusErr == nil && status.ProviderID != "" {
 			spec.NodeClass = "home"
 			spec.ProviderID = status.ProviderID
 			recoveredProviderID = status.ProviderID
@@ -1281,6 +1289,8 @@ func (s *Server) redeployKumbhaInstance(ctx context.Context, c *gin.Context, ses
 	if recoveredProviderID != "" {
 		if err := s.store.UpdateNodePlacement(ctx, existing.ID, recoveredProviderID); err != nil {
 			log.Printf("WARN: redeployed instance %s onto recovered provider %s but failed to persist it: %v", existing.ID, recoveredProviderID, err)
+		} else {
+			log.Printf("DEBUG: redeploy %s: UpdateNodePlacement persisted provider_id=%q", existing.ID, recoveredProviderID)
 		}
 	}
 

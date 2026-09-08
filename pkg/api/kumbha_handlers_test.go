@@ -941,10 +941,17 @@ func TestRedeployKumbhaInstance_RecoversMissingProviderFromLiveStatus(t *testing
 	mock.ExpectExec(`UPDATE compute\.instances`).
 		WithArgs("new-image:v6", existingID+"-pod", 80, compute.StatusPending, existingID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	// The recovery persistence — a SEPARATE UPDATE from the one above,
-	// matched in order (sqlmock's default) with its own distinct args.
+	// The recovery persistence — UpdateNodePlacement's two-step lookup:
+	// resolve the node id from provider_id FIRST (a plain SELECT, not a
+	// subselect embedded in the UPDATE), so a provider_id that matches no
+	// node is a loud, specific error rather than a silently-NULL node_id
+	// (see ErrNodeNotFoundForPlacement's own doc comment for the live bug
+	// this closes).
+	mock.ExpectQuery(`SELECT id FROM compute\.nodes WHERE provider_id = \$1`).
+		WithArgs("provider-srialla").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("node-srialla-uuid"))
 	mock.ExpectExec(`UPDATE compute\.instances`).
-		WithArgs("provider-srialla", existingID).
+		WithArgs("provider-srialla", "node-srialla-uuid", existingID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`UPDATE billing\.kumbha_workspace_versions`).
 		WithArgs(sessionID).
@@ -969,6 +976,74 @@ func TestRedeployKumbhaInstance_RecoversMissingProviderFromLiveStatus(t *testing
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations (recovery not persisted?): %v", err)
+	}
+}
+
+// TestRedeployKumbhaInstance_RecoveredProviderMatchesNoNodeStillSucceeds is
+// the regression test for the live 2026-09-08 incident: a redeploy's own
+// logs reported a recovered ProviderID and a "successful" persist, yet
+// nodes.ListNodeCapacity's used-count for that node stayed at zero
+// afterward. Root cause: UpdateNodePlacement used to write `node_id =
+// (SELECT id FROM compute.nodes WHERE provider_id = $1)` embedded directly
+// in the UPDATE — when that subselect matches nothing (e.g. the recovered
+// ProviderID has drifted from compute.nodes.provider_id somehow), Postgres
+// silently sets node_id to NULL and still reports success. This proves the
+// redeploy itself is UNAFFECTED by that failure (best-effort, matching
+// UpdateImage's own posture just above it) — the instance keeps running,
+// the HTTP response is still 200 — while the underlying store method now
+// returns a distinct, loggable error instead of silently no-op'ing.
+func TestRedeployKumbhaInstance_RecoveredProviderMatchesNoNodeStillSucceeds(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+
+	projectID, sessionID := uuid.New(), uuid.New()
+	existingID := "inst-existing5"
+	fc := newFakeCluster()
+	fc.add(existingID, projectID.String(), compute.StatusRunning)
+	fc.setProviderID(existingID, "provider-ghost") // matches no compute.nodes row
+	server := (&Server{store: cStore, cluster: fc}).WithKumbha(gw)
+
+	mock.ExpectQuery(`SELECT .+ FROM compute\.instances`).
+		WithArgs(existingID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "account_id", "project_id", "user_id", "name", "image",
+			"instance_type_id", "status", "gpu_vram_gb", "cpu_units", "memory_gb", "endpoint",
+			"k8s_pod_name", "k8s_namespace", "provider_id", "node_name", "dns_name", "public_ip",
+			"tls_enabled", "tls_ready", "container_port", "storage_gb",
+			"created_at", "updated_at", "started_at", "terminated_at", "kumbha_session_id",
+		}).AddRow(existingID, testAccountID, projectID, uuid.Nil, "kumbha-abc123", "old-image:v1",
+			"", compute.StatusRunning, 0, 1, 1, "https://inst-existing5.teepin.com",
+			existingID+"-pod", "default", "", "", existingID+".teepin.com", "",
+			true, true, 80, 0,
+			nowStub(), nowStub(), nil, nil, uuid.Nil))
+	mock.ExpectExec(`UPDATE compute\.instances`).
+		WithArgs("new-image:v6", existingID+"-pod", 80, compute.StatusPending, existingID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// The node lookup finds nothing — no UPDATE compute.instances for the
+	// placement follows at all, matching the fixed store method's shape.
+	mock.ExpectQuery(`SELECT id FROM compute\.nodes WHERE provider_id = \$1`).
+		WithArgs("provider-ghost").
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectExec(`UPDATE billing\.kumbha_workspace_versions`).
+		WithArgs(sessionID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE billing\.inference_sessions\s+SET last_deployed_version = current_workspace_version`).
+		WithArgs(sessionID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	sess := &kumbha.Session{ID: sessionID, AccountID: testAccountID, ProjectID: projectID, AppInstanceID: existingID}
+	c, w := newRedeployTestContext(projectID)
+	server.redeployKumbhaInstance(context.Background(), c, sessionID, sess, projectID, testAccountID, "new-image:v6",
+		[]models.PortMapping{{Container: 80, Protocol: "tcp"}}, nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (a placement-persistence failure must not fail the redeploy itself): %s", w.Code, w.Body.String())
+	}
+	if fc.lastSpec.ProviderID != "provider-ghost" {
+		t.Errorf("spec.ProviderID = %q, want the recovered value still threaded onto the spec regardless of the persist outcome", fc.lastSpec.ProviderID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
 	}
 }
 
