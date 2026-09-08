@@ -225,6 +225,22 @@ message RegisterRequest {
   string agent_version   = 2;  // for compatibility checks and rollout tracking
   string cluster_version = 3;  // Kubernetes version, for diagnostics
   string region          = 4;  // "us-east", used in TRNs and placement
+
+  // cpu_cores/memory_gb/os/arch: this machine's detected specs, sent on
+  // every fresh connection — i.e. every agent restart, including after
+  // an update — not just once at initial enrollment. The control plane
+  // applies these via the SAME write-through path (compute.nodes.
+  // UpsertSeen) an ordinary heartbeat already uses, which is deliberately
+  // identity-safe: it refreshes ONLY these capacity/platform fields and
+  // never node_name, provider_id or class — those remain settable only
+  // by a real re-enrollment (see UpsertSeen's own doc comment). Zero/
+  // empty here is a valid "could not detect" and simply leaves whatever
+  // the control plane already has on file untouched, the same as an
+  // enrollment request that omits them.
+  int32  cpu_cores = 5;
+  int32  memory_gb = 6;
+  string os        = 7;
+  string arch      = 8;
 }
 
 // GPUInventory is the agent's view of capacity. Sent on registration,

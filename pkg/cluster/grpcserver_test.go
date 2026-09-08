@@ -90,6 +90,45 @@ func (f *fakeNodeReporter) ReportSeen(seen NodeSeen) {
 	f.seen = append(f.seen, seen)
 }
 
+// TestReportRegisterSeen_ThreadsDetectedSpecs is the regression test for
+// the fix that lets a home node's cpu_cores/memory_gb/os/arch refresh on
+// every reconnect (e.g. after an agent update resizes the host VM),
+// instead of staying frozen at whatever was detected the day it first
+// enrolled.
+func TestReportRegisterSeen_ThreadsDetectedSpecs(t *testing.T) {
+	reporter := &fakeNodeReporter{}
+	s := NewAgentServer(nil, nil, "shared-secret").WithNodeReporter(reporter)
+
+	s.reportRegisterSeen("home-sreek", "home", &agentpb.RegisterRequest{
+		ProviderId:   "home-sreek",
+		AgentVersion: "v2",
+		Region:       "home",
+		CpuCores:     12,
+		MemoryGb:     28,
+		Os:           "linux",
+		Arch:         "arm64",
+	})
+
+	if len(reporter.seen) != 1 {
+		t.Fatalf("got %d ReportSeen calls, want 1", len(reporter.seen))
+	}
+	got := reporter.seen[0]
+	if got.NodeName != "home-sreek" || got.ProviderID != "home-sreek" || got.Class != "home" {
+		t.Errorf("identity fields = %+v, want NodeName/ProviderID=home-sreek, Class=home", got)
+	}
+	if got.CPUCores != 12 || got.MemoryGB != 28 || got.OS != "linux" || got.Arch != "arm64" {
+		t.Errorf("detected specs = %+v, want the exact values from RegisterRequest", got)
+	}
+}
+
+// TestReportRegisterSeen_NilReporterIsNoop proves the register path stays
+// exactly as safe as every other optional dependency in this file — a
+// deployment with no node reporter configured must not panic on connect.
+func TestReportRegisterSeen_NilReporterIsNoop(t *testing.T) {
+	s := NewAgentServer(nil, nil, "shared-secret") // no WithNodeReporter
+	s.reportRegisterSeen("home-sreek", "home", &agentpb.RegisterRequest{ProviderId: "home-sreek"})
+}
+
 // A home session reports zero GPUNodes (CPU-only) — handleMessage's Inventory
 // case must still thread the report's cluster_ready through to the single
 // "recorded under its own identity" ReportSeen call.

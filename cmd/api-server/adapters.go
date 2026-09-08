@@ -161,6 +161,8 @@ func (a *nodeReporterAdapter) ReportSeen(seen cluster.NodeSeen) {
 			Region:           seen.Region,
 			CPUCores:         seen.CPUCores,
 			MemoryGB:         seen.MemoryGB,
+			OS:               seen.OS,
+			Arch:             seen.Arch,
 			GPUModel:         seen.GPUModel,
 			GPUCount:         seen.GPUCount,
 			MIGCapable:       seen.MIGCapable,

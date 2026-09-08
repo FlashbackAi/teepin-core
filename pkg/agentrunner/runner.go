@@ -84,6 +84,20 @@ type Config struct {
 
 	// Inventory reports GPU capacity. May be nil on CPU-only providers.
 	Inventory *gpu.Inventory
+
+	// CPUCores/MemoryGB/OS/Arch are this machine's detected specs, sent
+	// once on every fresh connection (register, below) — i.e. on every
+	// agent restart, including after an update — so the control plane's
+	// recorded capacity stays current without a full re-enrollment. Zero/
+	// empty is a valid "not detected" and leaves whatever the control
+	// plane already has on file untouched (see RegisterRequest's own
+	// proto comment and compute.nodes.UpsertSeen's doc comment for why
+	// this is identity-safe: it can only ever refresh these fields, never
+	// node_name/provider_id/class).
+	CPUCores int
+	MemoryGB int
+	OS       string
+	Arch     string
 }
 
 // Runner owns one control-plane connection.
@@ -200,6 +214,10 @@ func (r *Runner) Run(ctx context.Context, s stream) error {
 				ProviderId:   r.cfg.ProviderID,
 				AgentVersion: r.cfg.Version,
 				Region:       r.cfg.Region,
+				CpuCores:     int32(r.cfg.CPUCores),
+				MemoryGb:     int32(r.cfg.MemoryGB),
+				Os:           r.cfg.OS,
+				Arch:         r.cfg.Arch,
 			},
 		},
 	}); err != nil {

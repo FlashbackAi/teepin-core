@@ -128,6 +128,11 @@ type DirectClient struct {
 	networking EndpointProvisioner
 	inventory  *gpu.Inventory
 
+	// podUnknownSince/podUnknownMu back podUnknownStatus — see its own
+	// doc comment.
+	podUnknownMu    sync.Mutex
+	podUnknownSince map[string]time.Time
+
 	// RuntimeClass for GPU pods. Empty disables it, for clusters where
 	// nvidia is already containerd's default runtime.
 	gpuRuntimeClass string
@@ -786,7 +791,7 @@ func (c *DirectClient) ListInstanceStatuses(ctx context.Context, scope Scope) ([
 // endpoint) or a lookup failure just reports the bare pod status, same as
 // before this method existed.
 func (c *DirectClient) statusWithEndpoint(ctx context.Context, pod *corev1.Pod) InstanceStatus {
-	status := podStatus(pod)
+	status := c.podStatus(pod)
 	if c.networking == nil {
 		return status
 	}
@@ -1352,7 +1357,68 @@ func buildNetworkPolicy(spec InstanceSpec, podCIDR string) *networkingv1.Network
 // TEEPIN statuses describe what a customer is billed for. A pod stuck on
 // ImagePullBackOff is Pending to Kubernetes but failed to us — nobody
 // should be charged for a container that will never start.
-func podStatus(pod *corev1.Pod) InstanceStatus {
+// podUnknownFailAfter bounds how long a pod may report corev1.PodUnknown
+// (its node has stopped reporting entirely — offline, network-partitioned,
+// or gone for good) before podStatus gives up waiting for it and reports
+// it terminated. Deliberately well past compute.nodes' own ~2-minute
+// stale-offline threshold (MarkStaleOffline in cmd/api-server/main.go),
+// so a brief network blip that resolves on its own is never mistaken for
+// a real termination — this only fires once the node's own absence has
+// already stood for a while.
+//
+// Found live 2026-09-05: several days-old stale kumbha-agent-* pods sat
+// stuck reporting PodUnknown after their node vanished, with the default
+// case below folding that into the SAME "pending" bucket a genuinely-
+// still-starting pod uses — which both nodes.ListNodeCapacity and the
+// hidden-workload accounting built the same night correctly treat as
+// still occupying capacity. A stuck-forever PodUnknown pod therefore
+// held its CPU/memory hostage in every capacity view indefinitely, with
+// no path back to "terminated" (the only status that frees a node's
+// capacity/stops billing — see reconciler.go's status-mirroring).
+const podUnknownFailAfter = 10 * time.Minute
+
+// podUnknownStatus decides what to report for a pod currently phase
+// Unknown, based on how long THIS client has continuously observed it in
+// that phase. Kubernetes keeps no simple, trustworthy "since when has
+// this been Unknown" field on the Pod object itself worth reading here,
+// so c.podUnknownSince tracks it in-process instead, keyed by pod name.
+//
+// The clock resets the moment a pod is observed in any OTHER phase
+// (podStatus's caller clears the entry below) — a pod that recovers even
+// briefly is proof its node is not gone for good, so only a CONTINUOUS
+// Unknown stretch counts toward the timeout. Entries for pods that
+// simply stop being listed at all (deleted/recreated) are never swept,
+// but this is an in-memory, per-process map that resets on every
+// control-plane restart, and pod-name churn is nowhere near large enough
+// for that to matter in practice.
+func (c *DirectClient) podUnknownStatus(podName string) (status, message string) {
+	c.podUnknownMu.Lock()
+	defer c.podUnknownMu.Unlock()
+	if c.podUnknownSince == nil {
+		c.podUnknownSince = map[string]time.Time{}
+	}
+	since, seen := c.podUnknownSince[podName]
+	if !seen {
+		c.podUnknownSince[podName] = time.Now()
+		return "pending", ""
+	}
+	if time.Since(since) >= podUnknownFailAfter {
+		return "terminated", "the node running this instance became unreachable and did not recover"
+	}
+	return "pending", ""
+}
+
+// podUnknownRecovered forgets any tracked Unknown-streak for podName —
+// called whenever podStatus observes a phase other than Unknown, so a
+// pod that recovers (or was never Unknown to begin with) never carries
+// stale staleness state into a LATER, unrelated Unknown streak.
+func (c *DirectClient) podUnknownRecovered(podName string) {
+	c.podUnknownMu.Lock()
+	defer c.podUnknownMu.Unlock()
+	delete(c.podUnknownSince, podName)
+}
+
+func (c *DirectClient) podStatus(pod *corev1.Pod) InstanceStatus {
 	st := InstanceStatus{
 		InstanceID: pod.Labels[labelInstanceID],
 		PodName:    pod.Name,
@@ -1367,13 +1433,26 @@ func podStatus(pod *corev1.Pod) InstanceStatus {
 	switch pod.Status.Phase {
 	case corev1.PodRunning:
 		st.Status = "running"
+		c.podUnknownRecovered(pod.Name)
 	case corev1.PodSucceeded:
 		st.Status = "terminated"
+		c.podUnknownRecovered(pod.Name)
 	case corev1.PodFailed:
 		st.Status = "failed"
 		st.Message = pod.Status.Reason
+		c.podUnknownRecovered(pod.Name)
+	case corev1.PodUnknown:
+		// Container statuses are whatever they last were BEFORE the node
+		// went unreachable — stale and potentially misleading (a
+		// transient CrashLoopBackOff right before the node vanished says
+		// nothing about now) — so, unlike every other case, this returns
+		// immediately rather than falling through to the container-status
+		// loop below.
+		st.Status, st.Message = c.podUnknownStatus(pod.Name)
+		return st
 	default:
 		st.Status = "pending"
+		c.podUnknownRecovered(pod.Name)
 	}
 
 	// Surface the waiting reason, and treat unrecoverable image problems

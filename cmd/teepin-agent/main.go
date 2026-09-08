@@ -154,12 +154,24 @@ func runEnrolledAgent(cfg *nodeConfig) {
 		log.Fatal("TEEPIN_CONTROL_PLANE is required (the gRPC control-plane address)")
 	}
 
+	// Detected fresh on every run — not just once at enrollment — so a
+	// resized VM (e.g. after the sizing fix's updated bootstrap script)
+	// or a changed OS/arch is picked up the next time this agent
+	// reconnects, with no separate re-enrollment required. See Config's
+	// own doc comment for why this is safe: it can only ever refresh
+	// capacity/platform fields server-side, never this node's identity.
+	cpuCores, memoryGB, osName, arch := hostSpecs()
+
 	runner := agentrunner.New(agentrunner.Config{
 		ProviderID: cfg.NodeName,
 		Region:     getEnv("TEEPIN_REGION", "home"),
 		Version:    Version,
 		Cluster:    homeClusterClient(),
 		Inventory:  nil, // CPU-only: no GPU inventory
+		CPUCores:   cpuCores,
+		MemoryGB:   memoryGB,
+		OS:         osName,
+		Arch:       arch,
 	})
 
 	ctx, cancel := shutdownContext()

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	corev1 "k8s.io/api/core/v1"
@@ -386,7 +387,7 @@ func TestPodStatus_ImagePullIsFailedNotPending(t *testing.T) {
 
 	// Kubernetes calls this Pending forever. Billing a customer for a
 	// container that will never start is wrong, so TEEPIN calls it failed.
-	st := podStatus(pod)
+	st := newTestClient().podStatus(pod)
 	if st.Status != "failed" {
 		t.Errorf("ImagePullBackOff mapped to %q, want \"failed\"", st.Status)
 	}
@@ -424,7 +425,7 @@ func TestPodStatus_TerminatedContainerCarriesExitReason(t *testing.T) {
 		},
 	}
 
-	st := podStatus(pod)
+	st := newTestClient().podStatus(pod)
 	if st.Status != "failed" {
 		t.Errorf("got status %q, want \"failed\"", st.Status)
 	}
@@ -445,12 +446,123 @@ func TestPodStatus_RunningIsRunning(t *testing.T) {
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}
 
-	st := podStatus(pod)
+	st := newTestClient().podStatus(pod)
 	if st.Status != "running" {
 		t.Errorf("Status = %q, want \"running\"", st.Status)
 	}
 	if st.NodeName != "gpu-node-1" {
 		t.Errorf("NodeName = %q, want \"gpu-node-1\"", st.NodeName)
+	}
+}
+
+// TestPodStatus_FreshPodUnknownIsPending is the correctness half of the
+// PodUnknown fix: the FIRST time a pod is observed Unknown (its node just
+// stopped reporting), it must still read as "pending" — the pod is very
+// likely still actually running, just unreported — not immediately
+// treated as gone.
+func TestPodStatus_FreshPodUnknownIsPending(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "inst-flaky-pod",
+			Labels: map[string]string{labelInstanceID: "inst-flaky"},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodUnknown},
+	}
+
+	st := newTestClient().podStatus(pod)
+	if st.Status != "pending" {
+		t.Errorf("Status = %q, want \"pending\" (a fresh PodUnknown must not be treated as gone immediately)", st.Status)
+	}
+}
+
+// TestPodStatus_LongPodUnknownIsTerminated is the regression test for the
+// live 2026-09-05 incident: a stale kumbha-agent-* pod stuck reporting
+// PodUnknown for days after its node vanished, permanently holding its
+// CPU/memory hostage because "pending" (what the old default case mapped
+// PodUnknown to) never frees capacity — only "terminated" does (see
+// reconciler.go). Seeds podUnknownSince directly rather than sleeping
+// podUnknownFailAfter in a live test.
+func TestPodStatus_LongPodUnknownIsTerminated(t *testing.T) {
+	c := newTestClient()
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "inst-gone-pod",
+			Labels: map[string]string{labelInstanceID: "inst-gone"},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodUnknown},
+	}
+	c.podUnknownSince = map[string]time.Time{
+		"inst-gone-pod": time.Now().Add(-(podUnknownFailAfter + time.Minute)),
+	}
+
+	st := c.podStatus(pod)
+	if st.Status != "terminated" {
+		t.Errorf("Status = %q, want \"terminated\" (capacity/billing must free up once the node's absence has stood this long)", st.Status)
+	}
+	if st.Message == "" {
+		t.Error("terminated-via-timeout status should carry a message explaining why")
+	}
+}
+
+// TestPodStatus_LongPodUnknownIgnoresStaleContainerStatus proves the
+// container-status loop (ImagePullBackOff/CrashLoopBackOff -> "failed")
+// never overrides the PodUnknown decision — those statuses are frozen
+// from before the node vanished and say nothing about the pod's current
+// state, so PodUnknown returns before that loop ever runs.
+func TestPodStatus_LongPodUnknownIgnoresStaleContainerStatus(t *testing.T) {
+	c := newTestClient()
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "inst-gone-pod2",
+			Labels: map[string]string{labelInstanceID: "inst-gone2"},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodUnknown,
+			ContainerStatuses: []corev1.ContainerStatus{{
+				State: corev1.ContainerState{
+					Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"},
+				},
+			}},
+		},
+	}
+	c.podUnknownSince = map[string]time.Time{
+		"inst-gone-pod2": time.Now().Add(-(podUnknownFailAfter + time.Minute)),
+	}
+
+	st := c.podStatus(pod)
+	if st.Status != "terminated" {
+		t.Errorf("Status = %q, want \"terminated\" (stale container status must not override the PodUnknown timeout decision)", st.Status)
+	}
+}
+
+// TestPodStatus_PodUnknownClockResetsOnRecovery proves a pod that
+// recovers even briefly (any phase other than Unknown) clears its
+// tracked Unknown streak — a LATER, unrelated Unknown period must not
+// inherit time already accumulated from a prior one.
+func TestPodStatus_PodUnknownClockResetsOnRecovery(t *testing.T) {
+	c := newTestClient()
+	podName := "inst-flappy-pod"
+
+	// Long-standing Unknown streak recorded...
+	c.podUnknownSince = map[string]time.Time{
+		podName: time.Now().Add(-(podUnknownFailAfter + time.Minute)),
+	}
+
+	// ...but the pod is observed Running again before this client ever
+	// reports the timeout.
+	c.podStatus(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: podName},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	})
+
+	// A brand new Unknown period must start the clock over, not resume
+	// from the old (already-expired) streak.
+	st := c.podStatus(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: podName},
+		Status:     corev1.PodStatus{Phase: corev1.PodUnknown},
+	})
+	if st.Status != "pending" {
+		t.Errorf("Status = %q, want \"pending\" (recovery must reset the Unknown clock, not let a stale streak immediately re-expire)", st.Status)
 	}
 }
 

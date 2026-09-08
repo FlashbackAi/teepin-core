@@ -49,6 +49,13 @@ type NodeSeen struct {
 	Region       string
 	CPUCores     int
 	MemoryGB     int
+	// OS/Arch are only ever populated by the register-time call this
+	// struct now also backs (see AgentServer.Connect) — the periodic
+	// Inventory-driven report has nothing new to say about either, so it
+	// always leaves these empty, which UpsertSeen's COALESCE correctly
+	// reads as "no change".
+	OS           string
+	Arch         string
 	GPUModel     string
 	GPUCount     int
 	MIGCapable   bool
@@ -61,10 +68,11 @@ type NodeSeen struct {
 	K8sReady bool
 	// CPUUsedPercent/MemoryUsedGB are the reporting HOST's own current
 	// utilization (not any one workload's) — see GPUInventory's own proto
-	// comment. Unlike CPUCores/MemoryGB (static capacity, set once at
-	// enroll and never refreshed — see UpsertSeen's own doc comment on
-	// why that gap exists for those two), these ARE refreshed on every
-	// report, since that is the whole point of a utilization reading.
+	// comment. Unlike CPUCores/MemoryGB (now ALSO refreshed at register
+	// time — see AgentServer.Connect and RegisterRequest's own proto
+	// comment; previously static, set once at enroll and never refreshed
+	// afterward), these ARE refreshed on every Inventory report, since
+	// that is the whole point of a utilization reading.
 	// Added 2026-09-04 as the foundation for node telemetry (stats/
 	// graphs/status page/marketing globe — ROADMAP.md's 2026-09-03 entry).
 	CPUUsedPercent float64
@@ -237,6 +245,8 @@ func (s *AgentServer) Connect(stream agentpb.ClusterAgent_ConnectServer) error {
 	s.registry.Add(session)
 	defer s.registry.Remove(session)
 
+	s.reportRegisterSeen(providerID, class, register)
+
 	log.Printf("Agent connected: provider=%s class=%s region=%s version=%s cluster=%s",
 		providerID, class, register.Region, register.AgentVersion, register.ClusterVersion)
 	defer log.Printf("Agent disconnected: provider=%s", providerID)
@@ -346,6 +356,32 @@ func (s *AgentServer) handleMessage(session *AgentSession, msg *agentpb.AgentMes
 	default:
 		log.Printf("Agent sent unknown message type from provider=%s", session.ProviderID)
 	}
+}
+
+// reportRegisterSeen refreshes a node's detected specs on every fresh
+// connection — i.e. every agent restart, including after an update — not
+// just once at enrollment. Write-through, async, best-effort, same
+// posture as reportInventorySeen: a slow or failing DB must never delay
+// registration. Safe to call unconditionally even when the agent could
+// not detect anything (zero/empty): UpsertSeen's COALESCE reads that as
+// "no change" (see NodeSpecs.nullInt/nullString), and it can only ever
+// touch these capacity/platform fields — node_name, provider_id and
+// class stay exactly as enrollment set them.
+func (s *AgentServer) reportRegisterSeen(providerID, class string, register *agentpb.RegisterRequest) {
+	if s.nodeReporter == nil {
+		return
+	}
+	s.nodeReporter.ReportSeen(NodeSeen{
+		NodeName:     providerID,
+		ProviderID:   providerID,
+		Class:        class,
+		Region:       register.Region,
+		AgentVersion: register.AgentVersion,
+		CPUCores:     int(register.CpuCores),
+		MemoryGB:     int(register.MemoryGb),
+		OS:           register.Os,
+		Arch:         register.Arch,
+	})
 }
 
 // reportInventorySeen persists a "seen" record for each node the session
