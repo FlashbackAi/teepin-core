@@ -1160,23 +1160,38 @@ func (s *Server) redeployKumbhaInstance(ctx context.Context, c *gin.Context, ses
 	// rediscover it again. Left empty on the ordinary path (existing
 	// already had one, or nothing could be recovered).
 	var recoveredProviderID string
-	log.Printf("DEBUG: redeploy %s: existing.ProviderID=%q", existing.ID, existing.ProviderID)
-	if existing.ProviderID != "" {
+	log.Printf("DEBUG: redeploy %s: existing.ProviderID=%q existing.NodeName=%q", existing.ID, existing.ProviderID, existing.NodeName)
+	switch {
+	case existing.ProviderID != "" && existing.NodeName != "":
+		// The common, fully-healthy case: provider_id is set AND resolves
+		// to a real compute.nodes row (existing.NodeName is populated via
+		// a correlated subquery on node_id — see selectColumns' own doc
+		// comment; it reads back "" when node_id is NULL OR does not
+		// resolve, exactly the signal the next case below depends on).
+		// Nothing to recover or repair.
 		spec.NodeClass = "home"
 		spec.ProviderID = existing.ProviderID
-		// spec.NodeName is deliberately NOT threaded through here:
-		// existing.NodeName is a separate, pre-existing gap (unrelated to
-		// this fix) — compute.instances has no plain node_name column at
-		// all (Create resolves it into a node_id FK via a sub-select), and
-		// nothing reads it back out, so existing.NodeName is always "".
-		// Harmless for THIS deployment (single home node — the scheduler
-		// has no other choice regardless) but worth fixing properly before
-		// a multi-node home provider exists, where a redeploy landing on a
-		// different node than the original create could break node-local
-		// storage affinity. createOrReplace's own dispatch only routes on
-		// ProviderID, never NodeName, so this does not affect the fix
-		// above.
-	} else {
+
+	case existing.ProviderID != "":
+		// provider_id is set but node_id never resolved — dispatch would
+		// still work fine (createOrReplace routes on ProviderID alone,
+		// never NodeName), which is exactly why this stayed invisible:
+		// the pod runs fine, only nodes.ListNodeCapacity's used-count
+		// (WHERE node_id IS NOT NULL) silently never saw it. Found live
+		// 2026-09-08 on inst-5ed29952: provider_id had already been
+		// recovered (by an EARLIER, partial attempt — a bare provider_id
+		// UPDATE with no matching node_id fix, or one that ran before
+		// UpdateNodePlacement's own node_id verification existed) but
+		// node_id stayed NULL forever after, because this branch used to
+		// treat "has a provider_id" as "nothing left to do" and never
+		// re-checked node_id specifically. We already KNOW the correct,
+		// trusted provider — no live-status rediscovery needed, just
+		// (re-)resolve node_id for it directly.
+		spec.NodeClass = "home"
+		spec.ProviderID = existing.ProviderID
+		recoveredProviderID = existing.ProviderID
+
+	default:
 		// Recovery path for instances that predate the NodeClass fix above
 		// (createReq.NodeClass = "home" on the ORIGINAL create) — their
 		// provider_id was never persisted at all. Left as spec.ProviderID
