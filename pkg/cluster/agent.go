@@ -375,7 +375,26 @@ func (c *AgentClient) GetInstanceStatus(_ context.Context, scope Scope, instance
 	status, ok := c.statuses[instanceID]
 	c.mu.RUnlock()
 
-	if !ok || !scopeAllows(scope, status) {
+	if !ok {
+		// Absent from the cache is genuinely ambiguous during the startup
+		// grace period — see ListInstanceStatuses' own doc comment for the
+		// exact multi-home-node race this closes: this specific instance's
+		// node may simply not have reconnected/reported since the control
+		// plane restarted yet, which is not the same fact as "this
+		// instance does not exist". Reported as ErrClusterUnavailable (ask
+		// again later) rather than ErrNotFound during the grace period so
+		// a caller — e.g. redeployKumbhaInstance's provider-recovery path,
+		// which reads this exact call's result to decide whether there is
+		// anything to recover — does not silently treat "hasn't reported
+		// back yet" as "nothing to recover" and skip a real fix. Found
+		// live 2026-09-08 alongside the same-root-cause mass-termination
+		// bug this mirrors.
+		if time.Since(c.startedAt) < statusCacheGracePeriod {
+			return nil, ErrClusterUnavailable
+		}
+		return nil, ErrNotFound
+	}
+	if !scopeAllows(scope, status) {
 		return nil, ErrNotFound
 	}
 
@@ -452,7 +471,22 @@ func (c *AgentClient) ListInstanceStatuses(_ context.Context, scope Scope) ([]In
 	// statusCacheGracePeriod so a deployment with genuinely zero
 	// instances, ever, does not return this error forever — only during
 	// the narrow window right after this process started.
-	if len(c.statuses) == 0 && time.Since(c.startedAt) < statusCacheGracePeriod {
+	//
+	// Deliberately NOT conditioned on len(c.statuses) == 0 (as this once
+	// was): with more than one home node connected, each reports on its
+	// OWN independent reconnect/ticker timing, so ONE node's report
+	// landing first makes the cache non-empty while a SLOWER node's
+	// instances are still completely absent from it — silently defeating
+	// this exact guard for exactly the instances it exists to protect.
+	// Found live 2026-09-08: inst-5ed29952 (home node "srialla") was
+	// mass-terminated by this narrower gap after a control-plane restart,
+	// despite this guard already existing, once a SECOND and THIRD home
+	// node were added and could race each other to report first. The
+	// grace period now blocks unconditionally for its full duration,
+	// trading a few extra seconds of staleness after every restart for
+	// never again half-trusting a cache some connected nodes haven't
+	// reported into yet.
+	if time.Since(c.startedAt) < statusCacheGracePeriod {
 		return nil, ErrClusterUnavailable
 	}
 

@@ -340,6 +340,7 @@ func TestAgentClient_ImagePullIsTyped(t *testing.T) {
 func TestAgentClient_ScopeHidesOtherTenants(t *testing.T) {
 	fake := newFakeAgent(&agentpb.CommandResult{Success: true})
 	c := NewAgentClient(registryWith(fake.session))
+	c.startedAt = time.Now().Add(-time.Hour) // past statusCacheGracePeriod
 
 	c.RecordStatus(InstanceStatus{
 		InstanceID: "inst-bob0001",
@@ -732,6 +733,7 @@ func TestAgentClient_DatacenterPathNeverSynthesizes(t *testing.T) {
 func TestAgentClient_CreateInstance_HidesLabeledPodFromListImmediately(t *testing.T) {
 	fake := newFakeAgent(&agentpb.CommandResult{Success: true, PodName: "kaniko-build-pod"})
 	c := NewAgentClient(registryWith(fake.session))
+	c.startedAt = time.Now().Add(-time.Hour) // past statusCacheGracePeriod
 
 	_, err := c.CreateInstance(context.Background(), InstanceSpec{
 		InstanceID: "kaniko-build-x",
@@ -779,6 +781,7 @@ func TestAgentClient_CreateInstance_HidesLabeledPodFromListImmediately(t *testin
 // its Go zero value (false), the exact state the live incident found.
 func TestAgentClient_ListInstanceStatuses_HidesByIDPrefixEvenWithoutTheFlag(t *testing.T) {
 	c := NewAgentClient(registryWith(newFakeAgent(&agentpb.CommandResult{Success: true}).session))
+	c.startedAt = time.Now().Add(-time.Hour) // past statusCacheGracePeriod
 
 	for _, id := range []string{"kumbha-agent-4ab155f0", "kaniko-build-43368ae2", "kumbha-shot-43368ae2"} {
 		c.RecordStatus(InstanceStatus{InstanceID: id, Status: "running", ProjectID: "project-alice"})
@@ -812,6 +815,81 @@ func TestAgentClient_ListInstanceStatuses_EmptyCacheJustAfterStartupIsUnavailabl
 	_, err := c.ListInstanceStatuses(context.Background(), AllTenants())
 	if !errors.Is(err, ErrClusterUnavailable) {
 		t.Fatalf("err = %v, want ErrClusterUnavailable for an empty cache right after startup", err)
+	}
+}
+
+// TestAgentClient_ListInstanceStatuses_PartiallyWarmCacheStillUnavailable
+// is the regression test for the live 2026-09-08 incident: the guard
+// above only checked len(c.statuses) == 0, which a SECOND or THIRD home
+// node's report defeats the moment it lands — even though the specific
+// instance a Reconcile pass cares about (hosted on a slower-to-reconnect
+// node) is still completely absent from the cache. This mass-terminated
+// inst-5ed29952 on "srialla" after a control-plane restart, once more
+// than one home node existed to race each other on reconnect. The fix
+// removed the len(c.statuses) == 0 condition entirely — the grace period
+// now blocks unconditionally for its full duration, regardless of how
+// many OTHER nodes have already reported in.
+func TestAgentClient_ListInstanceStatuses_PartiallyWarmCacheStillUnavailable(t *testing.T) {
+	c := NewAgentClient(registryWith(newFakeAgent(&agentpb.CommandResult{Success: true}).session))
+	// One node (e.g. FBlabs01) already reported — the cache is NOT empty —
+	// but a second, slower node (srialla) has not reconnected/reported
+	// yet. Under the old len(c.statuses) == 0 guard this single report
+	// alone would have been enough to defeat the whole protection.
+	c.RecordStatus(InstanceStatus{InstanceID: "inst-on-fblabs01", Status: "running", ProjectID: "project-alice"})
+
+	_, err := c.ListInstanceStatuses(context.Background(), AllTenants())
+	if !errors.Is(err, ErrClusterUnavailable) {
+		t.Fatalf("err = %v, want ErrClusterUnavailable — a non-empty cache during the grace period must still be treated as untrustworthy, since it may simply be missing a SLOWER node's instances", err)
+	}
+}
+
+// TestAgentClient_GetInstanceStatus_MissingDuringGracePeriodIsUnavailable
+// is GetInstanceStatus's own half of the same fix: an instance absent
+// from the cache during the startup grace period must report
+// ErrClusterUnavailable (ask again later), not ErrNotFound (this
+// instance does not exist) — the two are NOT the same fact, and a caller
+// like redeployKumbhaInstance's provider-recovery path depends on being
+// able to tell them apart rather than silently treating "hasn't reported
+// back yet" as "nothing to recover".
+func TestAgentClient_GetInstanceStatus_MissingDuringGracePeriodIsUnavailable(t *testing.T) {
+	c := NewAgentClient(registryWith(newFakeAgent(&agentpb.CommandResult{Success: true}).session))
+
+	_, err := c.GetInstanceStatus(context.Background(), AllTenants(), "inst-not-yet-reported")
+	if !errors.Is(err, ErrClusterUnavailable) {
+		t.Fatalf("err = %v, want ErrClusterUnavailable during the grace period", err)
+	}
+}
+
+// TestAgentClient_GetInstanceStatus_PresentDuringGracePeriodStillWorks
+// proves the fix above does not degrade the common case: an instance
+// that HAS already reported must still return its real status
+// immediately, even while the process is still within its own startup
+// grace period.
+func TestAgentClient_GetInstanceStatus_PresentDuringGracePeriodStillWorks(t *testing.T) {
+	c := NewAgentClient(registryWith(newFakeAgent(&agentpb.CommandResult{Success: true}).session))
+	c.RecordStatus(InstanceStatus{InstanceID: "inst-already-reported", Status: "running", ProjectID: "project-alice"})
+
+	status, err := c.GetInstanceStatus(context.Background(), AllTenants(), "inst-already-reported")
+	if err != nil {
+		t.Fatalf("GetInstanceStatus: %v, want the already-cached status returned normally", err)
+	}
+	if status.Status != "running" {
+		t.Errorf("Status = %q, want \"running\"", status.Status)
+	}
+}
+
+// TestAgentClient_GetInstanceStatus_MissingAfterGracePeriodIsNotFound is
+// the other half: once the grace period has genuinely elapsed, a missing
+// instance really does mean not-found — the protection must not become
+// permanent, matching ListInstanceStatuses' own EmptyCacheAfterGracePeriod
+// companion test.
+func TestAgentClient_GetInstanceStatus_MissingAfterGracePeriodIsNotFound(t *testing.T) {
+	c := NewAgentClient(registryWith(newFakeAgent(&agentpb.CommandResult{Success: true}).session))
+	c.startedAt = time.Now().Add(-statusCacheGracePeriod - time.Second)
+
+	_, err := c.GetInstanceStatus(context.Background(), AllTenants(), "inst-genuinely-gone")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound once the grace period has elapsed", err)
 	}
 }
 
@@ -851,6 +929,7 @@ func TestAgentClient_ListInstanceStatuses_EmptyCacheAfterGracePeriodIsTrusted(t 
 func TestAgentClient_RecordStatus_PreservesHiddenAcrossUpdate(t *testing.T) {
 	fake := newFakeAgent(&agentpb.CommandResult{Success: true, PodName: "kaniko-build-pod"})
 	c := NewAgentClient(registryWith(fake.session))
+	c.startedAt = time.Now().Add(-time.Hour) // past statusCacheGracePeriod
 
 	if _, err := c.CreateInstance(context.Background(), InstanceSpec{
 		InstanceID: "kaniko-build-y",
@@ -889,6 +968,7 @@ func TestAgentClient_RecordStatus_PreservesHiddenAcrossUpdate(t *testing.T) {
 func TestAgentClient_CreateInstance_OrdinaryInstanceStillListed(t *testing.T) {
 	fake := newFakeAgent(&agentpb.CommandResult{Success: true, PodName: "inst-real0001-pod"})
 	c := NewAgentClient(registryWith(fake.session))
+	c.startedAt = time.Now().Add(-time.Hour) // past statusCacheGracePeriod
 
 	_, err := c.CreateInstance(context.Background(), InstanceSpec{
 		InstanceID: "inst-real0001",
