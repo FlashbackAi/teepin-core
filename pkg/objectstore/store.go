@@ -245,16 +245,28 @@ func (s *Store) PutObjectRecord(ctx context.Context, rec *ObjectRecord) (oldPhys
 	if rec.ID == uuid.Nil {
 		rec.ID = uuid.New()
 	}
-	if _, err := tx.ExecContext(ctx, `
+	// QueryRowContext + RETURNING, not ExecContext: created_at/updated_at
+	// (DEFAULT NOW()) and uploaded_at (the literal NOW() below) are all
+	// database-generated, and ExecContext discards them — the caller
+	// (Service.PutObject, and the API response it feeds) would otherwise
+	// hand back a record with these still at Go's zero value ("0001-01-01
+	// T00:00:00Z"), confirmed live: the immediate PUT response showed
+	// zeroed timestamps while a follow-up list of the same object showed
+	// the real ones, since ListObjects re-reads the row from the DB.
+	var uploadedAt time.Time
+	if err := tx.QueryRowContext(ctx, `
 		INSERT INTO storage.objects
 		(id, bucket_id, account_id, project_id, key, physical_key, size_bytes,
 		 content_type, metadata, checksum_sha256, status, backend, uploaded_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
+		RETURNING created_at, updated_at, uploaded_at
 	`, rec.ID, rec.BucketID, rec.AccountID, rec.ProjectID, rec.Key, rec.PhysicalKey, rec.SizeBytes,
 		nullIfEmpty(rec.ContentType), jsonMetadata(rec.Metadata), nullIfEmpty(rec.ChecksumSHA256),
-		rec.Status, rec.Backend); err != nil {
+		rec.Status, rec.Backend,
+	).Scan(&rec.CreatedAt, &rec.UpdatedAt, &uploadedAt); err != nil {
 		return "", "", fmt.Errorf("objectstore: insert object: %w", err)
 	}
+	rec.UploadedAt = &uploadedAt
 
 	countDelta := 1
 	if isOverwrite {

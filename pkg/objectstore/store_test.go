@@ -113,8 +113,10 @@ func TestPutObjectRecord_Create(t *testing.T) {
 	mock.ExpectQuery(`SELECT id, physical_key, backend, size_bytes FROM storage\.objects`).
 		WithArgs(bucketID, "a.jpg").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "physical_key", "backend", "size_bytes"}))
-	mock.ExpectExec(`INSERT INTO storage\.objects`).
-		WillReturnResult(sqlmock.NewResult(0, 1))
+	insertedAt := time.Now()
+	mock.ExpectQuery(`INSERT INTO storage\.objects`).
+		WillReturnRows(sqlmock.NewRows([]string{"created_at", "updated_at", "uploaded_at"}).
+			AddRow(insertedAt, insertedAt, insertedAt))
 	mock.ExpectExec(`UPDATE storage\.buckets\s+SET object_count = object_count \+ \$1`).
 		WithArgs(1, int64(1024), bucketID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -131,6 +133,17 @@ func TestPutObjectRecord_Create(t *testing.T) {
 	}
 	if oldKey != "" || oldBackend != "" {
 		t.Fatalf("a fresh key must not report a superseded object, got (%q, %q)", oldKey, oldBackend)
+	}
+	// Regression pin: PutObjectRecord used to ExecContext the insert
+	// (discarding its own RETURNING-worthy columns), leaving these at Go's
+	// zero value — confirmed live: the PUT response showed
+	// "0001-01-01T00:00:00Z" while a follow-up list of the same object
+	// showed the real timestamp.
+	if rec.CreatedAt.IsZero() || rec.UpdatedAt.IsZero() {
+		t.Fatalf("CreatedAt/UpdatedAt were not populated from the insert: %+v", rec)
+	}
+	if rec.UploadedAt == nil || rec.UploadedAt.IsZero() {
+		t.Fatalf("UploadedAt was not populated from the insert: %+v", rec)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Error(err)
@@ -154,8 +167,9 @@ func TestPutObjectRecord_Overwrite(t *testing.T) {
 	mock.ExpectExec(`UPDATE storage\.objects SET status = \$1, deleted_at = NOW\(\) WHERE id = \$2`).
 		WithArgs(StatusDeleted, oldID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(`INSERT INTO storage\.objects`).
-		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(`INSERT INTO storage\.objects`).
+		WillReturnRows(sqlmock.NewRows([]string{"created_at", "updated_at", "uploaded_at"}).
+			AddRow(time.Now(), time.Now(), time.Now()))
 	mock.ExpectExec(`UPDATE storage\.buckets\s+SET object_count = object_count \+ \$1, total_bytes = total_bytes \+ \$2`).
 		WithArgs(0, int64(1524), bucketID). // 2024 - 500 = 1524
 		WillReturnResult(sqlmock.NewResult(0, 1))

@@ -119,7 +119,9 @@ func TestService_PutObject_WritesBackendThenCatalog(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectQuery(`SELECT id, physical_key, backend, size_bytes FROM storage\.objects`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "physical_key", "backend", "size_bytes"}))
-	mock.ExpectExec(`INSERT INTO storage\.objects`).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(`INSERT INTO storage\.objects`).
+		WillReturnRows(sqlmock.NewRows([]string{"created_at", "updated_at", "uploaded_at"}).
+			AddRow(time.Now(), time.Now(), time.Now()))
 	mock.ExpectExec(`UPDATE storage\.buckets\s+SET object_count`).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
@@ -134,6 +136,12 @@ func TestService_PutObject_WritesBackendThenCatalog(t *testing.T) {
 	}
 	if obj.ContentType != "text/plain" {
 		t.Fatalf("catalog record should keep the CALLER's content type, got %q", obj.ContentType)
+	}
+	// Regression pin: a PUT response used to hand back Go's zero-value
+	// timestamps ("0001-01-01T00:00:00Z") since the insert discarded its
+	// own RETURNING-worthy columns — confirmed live against a real object.
+	if obj.CreatedAt.IsZero() || obj.UpdatedAt.IsZero() || obj.UploadedAt == nil {
+		t.Fatalf("PutObject response has unpopulated timestamps: %+v", obj)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Error(err)
