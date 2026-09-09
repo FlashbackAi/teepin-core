@@ -28,11 +28,27 @@
 //     calculation was set to "when required" (boto3's
 //     request_checksum_calculation="when_required") — the Go equivalent,
 //     aws.RequestChecksumCalculationWhenRequired, is set below.
+//   - Multipart UploadPart calls were rejected outright ("api error
+//     NotImplemented: aws-chunked transfer encoding is not supported.
+//     Use standard Content-Length for uploads.", HTTP 501) — confirmed
+//     live on real uploads (42MB and 155MB, same failure both times).
+//     Root cause: aws-sdk-go-v2's manager.Uploader keeps its OWN
+//     RequestChecksumCalculation setting, entirely independent of the
+//     *s3.Client's — it defaults to WhenSupported regardless of the
+//     client, which attaches a CRC32 checksum to every part and forces
+//     aws-chunked trailer encoding to send it. Fixed by setting the
+//     SAME WhenRequired value on the Uploader itself (see NewBackend).
+//     Worth reporting to Shelby regardless: this is standard, documented
+//     AWS S3 behavior their compatibility layer doesn't implement, and
+//     any other current-generation S3 client's multipart upload would
+//     likely hit the same 501.
 //
 // These are seeded defaults, not a permanent truth: Shelby is an unstable
-// prototype with no SLA, and the health probe (a later phase) re-measures
-// them live once it exists, since it does double duty as both monitoring
-// and validation rather than a one-off spike.
+// prototype with no SLA and no ongoing monitoring exists to re-measure
+// them automatically (a health probe was built and then removed after
+// live testing showed it flagging Shelby's own eventual-consistency
+// window as a false failure) — treat these as accurate as of 2026-09-09,
+// not guaranteed to still hold later.
 package shelbybackend
 
 import (
@@ -123,6 +139,19 @@ func NewBackend(ctx context.Context, cfg Config) (*Backend, error) {
 		uploader: manager.NewUploader(client, func(u *manager.Uploader) {
 			u.PartSize = capabilities.MultipartPartSize
 			u.Concurrency = capabilities.MaxConcurrentOps
+			// manager.Uploader keeps its OWN RequestChecksumCalculation,
+			// entirely independent of the *s3.Client's setting above —
+			// it defaults to WhenSupported regardless of what the client
+			// is configured with. Left at that default, every part gets
+			// a CRC32 checksum attached, which forces the SDK to send it
+			// via aws-chunked trailer encoding — confirmed live against
+			// Shelby to be rejected outright: "api error NotImplemented:
+			// aws-chunked transfer encoding is not supported. Use
+			// standard Content-Length for uploads." Matching it to the
+			// client's own WhenRequired here is what actually avoids
+			// that, since each part is already fully buffered
+			// (known length) before UploadPart is called.
+			u.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
 		}),
 		bucket: cfg.Bucket,
 	}, nil
