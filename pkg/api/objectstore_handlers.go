@@ -13,10 +13,44 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/FlashbackAi/teepin-core/pkg/models"
 	"github.com/FlashbackAi/teepin-core/pkg/objectstore"
 )
 
 const metaHeaderPrefix = "X-Teepin-Meta-"
+
+// bucketModel/objectModel convert the catalog's internal *Record types to
+// their JSON-tagged, customer-facing DTOs — see pkg/models/objectstore.go
+// on why this indirection exists (in particular: objectModel is what
+// keeps ObjectRecord.PhysicalKey from ever reaching a response).
+func bucketModel(b *objectstore.BucketRecord) models.Bucket {
+	return models.Bucket{
+		ID:          b.ID.String(),
+		Name:        b.Name,
+		Backend:     b.Backend,
+		ObjectCount: b.ObjectCount,
+		TotalBytes:  b.TotalBytes,
+		CreatedAt:   b.CreatedAt,
+		UpdatedAt:   b.UpdatedAt,
+	}
+}
+
+func objectModel(o *objectstore.ObjectRecord) models.StorageObject {
+	return models.StorageObject{
+		ID:             o.ID.String(),
+		Key:            o.Key,
+		SizeBytes:      o.SizeBytes,
+		ContentType:    o.ContentType,
+		Metadata:       o.Metadata,
+		ChecksumSHA256: o.ChecksumSHA256,
+		Status:         o.Status,
+		Backend:        o.Backend,
+		UploadError:    o.UploadError,
+		CreatedAt:      o.CreatedAt,
+		UpdatedAt:      o.UpdatedAt,
+		UploadedAt:     o.UploadedAt,
+	}
+}
 
 // CreateBucket handles POST /v1/storage/buckets.
 func (s *Server) CreateBucket(c *gin.Context) {
@@ -46,7 +80,7 @@ func (s *Server) CreateBucket(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusCreated, bucket)
+	c.JSON(http.StatusCreated, bucketModel(bucket))
 }
 
 // ListBuckets handles GET /v1/storage/buckets.
@@ -65,7 +99,11 @@ func (s *Server) ListBuckets(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"buckets": buckets})
+	bucketDTOs := make([]models.Bucket, len(buckets))
+	for i := range buckets {
+		bucketDTOs[i] = bucketModel(&buckets[i])
+	}
+	c.JSON(http.StatusOK, gin.H{"buckets": bucketDTOs})
 }
 
 // GetBucket handles GET /v1/storage/buckets/:bucket.
@@ -88,7 +126,7 @@ func (s *Server) GetBucket(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, bucket)
+	c.JSON(http.StatusOK, bucketModel(bucket))
 }
 
 // DeleteBucket handles DELETE /v1/storage/buckets/:bucket.
@@ -137,7 +175,11 @@ func (s *Server) ListObjects(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"objects": objects})
+	objectDTOs := make([]models.StorageObject, len(objects))
+	for i := range objects {
+		objectDTOs[i] = objectModel(&objects[i])
+	}
+	c.JSON(http.StatusOK, gin.H{"objects": objectDTOs})
 }
 
 // PutObject handles PUT /v1/storage/buckets/:bucket/object?key=... — the
@@ -185,7 +227,7 @@ func (s *Server) PutObject(c *gin.Context) {
 		}
 		return
 	}
-	c.JSON(http.StatusOK, obj)
+	c.JSON(http.StatusOK, objectModel(obj))
 }
 
 // GetObjectMeta handles GET /v1/storage/buckets/:bucket/object?key=... —
@@ -215,7 +257,7 @@ func (s *Server) GetObjectMeta(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, obj)
+	c.JSON(http.StatusOK, objectModel(obj))
 }
 
 // GetObjectContent handles GET /v1/storage/buckets/:bucket/object/content?key=...
