@@ -27,6 +27,7 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/imageinfo"
 	"github.com/FlashbackAi/teepin-core/pkg/kumbha"
 	"github.com/FlashbackAi/teepin-core/pkg/models"
+	"github.com/FlashbackAi/teepin-core/pkg/objectstore"
 )
 
 // Server represents the API server
@@ -144,6 +145,32 @@ type Server struct {
 	// cleanly: a checkpoint just skips the push, same best-effort posture
 	// as CheckpointWorkspace/UpdateImage's own failure handling.
 	githubStore GithubStore
+
+	// objectStore backs the Teepin S3 endpoints (see objectstore_handlers.go).
+	// nil means the feature is off — every storage endpoint 404s, same
+	// posture as every other optional capability on this Server.
+	objectStore *objectstore.Service
+	// objectStoreSigner mints/verifies the signed download links that
+	// stand in for a presigned URL — independent of which backend
+	// objectStore uses, since it is a platform-wide key, not a
+	// per-backend credential. nil means download-link endpoints 404.
+	objectStoreSigner *objectstore.Signer
+}
+
+// WithObjectStore enables the Teepin S3 endpoints. Returns the same
+// *Server for chaining, so existing NewServer call sites compile
+// unchanged — a server built without this call keeps every /v1/storage
+// endpoint returning 404.
+func (s *Server) WithObjectStore(os *objectstore.Service) *Server {
+	s.objectStore = os
+	return s
+}
+
+// WithObjectStoreSigner enables minting and redeeming signed object
+// download links. Returns the same *Server for chaining.
+func (s *Server) WithObjectStoreSigner(signer *objectstore.Signer) *Server {
+	s.objectStoreSigner = signer
+	return s
 }
 
 // WithExecTickets enables interactive exec's REST half (ticket issuance).

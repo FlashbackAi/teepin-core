@@ -44,6 +44,9 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/kumbha"
 	"github.com/FlashbackAi/teepin-core/pkg/networking"
 	"github.com/FlashbackAi/teepin-core/pkg/nodes"
+	"github.com/FlashbackAi/teepin-core/pkg/objectstore"
+	"github.com/FlashbackAi/teepin-core/pkg/objectstore/miniobackend"
+	"github.com/FlashbackAi/teepin-core/pkg/objectstore/shelbybackend"
 	"github.com/FlashbackAi/teepin-core/pkg/payments"
 	"github.com/FlashbackAi/teepin-core/pkg/ratelimit"
 	"github.com/FlashbackAi/teepin-core/pkg/statuspage"
@@ -526,6 +529,89 @@ func main() {
 	// mode, no database), every project is allowed, same as today.
 	if authService != nil {
 		apiServer = apiServer.WithProjectPolicy(authService)
+	}
+
+	// Teepin S3 (pkg/objectstore): customer-facing object storage behind a
+	// pluggable backend (MinIO today; Shelby and AWS S3 land as their own
+	// backend packages later — see ROADMAP/plan). Backend selection is an
+	// EXPLICIT named switch on TEEPIN_OBJECTSTORE_BACKEND, deliberately
+	// NOT the first-configured-wins pattern the Kumbha registry chain uses
+	// below: silently picking a different storage backend would strand a
+	// customer's data somewhere the catalog doesn't point at, unlike a
+	// registry fallback that only costs a rebuild.
+	if dbClient != nil {
+		var objectStoreBackend objectstore.Backend
+		switch backend := getEnv("TEEPIN_OBJECTSTORE_BACKEND", ""); backend {
+		case "":
+			log.Println("Teepin S3 not configured (set TEEPIN_OBJECTSTORE_BACKEND=minio or shelby) — /v1/storage endpoints stay off")
+		case "minio":
+			minioBackend, err := miniobackend.NewBackend(context.Background(), miniobackend.Config{
+				Endpoint:  getEnv("TEEPIN_MINIO_ENDPOINT", ""),
+				Region:    getEnv("TEEPIN_MINIO_REGION", ""),
+				AccessKey: getEnv("TEEPIN_MINIO_ACCESS_KEY", ""),
+				SecretKey: getEnv("TEEPIN_MINIO_SECRET_KEY", ""),
+				Bucket:    getEnv("TEEPIN_MINIO_BUCKET", ""),
+			})
+			if err != nil {
+				log.Printf("⚠️  Teepin S3 (minio backend) initialization failed: %v", err)
+			} else {
+				objectStoreBackend = minioBackend
+				log.Println("✅ Teepin S3 enabled (backend: minio)")
+			}
+		case "shelby":
+			// Shelby (pkg/objectstore/shelbybackend): a third-party,
+			// blockchain-coordinated S3-compatible network evaluated
+			// hands-on in shelby-eval/ — see that package's own doc
+			// comment for exactly which confirmed findings drive its
+			// Capabilities values.
+			shelbyBackend, err := shelbybackend.NewBackend(context.Background(), shelbybackend.Config{
+				Endpoint: getEnv("TEEPIN_SHELBY_ENDPOINT", ""),
+				Region:   getEnv("TEEPIN_SHELBY_REGION", ""),
+				APIKey:   getEnv("TEEPIN_SHELBY_API_KEY", ""),
+				Bucket:   getEnv("TEEPIN_SHELBY_BUCKET", ""),
+			})
+			if err != nil {
+				log.Printf("⚠️  Teepin S3 (shelby backend) initialization failed: %v", err)
+			} else {
+				objectStoreBackend = shelbyBackend
+				log.Println("✅ Teepin S3 enabled (backend: shelby)")
+			}
+		default:
+			log.Printf("⚠️  Teepin S3: unknown TEEPIN_OBJECTSTORE_BACKEND=%q — /v1/storage endpoints stay off", backend)
+		}
+
+		if objectStoreBackend != nil {
+			objectStoreStore := objectstore.NewStore(dbClient.DB())
+			maxObjectBytes := int64(getEnvInt("TEEPIN_OBJECTSTORE_MAX_OBJECT_BYTES", 5<<30))
+			objectStoreService := objectstore.NewService(objectStoreStore, objectStoreBackend, maxObjectBytes)
+			apiServer = apiServer.WithObjectStore(objectStoreService)
+
+			// The health probe runs independently of request traffic —
+			// it's what turns "is this backend actually up" from a guess
+			// into something the storage service tab shows directly,
+			// since a backend like Shelby has no SLA and has been
+			// confirmed to fail silently under load (see shelby-eval/).
+			probeIntervalSeconds := getEnvInt("TEEPIN_OBJECTSTORE_PROBE_INTERVAL_SECONDS", 0)
+			prober := objectstore.NewProber(objectStoreBackend, objectStoreStore, time.Duration(probeIntervalSeconds)*time.Second)
+			go prober.Start(context.Background())
+			log.Println("✅ Teepin S3 health probe started")
+
+			// The signed-download link mechanism is independent of which
+			// backend is active (it's Teepin's own presigned-URL
+			// stand-in, needed most for Shelby but harmless to also offer
+			// on MinIO) — a platform-wide key, not a per-backend setting.
+			if signingKey := getEnv("TEEPIN_OBJECTSTORE_URL_SIGNING_KEY", ""); signingKey != "" {
+				signer, err := objectstore.NewSigner([]byte(signingKey))
+				if err != nil {
+					log.Printf("⚠️  Teepin S3 signed download links disabled: %v", err)
+				} else {
+					apiServer = apiServer.WithObjectStoreSigner(signer)
+					log.Println("✅ Teepin S3 signed download links enabled")
+				}
+			} else {
+				log.Println("Teepin S3 signed download links not configured (set TEEPIN_OBJECTSTORE_URL_SIGNING_KEY)")
+			}
+		}
 	}
 
 	// kumbhaEventTickets is set inside the Kumbha Gateway block below, but
@@ -1142,6 +1228,14 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 			v1.POST("/nodes/enroll", nodeHandler.Enroll)
 		}
 
+		// Signed object-download redemption — UNAUTHENTICATED at the
+		// router: this is Teepin's own stand-in for a presigned URL
+		// (Shelby rejects presigned URLs outright), so the whole point is
+		// that the token itself, not a session, is the credential. Always
+		// registered (RedeemObjectDownloadURL 404s if signing was never
+		// configured), same posture as every other optional endpoint.
+		v1.GET("/storage/d/:token", apiServer.RedeemObjectDownloadURL)
+
 		// Authentication endpoints (public)
 		if authHandler != nil {
 			authRoutes := v1.Group("/auth")
@@ -1288,6 +1382,32 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 			// customer GETs its own account-scoped read.
 			kumbhaGroup.POST("/sessions/:id/screenshot", apiServer.UploadKumbhaScreenshot)
 			kumbhaGroup.GET("/sessions/:id/screenshot", apiServer.GetKumbhaScreenshot)
+		}
+
+		// Teepin S3 (pkg/objectstore) — every handler 404s when
+		// s.objectStore is nil (feature not configured), same posture as
+		// the Kumbha group above.
+		storageGroup := v1.Group("/storage")
+		if authMiddleware != nil {
+			storageGroup.Use(authMiddleware.RequireAuth())
+		}
+		{
+			storageGroup.POST("/buckets", apiServer.CreateBucket)
+			storageGroup.GET("/buckets", apiServer.ListBuckets)
+			storageGroup.GET("/buckets/:bucket", apiServer.GetBucket)
+			storageGroup.DELETE("/buckets/:bucket", apiServer.DeleteBucket)
+			storageGroup.GET("/buckets/:bucket/objects", apiServer.ListObjects)
+			// Object key travels as a query parameter (?key=...), never a
+			// path segment — gin's *wildcard must be terminal, so
+			// /object/*key/content cannot coexist as a route with
+			// /object/*key, and a query param also sidesteps any %2F
+			// decoding ambiguity in the key itself.
+			storageGroup.PUT("/buckets/:bucket/object", apiServer.PutObject)
+			storageGroup.GET("/buckets/:bucket/object", apiServer.GetObjectMeta)
+			storageGroup.DELETE("/buckets/:bucket/object", apiServer.DeleteObject)
+			storageGroup.GET("/buckets/:bucket/object/content", apiServer.GetObjectContent)
+			storageGroup.POST("/buckets/:bucket/object/download-url", apiServer.MintObjectDownloadURL)
+			storageGroup.GET("/health", apiServer.GetStorageHealth)
 		}
 
 		// Compute endpoints require auth — requireScope (server.go) rejects
