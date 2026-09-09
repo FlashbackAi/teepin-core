@@ -298,27 +298,6 @@ func (s *Server) DeleteObject(c *gin.Context) {
 	}
 }
 
-// GetStorageHealth handles GET /v1/storage/health — the storage service
-// tab's monitoring panel reads this directly. Requires auth like every
-// other storage endpoint (this is per-account visibility into a shared
-// platform backend's health, not a public status page).
-func (s *Server) GetStorageHealth(c *gin.Context) {
-	if s.objectStore == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "object storage is not available on this deployment"})
-		return
-	}
-	if _, _, ok := s.requireScope(c); !ok {
-		return
-	}
-
-	health, err := s.objectStore.Health(c.Request.Context())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, health)
-}
-
 // MintObjectDownloadURL handles POST
 // /v1/storage/buckets/:bucket/object/download-url?key=&ttl_seconds= — our
 // own stand-in for a presigned URL, since Shelby rejects presigned URLs

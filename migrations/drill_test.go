@@ -1109,3 +1109,34 @@ func TestArchivabilityDrill041(t *testing.T) {
 	}
 	t.Log("archivability drill passed: 041 applies, reverts cleanly, and re-applies")
 }
+
+func TestArchivabilityDrill042(t *testing.T) {
+	dsn := os.Getenv("TEEPIN_DRILL_DSN")
+	if dsn == "" {
+		t.Skip("set TEEPIN_DRILL_DSN to run the migration drill")
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("initial up: %v", err)
+	}
+	if tableExists(t, db, "storage", "backend_health") {
+		t.Fatal("after up: storage.backend_health should be gone (042 drops what 041 created)")
+	}
+
+	if err := migrator(t, db).Migrate(41); err != nil {
+		t.Fatalf("migrate down to 041: %v", err)
+	}
+	if !tableExists(t, db, "storage", "backend_health") {
+		t.Error("after down to 041: storage.backend_health should be back")
+	}
+
+	if err := migrator(t, db).Up(); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("re-up: %v", err)
+	}
+	t.Log("archivability drill passed: 042 applies, reverts cleanly, and re-applies")
+}

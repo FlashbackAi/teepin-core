@@ -586,16 +586,6 @@ func main() {
 			objectStoreService := objectstore.NewService(objectStoreStore, objectStoreBackend, maxObjectBytes)
 			apiServer = apiServer.WithObjectStore(objectStoreService)
 
-			// The health probe runs independently of request traffic —
-			// it's what turns "is this backend actually up" from a guess
-			// into something the storage service tab shows directly,
-			// since a backend like Shelby has no SLA and has been
-			// confirmed to fail silently under load (see shelby-eval/).
-			probeIntervalSeconds := getEnvInt("TEEPIN_OBJECTSTORE_PROBE_INTERVAL_SECONDS", 0)
-			prober := objectstore.NewProber(objectStoreBackend, objectStoreStore, time.Duration(probeIntervalSeconds)*time.Second)
-			go prober.Start(context.Background())
-			log.Println("✅ Teepin S3 health probe started")
-
 			// The signed-download link mechanism is independent of which
 			// backend is active (it's Teepin's own presigned-URL
 			// stand-in, needed most for Shelby but harmless to also offer
@@ -1407,7 +1397,6 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 			storageGroup.DELETE("/buckets/:bucket/object", apiServer.DeleteObject)
 			storageGroup.GET("/buckets/:bucket/object/content", apiServer.GetObjectContent)
 			storageGroup.POST("/buckets/:bucket/object/download-url", apiServer.MintObjectDownloadURL)
-			storageGroup.GET("/health", apiServer.GetStorageHealth)
 		}
 
 		// Compute endpoints require auth — requireScope (server.go) rejects

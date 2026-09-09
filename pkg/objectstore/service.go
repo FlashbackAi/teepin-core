@@ -61,19 +61,6 @@ func NewService(store *Store, backend Backend, maxObjectBytes int64) *Service {
 // storage.buckets.backend is stamped once at bucket creation.
 func (s *Service) BackendName() string { return s.backend.Name() }
 
-// Health returns the currently active backend's derived health status —
-// what the storage service tab's monitoring panel renders. Reads probe
-// history only; it never itself performs a live probe (that's Prober's
-// job, running independently), so this call is always fast regardless of
-// how the backend itself is behaving right now.
-func (s *Service) Health(ctx context.Context) (HealthStatus, error) {
-	recent, err := s.store.RecentProbeResults(ctx, s.backend.Name(), 60)
-	if err != nil {
-		return HealthStatus{}, err
-	}
-	return DeriveHealthStatus(s.backend.Name(), recent), nil
-}
-
 func (s *Service) acquire(ctx context.Context) error {
 	select {
 	case s.sem <- struct{}{}:
