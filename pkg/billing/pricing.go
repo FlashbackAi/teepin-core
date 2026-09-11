@@ -29,10 +29,18 @@ type PricingInfo struct {
 	// output because the two cost very differently on every backend this
 	// gateway routes to. Same "default 0, ships on, bills nothing until an
 	// operator sets it" pattern as CPU/memory/storage.
-	LLMPricePerMillionInput  float64    `json:"llm_price_per_million_input"`
-	LLMPricePerMillionOutput float64    `json:"llm_price_per_million_output"`
-	UpdatedBy                *string    `json:"updated_by,omitempty"`
-	UpdatedAt                *time.Time `json:"updated_at,omitempty"`
+	LLMPricePerMillionInput  float64 `json:"llm_price_per_million_input"`
+	LLMPricePerMillionOutput float64 `json:"llm_price_per_million_output"`
+	// ObjectStorage rates back Teepin S3 (pkg/objectstore). GB-month for
+	// what's stored, GB for what's transferred out — same "default 0,
+	// ships on, bills nothing until an operator sets it" pattern as
+	// storage/CPU/memory above. No per-request rate: nothing in
+	// pkg/objectstore counts requests today, so there is nothing to meter
+	// against one.
+	ObjectStoragePricePerGBMonth  float64    `json:"object_storage_price_per_gb_month"`
+	ObjectStoragePricePerGBEgress float64    `json:"object_storage_price_per_gb_egress"`
+	UpdatedBy                     *string    `json:"updated_by,omitempty"`
+	UpdatedAt                     *time.Time `json:"updated_at,omitempty"`
 }
 
 // VRAMPricePerGBHour returns the live GPU VRAM rate from billing.pricing.
@@ -76,6 +84,18 @@ func (s *Service) StorageGBMonthRate(ctx context.Context) float64 {
 	return s.rate(ctx, "storage_price_per_gb_month")
 }
 
+// ObjectStorageGBMonthRate / ObjectStorageEgressGBRate return the live
+// Teepin S3 rates. Same 0-default, no-compiled-fallback contract as
+// CPUCoreRate — object storage bills nothing until an operator sets a
+// rate.
+func (s *Service) ObjectStorageGBMonthRate(ctx context.Context) float64 {
+	return s.rate(ctx, "object_storage_price_per_gb_month")
+}
+
+func (s *Service) ObjectStorageEgressGBRate(ctx context.Context) float64 {
+	return s.rate(ctx, "object_storage_price_per_gb_egress")
+}
+
 // LLMPriceInputPerMillion / LLMPriceOutputPerMillion return the live Kumbha
 // Gateway rates, per million tokens. Same 0-default, no-compiled-fallback
 // contract as CPUCoreRate — inference bills nothing until an operator sets
@@ -113,16 +133,42 @@ func (s *Service) GetPricing(ctx context.Context) (*PricingInfo, error) {
 		`SELECT vram_price_per_gb_hour, cpu_price_per_core_hour,
 		        memory_price_per_gb_hour, storage_price_per_gb_month,
 		        llm_price_per_million_input, llm_price_per_million_output,
+		        object_storage_price_per_gb_month, object_storage_price_per_gb_egress,
 		        updated_by, updated_at
 		 FROM billing.pricing WHERE id = 1`,
 	).Scan(&info.VRAMPricePerGBHour, &info.CPUPricePerCoreHour,
 		&info.MemoryPricePerGBHour, &info.StoragePricePerGBMonth,
 		&info.LLMPricePerMillionInput, &info.LLMPricePerMillionOutput,
+		&info.ObjectStoragePricePerGBMonth, &info.ObjectStoragePricePerGBEgress,
 		&info.UpdatedBy, &info.UpdatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read pricing: %w", err)
 	}
 	return info, nil
+}
+
+// SetObjectStoragePricing updates Teepin S3's GB-month and GB-egress
+// rates. Zero is valid ("do not charge"), same contract as
+// CPU/memory/storage — a separate endpoint from UpdatePricing so the GPU
+// rate's "must be positive" contract stays untouched.
+func (s *Service) SetObjectStoragePricing(ctx context.Context, gbMonthRate, egressRate float64, updatedBy string) error {
+	if gbMonthRate < 0 || egressRate < 0 {
+		return fmt.Errorf("rates must be non-negative")
+	}
+	result, err := s.db.ExecContext(ctx,
+		`UPDATE billing.pricing
+		 SET object_storage_price_per_gb_month = $1, object_storage_price_per_gb_egress = $2,
+		     updated_by = $3, updated_at = NOW()
+		 WHERE id = 1`,
+		gbMonthRate, egressRate, updatedBy)
+	if err != nil {
+		return fmt.Errorf("failed to update object storage pricing: %w", err)
+	}
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		return fmt.Errorf("pricing row missing; set the GPU rate first")
+	}
+	log.Printf("Object storage pricing updated to $%.4f/GB-month, $%.4f/GB-egress by %s", gbMonthRate, egressRate, updatedBy)
+	return nil
 }
 
 // SetLLMPricing updates the Kumbha Gateway's per-million-token rates. Zero

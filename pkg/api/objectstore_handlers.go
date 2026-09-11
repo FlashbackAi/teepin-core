@@ -6,12 +6,14 @@ package api
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 
 	"github.com/FlashbackAi/teepin-core/pkg/models"
 	"github.com/FlashbackAi/teepin-core/pkg/objectstore"
@@ -309,7 +311,37 @@ func (s *Server) GetObjectContent(c *gin.Context) {
 		length = rng.End - rng.Start + 1
 		extra["Content-Range"] = "bytes " + strconv.FormatInt(rng.Start, 10) + "-" + strconv.FormatInt(rng.End, 10) + "/" + strconv.FormatInt(meta.SizeBytes, 10)
 	}
-	c.DataFromReader(status, length, contentTypeOrDefault(meta.ContentType), body, extra)
+
+	counted := &countingReadCloser{ReadCloser: body}
+	c.DataFromReader(status, length, contentTypeOrDefault(meta.ContentType), counted, extra)
+	s.recordEgress(accountID, projectID, meta.BucketID, counted.n)
+}
+
+// recordEgress is a no-op when object storage egress billing isn't
+// configured (s.objectStoreEgress == nil) — same "feature off when
+// unconfigured" posture as every other optional capability here.
+func (s *Server) recordEgress(accountID, projectID, bucketID uuid.UUID, bytes int64) {
+	if s.objectStoreEgress == nil {
+		return
+	}
+	s.objectStoreEgress.Record(accountID, projectID, bucketID, bytes)
+}
+
+// countingReadCloser wraps a Backend's response body to count bytes
+// ACTUALLY read (and so actually streamed to the client) — not the
+// object's declared Content-Length, which would over-bill a download the
+// customer cancelled partway through. gin's DataFromReader stops reading
+// the moment the client disconnects, so n reflects exactly what was
+// delivered either way.
+type countingReadCloser struct {
+	io.ReadCloser
+	n int64
+}
+
+func (c *countingReadCloser) Read(p []byte) (int, error) {
+	n, err := c.ReadCloser.Read(p)
+	c.n += int64(n)
+	return n, err
 }
 
 // DeleteObject handles DELETE /v1/storage/buckets/:bucket/object?key=...
@@ -341,9 +373,16 @@ func (s *Server) DeleteObject(c *gin.Context) {
 }
 
 // MintObjectDownloadURL handles POST
-// /v1/storage/buckets/:bucket/object/download-url?key=&ttl_seconds= — our
-// own stand-in for a presigned URL, since Shelby rejects presigned URLs
-// outright (see pkg/objectstore/signer.go's doc comment).
+// /v1/storage/buckets/:bucket/object/download-url?key=&ttl_seconds=&disposition=
+// — our own stand-in for a presigned URL, since Shelby rejects presigned
+// URLs outright (see pkg/objectstore/signer.go's doc comment).
+//
+// disposition chooses Preview (inline — opens in the browser, default) vs.
+// Download (attachment — forces a save-as) and is baked INTO the signed
+// token rather than read again at redemption time: the redemption route
+// has no session to re-derive intent from, and letting disposition be a
+// plain (unsigned) query parameter on the redemption URL would let anyone
+// holding a Preview link edit it into a Download one and vice versa.
 func (s *Server) MintObjectDownloadURL(c *gin.Context) {
 	if s.objectStore == nil || s.objectStoreSigner == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "signed download links are not available on this deployment"})
@@ -387,9 +426,19 @@ func (s *Server) MintObjectDownloadURL(c *gin.Context) {
 		}
 	}
 
+	disposition := objectstore.DispositionInline
+	if raw := c.Query("disposition"); raw != "" {
+		if raw != objectstore.DispositionInline && raw != objectstore.DispositionAttachment {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "disposition must be \"inline\" or \"attachment\""})
+			return
+		}
+		disposition = raw
+	}
+
 	expiresAt := time.Now().Add(ttl)
 	token := s.objectStoreSigner.Mint(objectstore.SignedDownload{
-		AccountID: accountID, ProjectID: projectID, Bucket: bucketName, Key: key, ExpiresAt: expiresAt,
+		AccountID: accountID, ProjectID: projectID, Bucket: bucketName, Key: key,
+		ExpiresAt: expiresAt, Disposition: disposition,
 	})
 	c.JSON(http.StatusOK, gin.H{
 		"url":        "/v1/storage/d/" + token,
@@ -426,9 +475,14 @@ func (s *Server) RedeemObjectDownloadURL(c *gin.Context) {
 	}
 	defer body.Close()
 
-	c.DataFromReader(http.StatusOK, meta.SizeBytes, contentTypeOrDefault(meta.ContentType), body, map[string]string{
-		"Content-Disposition": `inline; filename="` + safeFilename(d.Key) + `"`,
+	// Disposition came from the SIGNED token (chosen at mint time by which
+	// button was clicked — Preview vs. Download), not a query parameter
+	// here — see MintObjectDownloadURL's own comment on why.
+	counted := &countingReadCloser{ReadCloser: body}
+	c.DataFromReader(http.StatusOK, meta.SizeBytes, contentTypeOrDefault(meta.ContentType), counted, map[string]string{
+		"Content-Disposition": d.Disposition + `; filename="` + safeFilename(d.Key) + `"`,
 	})
+	s.recordEgress(d.AccountID, d.ProjectID, meta.BucketID, counted.n)
 }
 
 // parseRange parses a single-range "bytes=start-end" Range header. Returns

@@ -51,16 +51,28 @@ func NewSigner(key []byte) (*Signer, error) {
 	return &Signer{key: key}, nil
 }
 
+// Disposition values for a signed download — mirrors the HTTP
+// Content-Disposition values they map to. Encoded INTO the token at mint
+// time (chosen by which button the customer clicked — Preview vs.
+// Download) rather than as a redemption-time query parameter, since a
+// query parameter on the token URL would be un-signed and so freely
+// editable by anyone holding the link.
+const (
+	DispositionInline     = "inline"
+	DispositionAttachment = "attachment"
+)
+
 // SignedDownload is what a mint call embeds in, and a redemption call
 // recovers from, a token. Bucket/Key travel in the token itself — not
 // looked up server-side by an opaque id — so redemption needs no state
 // beyond the token and a fresh read of the current catalog.
 type SignedDownload struct {
-	AccountID uuid.UUID
-	ProjectID uuid.UUID
-	Bucket    string
-	Key       string
-	ExpiresAt time.Time
+	AccountID   uuid.UUID
+	ProjectID   uuid.UUID
+	Bucket      string
+	Key         string
+	ExpiresAt   time.Time
+	Disposition string // DispositionInline or DispositionAttachment
 }
 
 // Mint produces an opaque, URL-safe token. Callers should clamp TTL
@@ -115,23 +127,24 @@ func (s *Signer) sign(payload string) []byte {
 
 // encodePayload/decodePayload deliberately put Key LAST and split with a
 // bounded count: an object key can legitimately contain "/" and, in
-// principle, "|" — Bucket cannot (ValidBucketName's regex allows only
-// lowercase alphanumerics, ".", "-"), so ordering the one field that
-// might contain the delimiter last, and taking everything remaining
-// after 4 splits as the key verbatim, means a "|" inside a key can never
-// corrupt the other fields. Tamper-resistance itself comes from the MAC
-// above, not from this choice — a mismatched split would simply fail to
-// verify, never silently misattribute a field.
+// principle, "|" — none of the other fields can (Bucket is constrained by
+// ValidBucketName's regex; Disposition is one of the two constants
+// above) — so ordering the one field that might contain the delimiter
+// last, and taking everything remaining after 5 splits as the key
+// verbatim, means a "|" inside a key can never corrupt the other fields.
+// Tamper-resistance itself comes from the MAC above, not from this
+// choice — a mismatched split would simply fail to verify, never
+// silently misattribute a field.
 func encodePayload(d SignedDownload) string {
 	return strings.Join([]string{
 		d.AccountID.String(), d.ProjectID.String(), d.Bucket,
-		strconv.FormatInt(d.ExpiresAt.Unix(), 10), d.Key,
+		strconv.FormatInt(d.ExpiresAt.Unix(), 10), d.Disposition, d.Key,
 	}, "|")
 }
 
 func decodePayload(payload string) (SignedDownload, error) {
-	parts := strings.SplitN(payload, "|", 5)
-	if len(parts) != 5 {
+	parts := strings.SplitN(payload, "|", 6)
+	if len(parts) != 6 {
 		return SignedDownload{}, ErrInvalidSignedURL
 	}
 	accountID, err := uuid.Parse(parts[0])
@@ -146,11 +159,16 @@ func decodePayload(payload string) (SignedDownload, error) {
 	if err != nil {
 		return SignedDownload{}, ErrInvalidSignedURL
 	}
+	disposition := parts[4]
+	if disposition != DispositionInline && disposition != DispositionAttachment {
+		return SignedDownload{}, ErrInvalidSignedURL
+	}
 	return SignedDownload{
-		AccountID: accountID,
-		ProjectID: projectID,
-		Bucket:    parts[2],
-		ExpiresAt: time.Unix(expiryUnix, 0),
-		Key:       parts[4],
+		AccountID:   accountID,
+		ProjectID:   projectID,
+		Bucket:      parts[2],
+		ExpiresAt:   time.Unix(expiryUnix, 0),
+		Disposition: disposition,
+		Key:         parts[5],
 	}, nil
 }

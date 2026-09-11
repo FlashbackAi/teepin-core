@@ -601,6 +601,22 @@ func main() {
 			} else {
 				log.Println("Teepin S3 signed download links not configured (set TEEPIN_OBJECTSTORE_URL_SIGNING_KEY)")
 			}
+
+			// Billing/metering — GB-stored (hourly, all buckets) and
+			// GB-transferred (batched from real download traffic). Both
+			// require billingService, which itself requires authService
+			// (see its own construction above) — dbClient alone isn't
+			// enough, so this is guarded separately rather than assumed.
+			if billingService != nil {
+				meter := objectstore.NewMeter(objectStoreStore, billingService, 0)
+				go meter.Start(context.Background())
+				egressTracker := objectstore.NewEgressTracker(billingService, 0)
+				go egressTracker.Start(context.Background())
+				apiServer = apiServer.WithObjectStoreEgress(egressTracker)
+				log.Println("✅ Teepin S3 billing/metering enabled (GB-stored + GB-transferred)")
+			} else {
+				log.Println("Teepin S3 billing/metering disabled (no billing service) — storage and transfer are not billed")
+			}
 		}
 	}
 
@@ -1440,6 +1456,7 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 				admin.PUT("/pricing", adminHandler.UpdatePricing)
 				admin.PUT("/pricing/cpu", adminHandler.UpdateCPUPricing)
 				admin.PUT("/pricing/storage", adminHandler.UpdateStoragePricing)
+				admin.PUT("/pricing/object-storage", adminHandler.UpdateObjectStoragePricing)
 				admin.PUT("/pricing/llm", adminHandler.UpdateLLMPricing)
 
 				// Manual invoicing for the operator control centre.

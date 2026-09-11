@@ -45,14 +45,12 @@ type ListInstancesResponse struct {
 }
 
 func runList(cmd *cobra.Command, args []string) {
-	config := loadConfig()
-
 	// Make API request
-	apiURL := config.APIURL + "/v1/compute/instances"
+	apiURL := getAPIURL() + "/v1/compute/instances"
 	resp, err := apiDo(http.MethodGet, apiURL, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Error connecting to API: %v\n", err)
-		fmt.Fprintf(os.Stderr, "   Make sure the API server is running at: %s\n", config.APIURL)
+		fmt.Fprintf(os.Stderr, "   Make sure the API server is running at: %s\n", getAPIURL())
 		os.Exit(1)
 	}
 	defer resp.Body.Close()

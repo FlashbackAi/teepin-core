@@ -78,9 +78,6 @@ func init() {
 }
 
 func runDeploy(cmd *cobra.Command, args []string) {
-	// Load config
-	config := loadConfig()
-
 	// Parse environment variables
 	envMap := make(map[string]string)
 	for _, env := range deployEnv {
@@ -138,7 +135,7 @@ func runDeploy(cmd *cobra.Command, args []string) {
 	}
 
 	// Make API request
-	apiURL := config.APIURL + "/v1/compute/instances"
+	apiURL := getAPIURL() + "/v1/compute/instances"
 	reqBody, err := json.Marshal(req)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Error: %v\n", err)
@@ -148,7 +145,7 @@ func runDeploy(cmd *cobra.Command, args []string) {
 	resp, err := apiDo(http.MethodPost, apiURL, bytes.NewBuffer(reqBody))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "❌ Error connecting to API: %v\n", err)
-		fmt.Fprintf(os.Stderr, "   Make sure the API server is running at: %s\n", config.APIURL)
+		fmt.Fprintf(os.Stderr, "   Make sure the API server is running at: %s\n", getAPIURL())
 		os.Exit(1)
 	}
 	defer resp.Body.Close()
@@ -220,9 +217,12 @@ func loadConfig() Config {
 	home, _ := os.UserHomeDir()
 	configFile := filepath.Join(home, ".teepin", "config.yaml")
 
-	// Default config
+	// Default config. dev-api.teepin.com is the live environment as of
+	// now — this default moves to https://api.teepin.com in a future CLI
+	// release once a separate prod stack exists; anyone with an existing
+	// config.yaml or TEEPIN_API_URL set is unaffected by that change.
 	config := Config{
-		APIURL:        "http://localhost:8080",
+		APIURL:        "https://dev-api.teepin.com",
 		DefaultRegion: "us-west-1",
 		OutputFormat:  "table",
 	}

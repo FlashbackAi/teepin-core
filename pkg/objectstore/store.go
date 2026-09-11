@@ -432,3 +432,50 @@ func parseMetadata(raw []byte) map[string]string {
 	_ = json.Unmarshal(raw, &m)
 	return m
 }
+
+// ListAllBucketsForMetering returns every live bucket across every
+// tenant — unlike ListBuckets, deliberately NOT scoped to one
+// account/project, since the meter (meter.go) runs platform-wide on its
+// own schedule rather than in response to a single customer's request.
+func (s *Store) ListAllBucketsForMetering(ctx context.Context) ([]BucketRecord, error) {
+	rows, err := s.db.QueryContext(ctx, bucketSelectColumns+`
+		WHERE deleted_at IS NULL
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("objectstore: list buckets for metering: %w", err)
+	}
+	defer rows.Close()
+
+	var out []BucketRecord
+	for rows.Next() {
+		var b BucketRecord
+		if err := rows.Scan(&b.ID, &b.AccountID, &b.ProjectID, &b.Name, &b.Backend,
+			&b.ObjectCount, &b.TotalBytes, &b.CreatedAt, &b.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("objectstore: scan bucket: %w", err)
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// LastBillingEndTime returns the most recent end_time already billed for
+// a subject (e.g. a bucket, by ID) in billing.usage_records, or the zero
+// time if nothing has been billed for it yet. Queries billing's own
+// table directly rather than through pkg/billing, the same cross-schema
+// pattern pkg/compute's own PurgeFullyBilledTerminated already uses
+// (`SELECT MAX(ur.end_time) FROM billing.usage_records ur WHERE
+// ur.instance_id = i.id`) — both tables live in the same database.
+func (s *Store) LastBillingEndTime(ctx context.Context, subjectType, subjectID string) (time.Time, error) {
+	var lastEnd sql.NullTime
+	err := s.db.QueryRowContext(ctx, `
+		SELECT MAX(end_time) FROM billing.usage_records
+		WHERE subject_type = $1 AND subject_id = $2
+	`, subjectType, subjectID).Scan(&lastEnd)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("objectstore: last billing end time: %w", err)
+	}
+	if !lastEnd.Valid {
+		return time.Time{}, nil
+	}
+	return lastEnd.Time, nil
+}

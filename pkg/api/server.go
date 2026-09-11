@@ -155,6 +155,11 @@ type Server struct {
 	// objectStore uses, since it is a platform-wide key, not a
 	// per-backend credential. nil means download-link endpoints 404.
 	objectStoreSigner *objectstore.Signer
+	// objectStoreEgress batches GB-transferred billing for object
+	// downloads (see recordEgress in objectstore_handlers.go). nil means
+	// egress simply isn't billed — downloads still work identically,
+	// same "feature off when unconfigured" posture as everything else.
+	objectStoreEgress *objectstore.EgressTracker
 }
 
 // WithObjectStore enables the Teepin S3 endpoints. Returns the same
@@ -170,6 +175,13 @@ func (s *Server) WithObjectStore(os *objectstore.Service) *Server {
 // download links. Returns the same *Server for chaining.
 func (s *Server) WithObjectStoreSigner(signer *objectstore.Signer) *Server {
 	s.objectStoreSigner = signer
+	return s
+}
+
+// WithObjectStoreEgress enables GB-transferred billing for object
+// downloads. Returns the same *Server for chaining.
+func (s *Server) WithObjectStoreEgress(tracker *objectstore.EgressTracker) *Server {
+	s.objectStoreEgress = tracker
 	return s
 }
 

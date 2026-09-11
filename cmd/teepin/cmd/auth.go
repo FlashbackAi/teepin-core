@@ -413,12 +413,19 @@ func runAuthLogin(cmd *cobra.Command, args []string) {
 }
 
 // Helper functions
+
+// getAPIURL resolves the TEEPIN API base URL — the single source every
+// command must use. Precedence: the TEEPIN_API_URL environment variable
+// (useful for scripts/CI that shouldn't have to touch the config file),
+// then loadConfig()'s api_url (~/.teepin/config.yaml, set by `teepin
+// init`). Previously this read only the env var while other commands
+// read only the config file, so setting one and not the other silently
+// left half the CLI talking to the wrong (or no) server.
 func getAPIURL() string {
-	apiURL := os.Getenv("TEEPIN_API_URL")
-	if apiURL == "" {
-		apiURL = "http://localhost:8080"
+	if apiURL := os.Getenv("TEEPIN_API_URL"); apiURL != "" {
+		return apiURL
 	}
-	return apiURL
+	return loadConfig().APIURL
 }
 
 func listProjectsAPI(token string) ([]map[string]interface{}, error) {

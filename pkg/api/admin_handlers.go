@@ -143,6 +143,31 @@ func (h *AdminHandler) UpdateStoragePricing(c *gin.Context) {
 	c.JSON(http.StatusOK, info)
 }
 
+// UpdateObjectStoragePricing sets Teepin S3's GB-month and GB-egress
+// rates. Zero is valid ("do not charge"), same contract as CPU/storage.
+// PUT /v1/admin/pricing/object-storage
+func (h *AdminHandler) UpdateObjectStoragePricing(c *gin.Context) {
+	var req struct {
+		ObjectStoragePricePerGBMonth  float64 `json:"object_storage_price_per_gb_month"`
+		ObjectStoragePricePerGBEgress float64 `json:"object_storage_price_per_gb_egress"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := h.billingService.SetObjectStoragePricing(c.Request.Context(),
+		req.ObjectStoragePricePerGBMonth, req.ObjectStoragePricePerGBEgress, "admin-api"); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	info, err := h.billingService.GetPricing(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, info)
+}
+
 // UpdateLLMPricing sets the Kumbha Gateway's per-million-token input/output
 // rates. Zero is valid ("do not charge"), same contract as CPU/storage.
 //
@@ -231,14 +256,14 @@ func (h *AdminHandler) ListAccountProjects(c *gin.Context) {
 // one thing a customer will always notice.
 func (h *AdminHandler) CreateManualInvoice(c *gin.Context) {
 	var req struct {
-		AccountID   string  `json:"account_id" binding:"required"`
-		PeriodStart string  `json:"period_start" binding:"required"`
-		PeriodEnd   string  `json:"period_end" binding:"required"`
-		DueDate     string  `json:"due_date"`
-		Currency    string  `json:"currency"`
-		Notes       string  `json:"notes"`
+		AccountID   string `json:"account_id" binding:"required"`
+		PeriodStart string `json:"period_start" binding:"required"`
+		PeriodEnd   string `json:"period_end" binding:"required"`
+		DueDate     string `json:"due_date"`
+		Currency    string `json:"currency"`
+		Notes       string `json:"notes"`
 		LineItems   []struct {
-			Description string  `json:"description" binding:"required"`
+			Description string `json:"description" binding:"required"`
 			// ProjectID is optional per line: most charges are attributed
 			// to the project that incurred them, but an account-wide
 			// charge (platform fee, setup cost, credit) is not tied to

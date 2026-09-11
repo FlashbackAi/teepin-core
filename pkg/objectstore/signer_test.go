@@ -18,11 +18,12 @@ func TestSigner_RoundTrip(t *testing.T) {
 	}
 
 	want := SignedDownload{
-		AccountID: uuid.New(),
-		ProjectID: uuid.New(),
-		Bucket:    "photos",
-		Key:       "vacation/day1/a.jpg",
-		ExpiresAt: time.Now().Add(10 * time.Minute).Truncate(time.Second),
+		AccountID:   uuid.New(),
+		ProjectID:   uuid.New(),
+		Bucket:      "photos",
+		Key:         "vacation/day1/a.jpg",
+		ExpiresAt:   time.Now().Add(10 * time.Minute).Truncate(time.Second),
+		Disposition: DispositionInline,
 	}
 	token := signer.Mint(want)
 
@@ -31,7 +32,8 @@ func TestSigner_RoundTrip(t *testing.T) {
 		t.Fatalf("Verify: %v", err)
 	}
 	if got.AccountID != want.AccountID || got.ProjectID != want.ProjectID ||
-		got.Bucket != want.Bucket || got.Key != want.Key || !got.ExpiresAt.Equal(want.ExpiresAt) {
+		got.Bucket != want.Bucket || got.Key != want.Key || !got.ExpiresAt.Equal(want.ExpiresAt) ||
+		got.Disposition != want.Disposition {
 		t.Fatalf("round-trip mismatch: got %+v, want %+v", got, want)
 	}
 }
@@ -44,8 +46,9 @@ func TestSigner_KeyContainingDelimiter(t *testing.T) {
 	signer, _ := NewSigner([]byte("k"))
 	want := SignedDownload{
 		AccountID: uuid.New(), ProjectID: uuid.New(), Bucket: "photos",
-		Key:       "weird|key|with|pipes.jpg",
-		ExpiresAt: time.Now().Add(time.Minute).Truncate(time.Second),
+		Key:         "weird|key|with|pipes.jpg",
+		ExpiresAt:   time.Now().Add(time.Minute).Truncate(time.Second),
+		Disposition: DispositionAttachment,
 	}
 	token := signer.Mint(want)
 	got, err := signer.Verify(token)
@@ -57,11 +60,33 @@ func TestSigner_KeyContainingDelimiter(t *testing.T) {
 	}
 }
 
+// TestSigner_DispositionRoundTrips proves the encoded disposition is what
+// the redemption handler later uses to choose Content-Disposition
+// (inline for Preview, attachment for Download) — see the token's own
+// doc comment on why this travels IN the signed payload rather than as
+// an editable query parameter.
+func TestSigner_DispositionRoundTrips(t *testing.T) {
+	signer, _ := NewSigner([]byte("k"))
+	for _, disposition := range []string{DispositionInline, DispositionAttachment} {
+		token := signer.Mint(SignedDownload{
+			AccountID: uuid.New(), ProjectID: uuid.New(), Bucket: "photos", Key: "a.jpg",
+			ExpiresAt: time.Now().Add(time.Minute), Disposition: disposition,
+		})
+		got, err := signer.Verify(token)
+		if err != nil {
+			t.Fatalf("Verify: %v", err)
+		}
+		if got.Disposition != disposition {
+			t.Fatalf("Disposition = %q, want %q", got.Disposition, disposition)
+		}
+	}
+}
+
 func TestSigner_TamperedTokenRejected(t *testing.T) {
 	signer, _ := NewSigner([]byte("k"))
 	token := signer.Mint(SignedDownload{
 		AccountID: uuid.New(), ProjectID: uuid.New(), Bucket: "photos", Key: "a.jpg",
-		ExpiresAt: time.Now().Add(time.Minute),
+		ExpiresAt: time.Now().Add(time.Minute), Disposition: DispositionInline,
 	})
 
 	// Flip the last character of the signature half.
@@ -84,7 +109,7 @@ func TestSigner_WrongKeyRejected(t *testing.T) {
 
 	token := signerA.Mint(SignedDownload{
 		AccountID: uuid.New(), ProjectID: uuid.New(), Bucket: "photos", Key: "a.jpg",
-		ExpiresAt: time.Now().Add(time.Minute),
+		ExpiresAt: time.Now().Add(time.Minute), Disposition: DispositionInline,
 	})
 	if _, err := signerB.Verify(token); err != ErrInvalidSignedURL {
 		t.Fatalf("expected ErrInvalidSignedURL across a key rotation, got %v", err)
@@ -95,7 +120,8 @@ func TestSigner_ExpiredTokenRejected(t *testing.T) {
 	signer, _ := NewSigner([]byte("k"))
 	token := signer.Mint(SignedDownload{
 		AccountID: uuid.New(), ProjectID: uuid.New(), Bucket: "photos", Key: "a.jpg",
-		ExpiresAt: time.Now().Add(-time.Minute), // already expired
+		ExpiresAt:   time.Now().Add(-time.Minute), // already expired
+		Disposition: DispositionInline,
 	})
 	if _, err := signer.Verify(token); err != ErrInvalidSignedURL {
 		t.Fatalf("expected ErrInvalidSignedURL for an expired token, got %v", err)
@@ -127,7 +153,7 @@ func TestSigner_TokenIsURLSafe(t *testing.T) {
 	signer, _ := NewSigner([]byte("k"))
 	token := signer.Mint(SignedDownload{
 		AccountID: uuid.New(), ProjectID: uuid.New(), Bucket: "photos", Key: "a.jpg",
-		ExpiresAt: time.Now().Add(time.Minute),
+		ExpiresAt: time.Now().Add(time.Minute), Disposition: DispositionInline,
 	})
 	if strings.ContainsAny(token, "/+") {
 		t.Fatalf("token contains characters unsafe in a URL path segment: %q", token)

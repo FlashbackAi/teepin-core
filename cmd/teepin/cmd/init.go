@@ -53,9 +53,11 @@ func runInit(cmd *cobra.Command, args []string) {
 	}
 	fmt.Printf("✓ Created config directory: %s\n", teepinDir)
 
-	// Create default config
+	// Create default config. dev-api.teepin.com is the live environment
+	// as of now — this default moves to https://api.teepin.com in a
+	// future CLI release once a separate prod stack exists.
 	config := Config{
-		APIURL:        "http://localhost:8080", // TODO: Change to https://api.teepin.cloud in production
+		APIURL:        "https://dev-api.teepin.com",
 		DefaultRegion: "us-west-1",
 		OutputFormat:  "table",
 	}

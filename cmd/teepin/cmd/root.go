@@ -10,7 +10,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const version = "0.1.0"
+// version is a var, not a const, so the release workflow can set it via
+// -ldflags "-X .../cmd.version=vX.Y.Z" at build time — a locally built
+// binary still shows "0.1.0" (dev build), which is the correct signal
+// that it wasn't produced by a tagged release.
+var version = "0.1.0"
 
 var (
 	cfgFile string

@@ -60,6 +60,27 @@ teepin logs inst-a82e7f3
 teepin version
 ```
 
+### Object Storage (Teepin S3)
+
+```bash
+# Buckets
+teepin storage buckets create my-bucket
+teepin storage buckets list
+teepin storage buckets delete my-bucket
+
+# Objects
+teepin storage objects put my-bucket photos/cat.jpg ./cat.jpg
+teepin storage objects list my-bucket --prefix photos/
+teepin storage objects get my-bucket photos/cat.jpg --outfile cat.jpg
+teepin storage objects delete my-bucket photos/cat.jpg
+
+# Mint a short-lived signed link (safe to hand to an end user/browser —
+# it carries no API key)
+teepin storage objects url my-bucket photos/cat.jpg --ttl 300 --disposition attachment
+```
+
+Every `storage` command except `objects url` sends your API key on the request — run these from a machine you control, never from anywhere a browser or mobile client could read the credential.
+
 ## 🔧 Configuration
 
 Config file location: `~/.teepin/config.yaml`
