@@ -767,12 +767,13 @@ func newRedeployTestContext(projectID uuid.UUID) (*gin.Context, *httptest.Respon
 func instanceRecordRow(id string, accountID, projectID uuid.UUID, name, image string, cpuUnits, memoryGB, storageGB, containerPort int, endpoint string) *sqlmock.Rows {
 	return sqlmock.NewRows([]string{
 		"id", "account_id", "project_id", "user_id", "name", "image",
-		"instance_type_id", "status", "gpu_vram_gb", "cpu_units", "memory_gb", "endpoint",
+		"instance_type_id", "status", "gpu_vram_gb", "cpu_units", "memory_gb",
+		"p_cores_used", "e_cores_used", "endpoint",
 		"k8s_pod_name", "k8s_namespace", "provider_id", "node_name", "dns_name", "public_ip",
 		"tls_enabled", "tls_ready", "container_port", "storage_gb",
 		"created_at", "updated_at", "started_at", "terminated_at", "kumbha_session_id",
 	}).AddRow(id, accountID, projectID, uuid.Nil, name, image,
-		"", compute.StatusRunning, 0, cpuUnits, memoryGB, endpoint,
+		"", compute.StatusRunning, 0, cpuUnits, memoryGB, nil, nil, endpoint,
 		id+"-pod", "default", "", "", id+".teepin.com", "",
 		true, true, containerPort, storageGB,
 		nowStub(), nowStub(), nil, nil, uuid.Nil)
@@ -866,12 +867,13 @@ func TestRedeployKumbhaInstance_ThreadsHomeNodeClassAndProviderOntoSpec(t *testi
 		WithArgs(existingID).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "account_id", "project_id", "user_id", "name", "image",
-			"instance_type_id", "status", "gpu_vram_gb", "cpu_units", "memory_gb", "endpoint",
+			"instance_type_id", "status", "gpu_vram_gb", "cpu_units", "memory_gb",
+			"p_cores_used", "e_cores_used", "endpoint",
 			"k8s_pod_name", "k8s_namespace", "provider_id", "node_name", "dns_name", "public_ip",
 			"tls_enabled", "tls_ready", "container_port", "storage_gb",
 			"created_at", "updated_at", "started_at", "terminated_at", "kumbha_session_id",
 		}).AddRow(existingID, testAccountID, projectID, uuid.Nil, "kumbha-abc123", "old-image:v1",
-			"", compute.StatusRunning, 0, 1, 1, "https://inst-existing5.teepin.com",
+			"", compute.StatusRunning, 0, 1, 1, nil, nil, "https://inst-existing5.teepin.com",
 			existingID+"-pod", "default", "provider-srialla", "srialla", existingID+".teepin.com", "",
 			true, true, 80, 0,
 			nowStub(), nowStub(), nil, nil, uuid.Nil))
@@ -928,12 +930,13 @@ func TestRedeployKumbhaInstance_ProviderSetButNodeUnlinkedRepairsNodeID(t *testi
 		WithArgs(existingID).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "account_id", "project_id", "user_id", "name", "image",
-			"instance_type_id", "status", "gpu_vram_gb", "cpu_units", "memory_gb", "endpoint",
+			"instance_type_id", "status", "gpu_vram_gb", "cpu_units", "memory_gb",
+			"p_cores_used", "e_cores_used", "endpoint",
 			"k8s_pod_name", "k8s_namespace", "provider_id", "node_name", "dns_name", "public_ip",
 			"tls_enabled", "tls_ready", "container_port", "storage_gb",
 			"created_at", "updated_at", "started_at", "terminated_at", "kumbha_session_id",
 		}).AddRow(existingID, testAccountID, projectID, uuid.Nil, "kumbha-abc123", "old-image:v1",
-			"", compute.StatusRunning, 0, 1, 1, "https://inst-existing5.teepin.com",
+			"", compute.StatusRunning, 0, 1, 1, nil, nil, "https://inst-existing5.teepin.com",
 			existingID+"-pod", "default", "Srialla", "", existingID+".teepin.com", "",
 			true, true, 80, 0,
 			nowStub(), nowStub(), nil, nil, uuid.Nil))
@@ -999,12 +1002,13 @@ func TestRedeployKumbhaInstance_RecoversMissingProviderFromLiveStatus(t *testing
 		WithArgs(existingID).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "account_id", "project_id", "user_id", "name", "image",
-			"instance_type_id", "status", "gpu_vram_gb", "cpu_units", "memory_gb", "endpoint",
+			"instance_type_id", "status", "gpu_vram_gb", "cpu_units", "memory_gb",
+			"p_cores_used", "e_cores_used", "endpoint",
 			"k8s_pod_name", "k8s_namespace", "provider_id", "node_name", "dns_name", "public_ip",
 			"tls_enabled", "tls_ready", "container_port", "storage_gb",
 			"created_at", "updated_at", "started_at", "terminated_at", "kumbha_session_id",
 		}).AddRow(existingID, testAccountID, projectID, uuid.Nil, "kumbha-abc123", "old-image:v1",
-			"", compute.StatusRunning, 0, 1, 1, "https://inst-existing5.teepin.com",
+			"", compute.StatusRunning, 0, 1, 1, nil, nil, "https://inst-existing5.teepin.com",
 			existingID+"-pod", "default", "", "", existingID+".teepin.com", "",
 			true, true, 80, 0,
 			nowStub(), nowStub(), nil, nil, uuid.Nil))
@@ -1077,12 +1081,13 @@ func TestRedeployKumbhaInstance_RecoveredProviderMatchesNoNodeStillSucceeds(t *t
 		WithArgs(existingID).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "account_id", "project_id", "user_id", "name", "image",
-			"instance_type_id", "status", "gpu_vram_gb", "cpu_units", "memory_gb", "endpoint",
+			"instance_type_id", "status", "gpu_vram_gb", "cpu_units", "memory_gb",
+			"p_cores_used", "e_cores_used", "endpoint",
 			"k8s_pod_name", "k8s_namespace", "provider_id", "node_name", "dns_name", "public_ip",
 			"tls_enabled", "tls_ready", "container_port", "storage_gb",
 			"created_at", "updated_at", "started_at", "terminated_at", "kumbha_session_id",
 		}).AddRow(existingID, testAccountID, projectID, uuid.Nil, "kumbha-abc123", "old-image:v1",
-			"", compute.StatusRunning, 0, 1, 1, "https://inst-existing5.teepin.com",
+			"", compute.StatusRunning, 0, 1, 1, nil, nil, "https://inst-existing5.teepin.com",
 			existingID+"-pod", "default", "", "", existingID+".teepin.com", "",
 			true, true, 80, 0,
 			nowStub(), nowStub(), nil, nil, uuid.Nil))
@@ -1139,12 +1144,13 @@ func TestRedeployKumbhaInstance_NoLiveProviderLeavesRecoveryOff(t *testing.T) {
 		WithArgs(existingID).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "account_id", "project_id", "user_id", "name", "image",
-			"instance_type_id", "status", "gpu_vram_gb", "cpu_units", "memory_gb", "endpoint",
+			"instance_type_id", "status", "gpu_vram_gb", "cpu_units", "memory_gb",
+			"p_cores_used", "e_cores_used", "endpoint",
 			"k8s_pod_name", "k8s_namespace", "provider_id", "node_name", "dns_name", "public_ip",
 			"tls_enabled", "tls_ready", "container_port", "storage_gb",
 			"created_at", "updated_at", "started_at", "terminated_at", "kumbha_session_id",
 		}).AddRow(existingID, testAccountID, projectID, uuid.Nil, "kumbha-abc123", "old-image:v1",
-			"", compute.StatusRunning, 0, 1, 1, "https://inst-existing5.teepin.com",
+			"", compute.StatusRunning, 0, 1, 1, nil, nil, "https://inst-existing5.teepin.com",
 			existingID+"-pod", "default", "", "", existingID+".teepin.com", "",
 			true, true, 80, 0,
 			nowStub(), nowStub(), nil, nil, uuid.Nil))

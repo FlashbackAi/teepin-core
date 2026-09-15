@@ -12,7 +12,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -77,6 +79,86 @@ func hostSpecs() (cpuCores, memoryGB int, osName, arch string) {
 	return runtime.NumCPU(), detectMemoryGB(), runtime.GOOS, runtime.GOARCH
 }
 
+// detectPECores resolves this node's P-core/E-core split for a hybrid
+// consumer CPU. Both 0 means "no split detected" — never a guess.
+//
+// Resolution order: (1) TEEPIN_PCORES/TEEPIN_ECORES env vars — set by the
+// Windows/macOS bootstrap script from cmd/teepin-hostprobe's real host-OS
+// detection, since this agent only ever runs as Linux (see this file's own
+// package comment) and cannot call Windows/macOS-native detection APIs
+// itself; (2) a best-effort native Linux topology read, for a bare-metal
+// Linux home node running this agent directly with no VM involved.
+func detectPECores() (pCores, eCores int) {
+	if p, e, ok := peCoresFromEnv(); ok {
+		return p, e
+	}
+	return peCoresFromLinuxTopology()
+}
+
+func peCoresFromEnv() (pCores, eCores int, ok bool) {
+	pStr, eStr := os.Getenv("TEEPIN_PCORES"), os.Getenv("TEEPIN_ECORES")
+	if pStr == "" || eStr == "" {
+		return 0, 0, false
+	}
+	p, errP := strconv.Atoi(pStr)
+	e, errE := strconv.Atoi(eStr)
+	if errP != nil || errE != nil || p <= 0 {
+		return 0, 0, false
+	}
+	return p, e, true
+}
+
+var sysCPURE = regexp.MustCompile(`^cpu[0-9]+$`)
+
+// sysCPUDir is /sys/devices/system/cpu, overridable in tests so
+// peCoresFromLinuxTopology can be exercised against fixture files without a
+// real /sys (the sandbox running the tests need not even be Linux) — same
+// seam-by-variable pattern as pkg/agentrunner's own readFileFunc.
+var sysCPUDir = "/sys/devices/system/cpu"
+
+// peCoresFromLinuxTopology groups logical CPUs by
+// /sys/devices/system/cpu/cpuN/cpu_capacity — the kernel's own per-core
+// relative-performance figure, populated from ACPI CPPC / hardware feedback
+// on hybrid-aware kernels (and on ARM big.LITTLE). Exactly two distinct
+// capacity values is treated as a P/E split (the higher-capacity group is
+// P-cores); anything else — the file missing on any core, only one distinct
+// value (homogeneous), or more than two (a design this code does not model)
+// — is not a split this code is confident enough to report, so it returns
+// (0, 0) rather than guess.
+func peCoresFromLinuxTopology() (pCores, eCores int) {
+	entries, err := os.ReadDir(sysCPUDir)
+	if err != nil {
+		return 0, 0
+	}
+
+	countByCapacity := map[int]int{}
+	for _, entry := range entries {
+		if !sysCPURE.MatchString(entry.Name()) {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(sysCPUDir, entry.Name(), "cpu_capacity"))
+		if err != nil {
+			return 0, 0 // any core missing the file — not confident enough to report a split
+		}
+		v, err := strconv.Atoi(strings.TrimSpace(string(data)))
+		if err != nil {
+			return 0, 0
+		}
+		countByCapacity[v]++
+	}
+	if len(countByCapacity) != 2 {
+		return 0, 0
+	}
+
+	values := make([]int, 0, 2)
+	for v := range countByCapacity {
+		values = append(values, v)
+	}
+	sort.Ints(values)
+	low, high := values[0], values[1]
+	return countByCapacity[high], countByCapacity[low]
+}
+
 // detectMemoryGB returns total physical memory in whole GB, read from
 // /proc/meminfo (MemTotal, in kB). Returns 0 if it cannot be read.
 func detectMemoryGB() int {
@@ -138,6 +220,7 @@ func runEnroll(args []string) error {
 	}
 
 	cores, memGB, osName, arch := hostSpecs()
+	pCores, eCores := detectPECores()
 
 	body, _ := json.Marshal(map[string]any{
 		"token":         *token,
@@ -146,6 +229,8 @@ func runEnroll(args []string) error {
 		"region":        *region,
 		"cpu_cores":     cores,
 		"memory_gb":     memGB,
+		"p_cores":       pCores,
+		"e_cores":       eCores,
 		"os":            osName,
 		"arch":          arch,
 		"agent_version": Version,

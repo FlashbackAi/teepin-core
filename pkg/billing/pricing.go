@@ -37,10 +37,17 @@ type PricingInfo struct {
 	// storage/CPU/memory above. No per-request rate: nothing in
 	// pkg/objectstore counts requests today, so there is nothing to meter
 	// against one.
-	ObjectStoragePricePerGBMonth  float64    `json:"object_storage_price_per_gb_month"`
-	ObjectStoragePricePerGBEgress float64    `json:"object_storage_price_per_gb_egress"`
-	UpdatedBy                     *string    `json:"updated_by,omitempty"`
-	UpdatedAt                     *time.Time `json:"updated_at,omitempty"`
+	ObjectStoragePricePerGBMonth  float64 `json:"object_storage_price_per_gb_month"`
+	ObjectStoragePricePerGBEgress float64 `json:"object_storage_price_per_gb_egress"`
+	// P/E-core rates apply to a home-node instance placed with a detected
+	// P-core/E-core split (migration 044/045) — an instance with no
+	// detected split is unaffected and keeps billing off
+	// CPUPricePerCoreHour above. Same "default 0, ships on, bills nothing
+	// until an operator sets it" pattern as every other rate here.
+	PCorePricePerHour float64    `json:"p_core_price_per_hour"`
+	ECorePricePerHour float64    `json:"e_core_price_per_hour"`
+	UpdatedBy         *string    `json:"updated_by,omitempty"`
+	UpdatedAt         *time.Time `json:"updated_at,omitempty"`
 }
 
 // VRAMPricePerGBHour returns the live GPU VRAM rate from billing.pricing.
@@ -76,6 +83,19 @@ func (s *Service) CPUCoreRate(ctx context.Context) float64 {
 
 func (s *Service) MemoryGBRate(ctx context.Context) float64 {
 	return s.rate(ctx, "memory_price_per_gb_hour")
+}
+
+// PCoreRate / ECoreRate return the live P-core/E-core rates for a home-node
+// instance placed with a detected split. Same 0-default, no-compiled-
+// fallback contract as CPUCoreRate — an instance with no detected split
+// never reads these at all, billing off CPUCoreRate instead (see
+// pkg/billing/collector.go's own P/E-aware branch).
+func (s *Service) PCoreRate(ctx context.Context) float64 {
+	return s.rate(ctx, "p_core_price_per_hour")
+}
+
+func (s *Service) ECoreRate(ctx context.Context) float64 {
+	return s.rate(ctx, "e_core_price_per_hour")
 }
 
 // StorageGBMonthRate returns the live per-GB-month persistent-storage
@@ -134,12 +154,14 @@ func (s *Service) GetPricing(ctx context.Context) (*PricingInfo, error) {
 		        memory_price_per_gb_hour, storage_price_per_gb_month,
 		        llm_price_per_million_input, llm_price_per_million_output,
 		        object_storage_price_per_gb_month, object_storage_price_per_gb_egress,
+		        p_core_price_per_hour, e_core_price_per_hour,
 		        updated_by, updated_at
 		 FROM billing.pricing WHERE id = 1`,
 	).Scan(&info.VRAMPricePerGBHour, &info.CPUPricePerCoreHour,
 		&info.MemoryPricePerGBHour, &info.StoragePricePerGBMonth,
 		&info.LLMPricePerMillionInput, &info.LLMPricePerMillionOutput,
 		&info.ObjectStoragePricePerGBMonth, &info.ObjectStoragePricePerGBEgress,
+		&info.PCorePricePerHour, &info.ECorePricePerHour,
 		&info.UpdatedBy, &info.UpdatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read pricing: %w", err)
@@ -216,6 +238,32 @@ func (s *Service) SetCPUPricing(ctx context.Context, cpuRate, memRate float64, u
 		return fmt.Errorf("pricing row missing; set the GPU rate first")
 	}
 	log.Printf("CPU pricing updated to $%.4f/core-hr, $%.4f/GB-hr by %s", cpuRate, memRate, updatedBy)
+	return nil
+}
+
+// SetPECorePricing updates the P-core/E-core rates for a home-node instance
+// placed with a detected split. Zero is allowed (means "do not charge"),
+// same contract as CPU/memory — a separate endpoint from the GPU rate's PUT
+// so that rate's "must be positive" contract stays untouched.
+// cpu_price_per_core_hour (SetCPUPricing) is untouched by this call and
+// remains the rate for an instance with no detected split.
+func (s *Service) SetPECorePricing(ctx context.Context, pCoreRate, eCoreRate float64, updatedBy string) error {
+	if pCoreRate < 0 || eCoreRate < 0 {
+		return fmt.Errorf("rates must be non-negative")
+	}
+	result, err := s.db.ExecContext(ctx,
+		`UPDATE billing.pricing
+		 SET p_core_price_per_hour = $1, e_core_price_per_hour = $2,
+		     updated_by = $3, updated_at = NOW()
+		 WHERE id = 1`,
+		pCoreRate, eCoreRate, updatedBy)
+	if err != nil {
+		return fmt.Errorf("failed to update P/E-core pricing: %w", err)
+	}
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		return fmt.Errorf("pricing row missing; set the GPU rate first")
+	}
+	log.Printf("P/E-core pricing updated to $%.4f/P-core-hr, $%.4f/E-core-hr by %s", pCoreRate, eCoreRate, updatedBy)
 	return nil
 }
 

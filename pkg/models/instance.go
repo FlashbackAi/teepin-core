@@ -54,6 +54,14 @@ type CreateInstanceRequest struct {
 	InstanceType string `json:"instance_type,omitempty"` // Legacy: "gpu.h100.mig-2g"
 	CPUUnits     int    `json:"cpu_units" binding:"required,min=1"`
 	Memory       string `json:"memory" binding:"required"` // e.g., "32GB"
+	// PCores/ECores are an optional, explicit P-core/E-core preference for
+	// a home-node instance (node_class: "home"). Both 0 (the default)
+	// means "no preference" — the platform either falls back to the
+	// undifferentiated CPUUnits path (a node with no detected split) or
+	// picks a proportional default. Ignored on the GPU/datacenter path.
+	// See nodes.PlacementReq's own doc comment for the full contract.
+	PCores int `json:"p_cores,omitempty"`
+	ECores int `json:"e_cores,omitempty"`
 	// NodeClass opts a workload onto a specific capacity class. Empty (the
 	// default) is the datacenter/GPU path — unchanged. "home" places the
 	// workload on a consumer-grade CPU node. A workload NEVER lands on a

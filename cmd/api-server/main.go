@@ -1461,6 +1461,7 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 				admin.GET("/pricing", adminHandler.GetPricing)
 				admin.PUT("/pricing", adminHandler.UpdatePricing)
 				admin.PUT("/pricing/cpu", adminHandler.UpdateCPUPricing)
+				admin.PUT("/pricing/cpu-pe", adminHandler.UpdatePECorePricing)
 				admin.PUT("/pricing/storage", adminHandler.UpdateStoragePricing)
 				admin.PUT("/pricing/object-storage", adminHandler.UpdateObjectStoragePricing)
 				admin.PUT("/pricing/llm", adminHandler.UpdateLLMPricing)

@@ -117,6 +117,34 @@ func (h *AdminHandler) UpdateCPUPricing(c *gin.Context) {
 	c.JSON(http.StatusOK, info)
 }
 
+// UpdatePECorePricing sets the P-core/E-core rates for a home-node instance
+// placed with a detected split. Zero is a valid value ("do not charge"), so
+// neither field is required. Kept separate from UpdateCPUPricing (which
+// remains the rate for an instance with no detected split) — same reasoning
+// as every other per-dimension pricing endpoint here.
+// PUT /v1/admin/pricing/cpu-pe
+func (h *AdminHandler) UpdatePECorePricing(c *gin.Context) {
+	var req struct {
+		PCorePricePerHour float64 `json:"p_core_price_per_hour"`
+		ECorePricePerHour float64 `json:"e_core_price_per_hour"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := h.billingService.SetPECorePricing(c.Request.Context(),
+		req.PCorePricePerHour, req.ECorePricePerHour, "admin-api"); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	info, err := h.billingService.GetPricing(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, info)
+}
+
 // UpdateStoragePricing sets the persistent-storage GB-month rate. Zero is
 // valid ("do not charge"). A separate endpoint from UpdatePricing, same
 // reasoning as UpdateCPUPricing: the GPU rate's "must be positive"

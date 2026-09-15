@@ -188,14 +188,16 @@ func (s *Service) Enroll(ctx context.Context, token string, specs NodeSpecs) (cr
 	err = tx.QueryRowContext(ctx, `
 		INSERT INTO compute.nodes
 		(node_name, provider_id, class, region, cpu_cores, memory_gb,
-		 gpu_model, gpu_count, mig_capable, os, arch, agent_version,
-		 status, credential_hash, credential_prefix)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'enrolled',$13,$14)
+		 p_cores, e_cores, gpu_model, gpu_count, mig_capable, os, arch,
+		 agent_version, status, credential_hash, credential_prefix)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'enrolled',$15,$16)
 		ON CONFLICT (provider_id) DO UPDATE SET
 			class = EXCLUDED.class,
 			region = COALESCE(EXCLUDED.region, compute.nodes.region),
 			cpu_cores = COALESCE(EXCLUDED.cpu_cores, compute.nodes.cpu_cores),
 			memory_gb = COALESCE(EXCLUDED.memory_gb, compute.nodes.memory_gb),
+			p_cores = COALESCE(EXCLUDED.p_cores, compute.nodes.p_cores),
+			e_cores = COALESCE(EXCLUDED.e_cores, compute.nodes.e_cores),
 			gpu_model = COALESCE(EXCLUDED.gpu_model, compute.nodes.gpu_model),
 			gpu_count = EXCLUDED.gpu_count,
 			mig_capable = EXCLUDED.mig_capable,
@@ -212,8 +214,8 @@ func (s *Service) Enroll(ctx context.Context, token string, specs NodeSpecs) (cr
 			updated_at = NOW()
 		RETURNING id, node_name, created_at, updated_at
 	`, specs.NodeName, specs.ProviderID, class, nullString(specs.Region),
-		nullInt(specs.CPUCores), nullInt(specs.MemoryGB), nullString(specs.GPUModel),
-		specs.GPUCount, specs.MIGCapable, nullString(specs.OS), nullString(specs.Arch),
+		nullInt(specs.CPUCores), nullInt(specs.MemoryGB), nullInt(specs.PCores), nullInt(specs.ECores),
+		nullString(specs.GPUModel), specs.GPUCount, specs.MIGCapable, nullString(specs.OS), nullString(specs.Arch),
 		nullString(specs.AgentVersion), credHash, credPrefix,
 	).Scan(&nodeID, &actualName, &created, &updated)
 	if err != nil {
@@ -240,7 +242,8 @@ func (s *Service) Enroll(ctx context.Context, token string, specs NodeSpecs) (cr
 		// UPDATE branch above deliberately left untouched.
 		ID: nodeID, NodeName: actualName, ProviderID: specs.ProviderID,
 		Class: class, Region: specs.Region, CPUCores: specs.CPUCores,
-		MemoryGB: specs.MemoryGB, GPUModel: specs.GPUModel, GPUCount: specs.GPUCount,
+		MemoryGB: specs.MemoryGB, PCores: specs.PCores, ECores: specs.ECores,
+		GPUModel: specs.GPUModel, GPUCount: specs.GPUCount,
 		MIGCapable: specs.MIGCapable, OS: specs.OS, Arch: specs.Arch,
 		AgentVersion: specs.AgentVersion, Status: StatusEnrolled,
 		CreatedAt: created, UpdatedAt: updated,
@@ -303,13 +306,15 @@ func (s *Service) RecordHeartbeat(ctx context.Context, nodeID uuid.UUID, specs N
 		    last_seen_at = NOW(),
 		    cpu_cores = COALESCE(NULLIF($2,0), cpu_cores),
 		    memory_gb = COALESCE(NULLIF($3,0), memory_gb),
-		    gpu_model = COALESCE(NULLIF($4,''), gpu_model),
-		    gpu_count = $5,
-		    mig_capable = $6,
-		    agent_version = COALESCE(NULLIF($7,''), agent_version),
+		    p_cores = COALESCE(NULLIF($4,0), p_cores),
+		    e_cores = COALESCE(NULLIF($5,0), e_cores),
+		    gpu_model = COALESCE(NULLIF($6,''), gpu_model),
+		    gpu_count = $7,
+		    mig_capable = $8,
+		    agent_version = COALESCE(NULLIF($9,''), agent_version),
 		    updated_at = NOW()
 		WHERE id = $1
-	`, nodeID, specs.CPUCores, specs.MemoryGB, specs.GPUModel,
+	`, nodeID, specs.CPUCores, specs.MemoryGB, specs.PCores, specs.ECores, specs.GPUModel,
 		specs.GPUCount, specs.MIGCapable, specs.AgentVersion)
 	if err != nil {
 		return fmt.Errorf("failed to record heartbeat: %w", err)
@@ -361,9 +366,9 @@ func (s *Service) UpsertSeen(ctx context.Context, class string, specs NodeSpecs)
 	err := s.db.QueryRowContext(ctx, `
 		INSERT INTO compute.nodes
 		(node_name, provider_id, class, region, cpu_cores, memory_gb,
-		 gpu_model, gpu_count, mig_capable, os, arch, agent_version,
-		 status, last_seen_at, k8s_ready)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'online',NOW(),$13)
+		 p_cores, e_cores, gpu_model, gpu_count, mig_capable, os, arch,
+		 agent_version, status, last_seen_at, k8s_ready)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'online',NOW(),$15)
 		ON CONFLICT (provider_id) DO UPDATE SET
 			-- Never resurrect a disabled node via a heartbeat.
 			status = CASE WHEN compute.nodes.status = 'disabled'
@@ -372,6 +377,8 @@ func (s *Service) UpsertSeen(ctx context.Context, class string, specs NodeSpecs)
 			region = COALESCE(EXCLUDED.region, compute.nodes.region),
 			cpu_cores = COALESCE(EXCLUDED.cpu_cores, compute.nodes.cpu_cores),
 			memory_gb = COALESCE(EXCLUDED.memory_gb, compute.nodes.memory_gb),
+			p_cores = COALESCE(EXCLUDED.p_cores, compute.nodes.p_cores),
+			e_cores = COALESCE(EXCLUDED.e_cores, compute.nodes.e_cores),
 			gpu_model = COALESCE(EXCLUDED.gpu_model, compute.nodes.gpu_model),
 			gpu_count = EXCLUDED.gpu_count,
 			mig_capable = EXCLUDED.mig_capable,
@@ -390,8 +397,8 @@ func (s *Service) UpsertSeen(ctx context.Context, class string, specs NodeSpecs)
 			updated_at = NOW()
 		RETURNING id
 	`, specs.NodeName, specs.ProviderID, class, nullString(specs.Region),
-		nullInt(specs.CPUCores), nullInt(specs.MemoryGB), nullString(specs.GPUModel),
-		specs.GPUCount, specs.MIGCapable, nullString(specs.OS), nullString(specs.Arch),
+		nullInt(specs.CPUCores), nullInt(specs.MemoryGB), nullInt(specs.PCores), nullInt(specs.ECores),
+		nullString(specs.GPUModel), specs.GPUCount, specs.MIGCapable, nullString(specs.OS), nullString(specs.Arch),
 		nullString(specs.AgentVersion), specs.K8sReady,
 	).Scan(&nodeID)
 	if err != nil {

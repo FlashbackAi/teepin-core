@@ -224,12 +224,14 @@ func newNodePlacerAdapter(svc *nodes.Service) *nodePlacerAdapter {
 	return &nodePlacerAdapter{svc: svc}
 }
 
-func (a *nodePlacerAdapter) PlaceCPU(ctx context.Context, arch string, cpuUnits, memoryGB int) (string, string, string, error) {
-	p, err := a.svc.PlaceCPU(ctx, nodes.PlacementReq{Arch: arch, CPUUnits: cpuUnits, MemoryGB: memoryGB})
+func (a *nodePlacerAdapter) PlaceCPU(ctx context.Context, arch string, cpuUnits, memoryGB, pCores, eCores int) (string, string, string, *int, *int, error) {
+	p, err := a.svc.PlaceCPU(ctx, nodes.PlacementReq{
+		Arch: arch, CPUUnits: cpuUnits, MemoryGB: memoryGB, PCores: pCores, ECores: eCores,
+	})
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", nil, nil, err
 	}
-	return p.NodeName, p.ProviderID, p.Arch, nil
+	return p.NodeName, p.ProviderID, p.Arch, p.PCoresUsed, p.ECoresUsed, nil
 }
 
 func (a *nodePlacerAdapter) IsNoCapacity(err error) bool {

@@ -42,6 +42,12 @@ type InstanceRecord struct {
 	GPUVRAMGB    int // 0 for CPU-only instances
 	CPUUnits     int
 	MemoryGB     int
+	// PCoresUsed/ECoresUsed are nil unless this instance was placed with a
+	// detected P-core/E-core split (nodes.Placement) — nil means bill and
+	// report via CPUUnits alone, exactly as before this feature. See
+	// migration 045's own comment.
+	PCoresUsed   *int
+	ECoresUsed   *int
 	Endpoint     string
 	K8sPodName   string
 	K8sNamespace string
@@ -110,11 +116,13 @@ func (s *Store) Create(ctx context.Context, rec *InstanceRecord) error {
 	query := `
 		INSERT INTO compute.instances
 		(id, account_id, project_id, user_id, name, image, instance_type_id, status,
-		 gpu_vram_gb, cpu_units, memory_gb, endpoint, k8s_pod_name, k8s_namespace,
+		 gpu_vram_gb, cpu_units, memory_gb, p_cores_used, e_cores_used, endpoint,
+		 k8s_pod_name, k8s_namespace,
 		 provider_id, node_id, dns_name, public_ip, tls_enabled, tls_ready, container_port,
 		 storage_gb, kumbha_session_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-		 (SELECT id FROM compute.nodes WHERE node_name = $16), $17, $18, $19, $20, $21, $22, $23)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+		 $17, (SELECT id FROM compute.nodes WHERE node_name = $18), $19, $20, $21, $22, $23,
+		 $24, $25)
 		RETURNING created_at, updated_at
 	`
 
@@ -130,6 +138,7 @@ func (s *Store) Create(ctx context.Context, rec *InstanceRecord) error {
 	err := s.db.QueryRowContext(ctx, query,
 		rec.ID, rec.AccountID, rec.ProjectID, nullUUID(rec.UserID), rec.Name, rec.Image,
 		rec.InstanceType, rec.Status, vram, rec.CPUUnits, rec.MemoryGB,
+		rec.PCoresUsed, rec.ECoresUsed,
 		nullIfEmpty(rec.Endpoint), nullIfEmpty(rec.K8sPodName), rec.K8sNamespace,
 		nullIfEmpty(rec.ProviderID), nullIfEmpty(rec.NodeName),
 		nullIfEmpty(rec.DNSName), nullIfEmpty(rec.PublicIP), rec.TLSEnabled, rec.TLSReady,
@@ -455,7 +464,7 @@ func (s *Store) ListByKumbhaSession(ctx context.Context, sessionID uuid.UUID) ([
 const selectColumns = `
 	SELECT id, account_id, project_id, user_id, name, image,
 	       COALESCE(instance_type_id, ''), status, COALESCE(gpu_vram_gb, 0),
-	       cpu_units, memory_gb, COALESCE(endpoint, ''),
+	       cpu_units, memory_gb, p_cores_used, e_cores_used, COALESCE(endpoint, ''),
 	       COALESCE(k8s_pod_name, ''), COALESCE(k8s_namespace, ''),
 	       COALESCE(provider_id, ''),
 	       COALESCE((SELECT node_name FROM compute.nodes WHERE compute.nodes.id = compute.instances.node_id), ''),
@@ -478,7 +487,7 @@ func (s *Store) query(ctx context.Context, where string, args ...interface{}) ([
 		if err := rows.Scan(
 			&rec.ID, &rec.AccountID, &rec.ProjectID, &rec.UserID, &rec.Name, &rec.Image,
 			&rec.InstanceType, &rec.Status, &rec.GPUVRAMGB,
-			&rec.CPUUnits, &rec.MemoryGB, &rec.Endpoint,
+			&rec.CPUUnits, &rec.MemoryGB, &rec.PCoresUsed, &rec.ECoresUsed, &rec.Endpoint,
 			&rec.K8sPodName, &rec.K8sNamespace,
 			&rec.ProviderID, &rec.NodeName, &rec.DNSName, &rec.PublicIP, &rec.TLSEnabled, &rec.TLSReady,
 			&rec.ContainerPort, &rec.StorageGB,

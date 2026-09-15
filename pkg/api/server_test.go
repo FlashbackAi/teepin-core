@@ -485,7 +485,7 @@ func TestGetInstanceMetrics_OwnerGetsSamples(t *testing.T) {
 		t.Fatalf("owner metrics status = %d, want 200 (body: %s)", w.Code, w.Body.String())
 	}
 	var resp struct {
-		InstanceID string                        `json:"instance_id"`
+		InstanceID string                         `json:"instance_id"`
 		Samples    []compute.InstanceMetricSample `json:"samples"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
@@ -703,15 +703,15 @@ type fakePlacer struct {
 	insuffCap bool
 }
 
-func (p *fakePlacer) PlaceCPU(_ context.Context, arch string, cpuUnits, memoryGB int) (string, string, string, error) {
+func (p *fakePlacer) PlaceCPU(_ context.Context, arch string, cpuUnits, memoryGB, _, _ int) (string, string, string, *int, *int, error) {
 	p.called = true
 	p.lastArch = arch
 	p.lastCPU = cpuUnits
 	p.lastMem = memoryGB
 	if p.err != nil {
-		return "", "", "", p.err
+		return "", "", "", nil, nil, p.err
 	}
-	return p.nodeName, p.provider, p.arch, nil
+	return p.nodeName, p.provider, p.arch, nil, nil, nil
 }
 func (p *fakePlacer) IsNoCapacity(error) bool           { return p.noCap }
 func (p *fakePlacer) IsArchUnavailable(error) bool      { return p.archUnav }
@@ -1243,8 +1243,8 @@ func TestCreateInstance_PersistsEndpointFields(t *testing.T) {
 	mock.ExpectQuery(`INSERT INTO compute\.instances`).
 		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
-			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
-			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
 			sqlmock.AnyArg(), "203.0.113.20", true, false, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"created_at", "updated_at"}).
 			AddRow(time.Now(), time.Now()))
@@ -1282,10 +1282,10 @@ func TestCreateInstance_CheckspointsKumbhaWorkspaceWhenSessionLinked(t *testing.
 	mock.ExpectQuery(`INSERT INTO compute\.instances`).
 		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
-			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
-			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"created_at", "updated_at"}).
 			AddRow(time.Now(), time.Now()))
 	mock.ExpectExec(`UPDATE billing\.kumbha_workspace_versions`).

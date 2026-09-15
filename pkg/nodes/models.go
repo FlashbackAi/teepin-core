@@ -47,8 +47,16 @@ type Node struct {
 
 	// Specs. GPU fields are zero/false on CPU-only home nodes; a consumer
 	// GPU is reported here as an attribute, never as sellable VRAM.
-	CPUCores   int    `json:"cpu_cores,omitempty"`
-	MemoryGB   int    `json:"memory_gb,omitempty"`
+	CPUCores int `json:"cpu_cores,omitempty"`
+	MemoryGB int `json:"memory_gb,omitempty"`
+	// PCores/ECores are the physical-core P-core/E-core split for a hybrid
+	// consumer CPU, detected by cmd/teepin-hostprobe (Windows/macOS) or
+	// natively (bare-metal Linux). Both 0 means "no split detected" — a
+	// homogeneous CPU, an agent predating this feature, or a hypervisor
+	// that does not expose real core-type info to its guest — never a
+	// guess. See migration 044's own comment for the full reasoning.
+	PCores     int    `json:"p_cores,omitempty"`
+	ECores     int    `json:"e_cores,omitempty"`
 	GPUModel   string `json:"gpu_model,omitempty"`
 	GPUCount   int    `json:"gpu_count"`
 	MIGCapable bool   `json:"mig_capable"`
@@ -110,11 +118,15 @@ type MetricSample struct {
 // UpsertSeen) what a connected session reports on each inventory sweep. The
 // class is deliberately ABSENT: it is not the agent's to choose.
 type NodeSpecs struct {
-	NodeName     string
-	ProviderID   string
-	Region       string
-	CPUCores     int
-	MemoryGB     int
+	NodeName   string
+	ProviderID string
+	Region     string
+	CPUCores   int
+	MemoryGB   int
+	// PCores/ECores — see the identical fields on Node above for the full
+	// doc comment; both 0 means "no split detected."
+	PCores       int
+	ECores       int
 	GPUModel     string
 	GPUCount     int
 	MIGCapable   bool

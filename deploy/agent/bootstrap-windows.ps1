@@ -348,6 +348,7 @@ Info "installer path in WSL: $wslPath"
 # of a clear PowerShell one.
 $alreadyEnrolled = (wsl -d $Distro -u root -- bash -c "[ -f /etc/teepin/agent.json ] && [ -f /etc/systemd/system/teepin-agent.service ] && echo yes || echo no").Trim()
 
+$peExportPrefix = ""
 if ($alreadyEnrolled -eq "yes") {
     Info "existing enrollment found inside $Distro -- updating the agent binary only (Token/ControlPlane not needed)."
     $installArgs = ""
@@ -358,10 +359,51 @@ if ($alreadyEnrolled -eq "yes") {
     $grpcArg = ""
     if ($Grpc -ne "") { $grpcArg = "--grpc $Grpc" }
     $installArgs = "--token '$Token' --control-plane '$ControlPlane' $grpcArg"
+
+    # --- P-core/E-core detection (Windows host side, before enrollment) --
+    # Must happen HERE, on the real Windows host, not inside WSL2: the agent
+    # (built GOOS=linux only) always runs inside this WSL2 distro, and the
+    # distro's own view of CPU topology is not reliably the host's real one
+    # -- WSL2/Hyper-V may not expose true core-type info to it at all. See
+    # cmd/teepin-hostprobe's own doc comment for the full reasoning.
+    $probeBin = Join-Path $here "teepin-hostprobe.exe"
+    if (-not (Test-Path $probeBin)) {
+        $goCmd = Get-Command go -ErrorAction SilentlyContinue
+        if ($goCmd) {
+            Info "building teepin-hostprobe from source..."
+            $repoRoot = (Resolve-Path (Join-Path $here "..\..")).Path
+            $probeBin = Join-Path $env:TEMP "teepin-hostprobe.exe"
+            Push-Location $repoRoot
+            try {
+                & go build -o $probeBin ./cmd/teepin-hostprobe
+                if ($LASTEXITCODE -ne 0) {
+                    Info "note: could not build teepin-hostprobe -- P/E-core detection skipped."
+                    $probeBin = ""
+                }
+            } finally { Pop-Location }
+        } else {
+            Info "note: teepin-hostprobe.exe not found and Go is not installed to build it -- P/E-core detection skipped."
+            $probeBin = ""
+        }
+    }
+    if ($probeBin) {
+        try {
+            $probeJson = (& $probeBin 2>$null | Out-String).Trim()
+            $probe = $probeJson | ConvertFrom-Json
+            if ($probe.p_cores -gt 0) {
+                Info "detected CPU: $($probe.p_cores) P-cores / $($probe.e_cores) E-cores"
+                $peExportPrefix = "export TEEPIN_PCORES=$($probe.p_cores) TEEPIN_ECORES=$($probe.e_cores); "
+            } else {
+                Info "note: teepin-hostprobe did not report a usable P/E-core split -- this CPU will be treated as homogeneous."
+            }
+        } catch {
+            Info "note: teepin-hostprobe did not return usable output ($_) -- P/E-core detection skipped."
+        }
+    }
 }
 
 Info "running the Linux installer inside $Distro..."
-wsl -d $Distro -u root -- bash -c "cd '$wslPath' && bash install.sh $installArgs"
+wsl -d $Distro -u root -- bash -c "$peExportPrefix cd '$wslPath' && bash install.sh $installArgs"
 
 Info "done. The node should appear in the control centre (Nodes) as online within a minute."
 Info "check inside WSL:  wsl -d $Distro -- systemctl status teepin-agent"

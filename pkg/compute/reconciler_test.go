@@ -70,7 +70,7 @@ func expectListActive(mock sqlmock.Sqlmock, id, status string) {
 	mock.ExpectQuery(`SELECT .+ FROM compute\.instances WHERE terminated_at IS NULL`).
 		WillReturnRows(instanceRows().AddRow(
 			id, uuid.New(), uuid.New(), uuid.New(), "app", "nginx:latest",
-			"gpu.h100.2g.20gb", status, 20, 8, 32, "",
+			"gpu.h100.2g.20gb", status, 20, 8, 32, nil, nil, "",
 			id+"-pod", "default", "", "", "", "", false, false, 0,
 			0,
 			time.Now(), time.Now(), nil, nil, nil,
@@ -220,7 +220,7 @@ func TestReconcile_RevivesTerminatedInstanceReportingHealthy(t *testing.T) {
 	mock.ExpectQuery(`SELECT .+ FROM compute\.instances\s+WHERE terminated_at IS NOT NULL AND terminated_at > `).
 		WillReturnRows(instanceRows().AddRow(
 			"inst-revived1", uuid.New(), uuid.New(), uuid.New(), "app", "nginx:latest",
-			"", StatusTerminated, 0, 1, 1, "",
+			"", StatusTerminated, 0, 1, 1, nil, nil, "",
 			"inst-revived1-pod", "default", "", "", "", "", false, false, 80,
 			0,
 			time.Now(), time.Now(), nil, time.Now(), nil,
@@ -253,7 +253,7 @@ func TestReconcile_DoesNotReviveTerminatedInstanceStillGone(t *testing.T) {
 	mock.ExpectQuery(`SELECT .+ FROM compute\.instances\s+WHERE terminated_at IS NOT NULL AND terminated_at > `).
 		WillReturnRows(instanceRows().AddRow(
 			"inst-stillgone", uuid.New(), uuid.New(), uuid.New(), "app", "nginx:latest",
-			"", StatusTerminated, 0, 1, 1, "",
+			"", StatusTerminated, 0, 1, 1, nil, nil, "",
 			"inst-stillgone-pod", "default", "", "", "", "", false, false, 80,
 			0,
 			time.Now(), time.Now(), nil, time.Now(), nil,
@@ -282,7 +282,7 @@ func TestReconcile_DoesNotReviveOnUnhealthyStatus(t *testing.T) {
 	mock.ExpectQuery(`SELECT .+ FROM compute\.instances\s+WHERE terminated_at IS NOT NULL AND terminated_at > `).
 		WillReturnRows(instanceRows().AddRow(
 			"inst-unhealthy", uuid.New(), uuid.New(), uuid.New(), "app", "nginx:latest",
-			"", StatusTerminated, 0, 1, 1, "",
+			"", StatusTerminated, 0, 1, 1, nil, nil, "",
 			"inst-unhealthy-pod", "default", "", "", "", "", false, false, 80,
 			0,
 			time.Now(), time.Now(), nil, time.Now(), nil,
@@ -336,7 +336,7 @@ func TestReconcile_AllEmptyObservedEndpointNeverErasesKnownEndpoint(t *testing.T
 	mock.ExpectQuery(`SELECT .+ FROM compute\.instances WHERE terminated_at IS NULL`).
 		WillReturnRows(instanceRows().AddRow(
 			"inst-5ed29952", accountID, projectID, userID, "app", "nginx:latest",
-			"gpu.h100.2g.20gb", StatusRunning, 20, 8, 32,
+			"gpu.h100.2g.20gb", StatusRunning, 20, 8, 32, nil, nil,
 			"https://inst-5ed29952.dev.teepin.com",
 			"inst-5ed29952-pod", "default", "", "",
 			"inst-5ed29952.dev.teepin.com", "", true, true, 8080,

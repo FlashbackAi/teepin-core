@@ -82,7 +82,8 @@ func TestEnroll_ClassComesFromToken(t *testing.T) {
 			AddRow(tokenID, hash, "datacenter", time.Now().Add(time.Hour), nil))
 	mock.ExpectQuery(`INSERT INTO compute\.nodes`).
 		WithArgs("node-a", "prov-a", "datacenter", sqlmock.AnyArg(), sqlmock.AnyArg(),
-			sqlmock.AnyArg(), sqlmock.AnyArg(), 0, false, sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			0, false, sqlmock.AnyArg(), sqlmock.AnyArg(),
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "node_name", "created_at", "updated_at"}).
 			AddRow(nodeID, "node-a", time.Now(), time.Now()))
@@ -242,7 +243,8 @@ func TestUpsertSeen(t *testing.T) {
 	nodeID := uuid.New()
 	mock.ExpectQuery(`(?s)INSERT INTO compute\.nodes.*ON CONFLICT \(provider_id\) DO UPDATE`).
 		WithArgs("gpu-node-1", "dc-provider", "datacenter", sqlmock.AnyArg(),
-			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), 8, true,
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), 8, true,
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), true).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(nodeID))
 	mock.ExpectExec(`INSERT INTO compute\.node_metrics`).
@@ -281,7 +283,8 @@ func TestUpsertSeen_KeyedByProviderIDNotNodeName(t *testing.T) {
 	nodeID := uuid.New()
 	mock.ExpectQuery(`(?s)INSERT INTO compute\.nodes.*ON CONFLICT \(provider_id\) DO UPDATE`).
 		WithArgs("stale-agent-reported-name", "stable-provider-id", "home", sqlmock.AnyArg(),
-			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), 0, false,
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), 0, false,
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), true).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(nodeID))
 	mock.ExpectExec(`INSERT INTO compute\.node_metrics`).
@@ -316,7 +319,8 @@ func TestUpsertSeen_RecordsUtilizationHistory(t *testing.T) {
 	nodeID := uuid.New()
 	mock.ExpectQuery(`(?s)INSERT INTO compute\.nodes.*ON CONFLICT \(provider_id\) DO UPDATE`).
 		WithArgs("srialla", "srialla", "home", sqlmock.AnyArg(),
-			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), 0, false,
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), 0, false,
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), true).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(nodeID))
 	mock.ExpectExec(`INSERT INTO compute\.node_metrics`).
@@ -351,7 +355,8 @@ func TestUpsertSeen_MetricsHistoryFailureIsNonFatal(t *testing.T) {
 	nodeID := uuid.New()
 	mock.ExpectQuery(`(?s)INSERT INTO compute\.nodes.*ON CONFLICT \(provider_id\) DO UPDATE`).
 		WithArgs("srialla", "srialla", "home", sqlmock.AnyArg(),
-			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), 0, false,
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), 0, false,
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), true).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(nodeID))
 	mock.ExpectExec(`INSERT INTO compute\.node_metrics`).

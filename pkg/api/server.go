@@ -295,7 +295,11 @@ func (s *Server) WithEphemeralStorageGB(gb int) *Server {
 // main injects the concrete nodes.Service through a thin adapter. Mirrors the
 // ProvisionGate/PricingProvider pattern.
 type NodePlacer interface {
-	PlaceCPU(ctx context.Context, arch string, cpuUnits, memoryGB int) (nodeName, providerID, nodeArch string, err error)
+	// pCores/eCores are the customer's explicit P-core/E-core preference
+	// (both 0 = no preference — see nodes.PlacementReq's own doc comment).
+	// pCoresUsed/eCoresUsed on return are nil unless the chosen node has a
+	// detected split, matching nodes.Placement's own contract.
+	PlaceCPU(ctx context.Context, arch string, cpuUnits, memoryGB, pCores, eCores int) (nodeName, providerID, nodeArch string, pCoresUsed, eCoresUsed *int, err error)
 	// Error classification so the handler can return the right status.
 	IsNoCapacity(err error) bool
 	IsArchUnavailable(err error) bool
@@ -340,6 +344,9 @@ type homeTarget struct {
 	nodeName   string
 	providerID string
 	arch       string
+	// pCoresUsed/eCoresUsed — see NodePlacer.PlaceCPU's own doc comment.
+	pCoresUsed *int
+	eCoresUsed *int
 }
 
 // NewServer creates a new API server. store, pricing and gate may be nil
@@ -675,8 +682,8 @@ func (s *Server) CreateInstance(c *gin.Context) {
 		// tier's cpu_units and memory). Placement refuses a node that cannot
 		// fit this size.
 		reqMemGB := parseMemoryGB(req.Memory)
-		nodeName, providerID, nodeArch, err := s.nodePlacer.PlaceCPU(
-			c.Request.Context(), req.Arch, req.CPUUnits, reqMemGB)
+		nodeName, providerID, nodeArch, pCoresUsed, eCoresUsed, err := s.nodePlacer.PlaceCPU(
+			c.Request.Context(), req.Arch, req.CPUUnits, reqMemGB, req.PCores, req.ECores)
 		if err != nil {
 			switch {
 			case s.nodePlacer.IsArchUnavailable(err):
@@ -691,7 +698,10 @@ func (s *Server) CreateInstance(c *gin.Context) {
 			}
 			return
 		}
-		homePlacement = &homeTarget{nodeName: nodeName, providerID: providerID, arch: nodeArch}
+		homePlacement = &homeTarget{
+			nodeName: nodeName, providerID: providerID, arch: nodeArch,
+			pCoresUsed: pCoresUsed, eCoresUsed: eCoresUsed,
+		}
 	}
 
 	// Parse VRAM requirement (GPU path — mutually exclusive with home).
@@ -804,6 +814,8 @@ func (s *Server) CreateInstance(c *gin.Context) {
 			record.ProviderID = homePlacement.providerID
 			record.NodeName = homePlacement.nodeName
 			record.InstanceType = "cpu.home"
+			record.PCoresUsed = homePlacement.pCoresUsed
+			record.ECoresUsed = homePlacement.eCoresUsed
 		}
 		record.Endpoint = result.EndpointURL
 		record.DNSName = result.DNSName

@@ -230,6 +230,13 @@ type HomeCapacitySummary struct {
 	// tier fits only if it is within ONE node's free capacity, not the sum.
 	MaxFreeCPU   int `json:"max_free_cpu_cores"`
 	MaxFreeMemGB int `json:"max_free_memory_gb"`
+	// CPUCoreRate/MemoryGBRate are the same live rates each tier is priced
+	// from (see the pricing comment below) — exposed directly so a client
+	// offering free-form vCPU/memory entry (rather than a fixed tier) can
+	// quote cpu*CPUCoreRate + mem*MemoryGBRate locally, live as the customer
+	// types, without a round trip per keystroke.
+	CPUCoreRate  float64 `json:"cpu_core_rate_per_hour"`
+	MemoryGBRate float64 `json:"memory_gb_rate_per_hour"`
 }
 
 // HomeCapacitySummary computes tier fitment against online home nodes and
@@ -245,7 +252,10 @@ func (s *Service) HomeCapacitySummary(ctx context.Context, rates CPURates) (*Hom
 		return nil, err
 	}
 
-	summary := &HomeCapacitySummary{}
+	summary := &HomeCapacitySummary{
+		CPUCoreRate:  rates.CPUCoreRate,
+		MemoryGBRate: rates.MemoryGBRate,
+	}
 	for _, c := range caps {
 		if c.Class != "home" || c.Status != "online" {
 			continue

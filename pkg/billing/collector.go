@@ -97,6 +97,8 @@ func (c *UsageCollector) collectUsage(ctx context.Context) error {
 	cpuRate := 0.0
 	memRate := 0.0
 	storageRate := 0.0
+	pCoreRate := 0.0
+	eCoreRate := 0.0
 	rateFetched := false
 
 	for _, inst := range instances {
@@ -133,18 +135,28 @@ func (c *UsageCollector) collectUsage(ctx context.Context) error {
 			cpuRate = c.billingService.CPUCoreRate(ctx)
 			memRate = c.billingService.MemoryGBRate(ctx)
 			storageRate = c.billingService.StorageGBMonthRate(ctx)
+			pCoreRate = c.billingService.PCoreRate(ctx)
+			eCoreRate = c.billingService.ECoreRate(ctx)
 			rateFetched = true
 		}
 
 		// Cost by class. A GPU instance is linear on allocated VRAM. A
 		// CPU-only instance (home compute) is linear on cores + memory; its
 		// rates default to 0, so it costs nothing until an operator sets a
-		// price. unitPrice is the per-hour rate for the interval, recorded
-		// for transparency on the usage record.
+		// price. A CPU instance placed with a DETECTED P/E split
+		// (PCoresUsed/ECoresUsed both non-nil — see billableInstance's own
+		// doc comment) prices via the separate P-core/E-core rates instead
+		// of the single undifferentiated CPUUnits rate; an instance with no
+		// detected split is billed exactly as before this feature.
+		// unitPrice is the per-hour rate for the interval, recorded for
+		// transparency on the usage record.
 		var unitPrice float64
-		if inst.GPUVRAMGB > 0 {
+		switch {
+		case inst.GPUVRAMGB > 0:
 			unitPrice = float64(inst.GPUVRAMGB) * vramRate
-		} else {
+		case inst.PCoresUsed != nil && inst.ECoresUsed != nil:
+			unitPrice = float64(*inst.PCoresUsed)*pCoreRate + float64(*inst.ECoresUsed)*eCoreRate + float64(inst.MemoryGB)*memRate
+		default:
 			unitPrice = float64(inst.CPUUnits)*cpuRate + float64(inst.MemoryGB)*memRate
 		}
 		cost := unitPrice * hours
@@ -208,6 +220,11 @@ type billableInstance struct {
 	CPUUnits     int
 	MemoryGB     int
 	StorageGB    int
+	// PCoresUsed/ECoresUsed are nil unless this instance was placed with a
+	// detected P-core/E-core split (migration 045) — nil means "bill via
+	// CPUUnits*CPUCoreRate exactly as before this feature," never a guess.
+	PCoresUsed   *int
+	ECoresUsed   *int
 	CreatedAt    time.Time
 	TerminatedAt *time.Time
 }
@@ -224,6 +241,7 @@ func (c *UsageCollector) getBillableInstances(ctx context.Context) ([]billableIn
 		SELECT i.id, i.account_id, i.project_id, COALESCE(i.instance_type_id, ''),
 		       COALESCE(i.gpu_vram_gb, 0), COALESCE(i.cpu_units, 0),
 		       COALESCE(i.memory_gb, 0), COALESCE(i.storage_gb, 0),
+		       i.p_cores_used, i.e_cores_used,
 		       i.created_at, i.terminated_at
 		FROM compute.instances i
 		LEFT JOIN LATERAL (
@@ -247,6 +265,7 @@ func (c *UsageCollector) getBillableInstances(ctx context.Context) ([]billableIn
 		var inst billableInstance
 		if err := rows.Scan(&inst.ID, &inst.AccountID, &inst.ProjectID, &inst.InstanceType,
 			&inst.GPUVRAMGB, &inst.CPUUnits, &inst.MemoryGB, &inst.StorageGB,
+			&inst.PCoresUsed, &inst.ECoresUsed,
 			&inst.CreatedAt, &inst.TerminatedAt); err != nil {
 			return nil, fmt.Errorf("scan failed: %w", err)
 		}
