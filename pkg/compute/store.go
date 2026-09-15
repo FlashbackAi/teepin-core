@@ -311,6 +311,34 @@ func (s *Store) UpdateNodePlacement(ctx context.Context, id, providerID string) 
 	return nil
 }
 
+// UpdateInstanceType backfills instance_type_id on an EXISTING row whose
+// original create never set it — the same class of historical gap
+// UpdateNodePlacement backfills for provider_id/node_id (see that
+// function's own doc comment), found on the SAME two legacy rows
+// (inst-55b4d443, inst-5ed29952): their instance_type_id was never
+// persisted at create time, so the console's CPU-compute list has shown a
+// blank Type column for them ever since — COALESCE(instance_type_id, '')
+// in selectColumns turns the missing value into an empty string, which
+// the console's `?? "—"` fallback does not catch (that only catches
+// null/undefined, not ""). Called by redeployKumbhaInstance's own
+// provider-recovery path, which already knows definitively that this is
+// a home-class instance the moment it resolves spec.NodeClass == "home"
+// for one with no instance_type recorded.
+func (s *Store) UpdateInstanceType(ctx context.Context, id, instanceType string) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE compute.instances
+		SET instance_type_id = $1
+		WHERE id = $2
+	`, instanceType, id)
+	if err != nil {
+		return fmt.Errorf("failed to update instance type for %s: %w", id, err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return fmt.Errorf("instance %s not found", id)
+	}
+	return nil
+}
+
 // MarkTerminated finalizes an instance: status becomes terminated and
 // terminated_at is stamped, which stops billing collection for it.
 // Idempotent: terminating an already-terminated instance is a no-op.

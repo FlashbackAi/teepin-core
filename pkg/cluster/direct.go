@@ -403,7 +403,15 @@ func (c *DirectClient) ResolveInstanceAddress(ctx context.Context, instanceID st
 	if len(pods.Items) == 0 {
 		return "", ErrNotFound
 	}
-	ip := pods.Items[0].Status.PodIP
+	// See newestPod's own doc comment: during a redeploy's replace window,
+	// the OLD pod being torn down can still carry this instance ID and
+	// still momentarily have a routable IP as its container exits — proxy
+	// traffic (screenshot capture included) landing on pods.Items[0]
+	// arbitrarily risked being served by the dying pod instead of its
+	// healthy replacement, a plausible cause of a blank/broken response
+	// captured mid-redeploy. Found live 2026-09-15 alongside the identical
+	// bug in GetInstanceStatus/ListInstanceStatuses.
+	ip := newestPod(pods.Items).Status.PodIP
 	if ip == "" {
 		// Pod exists but has no IP yet (still scheduling/starting) —
 		// distinct from "does not exist", but the caller only has one
@@ -573,7 +581,10 @@ func (c *DirectClient) ExecAttach(ctx context.Context, req ExecRequest, ioStream
 	if len(pods.Items) == 0 {
 		return ExecOutcome{}, ErrNotFound
 	}
-	pod := pods.Items[0]
+	// See newestPod's own doc comment — during a redeploy's replace
+	// window an exec request must land on the pod actually replacing the
+	// old one, not whichever of the two happens to be terminating.
+	pod := *newestPod(pods.Items)
 	if pod.Status.Phase != corev1.PodRunning {
 		return ExecOutcome{}, fmt.Errorf("instance is %s, not running", strings.ToLower(string(pod.Status.Phase)))
 	}
@@ -902,8 +913,11 @@ func (c *DirectClient) StreamLogs(ctx context.Context, scope Scope, instanceID s
 		logOpts.TailLines = &tail
 	}
 
+	// See newestPod's own doc comment — during a redeploy's replace
+	// window, logs must come from the pod actually replacing the old one,
+	// not whichever of the two happens to be terminating.
 	stream, err := c.k8s.CoreV1().Pods(workloadNamespace).
-		GetLogs(pods.Items[0].Name, logOpts).Stream(ctx)
+		GetLogs(newestPod(pods.Items).Name, logOpts).Stream(ctx)
 	if err != nil {
 		return fmt.Errorf("open log stream: %w", err)
 	}

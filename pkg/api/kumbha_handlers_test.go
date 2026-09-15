@@ -1053,6 +1053,79 @@ func TestRedeployKumbhaInstance_RecoversMissingProviderFromLiveStatus(t *testing
 	}
 }
 
+// TestRedeployKumbhaInstance_BackfillsMissingInstanceType is the
+// regression test for a live incident found alongside the provider/node_id
+// recovery above, on the SAME two legacy rows (inst-55b4d443,
+// inst-5ed29952): instance_type_id was never persisted at their original
+// create either, so the console's CPU-compute list showed a blank Type
+// column for them indefinitely — COALESCE(instance_type_id, ”) turns the
+// missing value into "", which the console's `?? "—"` fallback does not
+// catch (that only catches null/undefined, not an empty string).
+// UpdateImage (called on every redeploy) never touches this column, so
+// nothing was ever going to fix it on its own. The moment this redeploy
+// resolves spec.NodeClass == "home" for a record with no type on file, it
+// already knows definitively what that type is — backfilled the same way
+// UpdateNodePlacement backfills provider_id/node_id just above it.
+func TestRedeployKumbhaInstance_BackfillsMissingInstanceType(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+
+	projectID, sessionID := uuid.New(), uuid.New()
+	existingID := "inst-existing5"
+	fc := newFakeCluster()
+	fc.add(existingID, projectID.String(), compute.StatusRunning)
+	fc.setProviderID(existingID, "provider-srialla")
+	server := (&Server{store: cStore, cluster: fc}).WithKumbha(gw)
+
+	// instance_type_id EMPTY, alongside provider_id / node_name also both
+	// empty — the exact shape of the two known legacy rows.
+	mock.ExpectQuery(`SELECT .+ FROM compute\.instances`).
+		WithArgs(existingID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "account_id", "project_id", "user_id", "name", "image",
+			"instance_type_id", "status", "gpu_vram_gb", "cpu_units", "memory_gb",
+			"p_cores_used", "e_cores_used", "endpoint",
+			"k8s_pod_name", "k8s_namespace", "provider_id", "node_name", "dns_name", "public_ip",
+			"tls_enabled", "tls_ready", "container_port", "storage_gb",
+			"created_at", "updated_at", "started_at", "terminated_at", "kumbha_session_id",
+		}).AddRow(existingID, testAccountID, projectID, uuid.Nil, "kumbha-abc123", "old-image:v1",
+			"", compute.StatusRunning, 0, 1, 1, nil, nil, "https://inst-existing5.teepin.com",
+			existingID+"-pod", "default", "", "", existingID+".teepin.com", "",
+			true, true, 80, 0,
+			nowStub(), nowStub(), nil, nil, uuid.Nil))
+	mock.ExpectExec(`UPDATE compute\.instances`).
+		WithArgs("new-image:v6", existingID+"-pod", 80, compute.StatusPending, existingID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(`SELECT id FROM compute\.nodes WHERE provider_id = \$1`).
+		WithArgs("provider-srialla").
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("node-srialla-uuid"))
+	mock.ExpectExec(`UPDATE compute\.instances`).
+		WithArgs("provider-srialla", "node-srialla-uuid", existingID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// The instance-type backfill this test exists to prove.
+	mock.ExpectExec(`UPDATE compute\.instances\s+SET instance_type_id = \$1`).
+		WithArgs("cpu.home", existingID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE billing\.kumbha_workspace_versions`).
+		WithArgs(sessionID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE billing\.inference_sessions\s+SET last_deployed_version = current_workspace_version`).
+		WithArgs(sessionID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	sess := &kumbha.Session{ID: sessionID, AccountID: testAccountID, ProjectID: projectID, AppInstanceID: existingID}
+	c, w := newRedeployTestContext(projectID)
+	server.redeployKumbhaInstance(context.Background(), c, sessionID, sess, projectID, testAccountID, "new-image:v6",
+		[]models.PortMapping{{Container: 80, Protocol: "tcp"}}, nil)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations (instance_type backfill not attempted?): %v", err)
+	}
+}
+
 // TestRedeployKumbhaInstance_RecoveredProviderMatchesNoNodeStillSucceeds is
 // the regression test for the live 2026-09-08 incident: a redeploy's own
 // logs reported a recovered ProviderID and a "successful" persist, yet

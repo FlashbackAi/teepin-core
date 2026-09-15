@@ -1309,6 +1309,22 @@ func (s *Server) redeployKumbhaInstance(ctx context.Context, c *gin.Context, ses
 		}
 	}
 
+	// Same historical gap as provider_id/node_id above, on the same
+	// legacy rows: a home-class instance whose original create never
+	// recorded instance_type_id shows a blank Type column in the
+	// console's CPU-compute list forever, since UpdateImage (above) never
+	// touches this column. The moment this redeploy resolves
+	// spec.NodeClass == "home" for a record with no type on file, it
+	// already knows definitively what that type is — no separate
+	// recovery signal needed, unlike provider_id.
+	if spec.NodeClass == "home" && existing.InstanceType == "" {
+		if err := s.store.UpdateInstanceType(ctx, existing.ID, "cpu.home"); err != nil {
+			log.Printf("WARN: redeployed home instance %s but failed to backfill its instance_type: %v", existing.ID, err)
+		} else {
+			log.Printf("DEBUG: redeploy %s: UpdateInstanceType backfilled instance_type=\"cpu.home\"", existing.ID)
+		}
+	}
+
 	if err := s.kumbha.CheckpointWorkspace(ctx, sessionID); err != nil {
 		log.Printf("WARN: redeployed Kumbha session %s but failed to checkpoint its workspace version: %v", sessionID, err)
 	}

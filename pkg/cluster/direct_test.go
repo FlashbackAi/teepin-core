@@ -893,6 +893,55 @@ func TestGetInstanceStatus_PrefersNewestPodWhenReplaceOverlaps(t *testing.T) {
 	}
 }
 
+// TestResolveInstanceAddress_PrefersNewestPodWhenReplaceOverlaps is the
+// Stage-3-tunnel-proxy counterpart of the two regressions above: the
+// tunnel resolves EVERY proxied request (screenshot capture included) to
+// a pod IP via this exact method. Landing on the dying old pod's IP
+// during a redeploy's replace window — rather than the healthy new
+// pod's — is a real, plausible cause of a blank/broken response
+// captured mid-redeploy (found live 2026-09-15).
+func TestResolveInstanceAddress_PrefersNewestPodWhenReplaceOverlaps(t *testing.T) {
+	older := metav1.NewTime(time.Now().Add(-time.Minute))
+	newer := metav1.NewTime(time.Now())
+
+	oldPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "inst-addr00001",
+			Namespace:         workloadNamespace,
+			CreationTimestamp: older,
+			Labels: map[string]string{
+				labelManaged:    "true",
+				labelInstanceID: "inst-addr00001",
+				labelProjectID:  "project-a",
+			},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodSucceeded, PodIP: "10.0.0.1"},
+	}
+	newPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "inst-addr00001-2",
+			Namespace:         workloadNamespace,
+			CreationTimestamp: newer,
+			Labels: map[string]string{
+				labelManaged:    "true",
+				labelInstanceID: "inst-addr00001",
+				labelProjectID:  "project-a",
+			},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.2"},
+	}
+
+	c := NewDirectClient(fake.NewSimpleClientset(oldPod, newPod), nil, nil, "nvidia")
+
+	addr, err := c.ResolveInstanceAddress(context.Background(), "inst-addr00001", 8080)
+	if err != nil {
+		t.Fatalf("ResolveInstanceAddress: %v", err)
+	}
+	if addr != "10.0.0.2:8080" {
+		t.Fatalf("addr = %q, want \"10.0.0.2:8080\" (the newest pod's IP) — the stale exiting pod won instead", addr)
+	}
+}
+
 func TestStreamLogs_OtherTenantIsNotFound(t *testing.T) {
 	c := twoTenantCluster()
 
