@@ -531,7 +531,12 @@ func (c *DirectClient) GetInstanceStatus(ctx context.Context, scope Scope, insta
 		return nil, ErrNotFound
 	}
 
-	status := c.statusWithEndpoint(ctx, &pods.Items[0])
+	// See newestPod's own doc comment: during a redeploy's replace window,
+	// more than one pod can carry this instance ID at once, and picking an
+	// arbitrary one (pods.Items[0], the previous behaviour) risks reporting
+	// the OLD, exiting pod's status instead of the new one actually
+	// replacing it.
+	status := c.statusWithEndpoint(ctx, newestPod(pods.Items))
 	return &status, nil
 }
 
@@ -776,11 +781,56 @@ func (c *DirectClient) ListInstanceStatuses(ctx context.Context, scope Scope) ([
 		return nil, fmt.Errorf("list pods: %w", err)
 	}
 
-	statuses := make([]InstanceStatus, 0, len(pods.Items))
+	// De-duplicate by instance ID before reporting anything — see
+	// newestPod's own doc comment for why more than one pod can carry the
+	// same instance ID here, and why reporting both let a stale "terminated"
+	// status from the pod BEING REPLACED silently win over the healthy new
+	// one in the reconciler's naive map[instanceID]status collapse. Found
+	// live 2026-09-15: two real Kumbha redeploys (inst-55b4d443,
+	// inst-5ed29952) got their compute.instances rows marked terminated
+	// seconds-to-tens-of-seconds after a genuinely successful redeploy,
+	// because UpdateInstance's delete-then-create replace is not atomic —
+	// the old pod's container often exits 0 on SIGTERM (PodSucceeded ->
+	// "terminated", see podStatus) and lingers, still labelled with the
+	// same instance ID, until Kubernetes garbage-collects it.
+	byInstance := make(map[string]*corev1.Pod, len(pods.Items))
 	for i := range pods.Items {
-		statuses = append(statuses, c.statusWithEndpoint(ctx, &pods.Items[i]))
+		pod := &pods.Items[i]
+		id := pod.Labels[labelInstanceID]
+		if id == "" {
+			continue
+		}
+		if cur, ok := byInstance[id]; !ok || pod.CreationTimestamp.After(cur.CreationTimestamp.Time) {
+			byInstance[id] = pod
+		}
+	}
+
+	statuses := make([]InstanceStatus, 0, len(byInstance))
+	for _, pod := range byInstance {
+		statuses = append(statuses, c.statusWithEndpoint(ctx, pod))
 	}
 	return statuses, nil
+}
+
+// newestPod returns the pod with the latest CreationTimestamp — the
+// unambiguous tiebreaker when more than one pod carries the same instance
+// ID, which happens routinely during a redeploy: UpdateInstance deletes
+// the old pod and immediately creates its replacement, but Kubernetes
+// pod deletion is not instantaneous (the old container often keeps
+// running, and the pod object keeps existing, until it actually exits —
+// up to its terminationGracePeriodSeconds). Whichever pod was created
+// LAST is always the one that reflects current reality; the one being
+// replaced never is, regardless of what phase it happens to report.
+// pods must be non-empty — callers already check len(pods.Items) == 0
+// before reaching here.
+func newestPod(pods []corev1.Pod) *corev1.Pod {
+	newest := &pods[0]
+	for i := 1; i < len(pods); i++ {
+		if pods[i].CreationTimestamp.After(newest.CreationTimestamp.Time) {
+			newest = &pods[i]
+		}
+	}
+	return newest
 }
 
 // statusWithEndpoint reports podStatus plus, when the pod has a

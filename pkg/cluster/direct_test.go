@@ -775,6 +775,124 @@ func TestListInstanceStatuses_AllTenantsSeesEverything(t *testing.T) {
 	}
 }
 
+// TestListInstanceStatuses_PrefersNewestPodWhenReplaceOverlaps is the
+// regression test for a real live incident (2026-09-15): UpdateInstance's
+// delete-then-create redeploy is not atomic, so for a brief window the OLD
+// pod (often already Succeeded — its container exits 0 on SIGTERM) and the
+// NEW pod can carry the SAME instance ID at once. Reporting both let the
+// stale "terminated" status win in the reconciler's naive
+// map[instanceID]status collapse, killing two real Kumbha instances'
+// database rows seconds after a genuinely successful redeploy. The newest
+// pod (by CreationTimestamp) must always be the one reported, regardless
+// of which order Kubernetes happens to return them in.
+func TestListInstanceStatuses_PrefersNewestPodWhenReplaceOverlaps(t *testing.T) {
+	older := metav1.NewTime(time.Now().Add(-time.Minute))
+	newer := metav1.NewTime(time.Now())
+
+	oldPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "inst-abc12345",
+			Namespace:         workloadNamespace,
+			CreationTimestamp: older,
+			Labels: map[string]string{
+				labelManaged:    "true",
+				labelInstanceID: "inst-abc12345",
+				labelProjectID:  "project-a",
+			},
+		},
+		// The old container exiting 0 on SIGTERM — by far the common case
+		// for a well-behaved server process — maps to PodSucceeded, i.e.
+		// "terminated" (podStatus's own switch).
+		Status: corev1.PodStatus{Phase: corev1.PodSucceeded},
+	}
+	newPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			// A REAL redeploy reuses the exact same pod name (deterministic,
+			// derived from the instance ID) — deliberately given a
+			// DIFFERENT name here so the fake clientset can hold both
+			// objects simultaneously, matching the real cluster's own
+			// transient state where the old pod object still exists
+			// (Terminating) alongside the newly-created one.
+			Name:              "inst-abc12345-2",
+			Namespace:         workloadNamespace,
+			CreationTimestamp: newer,
+			Labels: map[string]string{
+				labelManaged:    "true",
+				labelInstanceID: "inst-abc12345",
+				labelProjectID:  "project-a",
+			},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	// Insert the OLDER (terminated) pod SECOND, so a naive "last one in the
+	// list wins" collapse (map keyed by instance ID, overwritten in
+	// iteration order) would pick the wrong one if this fix were absent —
+	// proves the dedup is order-independent, not accidentally passing
+	// because of fake.NewSimpleClientset's own listing order.
+	c := NewDirectClient(fake.NewSimpleClientset(newPod, oldPod), nil, nil, "nvidia")
+
+	statuses, err := c.ListInstanceStatuses(context.Background(), AllTenants())
+	if err != nil {
+		t.Fatalf("ListInstanceStatuses: %v", err)
+	}
+	if len(statuses) != 1 {
+		t.Fatalf("expected exactly 1 status for the shared instance ID, got %d", len(statuses))
+	}
+	if statuses[0].Status != "running" {
+		t.Fatalf("Status = %q, want \"running\" (the newest pod's status) — the stale terminated pod won instead", statuses[0].Status)
+	}
+	if statuses[0].PodName != "inst-abc12345-2" {
+		t.Errorf("PodName = %q, want the newer pod's name", statuses[0].PodName)
+	}
+}
+
+// TestGetInstanceStatus_PrefersNewestPodWhenReplaceOverlaps is the
+// single-instance-lookup counterpart of the ListInstanceStatuses
+// regression above — redeployKumbhaInstance's own provider-recovery path
+// calls GetInstanceStatus directly during exactly this replace window.
+func TestGetInstanceStatus_PrefersNewestPodWhenReplaceOverlaps(t *testing.T) {
+	older := metav1.NewTime(time.Now().Add(-time.Minute))
+	newer := metav1.NewTime(time.Now())
+
+	oldPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "inst-xyz98765",
+			Namespace:         workloadNamespace,
+			CreationTimestamp: older,
+			Labels: map[string]string{
+				labelManaged:    "true",
+				labelInstanceID: "inst-xyz98765",
+				labelProjectID:  "project-a",
+			},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodSucceeded},
+	}
+	newPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "inst-xyz98765-2",
+			Namespace:         workloadNamespace,
+			CreationTimestamp: newer,
+			Labels: map[string]string{
+				labelManaged:    "true",
+				labelInstanceID: "inst-xyz98765",
+				labelProjectID:  "project-a",
+			},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	c := NewDirectClient(fake.NewSimpleClientset(oldPod, newPod), nil, nil, "nvidia")
+
+	status, err := c.GetInstanceStatus(context.Background(), AllTenants(), "inst-xyz98765")
+	if err != nil {
+		t.Fatalf("GetInstanceStatus: %v", err)
+	}
+	if status.Status != "running" {
+		t.Fatalf("Status = %q, want \"running\" (the newest pod's status) — the stale terminated pod won instead", status.Status)
+	}
+}
+
 func TestStreamLogs_OtherTenantIsNotFound(t *testing.T) {
 	c := twoTenantCluster()
 
