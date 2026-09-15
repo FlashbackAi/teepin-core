@@ -1046,6 +1046,12 @@ func initDatabaseClient() (*database.Client, error) {
 		Password: password,
 		DBName:   dbname,
 		SSLMode:  sslmode,
+		// Set only in environments whose DB password can rotate out from
+		// under a running task (e.g. RDS's manage_master_user_password) —
+		// see pkg/database's own doc comment on why a plain env var alone
+		// leaves a long-running process stuck on the pre-rotation
+		// password until it happens to restart.
+		PasswordSecretARN: getEnv("DB_PASSWORD_SECRET_ARN", ""),
 	}
 
 	client, err := database.NewClient(cfg)
