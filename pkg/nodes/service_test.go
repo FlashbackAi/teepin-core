@@ -27,6 +27,49 @@ func newMock(t *testing.T) (*Service, sqlmock.Sqlmock, func()) {
 	return NewService(db), mock, func() { db.Close() }
 }
 
+// TestListNodes_ReturnsPECoreSplit is the regression test for a real bug
+// found live: p_cores/e_cores were written to compute.nodes correctly at
+// enroll and on every reconnect (Enroll, RecordHeartbeat, UpsertSeen all
+// handle them), but ListNodes' own SELECT never named either column, so
+// the console's node list/detail pages silently showed no split for any
+// node no matter what the database actually held — a read-side gap, not
+// a write-side one, and easy to miss because every other symptom (agent
+// logs, server logs, the write path itself) looked completely healthy.
+func TestListNodes_ReturnsPECoreSplit(t *testing.T) {
+	s, mock, done := newMock(t)
+	defer done()
+
+	nodeID := uuid.New()
+	now := time.Now()
+	mock.ExpectQuery(`SELECT id, node_name, provider_id, class`).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "node_name", "provider_id", "class", "region",
+			"cpu_cores", "memory_gb", "p_cores", "e_cores", "gpu_model",
+			"gpu_count", "mig_capable", "os", "arch",
+			"agent_version", "status", "last_seen_at", "revoked_at",
+			"rentable_cpu_cores", "rentable_memory_gb", "k8s_ready",
+			"created_at", "updated_at",
+		}).AddRow(
+			nodeID, "Srialla", "srialla", "home", "home",
+			30, 42, 8, 16, "",
+			0, false, "linux", "amd64",
+			"dev", "online", &now, nil,
+			18, 42, true,
+			now, now,
+		))
+
+	nodes, err := s.ListNodes(context.Background())
+	if err != nil {
+		t.Fatalf("ListNodes: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("got %d nodes, want 1", len(nodes))
+	}
+	if nodes[0].PCores != 8 || nodes[0].ECores != 16 {
+		t.Errorf("PCores/ECores = %d/%d, want 8/16", nodes[0].PCores, nodes[0].ECores)
+	}
+}
+
 // A minted token stores only a hash, and the class is whatever the operator
 // chose — proving class is fixed server-side at mint time.
 func TestCreateEnrollmentToken_StoresHashAndClass(t *testing.T) {

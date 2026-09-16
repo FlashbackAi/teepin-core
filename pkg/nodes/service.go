@@ -512,7 +512,8 @@ func (s *Service) ListMetrics(ctx context.Context, nodeID uuid.UUID, since time.
 func (s *Service) ListNodes(ctx context.Context) ([]Node, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, node_name, provider_id, class, COALESCE(region,''),
-		       COALESCE(cpu_cores,0), COALESCE(memory_gb,0), COALESCE(gpu_model,''),
+		       COALESCE(cpu_cores,0), COALESCE(memory_gb,0),
+		       COALESCE(p_cores,0), COALESCE(e_cores,0), COALESCE(gpu_model,''),
 		       gpu_count, mig_capable, COALESCE(os,''), COALESCE(arch,''),
 		       COALESCE(agent_version,''), status, last_seen_at, revoked_at,
 		       rentable_cpu_cores, rentable_memory_gb, k8s_ready,
@@ -529,7 +530,7 @@ func (s *Service) ListNodes(ctx context.Context) ([]Node, error) {
 	for rows.Next() {
 		var n Node
 		if err := rows.Scan(&n.ID, &n.NodeName, &n.ProviderID, &n.Class, &n.Region,
-			&n.CPUCores, &n.MemoryGB, &n.GPUModel, &n.GPUCount, &n.MIGCapable,
+			&n.CPUCores, &n.MemoryGB, &n.PCores, &n.ECores, &n.GPUModel, &n.GPUCount, &n.MIGCapable,
 			&n.OS, &n.Arch, &n.AgentVersion, &n.Status, &n.LastSeenAt, &n.RevokedAt,
 			&n.RentableCPUCores, &n.RentableMemoryGB, &n.K8sReady,
 			&n.CreatedAt, &n.UpdatedAt); err != nil {
