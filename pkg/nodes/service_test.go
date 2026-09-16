@@ -41,6 +41,7 @@ func TestListNodes_ReturnsPECoreSplit(t *testing.T) {
 
 	nodeID := uuid.New()
 	now := time.Now()
+	lat, lng := 12.9716, 77.5946
 	mock.ExpectQuery(`SELECT id, node_name, provider_id, class`).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "node_name", "provider_id", "class", "region",
@@ -48,6 +49,7 @@ func TestListNodes_ReturnsPECoreSplit(t *testing.T) {
 			"gpu_count", "mig_capable", "os", "arch",
 			"agent_version", "status", "last_seen_at", "revoked_at",
 			"rentable_cpu_cores", "rentable_memory_gb", "k8s_ready",
+			"latitude", "longitude", "location_label",
 			"created_at", "updated_at",
 		}).AddRow(
 			nodeID, "Srialla", "srialla", "home", "home",
@@ -55,6 +57,7 @@ func TestListNodes_ReturnsPECoreSplit(t *testing.T) {
 			0, false, "linux", "amd64",
 			"dev", "online", &now, nil,
 			18, 42, true,
+			&lat, &lng, "Bengaluru, India",
 			now, now,
 		))
 
@@ -67,6 +70,80 @@ func TestListNodes_ReturnsPECoreSplit(t *testing.T) {
 	}
 	if nodes[0].PCores != 8 || nodes[0].ECores != 16 {
 		t.Errorf("PCores/ECores = %d/%d, want 8/16", nodes[0].PCores, nodes[0].ECores)
+	}
+	if nodes[0].Latitude == nil || nodes[0].Longitude == nil || *nodes[0].Latitude != lat || *nodes[0].Longitude != lng {
+		t.Errorf("Latitude/Longitude = %v/%v, want %v/%v", nodes[0].Latitude, nodes[0].Longitude, lat, lng)
+	}
+	if nodes[0].LocationLabel != "Bengaluru, India" {
+		t.Errorf("LocationLabel = %q, want %q", nodes[0].LocationLabel, "Bengaluru, India")
+	}
+}
+
+// TestSetLocation_UpdatesRow proves a happy-path location update reaches the
+// row unmodified — no rounding/derivation, exactly the operator-typed value.
+func TestSetLocation_UpdatesRow(t *testing.T) {
+	s, mock, done := newMock(t)
+	defer done()
+
+	nodeID := uuid.New()
+	lat, lng := 12.9716, 77.5946
+	mock.ExpectExec(`UPDATE compute\.nodes\s+SET latitude`).
+		WithArgs(&lat, &lng, "Bengaluru, India", nodeID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := s.SetLocation(context.Background(), nodeID, &lat, &lng, "Bengaluru, India"); err != nil {
+		t.Fatalf("SetLocation: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
+	}
+}
+
+// TestSetLocation_RequiresLatLngTogether proves a lat with no lng (or vice
+// versa) is rejected before any query — a half-set coordinate is silently
+// wrong, not a valid "no coordinate" state.
+func TestSetLocation_RequiresLatLngTogether(t *testing.T) {
+	s, _, done := newMock(t)
+	defer done()
+
+	lat := 12.9716
+	if err := s.SetLocation(context.Background(), uuid.New(), &lat, nil, ""); err == nil {
+		t.Error("expected an error when longitude is missing")
+	}
+}
+
+// TestSetLocation_RejectsOutOfRangeLatLng proves the same bounds the column
+// CHECK constraints enforce are also enforced here, so a bad value never
+// even reaches the database as a query attempt.
+func TestSetLocation_RejectsOutOfRangeLatLng(t *testing.T) {
+	s, _, done := newMock(t)
+	defer done()
+
+	badLat, okLng := 91.0, 77.5946
+	if err := s.SetLocation(context.Background(), uuid.New(), &badLat, &okLng, ""); err == nil {
+		t.Error("expected an error for latitude out of range")
+	}
+
+	okLat, badLng := 12.9716, 181.0
+	if err := s.SetLocation(context.Background(), uuid.New(), &okLat, &badLng, ""); err == nil {
+		t.Error("expected an error for longitude out of range")
+	}
+}
+
+// TestSetLocation_NotFound proves a nonexistent node id surfaces ErrNotFound
+// rather than a silent no-op success.
+func TestSetLocation_NotFound(t *testing.T) {
+	s, mock, done := newMock(t)
+	defer done()
+
+	nodeID := uuid.New()
+	lat, lng := 12.9716, 77.5946
+	mock.ExpectExec(`UPDATE compute\.nodes\s+SET latitude`).
+		WithArgs(&lat, &lng, "", nodeID).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
+	if err := s.SetLocation(context.Background(), nodeID, &lat, &lng, ""); !errors.Is(err, ErrNotFound) {
+		t.Errorf("got %v, want ErrNotFound", err)
 	}
 }
 

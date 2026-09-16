@@ -1487,6 +1487,7 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 					admin.GET("/nodes", nodeHandler.ListNodes)
 					admin.POST("/nodes/enrollment-tokens", nodeHandler.CreateEnrollmentToken)
 					admin.PUT("/nodes/:id/reservation", nodeHandler.SetReservation)
+					admin.PUT("/nodes/:id/location", nodeHandler.SetLocation)
 					admin.PATCH("/nodes/:id", nodeHandler.RenameNode)
 					admin.DELETE("/nodes/:id", nodeHandler.DeleteNode)
 					admin.POST("/nodes/:id/disable", nodeHandler.DisableNode)

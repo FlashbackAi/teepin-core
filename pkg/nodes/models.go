@@ -72,6 +72,15 @@ type Node struct {
 	Arch         string `json:"arch,omitempty"`
 	AgentVersion string `json:"agent_version,omitempty"`
 
+	// Latitude/Longitude/LocationLabel are operator-provided, set any time
+	// after enrollment via Control Centre — never derived from IP
+	// geolocation (see migration 046's own comment for why). All three nil/
+	// empty until an operator sets them; purely informational (a map pin),
+	// no effect on placement or billing.
+	Latitude      *float64 `json:"latitude,omitempty"`
+	Longitude     *float64 `json:"longitude,omitempty"`
+	LocationLabel string   `json:"location_label,omitempty"`
+
 	Status     string     `json:"status"`
 	LastSeenAt *time.Time `json:"last_seen_at,omitempty"`
 

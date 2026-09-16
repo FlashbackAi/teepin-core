@@ -517,6 +517,7 @@ func (s *Service) ListNodes(ctx context.Context) ([]Node, error) {
 		       gpu_count, mig_capable, COALESCE(os,''), COALESCE(arch,''),
 		       COALESCE(agent_version,''), status, last_seen_at, revoked_at,
 		       rentable_cpu_cores, rentable_memory_gb, k8s_ready,
+		       latitude, longitude, COALESCE(location_label,''),
 		       created_at, updated_at
 		FROM compute.nodes
 		ORDER BY created_at DESC
@@ -533,6 +534,7 @@ func (s *Service) ListNodes(ctx context.Context) ([]Node, error) {
 			&n.CPUCores, &n.MemoryGB, &n.PCores, &n.ECores, &n.GPUModel, &n.GPUCount, &n.MIGCapable,
 			&n.OS, &n.Arch, &n.AgentVersion, &n.Status, &n.LastSeenAt, &n.RevokedAt,
 			&n.RentableCPUCores, &n.RentableMemoryGB, &n.K8sReady,
+			&n.Latitude, &n.Longitude, &n.LocationLabel,
 			&n.CreatedAt, &n.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("failed to scan node: %w", err)
 		}
@@ -557,6 +559,37 @@ func (s *Service) RenameNode(ctx context.Context, nodeID uuid.UUID, name string)
 	`, name, nodeID)
 	if err != nil {
 		return fmt.Errorf("failed to rename node: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetLocation sets an operator-provided location for a node — a manual
+// coordinate/label, never derived from IP geolocation (see migration 046's
+// own comment for why). lat/lng nil clears the coordinate (label may still
+// stand alone, e.g. "Bengaluru, India" with no precise pin); both non-nil
+// must be valid latitude/longitude, enforced here AND by the column CHECK
+// constraints so a bad value can never reach the table via any future
+// caller either.
+func (s *Service) SetLocation(ctx context.Context, nodeID uuid.UUID, lat, lng *float64, label string) error {
+	if (lat == nil) != (lng == nil) {
+		return fmt.Errorf("latitude and longitude must be set together")
+	}
+	if lat != nil && (*lat < -90 || *lat > 90) {
+		return fmt.Errorf("latitude must be between -90 and 90")
+	}
+	if lng != nil && (*lng < -180 || *lng > 180) {
+		return fmt.Errorf("longitude must be between -180 and 180")
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE compute.nodes
+		SET latitude = $1, longitude = $2, location_label = $3, updated_at = NOW()
+		WHERE id = $4
+	`, lat, lng, label, nodeID)
+	if err != nil {
+		return fmt.Errorf("failed to set node location: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrNotFound

@@ -254,6 +254,45 @@ func (h *NodeHandler) RenameNode(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "node renamed", "id": id, "node_name": req.NodeName})
 }
 
+// locationRequest sets an operator-provided location. Latitude/Longitude are
+// pointers so "field omitted" (nil, clear the coordinate) is distinguishable
+// from "field present but zero" (a real point at 0,0) — a plain float would
+// make those indistinguishable. Label may stand alone with no coordinate
+// (e.g. "Bengaluru, India" with no precise pin).
+type locationRequest struct {
+	Latitude  *float64 `json:"latitude"`
+	Longitude *float64 `json:"longitude"`
+	Label     string   `json:"location_label"`
+}
+
+// SetLocation is PUT /v1/admin/nodes/:id/location. Manual/operator-provided
+// only — see nodes.Service.SetLocation's own doc comment for why this is
+// never derived from IP geolocation.
+func (h *NodeHandler) SetLocation(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid node id"})
+		return
+	}
+	var req locationRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := h.nodes.SetLocation(c.Request.Context(), id, req.Latitude, req.Longitude, req.Label); err != nil {
+		if errors.Is(err, nodes.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "node not found"})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"message": "location updated", "id": id,
+		"latitude": req.Latitude, "longitude": req.Longitude, "location_label": req.Label,
+	})
+}
+
 // DeleteNode is DELETE /v1/admin/nodes/:id. Refuses (409) when the node still
 // has active instances — the operator must terminate them or disable instead.
 func (h *NodeHandler) DeleteNode(c *gin.Context) {
