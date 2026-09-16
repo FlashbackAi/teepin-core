@@ -50,6 +50,21 @@ $ErrorActionPreference = "Stop"
 function Info($m) { Write-Host "[bootstrap] $m" }
 function Fail($m) { Write-Error "[bootstrap] $m"; exit 1 }
 
+# ConvertTo-WslPath translates a Windows path to its WSL /mnt equivalent
+# directly (drive-letter path -> /mnt/<lowercase-drive>/<forward-slashes>)
+# rather than shelling out to `wslpath` through `wsl -- ...`: PowerShell
+# mangles backslashes crossing that boundary (E:\Data -> E:Data), so
+# wslpath would receive garbage. Falls back to invoking wslpath (quoted)
+# for anything that is not a plain drive-letter path (e.g. a UNC path).
+function ConvertTo-WslPath($windowsPath, $distro) {
+    if ($windowsPath -match '^([A-Za-z]):\\(.*)$') {
+        $drive = $Matches[1].ToLower()
+        $rest = $Matches[2] -replace '\\', '/'
+        return "/mnt/$drive/$rest"
+    }
+    return (& wsl.exe -d $distro -- wslpath -a "$windowsPath" 2>$null | Out-String).Trim()
+}
+
 # Get-WslDistros returns the installed distro names as a clean string array.
 # wsl.exe emits UTF-16LE with embedded NUL bytes; read as normal text those
 # NULs corrupt every match (the false "distro did not install" failures). We
@@ -104,12 +119,31 @@ if (-not $wsl) {
     exit 0
 }
 
-# Resolve which distro to use. Prefer an explicit -Distro; otherwise reuse an
-# existing Ubuntu (so a machine that already set one up is not made to install
-# a second, empty 'Ubuntu' - the bug that kept targeting the wrong distro).
+# Resolve which distro to use. Prefer an explicit -Distro; otherwise prefer
+# whichever installed Ubuntu-like distro is ALREADY enrolled -- a machine can
+# accumulate more than one (e.g. a stray fresh "Ubuntu" alongside the
+# "Ubuntu-22.04" someone actually set up by hand, or vice versa), and
+# guessing by name alone silently targeted the wrong one: this script would
+# report "no existing enrollment" against an empty distro while the real,
+# enrolled one sat untouched. Only a distro with BOTH the agent config and
+# the systemd unit counts as enrolled -- a half-finished install must not
+# match here. Falls back to the original name-preference (bare "Ubuntu",
+# then any "Ubuntu*") only when nothing is enrolled yet, i.e. a genuine
+# fresh install -- that case is unaffected.
 $distros = Get-WslDistros
 if (-not $Distro) {
-    if ($distros -contains "Ubuntu") {
+    $ubuntuLike = $distros | Where-Object { $_ -eq "Ubuntu" -or $_ -like "Ubuntu*" }
+    $enrolledDistros = @()
+    foreach ($d in $ubuntuLike) {
+        $check = (wsl -d $d -u root -- bash -c "[ -f /etc/teepin/agent.json ] && [ -f /etc/systemd/system/teepin-agent.service ] && echo yes || echo no" 2>$null | Out-String).Trim()
+        if ($check -eq "yes") { $enrolledDistros += $d }
+    }
+    if ($enrolledDistros.Count -eq 1) {
+        $Distro = $enrolledDistros[0]
+        Info "found existing enrollment in distro '$Distro' -- using it."
+    } elseif ($enrolledDistros.Count -gt 1) {
+        Fail "more than one installed distro is already enrolled ($($enrolledDistros -join ', ')) -- pass -Distro explicitly to say which one."
+    } elseif ($distros -contains "Ubuntu") {
         $Distro = "Ubuntu"
     } else {
         $ubuntu = $distros | Where-Object { $_ -like "Ubuntu*" } | Select-Object -First 1
@@ -323,20 +357,7 @@ Info "cgroup v2 active."
 # --- 3. run the Linux core installer inside the distro ------------------
 # Run install.sh from this script's directory, inside the distro.
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-
-# Translate the Windows path to its WSL /mnt path OURSELVES rather than calling
-# `wslpath` through `wsl -- ...`: PowerShell mangles backslashes when passing a
-# Windows path as an argument across that boundary (E:\Data -> E:Data), so
-# wslpath receives garbage. A drive-letter path maps deterministically to
-# /mnt/<lowercase-drive>/<forward-slash-path>, which we build directly.
-if ($here -match '^([A-Za-z]):\\(.*)$') {
-    $drive = $Matches[1].ToLower()
-    $rest = $Matches[2] -replace '\\', '/'
-    $wslPath = "/mnt/$drive/$rest"
-} else {
-    # Fallback (e.g. a UNC path): let wslpath try, quoting to preserve slashes.
-    $wslPath = (& wsl.exe -d $Distro -- wslpath -a "$here" 2>$null | Out-String).Trim()
-}
+$wslPath = ConvertTo-WslPath $here $Distro
 if (-not $wslPath) { Fail "could not resolve the WSL path for '$here'." }
 Info "installer path in WSL: $wslPath"
 
@@ -348,7 +369,57 @@ Info "installer path in WSL: $wslPath"
 # of a clear PowerShell one.
 $alreadyEnrolled = (wsl -d $Distro -u root -- bash -c "[ -f /etc/teepin/agent.json ] && [ -f /etc/systemd/system/teepin-agent.service ] && echo yes || echo no").Trim()
 
+# --- P-core/E-core detection (Windows host side) -------------------------
+# Runs on EVERY invocation of this script -- fresh install AND an update of
+# an already-enrolled node alike -- not just the first. P/E-cores are
+# capacity, refreshed on every agent reconnect the same as CPU/memory/OS/
+# arch (see RegisterRequest.p_cores' own proto comment): install.sh's
+# apply_pe_core_env persists whatever this probe finds into the agent's
+# systemd unit regardless of which branch it takes below, so a fixed
+# detector, a hardware change, or simply re-running this script is enough
+# to correct a bad reading -- no fresh enrollment token required.
+#
+# Must happen HERE, on the real Windows host, not inside WSL2: the agent
+# (built GOOS=linux only) always runs inside this WSL2 distro, and the
+# distro's own view of CPU topology is not reliably the host's real one --
+# WSL2/Hyper-V may not expose true core-type info to it at all. See
+# cmd/teepin-hostprobe's own doc comment for the full reasoning.
 $peExportPrefix = ""
+$probeBin = Join-Path $here "teepin-hostprobe.exe"
+if (-not (Test-Path $probeBin)) {
+    $goCmd = Get-Command go -ErrorAction SilentlyContinue
+    if ($goCmd) {
+        Info "building teepin-hostprobe from source..."
+        $repoRoot = (Resolve-Path (Join-Path $here "..\..")).Path
+        $probeBin = Join-Path $env:TEMP "teepin-hostprobe.exe"
+        Push-Location $repoRoot
+        try {
+            & go build -o $probeBin ./cmd/teepin-hostprobe
+            if ($LASTEXITCODE -ne 0) {
+                Info "note: could not build teepin-hostprobe -- P/E-core detection skipped."
+                $probeBin = ""
+            }
+        } finally { Pop-Location }
+    } else {
+        Info "note: teepin-hostprobe.exe not found and Go is not installed to build it -- P/E-core detection skipped."
+        $probeBin = ""
+    }
+}
+if ($probeBin) {
+    try {
+        $probeJson = (& $probeBin 2>$null | Out-String).Trim()
+        $probe = $probeJson | ConvertFrom-Json
+        if ($probe.p_cores -gt 0) {
+            Info "detected CPU: $($probe.p_cores) P-cores / $($probe.e_cores) E-cores"
+            $peExportPrefix = "export TEEPIN_PCORES=$($probe.p_cores) TEEPIN_ECORES=$($probe.e_cores); "
+        } else {
+            Info "note: teepin-hostprobe did not report a usable P/E-core split -- this CPU will be treated as homogeneous."
+        }
+    } catch {
+        Info "note: teepin-hostprobe did not return usable output ($_) -- P/E-core detection skipped."
+    }
+}
+
 if ($alreadyEnrolled -eq "yes") {
     Info "existing enrollment found inside $Distro -- updating the agent binary only (Token/ControlPlane not needed)."
     $installArgs = ""
@@ -359,51 +430,62 @@ if ($alreadyEnrolled -eq "yes") {
     $grpcArg = ""
     if ($Grpc -ne "") { $grpcArg = "--grpc $Grpc" }
     $installArgs = "--token '$Token' --control-plane '$ControlPlane' $grpcArg"
+}
 
-    # --- P-core/E-core detection (Windows host side, before enrollment) --
-    # Must happen HERE, on the real Windows host, not inside WSL2: the agent
-    # (built GOOS=linux only) always runs inside this WSL2 distro, and the
-    # distro's own view of CPU topology is not reliably the host's real one
-    # -- WSL2/Hyper-V may not expose true core-type info to it at all. See
-    # cmd/teepin-hostprobe's own doc comment for the full reasoning.
-    $probeBin = Join-Path $here "teepin-hostprobe.exe"
-    if (-not (Test-Path $probeBin)) {
-        $goCmd = Get-Command go -ErrorAction SilentlyContinue
-        if ($goCmd) {
-            Info "building teepin-hostprobe from source..."
-            $repoRoot = (Resolve-Path (Join-Path $here "..\..")).Path
-            $probeBin = Join-Path $env:TEMP "teepin-hostprobe.exe"
-            Push-Location $repoRoot
-            try {
-                & go build -o $probeBin ./cmd/teepin-hostprobe
-                if ($LASTEXITCODE -ne 0) {
-                    Info "note: could not build teepin-hostprobe -- P/E-core detection skipped."
-                    $probeBin = ""
-                }
-            } finally { Pop-Location }
-        } else {
-            Info "note: teepin-hostprobe.exe not found and Go is not installed to build it -- P/E-core detection skipped."
-            $probeBin = ""
-        }
+# --- teepin-agent binary (Windows host side, cross-compiled for Linux) --
+# Built HERE, on the host, rather than requiring a SECOND full Go
+# toolchain inside the disposable WSL2 distro just to build the one binary
+# install.sh needs -- the host already needs Go for teepin-hostprobe
+# above, and install.sh's own "no --binary given and Go is not installed"
+# fallback otherwise forces every node operator to also set up Go inside
+# their Linux guest for no reason beyond this one build. --binary is
+# passed to install.sh unconditionally whenever this succeeds, in BOTH
+# the fresh-install and update branches -- it takes the same path either
+# way. Best-effort: if this host has no Go (or the cross-build fails),
+# install.sh falls back to its own in-distro build exactly as before.
+$goForAgent = Get-Command go -ErrorAction SilentlyContinue
+if ($goForAgent) {
+    $guestArch = (wsl -d $Distro -- uname -m 2>$null | Out-String).Trim()
+    $goArch = switch ($guestArch) {
+        "x86_64" { "amd64" }
+        "aarch64" { "arm64" }
+        "arm64" { "arm64" }
+        default { "" }
     }
-    if ($probeBin) {
+    if (-not $goArch) {
+        Info "note: unrecognised guest architecture '$guestArch' -- install.sh will build teepin-agent inside the distro instead."
+    } else {
+        Info "cross-compiling teepin-agent for linux/$goArch..."
+        $repoRootForAgent = (Resolve-Path (Join-Path $here "..\..")).Path
+        $agentBinWin = Join-Path $env:TEMP "teepin-agent-linux-$goArch"
+        Push-Location $repoRootForAgent
         try {
-            $probeJson = (& $probeBin 2>$null | Out-String).Trim()
-            $probe = $probeJson | ConvertFrom-Json
-            if ($probe.p_cores -gt 0) {
-                Info "detected CPU: $($probe.p_cores) P-cores / $($probe.e_cores) E-cores"
-                $peExportPrefix = "export TEEPIN_PCORES=$($probe.p_cores) TEEPIN_ECORES=$($probe.e_cores); "
-            } else {
-                Info "note: teepin-hostprobe did not report a usable P/E-core split -- this CPU will be treated as homogeneous."
+            $env:GOOS = "linux"; $env:GOARCH = $goArch
+            & go build -o $agentBinWin ./cmd/teepin-agent
+            $agentBuildExit = $LASTEXITCODE
+        } finally {
+            Remove-Item Env:\GOOS -ErrorAction SilentlyContinue
+            Remove-Item Env:\GOARCH -ErrorAction SilentlyContinue
+            Pop-Location
+        }
+        if ($agentBuildExit -eq 0) {
+            $agentBinWsl = ConvertTo-WslPath $agentBinWin $Distro
+            if ($agentBinWsl) {
+                $installArgs = "$installArgs --binary '$agentBinWsl'"
             }
-        } catch {
-            Info "note: teepin-hostprobe did not return usable output ($_) -- P/E-core detection skipped."
+        } else {
+            Info "note: could not cross-compile teepin-agent -- install.sh will build it inside the distro instead."
         }
     }
+} else {
+    Info "note: Go not found on this host -- install.sh will build teepin-agent inside the distro instead (requires Go there too)."
 }
 
 Info "running the Linux installer inside $Distro..."
 wsl -d $Distro -u root -- bash -c "$peExportPrefix cd '$wslPath' && bash install.sh $installArgs"
+if ($LASTEXITCODE -ne 0) {
+    Fail "install.sh failed inside $Distro (exit $LASTEXITCODE) -- see the [install] output above for the actual cause. Nothing further below ran."
+}
 
 Info "done. The node should appear in the control centre (Nodes) as online within a minute."
 Info "check inside WSL:  wsl -d $Distro -- systemctl status teepin-agent"

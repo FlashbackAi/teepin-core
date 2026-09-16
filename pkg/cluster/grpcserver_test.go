@@ -91,10 +91,12 @@ func (f *fakeNodeReporter) ReportSeen(seen NodeSeen) {
 }
 
 // TestReportRegisterSeen_ThreadsDetectedSpecs is the regression test for
-// the fix that lets a home node's cpu_cores/memory_gb/os/arch refresh on
-// every reconnect (e.g. after an agent update resizes the host VM),
-// instead of staying frozen at whatever was detected the day it first
-// enrolled.
+// the fix that lets a home node's cpu_cores/memory_gb/os/arch/p_cores/
+// e_cores refresh on every reconnect (e.g. after an agent update resizes
+// the host VM, or a corrected P/E-core reading), instead of staying frozen
+// at whatever was detected the day it first enrolled. p_cores/e_cores
+// joined this set later than the rest — see RegisterRequest.p_cores' own
+// proto comment for why enroll-time-only was a gap, not a requirement.
 func TestReportRegisterSeen_ThreadsDetectedSpecs(t *testing.T) {
 	reporter := &fakeNodeReporter{}
 	s := NewAgentServer(nil, nil, "shared-secret").WithNodeReporter(reporter)
@@ -107,6 +109,8 @@ func TestReportRegisterSeen_ThreadsDetectedSpecs(t *testing.T) {
 		MemoryGb:     28,
 		Os:           "linux",
 		Arch:         "arm64",
+		PCores:       8,
+		ECores:       4,
 	})
 
 	if len(reporter.seen) != 1 {
@@ -118,6 +122,9 @@ func TestReportRegisterSeen_ThreadsDetectedSpecs(t *testing.T) {
 	}
 	if got.CPUCores != 12 || got.MemoryGB != 28 || got.OS != "linux" || got.Arch != "arm64" {
 		t.Errorf("detected specs = %+v, want the exact values from RegisterRequest", got)
+	}
+	if got.PCores != 8 || got.ECores != 4 {
+		t.Errorf("PCores/ECores = %d/%d, want 8/4", got.PCores, got.ECores)
 	}
 }
 

@@ -72,6 +72,41 @@ done
 info() { echo "[install] $*"; }
 fail() { echo "[install] ERROR: $*" >&2; exit 1; }
 
+# apply_pe_core_env (idempotently) writes TEEPIN_PCORES/TEEPIN_ECORES into
+# the given systemd unit's [Service] Environment lines and reloads systemd
+# so the change is picked up on the unit's next start. A no-op when
+# TEEPIN_PCORES/TEEPIN_ECORES are not both set in THIS script's own
+# environment — the bootstrap script only exports them when
+# teepin-hostprobe actually reported a usable split (see
+# bootstrap-windows.ps1/bootstrap-macos.sh's own P/E-core detection step).
+#
+# Called on EVERY run of this script — fresh install AND update alike —
+# so a fixed detector, a hardware change, or simply re-running the
+# bootstrap script is enough to correct a bad reading, with no fresh
+# enrollment token required. Persisting into the unit file (rather than
+# leaving these only exported in the one-time `enroll` shell) is what
+# lets detectPECores() see the same value on every later `teepin-agent
+# run` too — see that function's own doc comment in cmd/teepin-agent.
+apply_pe_core_env() {
+    local unit_file="$1"
+    [ -n "${TEEPIN_PCORES:-}" ] && [ -n "${TEEPIN_ECORES:-}" ] || return 0
+    [ -f "$unit_file" ] || return 0
+
+    info "recording P/E-core split in $unit_file (P=$TEEPIN_PCORES E=$TEEPIN_ECORES)..."
+    local tmp
+    tmp="$(mktemp)"
+    # Strip any TEEPIN_PCORES/TEEPIN_ECORES lines a PREVIOUS run of this
+    # function wrote, then insert the current values fresh right after
+    # [Service] — idempotent regardless of how many times this runs.
+    grep -v -E '^Environment=TEEPIN_(P|E)CORES=' "$unit_file" > "$tmp"
+    awk -v p="$TEEPIN_PCORES" -v e="$TEEPIN_ECORES" '
+        { print }
+        /^\[Service\]/ { print "Environment=TEEPIN_PCORES=" p; print "Environment=TEEPIN_ECORES=" e }
+    ' "$tmp" > "$unit_file"
+    rm -f "$tmp"
+    systemctl daemon-reload
+}
+
 # ensure_ecr_pull_secret (re)installs the ECR pull-secret refresh timer and,
 # if a credential is already on file, forces one immediate refresh. Called
 # on EVERY run of this script — fresh install and update mode alike — so
@@ -158,6 +193,8 @@ if [ -f "$CONFIG_FILE_DEFAULT" ] && [ -f "$UNIT_FILE" ]; then
     systemctl stop teepin-agent.service
 
     install -m 0755 "$NEW_BIN" "$AGENT_BIN"
+
+    apply_pe_core_env "$UNIT_FILE"
 
     info "starting the agent..."
     systemctl start teepin-agent.service
@@ -259,6 +296,8 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
+
+apply_pe_core_env /etc/systemd/system/teepin-agent.service
 
 info "starting the agent service..."
 systemctl daemon-reload

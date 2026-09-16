@@ -241,6 +241,18 @@ message RegisterRequest {
   int32  memory_gb = 6;
   string os        = 7;
   string arch      = 8;
+
+  // p_cores/e_cores: this machine's detected P-core/E-core split for a
+  // hybrid consumer CPU, refreshed on every reconnect the same as
+  // cpu_cores/memory_gb/os/arch above — deliberately NOT enroll-time-only,
+  // since a home node's bootstrap script may be re-run (a fixed detector,
+  // a resized VM) without a fresh enrollment token, and that re-run should
+  // be enough to correct a bad reading. 0/0 is "no split detected" (a
+  // homogeneous CPU, or detection unavailable) and, like the fields above,
+  // leaves whatever the control plane already has on file untouched
+  // rather than clobbering a previously-detected split with a zero.
+  int32  p_cores = 9;
+  int32  e_cores = 10;
 }
 
 // GPUInventory is the agent's view of capacity. Sent on registration,

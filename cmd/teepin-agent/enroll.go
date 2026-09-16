@@ -80,14 +80,21 @@ func hostSpecs() (cpuCores, memoryGB int, osName, arch string) {
 }
 
 // detectPECores resolves this node's P-core/E-core split for a hybrid
-// consumer CPU. Both 0 means "no split detected" — never a guess.
+// consumer CPU. Both 0 means "no split detected" — never a guess. Called
+// from BOTH `enroll` (this file) and `run`'s reconnect loop (main.go) —
+// like hostSpecs, it is not enroll-time-only, so a fixed detector or a
+// corrected reading only needs an agent restart, never a fresh
+// enrollment token.
 //
 // Resolution order: (1) TEEPIN_PCORES/TEEPIN_ECORES env vars — set by the
 // Windows/macOS bootstrap script from cmd/teepin-hostprobe's real host-OS
 // detection, since this agent only ever runs as Linux (see this file's own
 // package comment) and cannot call Windows/macOS-native detection APIs
-// itself; (2) a best-effort native Linux topology read, for a bare-metal
-// Linux home node running this agent directly with no VM involved.
+// itself, and PERSISTED into this service's own systemd unit by
+// install.sh's apply_pe_core_env so they survive past the one-time enroll
+// shell into every later `run`; (2) a best-effort native Linux topology
+// read, for a bare-metal Linux home node running this agent directly with
+// no VM involved.
 func detectPECores() (pCores, eCores int) {
 	if p, e, ok := peCoresFromEnv(); ok {
 		return p, e

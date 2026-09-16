@@ -49,13 +49,15 @@ type NodeSeen struct {
 	Region       string
 	CPUCores     int
 	MemoryGB     int
-	// OS/Arch are only ever populated by the register-time call this
-	// struct now also backs (see AgentServer.Connect) — the periodic
-	// Inventory-driven report has nothing new to say about either, so it
-	// always leaves these empty, which UpsertSeen's COALESCE correctly
-	// reads as "no change".
+	// OS/Arch/PCores/ECores are only ever populated by the register-time
+	// call this struct now also backs (see AgentServer.Connect) — the
+	// periodic Inventory-driven report has nothing new to say about any of
+	// them, so it always leaves these zero/empty, which UpsertSeen's
+	// COALESCE correctly reads as "no change".
 	OS           string
 	Arch         string
+	PCores       int
+	ECores       int
 	GPUModel     string
 	GPUCount     int
 	MIGCapable   bool
@@ -367,6 +369,11 @@ func (s *AgentServer) handleMessage(session *AgentSession, msg *agentpb.AgentMes
 // "no change" (see NodeSpecs.nullInt/nullString), and it can only ever
 // touch these capacity/platform fields — node_name, provider_id and
 // class stay exactly as enrollment set them.
+//
+// PCores/ECores ride along the same way as CPUCores/MemoryGB — a home
+// node's P/E-core split is capacity, not identity, so it self-heals on
+// every reconnect rather than being frozen at whatever enrollment first
+// recorded (see agent.proto's own comment on RegisterRequest.p_cores).
 func (s *AgentServer) reportRegisterSeen(providerID, class string, register *agentpb.RegisterRequest) {
 	if s.nodeReporter == nil {
 		return
@@ -381,6 +388,8 @@ func (s *AgentServer) reportRegisterSeen(providerID, class string, register *age
 		MemoryGB:     int(register.MemoryGb),
 		OS:           register.Os,
 		Arch:         register.Arch,
+		PCores:       int(register.PCores),
+		ECores:       int(register.ECores),
 	})
 }
 

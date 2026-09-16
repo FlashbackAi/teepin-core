@@ -98,6 +98,14 @@ type Config struct {
 	MemoryGB int
 	OS       string
 	Arch     string
+
+	// PCores/ECores: this home node's detected P-core/E-core split,
+	// refreshed on every reconnect the same as the fields above — see
+	// RegisterRequest.p_cores' own proto comment for why this is
+	// deliberately NOT enroll-time-only. 0/0 is "no split detected" and
+	// leaves whatever the control plane already has on file untouched.
+	PCores int
+	ECores int
 }
 
 // Runner owns one control-plane connection.
@@ -218,6 +226,8 @@ func (r *Runner) Run(ctx context.Context, s stream) error {
 				MemoryGb:     int32(r.cfg.MemoryGB),
 				Os:           r.cfg.OS,
 				Arch:         r.cfg.Arch,
+				PCores:       int32(r.cfg.PCores),
+				ECores:       int32(r.cfg.ECores),
 			},
 		},
 	}); err != nil {

@@ -160,7 +160,14 @@ func runEnrolledAgent(cfg *nodeConfig) {
 	// reconnects, with no separate re-enrollment required. See Config's
 	// own doc comment for why this is safe: it can only ever refresh
 	// capacity/platform fields server-side, never this node's identity.
+	//
+	// detectPECores() joins this refresh-on-every-run set for the same
+	// reason: TEEPIN_PCORES/TEEPIN_ECORES (when the bootstrap script set
+	// them) are persisted into this service's own systemd unit — see
+	// install.sh's apply_pe_core_env — so a fixed detector or a corrected
+	// reading reaches the control plane on the next agent restart alone.
 	cpuCores, memoryGB, osName, arch := hostSpecs()
+	pCores, eCores := detectPECores()
 
 	runner := agentrunner.New(agentrunner.Config{
 		ProviderID: cfg.NodeName,
@@ -172,6 +179,8 @@ func runEnrolledAgent(cfg *nodeConfig) {
 		MemoryGB:   memoryGB,
 		OS:         osName,
 		Arch:       arch,
+		PCores:     pCores,
+		ECores:     eCores,
 	})
 
 	ctx, cancel := shutdownContext()
