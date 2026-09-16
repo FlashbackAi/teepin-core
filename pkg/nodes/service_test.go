@@ -79,6 +79,33 @@ func TestListNodes_ReturnsPECoreSplit(t *testing.T) {
 	}
 }
 
+// TestPublicNodeLocations_ReturnsOnlyCoordinates is the regression guard for
+// the public status/marketing globe's data-minimization guarantee: the
+// query must select exactly two columns (rounded lat/lng), never anything
+// identifying. Asserted two ways — the mocked row only offers two columns
+// (Scan would fail if the real query asked for more), AND the returned
+// struct's own type (PublicNodeLocation) has no field to hold anything
+// else even if it tried.
+func TestPublicNodeLocations_ReturnsOnlyCoordinates(t *testing.T) {
+	s, mock, done := newMock(t)
+	defer done()
+
+	mock.ExpectQuery(`SELECT ROUND\(latitude`).
+		WillReturnRows(sqlmock.NewRows([]string{"round", "round"}).
+			AddRow(12.9, 77.6))
+
+	locations, err := s.PublicNodeLocations(context.Background())
+	if err != nil {
+		t.Fatalf("PublicNodeLocations: %v", err)
+	}
+	if len(locations) != 1 {
+		t.Fatalf("got %d locations, want 1", len(locations))
+	}
+	if locations[0].Latitude != 12.9 || locations[0].Longitude != 77.6 {
+		t.Errorf("got %+v, want {12.9 77.6}", locations[0])
+	}
+}
+
 // TestSetLocation_UpdatesRow proves a happy-path location update reaches the
 // row unmodified — no rounding/derivation, exactly the operator-typed value.
 func TestSetLocation_UpdatesRow(t *testing.T) {

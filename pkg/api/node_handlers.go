@@ -226,6 +226,20 @@ func (h *NodeHandler) HomeCapacity(c *gin.Context) {
 	c.JSON(http.StatusOK, summary)
 }
 
+// PublicNodeLocations is GET /v1/status/node-locations — UNAUTHENTICATED,
+// for a public status/marketing globe. Returns ONLY rounded coordinates
+// (nodes.PublicNodeLocation carries nothing else) — see that type's own
+// doc comment for why this is safe to expose with no auth at all, not
+// merely "the client happens not to show more today."
+func (h *NodeHandler) PublicNodeLocations(c *gin.Context) {
+	locations, err := h.nodes.PublicNodeLocations(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list node locations"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"locations": locations})
+}
+
 // renameRequest changes a node's display name.
 type renameRequest struct {
 	NodeName string `json:"node_name" binding:"required"`

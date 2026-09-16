@@ -1240,6 +1240,16 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 			v1.POST("/nodes/enroll", nodeHandler.Enroll)
 		}
 
+		// Public status/marketing globe — UNAUTHENTICATED at the router
+		// BY DESIGN, not merely unguarded: the handler (PublicNodeLocations)
+		// calls a query that returns nothing beyond rounded coordinates,
+		// so there is no admin/customer data this route could leak
+		// regardless of who calls it. See nodes.PublicNodeLocation's own
+		// doc comment before ever widening what this returns.
+		if nodeHandler != nil {
+			v1.GET("/status/node-locations", nodeHandler.PublicNodeLocations)
+		}
+
 		// Signed object-download redemption — UNAUTHENTICATED at the
 		// router: this is Teepin's own stand-in for a presigned URL
 		// (Shelby rejects presigned URLs outright), so the whole point is

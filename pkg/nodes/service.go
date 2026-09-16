@@ -543,6 +543,51 @@ func (s *Service) ListNodes(ctx context.Context) ([]Node, error) {
 	return out, rows.Err()
 }
 
+// PublicNodeLocation is the ENTIRE payload the public, unauthenticated
+// status/marketing globe may ever see for one node — coordinates only,
+// rounded to ~11km (one decimal degree) so what an operator sees as their
+// own precise, self-reported location in Control Centre (a real street
+// address in the common case) is never reconstructable from the public
+// page. No id, no name, no provider_id, no status, no specs, no
+// timestamps — deliberately not "the same data with fields omitted", a
+// distinct, minimal type so a future field added to Node can never leak
+// here just by being added to a shared struct.
+type PublicNodeLocation struct {
+	Latitude  float64 `json:"latitude"`
+	Longitude float64 `json:"longitude"`
+}
+
+// PublicNodeLocations returns rounded coordinates for every node an
+// operator has given a location, for the public status/marketing globe.
+// Excludes disabled and revoked nodes — decommissioned hardware has no
+// business appearing on a "here is where our fleet is" map. Rounding
+// happens IN SQL, not in Go after the fact: the precise value never
+// leaves the database for this query, which is what makes this safe to
+// expose with no auth at all rather than merely "not shown by today's
+// client code."
+func (s *Service) PublicNodeLocations(ctx context.Context) ([]PublicNodeLocation, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT ROUND(latitude::numeric, 1)::float8, ROUND(longitude::numeric, 1)::float8
+		FROM compute.nodes
+		WHERE latitude IS NOT NULL AND longitude IS NOT NULL
+		  AND status != 'disabled' AND revoked_at IS NULL
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list public node locations: %w", err)
+	}
+	defer rows.Close()
+
+	out := []PublicNodeLocation{}
+	for rows.Next() {
+		var p PublicNodeLocation
+		if err := rows.Scan(&p.Latitude, &p.Longitude); err != nil {
+			return nil, fmt.Errorf("failed to scan public node location: %w", err)
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 // ErrNodeHasInstances is returned when deleting a node that still has active
 // instances — they must be terminated first (or the node disabled instead).
 var ErrNodeHasInstances = errors.New("node has active instances; terminate them or disable the node instead")
