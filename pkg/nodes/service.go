@@ -544,30 +544,35 @@ func (s *Service) ListNodes(ctx context.Context) ([]Node, error) {
 }
 
 // PublicNodeLocation is the ENTIRE payload the public, unauthenticated
-// status/marketing globe may ever see for one node — coordinates only,
-// rounded to ~11km (one decimal degree) so what an operator sees as their
-// own precise, self-reported location in Control Centre (a real street
-// address in the common case) is never reconstructable from the public
-// page. No id, no name, no provider_id, no status, no specs, no
-// timestamps — deliberately not "the same data with fields omitted", a
-// distinct, minimal type so a future field added to Node can never leak
-// here just by being added to a shared struct.
+// status/marketing globe may ever see for one node — coordinates (rounded
+// to ~11km, one decimal degree, so what an operator sees as their own
+// precise, self-reported location in Control Centre is never
+// reconstructable from the public page) plus the operator's own location
+// label, shown as-is. No id, no name, no provider_id, no status, no
+// specs, no timestamps — deliberately not "the same data with fields
+// omitted", a distinct, minimal type so a future field added to Node can
+// never leak here just by being added to a shared struct.
+//
+// LocationLabel is free text an operator typed in Control Centre — see
+// location-dialog.tsx's own hint, which tells them explicitly that this
+// field is shown publicly, so they know not to put anything identifying
+// in it (an address, not just a city).
 type PublicNodeLocation struct {
-	Latitude  float64 `json:"latitude"`
-	Longitude float64 `json:"longitude"`
+	Latitude      float64 `json:"latitude"`
+	Longitude     float64 `json:"longitude"`
+	LocationLabel string  `json:"location_label,omitempty"`
 }
 
-// PublicNodeLocations returns rounded coordinates for every node an
-// operator has given a location, for the public status/marketing globe.
-// Excludes disabled and revoked nodes — decommissioned hardware has no
-// business appearing on a "here is where our fleet is" map. Rounding
-// happens IN SQL, not in Go after the fact: the precise value never
-// leaves the database for this query, which is what makes this safe to
-// expose with no auth at all rather than merely "not shown by today's
-// client code."
+// PublicNodeLocations returns rounded coordinates (plus the operator's own
+// label) for every node an operator has given a location, for the public
+// status/marketing globe. Excludes disabled and revoked nodes —
+// decommissioned hardware has no business appearing on a "here is where
+// our fleet is" map. Coordinate rounding happens IN SQL, not in Go after
+// the fact: the precise value never leaves the database for this query.
 func (s *Service) PublicNodeLocations(ctx context.Context) ([]PublicNodeLocation, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT ROUND(latitude::numeric, 1)::float8, ROUND(longitude::numeric, 1)::float8
+		SELECT ROUND(latitude::numeric, 1)::float8, ROUND(longitude::numeric, 1)::float8,
+		       COALESCE(location_label,'')
 		FROM compute.nodes
 		WHERE latitude IS NOT NULL AND longitude IS NOT NULL
 		  AND status != 'disabled' AND revoked_at IS NULL
@@ -580,7 +585,7 @@ func (s *Service) PublicNodeLocations(ctx context.Context) ([]PublicNodeLocation
 	out := []PublicNodeLocation{}
 	for rows.Next() {
 		var p PublicNodeLocation
-		if err := rows.Scan(&p.Latitude, &p.Longitude); err != nil {
+		if err := rows.Scan(&p.Latitude, &p.Longitude, &p.LocationLabel); err != nil {
 			return nil, fmt.Errorf("failed to scan public node location: %w", err)
 		}
 		out = append(out, p)

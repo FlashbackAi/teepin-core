@@ -79,20 +79,21 @@ func TestListNodes_ReturnsPECoreSplit(t *testing.T) {
 	}
 }
 
-// TestPublicNodeLocations_ReturnsOnlyCoordinates is the regression guard for
-// the public status/marketing globe's data-minimization guarantee: the
-// query must select exactly two columns (rounded lat/lng), never anything
-// identifying. Asserted two ways — the mocked row only offers two columns
-// (Scan would fail if the real query asked for more), AND the returned
-// struct's own type (PublicNodeLocation) has no field to hold anything
-// else even if it tried.
-func TestPublicNodeLocations_ReturnsOnlyCoordinates(t *testing.T) {
+// TestPublicNodeLocations_ReturnsRoundedCoordinatesAndLabel is the
+// regression guard for the public status/marketing globe's
+// data-minimization guarantee: the query must select exactly rounded
+// lat/lng plus the operator's own label, never anything identifying like
+// an id, node name, or status. Asserted two ways — the mocked row only
+// offers three columns (Scan would fail if the real query asked for
+// more), AND the returned struct's own type (PublicNodeLocation) has no
+// field to hold anything else even if it tried.
+func TestPublicNodeLocations_ReturnsRoundedCoordinatesAndLabel(t *testing.T) {
 	s, mock, done := newMock(t)
 	defer done()
 
 	mock.ExpectQuery(`SELECT ROUND\(latitude`).
-		WillReturnRows(sqlmock.NewRows([]string{"round", "round"}).
-			AddRow(12.9, 77.6))
+		WillReturnRows(sqlmock.NewRows([]string{"round", "round", "location_label"}).
+			AddRow(12.9, 77.6, "Bengaluru, India"))
 
 	locations, err := s.PublicNodeLocations(context.Background())
 	if err != nil {
@@ -102,7 +103,10 @@ func TestPublicNodeLocations_ReturnsOnlyCoordinates(t *testing.T) {
 		t.Fatalf("got %d locations, want 1", len(locations))
 	}
 	if locations[0].Latitude != 12.9 || locations[0].Longitude != 77.6 {
-		t.Errorf("got %+v, want {12.9 77.6}", locations[0])
+		t.Errorf("got %+v, want lat/lng 12.9/77.6", locations[0])
+	}
+	if locations[0].LocationLabel != "Bengaluru, India" {
+		t.Errorf("LocationLabel = %q, want %q", locations[0].LocationLabel, "Bengaluru, India")
 	}
 }
 
