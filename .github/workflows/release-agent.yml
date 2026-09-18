@@ -66,6 +66,20 @@ jobs:
               ./cmd/teepin-agent
           done
 
+      # macOS host agent (teepin-modeld): a native darwin/arm64 build for the
+      # single Mac installer. Not consumed by selfupdate.go (linux-only, and
+      # disabled for host-native agents) — updating a Mac re-runs the
+      # installer, which downloads this asset.
+      - name: Build macOS host agent
+        run: |
+          set -euo pipefail
+          outdir="dist/teepin-agent-darwin-arm64"
+          mkdir -p "$outdir"
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build \
+            -ldflags "-X main.Version=${GITHUB_REF_NAME}" \
+            -o "$outdir/teepin-agent" \
+            ./cmd/teepin-agent
+
       # Bundled alongside the binary so a fresh install never needs a
       # separate download — install.sh already looks for a teepin-agent
       # binary sitting next to itself. refresh-ecr-pull-secret.sh rides
@@ -95,7 +109,12 @@ jobs:
             chmod +x "$outdir/teepin-agent" "$outdir/install.sh" "$outdir/refresh-ecr-pull-secret.sh" "$outdir/bootstrap-macos.sh"
             tar -czf "teepin-agent-linux-${arch}.tar.gz" -C "$outdir" .
           done
-          sha256sum teepin-agent-linux-amd64.tar.gz teepin-agent-linux-arm64.tar.gz > SHA256SUMS
+          outdir="dist/teepin-agent-darwin-arm64"
+          cp deploy/agent/bootstrap-modeld-macos.sh "$outdir/"
+          cp deploy/agent/README.md "$outdir/"
+          chmod +x "$outdir/teepin-agent" "$outdir/bootstrap-modeld-macos.sh"
+          tar -czf teepin-agent-darwin-arm64.tar.gz -C "$outdir" .
+          sha256sum teepin-agent-linux-amd64.tar.gz teepin-agent-linux-arm64.tar.gz teepin-agent-darwin-arm64.tar.gz > SHA256SUMS
 
       # softprops/action-gh-release does NOT infer prerelease from the tag
       # name on its own — every tag would otherwise publish as a full
@@ -118,6 +137,7 @@ jobs:
           files: |
             teepin-agent-linux-amd64.tar.gz
             teepin-agent-linux-arm64.tar.gz
+            teepin-agent-darwin-arm64.tar.gz
             SHA256SUMS
           generate_release_notes: true
           prerelease: ${{ steps.prerelease.outputs.value }}

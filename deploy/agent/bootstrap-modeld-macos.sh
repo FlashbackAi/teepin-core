@@ -11,8 +11,13 @@
 #     cannot live in a VM;
 #   * (optional, --with-vm) a Lima Linux VM running k3s -- customer containers.
 #
+# Get it (no clone or copying; the tarball holds the agent binary + this script):
+#   mkdir -p ~/teepin-agent && curl -fsSL \
+#     https://github.com/FlashbackAi/teepin-core/releases/latest/download/teepin-agent-darwin-arm64.tar.gz \
+#     | tar -xz -C ~/teepin-agent && cd ~/teepin-agent
+#
 # NEW Mac:
-#   bash bootstrap-modeld-macos.sh --binary ./teepin-agent-darwin-arm64 \
+#   bash bootstrap-modeld-macos.sh \
 #       --token <tne_...> --control-plane https://api.teepin.com \
 #       --grpc api.teepin.com:9090 [--node-name mac-mini] [--with-vm]
 #
@@ -20,12 +25,13 @@
 # no second enrollment. This adopts the VM agent's credential, stops the VM
 # agent (two agents must never share a credential), and keeps the VM's k3s for
 # containers:
-#   bash bootstrap-modeld-macos.sh --binary ./teepin-agent-darwin-arm64 --with-vm
+#   bash bootstrap-modeld-macos.sh --with-vm
 #
-# Re-run with just --binary to update the agent binary.
+# Re-run the script (newer tarball) to update the agent.
 #
 # Options:
-#   --binary PATH        darwin/arm64 teepin-agent (required)
+#   --binary PATH        use this teepin-agent instead of downloading one
+#   --release TAG        release to download (default: latest; pre-releases need a tag, e.g. agent-v1.2.0-rc1)
 #   --token / --control-plane / --grpc / --node-name    first-install enrollment
 #   --with-vm [NAME]     also run container workloads via Lima k3s (default VM: teepin)
 #   --vm-memory GiB      memory for a NEWLY created VM (default 4)
@@ -34,6 +40,8 @@
 set -euo pipefail
 
 BINARY=""
+RELEASE="latest"
+REPO="FlashbackAi/teepin-core"
 TOKEN=""
 CONTROL_PLANE=""
 GRPC_ADDR=""
@@ -46,6 +54,7 @@ VM_CPUS=2
 while [ $# -gt 0 ]; do
     case "$1" in
         --binary)        BINARY="$2"; shift 2 ;;
+        --release)       RELEASE="$2"; shift 2 ;;
         --token)         TOKEN="$2"; shift 2 ;;
         --control-plane) CONTROL_PLANE="$2"; shift 2 ;;
         --grpc)          GRPC_ADDR="$2"; shift 2 ;;
@@ -65,7 +74,7 @@ fail() { echo "[modeld] ERROR: $*" >&2; exit 1; }
 [ "$(uname -s)" = "Darwin" ] || fail "macOS only."
 [ "$(uname -m)" = "arm64" ] || fail "MLX needs Apple Silicon."
 [ "$(id -u)" -ne 0 ] || fail "run as your normal user, not root."
-[ -n "$BINARY" ] && [ -f "$BINARY" ] || fail "--binary <path to the darwin/arm64 teepin-agent> is required."
+
 
 STATE_DIR="$HOME/.teepin/modeld"
 BIN_DIR="$HOME/.teepin/bin"
@@ -90,6 +99,35 @@ MLX_BIN="$(command -v mlx_lm.server || echo "$HOME/.local/bin/mlx_lm.server")"
 info "mlx server: $MLX_BIN"
 
 # --- 2. Agent binary -----------------------------------------------------
+# Source, in order: --binary PATH; a teepin-agent sitting next to this script
+# (the release tarball layout); otherwise download the release asset and
+# verify it against the release's SHA256SUMS.
+if [ -z "$BINARY" ]; then
+    here="$(cd "$(dirname "$0")" && pwd)"
+    if [ -x "$here/teepin-agent" ]; then
+        BINARY="$here/teepin-agent"
+    else
+        ASSET="teepin-agent-darwin-arm64.tar.gz"
+        if [ "$RELEASE" = "latest" ]; then
+            BASE="https://github.com/$REPO/releases/latest/download"
+        else
+            BASE="https://github.com/$REPO/releases/download/$RELEASE"
+        fi
+        tmp="$(mktemp -d)"
+        trap 'rm -rf "$tmp"' EXIT
+        info "downloading $ASSET ($RELEASE)..."
+        curl -fsSL "$BASE/$ASSET" -o "$tmp/$ASSET" \
+            || fail "could not download $BASE/$ASSET (no such release, or it has no macOS asset). For a pre-release pass --release <tag>."
+        curl -fsSL "$BASE/SHA256SUMS" -o "$tmp/SHA256SUMS" || fail "could not download SHA256SUMS."
+        want="$(grep " $ASSET\$" "$tmp/SHA256SUMS" | awk '{print $1}')"
+        got="$(shasum -a 256 "$tmp/$ASSET" | awk '{print $1}')"
+        [ -n "$want" ] && [ "$want" = "$got" ] || fail "checksum mismatch for $ASSET (want '$want', got '$got')."
+        tar -xzf "$tmp/$ASSET" -C "$tmp"
+        BINARY="$tmp/teepin-agent"
+        info "checksum verified."
+    fi
+fi
+[ -f "$BINARY" ] || fail "agent binary not found: $BINARY"
 install -m 0755 "$BINARY" "$BIN_DIR/teepin-agent"
 xattr -d com.apple.quarantine "$BIN_DIR/teepin-agent" 2>/dev/null || true
 info "installed $BIN_DIR/teepin-agent"
