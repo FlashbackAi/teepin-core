@@ -353,6 +353,16 @@ func (r *Runner) handleCreate(ctx context.Context, s stream, requestID string, c
 		})
 	}
 
+	var initContainer *cluster.InitContainerSpec
+	if cmd.InitContainer != nil {
+		initContainer = &cluster.InitContainerSpec{
+			Image:   cmd.InitContainer.Image,
+			Command: cmd.InitContainer.Command,
+			Args:    cmd.InitContainer.Args,
+			Env:     cmd.InitContainer.Env,
+		}
+	}
+
 	spec := cluster.InstanceSpec{
 		InstanceID:                      cmd.InstanceId,
 		AccountID:                       cmd.AccountId,
@@ -378,6 +388,7 @@ func (r *Runner) handleCreate(ctx context.Context, s stream, requestID string, c
 		AlwaysPullImage:                 cmd.AlwaysPullImage,
 		NeverRestart:                    cmd.NeverRestart,
 		AllowFilesystemOwnershipChanges: cmd.AllowFilesystemOwnershipChanges,
+		InitContainer:                   initContainer,
 	}
 
 	// Idempotency: a command redelivered after a reconnect must not
@@ -547,6 +558,10 @@ const (
 	// agent is always the one to give up first and report a clean error,
 	// rather than the edge timing out first with no explanation.
 	proxyLocalTimeout = 45 * time.Second
+	// proxyMaxLongTimeout is the ceiling for a control-plane-requested
+	// longer timeout (model inference: prefill and generation can take
+	// minutes). A request cannot ask for more than this.
+	proxyMaxLongTimeout = 15 * time.Minute
 )
 
 // deliverProxyBody routes a request-body chunk to the handleProxyRequest
@@ -582,7 +597,7 @@ func (r *Runner) deliverProxyBody(requestID string, data *agentpb.ProxyData) {
 // pkg/cluster/proxy.go's relayResponse, which turns Error into a 502 with
 // this text).
 func (r *Runner) handleProxyRequest(ctx context.Context, s stream, requestID string, req *agentpb.ProxyRequest) {
-	ctx, cancel := context.WithTimeout(ctx, proxyLocalTimeout)
+	ctx, cancel := context.WithTimeout(ctx, proxyTimeoutFor(req))
 	defer cancel()
 
 	addr, err := r.cfg.Cluster.ResolveInstanceAddress(ctx, req.InstanceId, req.Port)
@@ -1435,4 +1450,18 @@ func errorCodeFor(err error) agentpb.ErrorCode {
 	default:
 		return agentpb.ErrorCode_ERROR_CODE_CLUSTER_ERROR
 	}
+}
+
+// proxyTimeoutFor returns the local-call bound for one proxied request:
+// the short default unless the control plane asked for longer, clamped to
+// proxyMaxLongTimeout.
+func proxyTimeoutFor(req *agentpb.ProxyRequest) time.Duration {
+	if req.TimeoutSeconds <= 0 {
+		return proxyLocalTimeout
+	}
+	d := time.Duration(req.TimeoutSeconds) * time.Second
+	if d > proxyMaxLongTimeout {
+		return proxyMaxLongTimeout
+	}
+	return d
 }

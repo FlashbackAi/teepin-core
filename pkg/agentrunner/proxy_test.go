@@ -330,3 +330,20 @@ func (c recordingPortCluster) ResolveInstanceAddress(_ context.Context, _ string
 	*c.gotPort = port
 	return c.addr, nil
 }
+
+func TestProxyTimeoutFor(t *testing.T) {
+	cases := []struct {
+		secs int32
+		want time.Duration
+	}{
+		{0, proxyLocalTimeout},
+		{-5, proxyLocalTimeout},
+		{300, 300 * time.Second},
+		{999999, proxyMaxLongTimeout},
+	}
+	for _, c := range cases {
+		if got := proxyTimeoutFor(&agentpb.ProxyRequest{TimeoutSeconds: c.secs}); got != c.want {
+			t.Errorf("TimeoutSeconds=%d -> %v, want %v", c.secs, got, c.want)
+		}
+	}
+}

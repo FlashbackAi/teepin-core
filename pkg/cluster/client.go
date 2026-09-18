@@ -148,6 +148,28 @@ type InstanceSpec struct {
 	// (LaunchAgent, pkg/kumbha/agent.go) — that workload has no
 	// legitimate need for it and stays on the fully locked-down default.
 	AllowFilesystemOwnershipChanges bool
+
+	// InitContainer, when set, runs to completion before the main
+	// container starts, sharing the same /data volume — StorageGB must
+	// be > 0, since there is otherwise nothing to mount an init
+	// container's output into (implementations reject this combination
+	// rather than silently ignoring it). The standard Kubernetes pattern
+	// for a network-bound preparation step that should not be conflated
+	// with the main container's own startup/liveness semantics — Teepin
+	// Inference's model-mount reconciler (pkg/inferencereconciler) uses
+	// this to download model weights before the serving engine starts.
+	// Nil for every other caller, unchanged from before this field
+	// existed.
+	InitContainer *InitContainerSpec
+}
+
+// InitContainerSpec is one container that runs to completion before the
+// main container starts. See InstanceSpec.InitContainer's own doc comment.
+type InitContainerSpec struct {
+	Image   string
+	Command []string
+	Args    []string
+	Env     map[string]string
 }
 
 type PortMapping struct {

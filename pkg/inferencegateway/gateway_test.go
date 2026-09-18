@@ -25,8 +25,8 @@ type fakeProvider struct {
 	onComplete func(ctx context.Context, req inference.Request) (*inference.Response, error)
 }
 
-func (f *fakeProvider) Name() string                          { return f.name }
-func (f *fakeProvider) Capabilities() inference.Capabilities   { return inference.Capabilities{} }
+func (f *fakeProvider) Name() string                         { return f.name }
+func (f *fakeProvider) Capabilities() inference.Capabilities { return inference.Capabilities{} }
 func (f *fakeProvider) Complete(ctx context.Context, req inference.Request) (*inference.Response, error) {
 	return f.onComplete(ctx, req)
 }
@@ -74,18 +74,18 @@ func expectListByKindEmpty(mock sqlmock.Sqlmock) {
 		WithArgs("inference_model").
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "node_id", "kind", "config", "desired_state", "observed_state",
-			"observed_error", "observed_at", "created_by", "created_at", "updated_at",
+			"observed_error", "observed_endpoint", "observed_at", "created_by", "created_at", "updated_at",
 		}))
 }
 
 func expectListByKindRows(mock sqlmock.Sqlmock, rows []mountedRow) {
 	res := sqlmock.NewRows([]string{
 		"id", "node_id", "kind", "config", "desired_state", "observed_state",
-		"observed_error", "observed_at", "created_by", "created_at", "updated_at",
+		"observed_error", "observed_endpoint", "observed_at", "created_by", "created_at", "updated_at",
 	})
 	for _, r := range rows {
 		res = res.AddRow(r.id, uuid.New(), "inference_model", []byte(r.config), "mounted", "mounted",
-			nil, time.Now(), "op", time.Now(), time.Now())
+			nil, r.endpoint, time.Now(), "op", time.Now(), time.Now())
 	}
 	mock.ExpectQuery(`SELECT id, node_id, kind, config`).
 		WithArgs("inference_model").
@@ -93,8 +93,9 @@ func expectListByKindRows(mock sqlmock.Sqlmock, rows []mountedRow) {
 }
 
 type mountedRow struct {
-	id     uuid.UUID
-	config string
+	id       uuid.UUID
+	config   string
+	endpoint string
 }
 
 func TestComplete_UnknownModelRejected(t *testing.T) {
@@ -182,6 +183,33 @@ func TestComplete_NoBackendMounted(t *testing.T) {
 	}
 }
 
+// TestComplete_MountedWithNoEndpointYetIsSkipped proves a row that's
+// desired+observed mounted but has no ObservedEndpoint (a state that
+// should not exist per ReportObserved's own contract, but is worth
+// defending against rather than trusting blindly) is treated as not a
+// real candidate, not dereferenced into a panic.
+func TestComplete_MountedWithNoEndpointYetIsSkipped(t *testing.T) {
+	catalog, nodeSvcs, mock, done := newTestServices(t)
+	defer done()
+
+	expectGetModel(mock, "teepin/x", modelcatalog.Model{ModelRoute: "teepin/x", CostClass: modelcatalog.CostClassOwn, Engine: "vllm", Enabled: true})
+	mock.ExpectQuery(`SELECT id, node_id, kind, config`).
+		WithArgs("inference_model").
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "node_id", "kind", "config", "desired_state", "observed_state",
+			"observed_error", "observed_endpoint", "observed_at", "created_by", "created_at", "updated_at",
+		}).AddRow(
+			uuid.New(), uuid.New(), "inference_model", []byte(`{"model_route":"teepin/x","engine":"vllm"}`),
+			"mounted", "mounted", nil, nil, time.Now(), "op", time.Now(), time.Now(),
+		))
+
+	g := New(catalog, nodeSvcs, nil)
+	_, err := g.Complete(context.Background(), "acct1", inference.Request{Model: "teepin/x"})
+	if !errors.Is(err, inference.ErrProviderUnavailable) {
+		t.Fatalf("got %v, want ErrProviderUnavailable", err)
+	}
+}
+
 // TestComplete_RoutesToLeastLoadedBackend proves that when a model is
 // mounted on two backends, a request lands on whichever one currently has
 // fewer in-flight requests, not round-robin — the reasoning being LLM
@@ -192,8 +220,8 @@ func TestComplete_RoutesToLeastLoadedBackend(t *testing.T) {
 
 	idA, idB := uuid.New(), uuid.New()
 	rows := []mountedRow{
-		{id: idA, config: `{"model_route":"teepin/x","engine":"vllm","base_url":"http://a"}`},
-		{id: idB, config: `{"model_route":"teepin/x","engine":"vllm","base_url":"http://b"}`},
+		{id: idA, config: `{"model_route":"teepin/x","engine":"vllm"}`, endpoint: "http://a"},
+		{id: idB, config: `{"model_route":"teepin/x","engine":"vllm"}`, endpoint: "http://b"},
 	}
 
 	entered := make(chan struct{})
@@ -207,8 +235,8 @@ func TestComplete_RoutesToLeastLoadedBackend(t *testing.T) {
 		return &inference.Response{Model: "B"}, nil
 	}}
 
-	g := New(catalog, nodeSvcs, func(cfg ModelServiceConfig) (inference.Provider, error) {
-		if cfg.BaseURL == "http://a" {
+	g := New(catalog, nodeSvcs, func(cfg ModelServiceConfig, endpoint string) (inference.Provider, error) {
+		if endpoint == "http://a" {
 			return providerA, nil
 		}
 		return providerB, nil
@@ -298,35 +326,39 @@ func TestProviderFor_CachesUntilConfigChanges(t *testing.T) {
 	defer done()
 
 	calls := 0
-	g := New(catalog, nodeSvcs, func(cfg ModelServiceConfig) (inference.Provider, error) {
+	g := New(catalog, nodeSvcs, func(cfg ModelServiceConfig, endpoint string) (inference.Provider, error) {
 		calls++
-		return &fakeProvider{name: cfg.BaseURL}, nil
+		return &fakeProvider{name: endpoint}, nil
 	})
 
 	nsID := uuid.New()
-	cfg := ModelServiceConfig{Engine: "vllm", BaseURL: "http://a", BackendModel: "m"}
+	cfg := ModelServiceConfig{Engine: "vllm", BackendModel: "m"}
+	endpoint := "http://a"
 
-	if _, err := g.providerFor(nsID, cfg); err != nil {
+	if _, err := g.providerFor(nsID, cfg, endpoint); err != nil {
 		t.Fatalf("providerFor: %v", err)
 	}
-	if _, err := g.providerFor(nsID, cfg); err != nil {
+	if _, err := g.providerFor(nsID, cfg, endpoint); err != nil {
 		t.Fatalf("providerFor (cached): %v", err)
 	}
 	if calls != 1 {
 		t.Errorf("factory called %d times for an unchanged config, want 1", calls)
 	}
 
-	cfg.BaseURL = "http://b"
-	if _, err := g.providerFor(nsID, cfg); err != nil {
-		t.Fatalf("providerFor (changed config): %v", err)
+	// The endpoint changing (a pod recreated after a node reboot, say)
+	// must invalidate the cache even though cfg itself is unchanged —
+	// otherwise the gateway would keep dispatching to a dead address.
+	endpoint = "http://b"
+	if _, err := g.providerFor(nsID, cfg, endpoint); err != nil {
+		t.Fatalf("providerFor (changed endpoint): %v", err)
 	}
 	if calls != 2 {
-		t.Errorf("factory called %d times after a config change, want 2 (cache should invalidate)", calls)
+		t.Errorf("factory called %d times after the endpoint changed, want 2 (cache should invalidate)", calls)
 	}
 }
 
 func TestDefaultProviderFactory_UnsupportedEngineErrors(t *testing.T) {
-	if _, err := defaultProviderFactory(ModelServiceConfig{Engine: "mlx"}); err == nil {
-		t.Error("mlx engine accepted — not wired yet, should error until a tunnel-backed Provider exists")
+	if _, err := defaultProviderFactory(ModelServiceConfig{Engine: "llamacpp"}, "http://a"); err == nil {
+		t.Error("unknown engine accepted")
 	}
 }

@@ -41,6 +41,8 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/gpu"
 	"github.com/FlashbackAi/teepin-core/pkg/harbor"
 	"github.com/FlashbackAi/teepin-core/pkg/inference"
+	"github.com/FlashbackAi/teepin-core/pkg/inferencegateway"
+	"github.com/FlashbackAi/teepin-core/pkg/inferencereconciler"
 	"github.com/FlashbackAi/teepin-core/pkg/kumbha"
 	"github.com/FlashbackAi/teepin-core/pkg/modelcatalog"
 	"github.com/FlashbackAi/teepin-core/pkg/networking"
@@ -215,9 +217,13 @@ func main() {
 	// updates too), gated only on a database existing, same as billing.
 	var modelCatalogHandler *api.ModelCatalogHandler
 	var nodeServicesHandler *api.NodeServicesHandler
+	var nodeServicesService *nodeservices.Service
+	var modelCatalogService *modelcatalog.Service
 	if dbClient != nil {
-		modelCatalogHandler = api.NewModelCatalogHandler(modelcatalog.NewService(dbClient.DB()))
-		nodeServicesHandler = api.NewNodeServicesHandler(nodeservices.NewService(dbClient.DB()))
+		modelCatalogService = modelcatalog.NewService(dbClient.DB())
+		modelCatalogHandler = api.NewModelCatalogHandler(modelCatalogService)
+		nodeServicesService = nodeservices.NewService(dbClient.DB())
+		nodeServicesHandler = api.NewNodeServicesHandler(nodeServicesService)
 		log.Println("Teepin Inference catalog + node-services admin API enabled")
 	}
 
@@ -424,6 +430,54 @@ func main() {
 
 	default:
 		log.Fatalf("Invalid TEEPIN_CLUSTER_MODE %q (want \"direct\" or \"agent\")", clusterMode)
+	}
+
+	// Teepin Inference's Linux/CUDA reconciler — turns a node_services
+	// mount/unmount request into a real cluster.Client instance. Reuses
+	// clusterClient wholesale (it already abstracts direct-vs-tunneled
+	// dispatch identically for home and datacenter nodes), so this
+	// reconciler never needs its own notion of node class. Gated on
+	// nodeService (node persistence) existing, since resolving a mount's
+	// target node — ProviderID/NodeName/Class — depends on it; today that
+	// means HOME_COMPUTE_ENABLED=true, matching this feature's actual
+	// anchor use case. The Mac/MLX path is a different, not-yet-built
+	// reconciler (teepin-modeld); engines with no configured image are
+	// simply refused per-mount with a clear error, not silently ignored.
+	// Teepin Inference gateway: routes a request to whichever backend is live
+	// mounted right now. Home-node (tunnel://) backends are reached through
+	// the agent tunnel; without a registry (direct mode) they are refused.
+	var playgroundHandler *api.InferencePlaygroundHandler
+	if modelCatalogService != nil && nodeServicesService != nil {
+		inferenceGateway := inferencegateway.New(modelCatalogService, nodeServicesService, nil)
+		if agentRegistry != nil {
+			inferenceGateway.SetTunnelDialer(func(providerID, instanceID string, port int) http.RoundTripper {
+				return cluster.NewTunnelTransport(agentRegistry, providerID, instanceID, int32(port))
+			})
+		}
+		playgroundHandler = api.NewInferencePlaygroundHandler(inferenceGateway)
+		log.Println("Teepin Inference gateway + admin playground enabled")
+	}
+
+	if nodeServicesService != nil && nodeService != nil {
+		images := inferencereconciler.EngineConfig{
+			VLLMImage:     getEnv("TEEPIN_INFERENCE_VLLM_IMAGE", ""),
+			VLLMOmniImage: getEnv("TEEPIN_INFERENCE_VLLM_OMNI_IMAGE", ""),
+			MLXCommand:    getEnv("TEEPIN_INFERENCE_MLX_COMMAND", ""),
+			NodeReserveGB: getEnvInt("TEEPIN_INFERENCE_NODE_RESERVE_GB", 0),
+		}
+		reconciler := inferencereconciler.New(nodeServicesService, nodeService, clusterClient, images)
+		reconcileInterval := getEnvInt("TEEPIN_INFERENCE_RECONCILE_SECONDS", 30)
+		go func() {
+			ticker := time.NewTicker(time.Duration(reconcileInterval) * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				if err := reconciler.Reconcile(context.Background()); err != nil {
+					log.Printf("WARN: inference reconcile pass had errors: %v", err)
+				}
+			}
+		}()
+		log.Printf("Teepin Inference reconciler enabled (every %ds; vllm image=%q, vllm-omni image=%q)",
+			reconcileInterval, images.VLLMImage, images.VLLMOmniImage)
 	}
 
 	// GPU allocator, over whichever inventory source matches the
@@ -945,7 +999,7 @@ func main() {
 	}
 
 	// Setup router
-	router := setupRouter(apiServer, authHandler, accountHandler, authMiddleware, billingHandler, registryHandler, adminHandler, webhookHandler, nodeHandler, modelCatalogHandler, nodeServicesHandler, rateLimitMiddleware, proxyHandler, execHandler, kumbhaEventsHandler, getEnv("TEEPIN_DOMAIN", "teepin.com"))
+	router := setupRouter(apiServer, authHandler, accountHandler, authMiddleware, billingHandler, registryHandler, adminHandler, webhookHandler, nodeHandler, modelCatalogHandler, nodeServicesHandler, playgroundHandler, rateLimitMiddleware, proxyHandler, execHandler, kumbhaEventsHandler, getEnv("TEEPIN_DOMAIN", "teepin.com"))
 
 	// Create HTTP server
 	port := getEnv("PORT", "8080")
@@ -1168,7 +1222,7 @@ func initRateLimiting() *ratelimit.Config {
 	return config
 }
 
-func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHandler *api.AccountHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler, registryHandler *api.RegistryHandler, adminHandler *api.AdminHandler, webhookHandler *api.WebhookHandler, nodeHandler *api.NodeHandler, modelCatalogHandler *api.ModelCatalogHandler, nodeServicesHandler *api.NodeServicesHandler, rateLimitMiddleware *ratelimit.Middleware, proxyHandler *cluster.ProxyHandler, execHandler *cluster.ExecHandler, kumbhaEventsHandler *kumbha.EventsHandler, instanceDomain string) *gin.Engine {
+func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHandler *api.AccountHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler, registryHandler *api.RegistryHandler, adminHandler *api.AdminHandler, webhookHandler *api.WebhookHandler, nodeHandler *api.NodeHandler, modelCatalogHandler *api.ModelCatalogHandler, nodeServicesHandler *api.NodeServicesHandler, playgroundHandler *api.InferencePlaygroundHandler, rateLimitMiddleware *ratelimit.Middleware, proxyHandler *cluster.ProxyHandler, execHandler *cluster.ExecHandler, kumbhaEventsHandler *kumbha.EventsHandler, instanceDomain string) *gin.Engine {
 	// Set Gin to release mode in production
 	if os.Getenv("GIN_MODE") == "" {
 		gin.SetMode(gin.ReleaseMode)
@@ -1520,6 +1574,9 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 				}
 
 				// Teepin Inference: model catalog + pricing.
+				if playgroundHandler != nil {
+					admin.POST("/inference/chat", playgroundHandler.Chat)
+				}
 				if modelCatalogHandler != nil {
 					admin.POST("/inference/models", modelCatalogHandler.RegisterModel)
 					admin.GET("/inference/models", modelCatalogHandler.ListModels)

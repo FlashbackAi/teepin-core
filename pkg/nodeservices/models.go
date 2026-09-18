@@ -64,8 +64,15 @@ type NodeService struct {
 	DesiredState  DesiredState    `json:"desired_state"`
 	ObservedState ObservedState   `json:"observed_state"`
 	ObservedError *string         `json:"observed_error,omitempty"`
-	ObservedAt    *time.Time      `json:"observed_at,omitempty"`
-	CreatedBy     string          `json:"created_by"`
-	CreatedAt     time.Time       `json:"created_at"`
-	UpdatedAt     time.Time       `json:"updated_at"`
+	// ObservedEndpoint is the reachable address the reconciler resolved
+	// after actually starting the thing (e.g. a k3s Service's ClusterIP
+	// URL) — never operator-typed, unlike Config. nil until first
+	// reported, and cleared whenever the state isn't ObservedMounted (see
+	// ReportObserved), so a stale address can never outlive the mount it
+	// described.
+	ObservedEndpoint *string    `json:"observed_endpoint,omitempty"`
+	ObservedAt       *time.Time `json:"observed_at,omitempty"`
+	CreatedBy        string     `json:"created_by"`
+	CreatedAt        time.Time  `json:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at"`
 }

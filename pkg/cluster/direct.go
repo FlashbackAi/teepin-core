@@ -1047,6 +1047,10 @@ func (c *DirectClient) Healthy(ctx context.Context) bool {
 // Every non-obvious field here was a production failure at some point;
 // the comments say which.
 func (c *DirectClient) buildPod(spec InstanceSpec) (*corev1.Pod, error) {
+	if spec.InitContainer != nil && spec.StorageGB <= 0 {
+		return nil, fmt.Errorf("InitContainer requires StorageGB > 0 (nothing to mount its output into)")
+	}
+
 	labels := map[string]string{
 		labelManaged:    "true",
 		labelInstanceID: spec.InstanceID,
@@ -1209,6 +1213,38 @@ func (c *DirectClient) buildPod(spec InstanceSpec) (*corev1.Pod, error) {
 		}
 		pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{
 			{Name: volumeName, MountPath: "/data"},
+		}
+
+		// Runs to completion before the main container starts, sharing
+		// the same /data volume — see InstanceSpec.InitContainer's own
+		// doc comment for why this is a real init container rather than
+		// folded into the main container's own startup script. Nested
+		// inside the StorageGB block deliberately: buildPod already
+		// refused InitContainer without StorageGB > 0 above, so the
+		// volume this mounts always exists by the time this runs.
+		if spec.InitContainer != nil {
+			initEnv := make([]corev1.EnvVar, 0, len(spec.InitContainer.Env))
+			for k, v := range spec.InitContainer.Env {
+				initEnv = append(initEnv, corev1.EnvVar{Name: k, Value: v})
+			}
+			pod.Spec.InitContainers = []corev1.Container{
+				{
+					Name:    "init",
+					Image:   spec.InitContainer.Image,
+					Command: spec.InitContainer.Command,
+					Args:    spec.InitContainer.Args,
+					Env:     initEnv,
+					SecurityContext: &corev1.SecurityContext{
+						AllowPrivilegeEscalation: boolPtr(false),
+						Capabilities: &corev1.Capabilities{
+							Drop: []corev1.Capability{"ALL"},
+						},
+					},
+					VolumeMounts: []corev1.VolumeMount{
+						{Name: volumeName, MountPath: "/data"},
+					},
+				},
+			}
 		}
 	}
 

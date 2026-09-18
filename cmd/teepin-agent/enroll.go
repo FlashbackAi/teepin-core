@@ -99,6 +99,9 @@ func detectPECores() (pCores, eCores int) {
 	if p, e, ok := peCoresFromEnv(); ok {
 		return p, e
 	}
+	if p, e := nativePECores(); p > 0 {
+		return p, e // running natively on macOS — see hostspecs_darwin.go
+	}
 	return peCoresFromLinuxTopology()
 }
 
@@ -169,6 +172,9 @@ func peCoresFromLinuxTopology() (pCores, eCores int) {
 // detectMemoryGB returns total physical memory in whole GB, read from
 // /proc/meminfo (MemTotal, in kB). Returns 0 if it cannot be read.
 func detectMemoryGB() int {
+	if gb := nativeMemoryGB(); gb > 0 {
+		return gb // running natively on macOS — see hostspecs_darwin.go
+	}
 	data, err := os.ReadFile("/proc/meminfo")
 	if err != nil {
 		return 0

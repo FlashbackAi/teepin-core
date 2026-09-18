@@ -26,7 +26,7 @@ func newNodeServicesHandlerMock(t *testing.T) (*NodeServicesHandler, sqlmock.Sql
 func nodeServiceRows() []string {
 	return []string{
 		"id", "node_id", "kind", "config", "desired_state", "observed_state",
-		"observed_error", "observed_at", "created_by", "created_at", "updated_at",
+		"observed_error", "observed_endpoint", "observed_at", "created_by", "created_at", "updated_at",
 	}
 }
 
@@ -52,7 +52,7 @@ func TestMount_Success(t *testing.T) {
 	mock.ExpectQuery(`INSERT INTO compute\.node_services`).
 		WillReturnRows(sqlmock.NewRows(nodeServiceRows()).AddRow(
 			id, nodeID, "inference_model", []byte(config), "mounted", "pending",
-			nil, nil, "admin-api", time.Now(), time.Now(),
+			nil, nil, nil, "admin-api", time.Now(), time.Now(),
 		))
 
 	body := []byte(`{"node_id":"` + nodeID.String() + `","kind":"inference_model","config":` + config + `}`)
@@ -111,7 +111,7 @@ func TestList_ByNodeID(t *testing.T) {
 		WithArgs(nodeID).
 		WillReturnRows(sqlmock.NewRows(nodeServiceRows()).AddRow(
 			uuid.New(), nodeID, "inference_model", []byte(`{}`), "mounted", "mounted",
-			nil, time.Now(), "admin-api", time.Now(), time.Now(),
+			nil, nil, time.Now(), "admin-api", time.Now(), time.Now(),
 		))
 
 	w := jsonRequest(h.List, "GET", "/v1/admin/node-services?node_id="+nodeID.String(), nil, nil)

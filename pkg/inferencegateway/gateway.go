@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"sync"
 	"time"
 
@@ -35,11 +36,11 @@ const (
 	defaultQueueWait      = 30 * time.Second
 )
 
-// providerFactory builds a Provider for a mounted backend's config.
-// A field, not a hardcoded call, so tests can substitute a fake and so a
-// future tunnel-backed engine can be added without changing Gateway's own
-// dispatch logic.
-type providerFactory func(cfg ModelServiceConfig) (inference.Provider, error)
+// providerFactory builds a Provider for a mounted backend's config and its
+// live reachable address. A field, not a hardcoded call, so tests can
+// substitute a fake and so a future tunnel-backed engine can be added
+// without changing Gateway's own dispatch logic.
+type providerFactory func(cfg ModelServiceConfig, endpoint string) (inference.Provider, error)
 
 // Gateway is Teepin Inference's router.
 type Gateway struct {
@@ -78,6 +79,9 @@ type Gateway struct {
 	// (account, model route), the fairness ceiling that stops one account
 	// starving others against a shared backend.
 	accountInFlight map[accountModelKey]int
+
+	// tunnel reaches tunnel:// endpoints; nil until SetTunnelDialer.
+	tunnel TunnelDialer
 }
 
 type cachedProvider struct {
@@ -93,10 +97,7 @@ type accountModelKey struct {
 // New constructs a Gateway. newProvider may be nil to use the real
 // HTTP-backed factory (defaultProviderFactory); tests pass a fake.
 func New(catalog *modelcatalog.Service, nodeSvcs *nodeservices.Service, newProvider providerFactory) *Gateway {
-	if newProvider == nil {
-		newProvider = defaultProviderFactory
-	}
-	return &Gateway{
+	g := &Gateway{
 		catalog:         catalog,
 		nodeSvcs:        nodeSvcs,
 		newProvider:     newProvider,
@@ -107,16 +108,57 @@ func New(catalog *modelcatalog.Service, nodeSvcs *nodeservices.Service, newProvi
 		inFlight:        make(map[uuid.UUID]int),
 		accountInFlight: make(map[accountModelKey]int),
 	}
+	if newProvider == nil {
+		newProvider = g.defaultFactory
+	}
+	g.newProvider = newProvider
+	return g
 }
 
-// defaultProviderFactory builds a real HTTP-backed Provider. Only the two
-// engines actually deployed today are wired — see ModelServiceConfig's own
-// doc comment for why MLX/tunnel-backed engines aren't here yet.
-func defaultProviderFactory(cfg ModelServiceConfig) (inference.Provider, error) {
-	switch cfg.Engine {
-	case "vllm", "vllm-omni":
+// TunnelDialer returns an http.RoundTripper that reaches one instance on a
+// NAT'd provider through its agent tunnel.
+type TunnelDialer func(providerID, instanceID string, port int) http.RoundTripper
+
+// SetTunnelDialer enables tunnel:// endpoints (home nodes). Without it, such
+// an endpoint is refused with a clear error rather than dialled directly.
+func (g *Gateway) SetTunnelDialer(d TunnelDialer) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.tunnel = d
+}
+
+// defaultFactory builds real HTTP-backed Providers, routing tunnel://
+// endpoints through the configured TunnelDialer.
+func (g *Gateway) defaultFactory(cfg ModelServiceConfig, endpoint string) (inference.Provider, error) {
+	if providerID, instanceID, port, ok := ParseTunnelEndpoint(endpoint); ok {
+		g.mu.Lock()
+		dial := g.tunnel
+		g.mu.Unlock()
+		if dial == nil {
+			return defaultProviderFactory(cfg, endpoint)
+		}
 		return inference.NewVLLM(inference.VLLMConfig{
-			BaseURL: cfg.BaseURL,
+			BaseURL:    "http://tunnel.internal",
+			Model:      backendModelName(cfg),
+			APIKey:     cfg.APIKey,
+			HTTPClient: &http.Client{Transport: dial(providerID, instanceID, port)},
+		}), nil
+	}
+	return defaultProviderFactory(cfg, endpoint)
+}
+
+// defaultProviderFactory builds a real HTTP-backed Provider for a directly
+// dialable endpoint (tunnel:// endpoints go through Gateway.defaultFactory). endpoint
+// is the reconciler-resolved address (NodeService.ObservedEndpoint), never
+// operator-typed.
+func defaultProviderFactory(cfg ModelServiceConfig, endpoint string) (inference.Provider, error) {
+	if _, _, _, isTunnel := ParseTunnelEndpoint(endpoint); isTunnel {
+		return nil, fmt.Errorf("inferencegateway: %q is only reachable through a provider tunnel, and the tunnel-backed transport is not built yet", endpoint)
+	}
+	switch cfg.Engine {
+	case "vllm", "vllm-omni", "mlx": // mlx_lm.server speaks the same OpenAI-compatible surface
+		return inference.NewVLLM(inference.VLLMConfig{
+			BaseURL: endpoint,
 			Model:   cfg.BackendModel,
 			APIKey:  cfg.APIKey,
 		}), nil
@@ -206,7 +248,17 @@ func (g *Gateway) resolve(ctx context.Context, accountID, modelRoute string) (in
 		return nil, nil, noop, err
 	}
 
-	provider, err := g.providerFor(ns.ID, cfg)
+	// candidatesFor already filtered out rows with no ObservedEndpoint,
+	// so this is always set here — but nil-check anyway rather than
+	// trust that invariant silently, since a nil pointer here would
+	// otherwise panic deep inside a hot request path.
+	if ns.ObservedEndpoint == nil {
+		releaseBackend()
+		releaseAccount()
+		return nil, nil, noop, fmt.Errorf("%w: %q has no reachable endpoint yet", inference.ErrProviderUnavailable, modelRoute)
+	}
+
+	provider, err := g.providerFor(ns.ID, cfg, *ns.ObservedEndpoint)
 	if err != nil {
 		releaseBackend()
 		releaseAccount()
@@ -236,6 +288,9 @@ func (g *Gateway) candidatesFor(ctx context.Context, modelRoute string) ([]candi
 	for _, ns := range rows {
 		if ns.DesiredState != nodeservices.DesiredMounted || ns.ObservedState != nodeservices.ObservedMounted {
 			continue
+		}
+		if ns.ObservedEndpoint == nil {
+			continue // mounted but the reconciler hasn't resolved a reachable address yet
 		}
 		cfg, err := ParseModelServiceConfig(ns.Config)
 		if err != nil || cfg.ModelRoute != modelRoute {
@@ -352,8 +407,8 @@ func (g *Gateway) acquireAccountSlot(accountID, modelRoute string) (func(), erro
 // if this is the first request since the row was mounted or its config
 // changed (e.g. re-mounted with a different base_url) — config changes
 // invalidate the cache instead of silently keeping a stale HTTP client.
-func (g *Gateway) providerFor(nsID uuid.UUID, cfg ModelServiceConfig) (inference.Provider, error) {
-	hash := configHash(cfg)
+func (g *Gateway) providerFor(nsID uuid.UUID, cfg ModelServiceConfig, endpoint string) (inference.Provider, error) {
+	hash := configHash(cfg, endpoint)
 
 	g.mu.Lock()
 	if cached, ok := g.providers[nsID]; ok && cached.configHash == hash {
@@ -362,7 +417,7 @@ func (g *Gateway) providerFor(nsID uuid.UUID, cfg ModelServiceConfig) (inference
 	}
 	g.mu.Unlock()
 
-	p, err := g.newProvider(cfg)
+	p, err := g.newProvider(cfg, endpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -373,6 +428,11 @@ func (g *Gateway) providerFor(nsID uuid.UUID, cfg ModelServiceConfig) (inference
 	return p, nil
 }
 
-func configHash(cfg ModelServiceConfig) string {
-	return fmt.Sprintf("%s|%s|%s|%s|%d", cfg.Engine, cfg.BaseURL, cfg.BackendModel, cfg.APIKey, cfg.MaxConcurrency)
+// configHash includes endpoint alongside the config fields deliberately:
+// the reconciler can re-resolve a different address for the same mount
+// (a pod recreated after a node reboot, say), and a cached Provider built
+// against the old address would silently keep dispatching to a dead
+// endpoint otherwise.
+func configHash(cfg ModelServiceConfig, endpoint string) string {
+	return fmt.Sprintf("%s|%s|%s|%s|%d|%s", cfg.Engine, endpoint, cfg.BackendModel, cfg.APIKey, cfg.MaxConcurrency, cfg.ModelSource)
 }

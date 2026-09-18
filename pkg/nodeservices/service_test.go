@@ -37,10 +37,10 @@ func TestMount_InsertsPendingRow(t *testing.T) {
 		WithArgs(nodeID, "inference_model", []byte(config), "op").
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "node_id", "kind", "config", "desired_state", "observed_state",
-			"observed_error", "observed_at", "created_by", "created_at", "updated_at",
+			"observed_error", "observed_endpoint", "observed_at", "created_by", "created_at", "updated_at",
 		}).AddRow(
 			id, nodeID, "inference_model", []byte(config), "mounted", "pending",
-			nil, nil, "op", now, now,
+			nil, nil, nil, "op", now, now,
 		))
 
 	ns, err := s.Mount(context.Background(), nodeID, KindInferenceModel, config, "op")
@@ -105,12 +105,13 @@ func TestReportObserved_ClearsErrorWhenStateIsNotError(t *testing.T) {
 	defer done()
 
 	id := uuid.New()
+	endpoint := "http://10.0.0.42:8000"
 	mock.ExpectExec(`UPDATE compute\.node_services\s+SET observed_state`).
-		WithArgs("mounted", nil, id).
+		WithArgs("mounted", nil, &endpoint, id).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	staleErr := "previous failure"
-	if err := s.ReportObserved(context.Background(), id, ObservedMounted, &staleErr); err != nil {
+	if err := s.ReportObserved(context.Background(), id, ObservedMounted, &staleErr, &endpoint); err != nil {
 		t.Fatalf("ReportObserved: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -125,10 +126,10 @@ func TestReportObserved_KeepsErrorMessageWhenStateIsError(t *testing.T) {
 	id := uuid.New()
 	msg := "mlx server exited with code 1"
 	mock.ExpectExec(`UPDATE compute\.node_services\s+SET observed_state`).
-		WithArgs("error", &msg, id).
+		WithArgs("error", &msg, nil, id).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	if err := s.ReportObserved(context.Background(), id, ObservedError, &msg); err != nil {
+	if err := s.ReportObserved(context.Background(), id, ObservedError, &msg, nil); err != nil {
 		t.Fatalf("ReportObserved: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -136,9 +137,31 @@ func TestReportObserved_KeepsErrorMessageWhenStateIsError(t *testing.T) {
 	}
 }
 
+// TestReportObserved_ClearsEndpointWhenNotMounted proves an endpoint can
+// never outlive the mounted state it described — an unmount (or any
+// non-mounted report) must not leave a stale address a caller could
+// mistakenly dispatch a real request to.
+func TestReportObserved_ClearsEndpointWhenNotMounted(t *testing.T) {
+	s, mock, done := newMock(t)
+	defer done()
+
+	id := uuid.New()
+	staleEndpoint := "http://10.0.0.42:8000"
+	mock.ExpectExec(`UPDATE compute\.node_services\s+SET observed_state`).
+		WithArgs("unmounted", nil, nil, id).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := s.ReportObserved(context.Background(), id, ObservedUnmounted, nil, &staleEndpoint); err != nil {
+		t.Fatalf("ReportObserved: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet (endpoint should have been discarded, not sent): %v", err)
+	}
+}
+
 func TestReportObserved_RejectsInvalidState(t *testing.T) {
 	s := NewService(nil)
-	if err := s.ReportObserved(context.Background(), uuid.New(), ObservedState("bogus"), nil); err == nil {
+	if err := s.ReportObserved(context.Background(), uuid.New(), ObservedState("bogus"), nil, nil); err == nil {
 		t.Error("invalid observed state accepted")
 	}
 }
@@ -156,10 +179,10 @@ func TestListByKind_ReturnsMatchingRows(t *testing.T) {
 		WithArgs("inference_model").
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "node_id", "kind", "config", "desired_state", "observed_state",
-			"observed_error", "observed_at", "created_by", "created_at", "updated_at",
+			"observed_error", "observed_endpoint", "observed_at", "created_by", "created_at", "updated_at",
 		}).AddRow(
 			id, nodeID, "inference_model", []byte(config), "mounted", "mounted",
-			nil, now, "op", now, now,
+			nil, nil, now, "op", now, now,
 		))
 
 	list, err := s.ListByKind(context.Background(), KindInferenceModel)
@@ -184,7 +207,7 @@ func TestListByKind_NoMatchesReturnsEmptySliceNotNil(t *testing.T) {
 		WithArgs("inference_model").
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "node_id", "kind", "config", "desired_state", "observed_state",
-			"observed_error", "observed_at", "created_by", "created_at", "updated_at",
+			"observed_error", "observed_endpoint", "observed_at", "created_by", "created_at", "updated_at",
 		}))
 
 	list, err := s.ListByKind(context.Background(), KindInferenceModel)

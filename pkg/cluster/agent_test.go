@@ -275,6 +275,46 @@ func TestAgentClient_CreateSendsAllowFilesystemOwnershipChanges(t *testing.T) {
 	}
 }
 
+// TestAgentClient_CreateSendsInitContainer is the encode-side half of the
+// same regression class as TestAgentClient_CreateSendsAllowFilesystemOwnershipChanges
+// above, for InstanceSpec.InitContainer (added for Teepin Inference's
+// model-mount reconciler) — see pkg/agentrunner/runner_test.go for the
+// decode-side half; a field only tested on one side of the wire can
+// silently stop working the moment the other side drifts.
+func TestAgentClient_CreateSendsInitContainer(t *testing.T) {
+	fake := newFakeAgent(&agentpb.CommandResult{Success: true, PodName: "inference-pod"})
+	c := NewAgentClient(registryWith(fake.session))
+
+	_, err := c.CreateInstance(context.Background(), InstanceSpec{
+		InstanceID: "infsvc-abc123",
+		ProjectID:  "project-alice",
+		Image:      "vllm/vllm-openai:latest",
+		StorageGB:  100,
+		InitContainer: &InitContainerSpec{
+			Image:   "curlimages/curl",
+			Command: []string{"sh", "-c", "curl -L $URL -o /data/model"},
+			Env:     map[string]string{"URL": "https://example.com/model.bin"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	cmd := fake.lastSent().GetCreateInstance()
+	if cmd == nil {
+		t.Fatal("expected a CreateInstanceCommand")
+	}
+	if cmd.InitContainer == nil {
+		t.Fatal("InitContainer did not reach the wire command")
+	}
+	if cmd.InitContainer.Image != "curlimages/curl" {
+		t.Errorf("InitContainer.Image = %q, want curlimages/curl", cmd.InitContainer.Image)
+	}
+	if cmd.InitContainer.Env["URL"] != "https://example.com/model.bin" {
+		t.Errorf("InitContainer.Env[URL] = %q, want the download URL", cmd.InitContainer.Env["URL"])
+	}
+}
+
 // TestAgentClient_UpdateInstanceSetsReplaceExisting confirms the encode
 // side of the swap: UpdateInstance's ONLY difference from an ordinary
 // CreateInstance call, on the wire, is replace_existing — everything else

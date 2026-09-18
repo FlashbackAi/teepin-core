@@ -23,6 +23,7 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -41,6 +42,7 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/agentrunner"
 	"github.com/FlashbackAi/teepin-core/pkg/cluster"
 	"github.com/FlashbackAi/teepin-core/pkg/gpu"
+	"github.com/FlashbackAi/teepin-core/pkg/nativeruntime"
 	"github.com/FlashbackAi/teepin-core/pkg/networking"
 )
 
@@ -173,7 +175,7 @@ func runEnrolledAgent(cfg *nodeConfig) {
 		ProviderID: cfg.NodeName,
 		Region:     getEnv("TEEPIN_REGION", "home"),
 		Version:    Version,
-		Cluster:    homeClusterClient(),
+		Cluster:    homeClusterClient(cfg.NodeName),
 		Inventory:  nil, // CPU-only: no GPU inventory
 		CPUCores:   cpuCores,
 		MemoryGB:   memoryGB,
@@ -188,8 +190,14 @@ func runEnrolledAgent(cfg *nodeConfig) {
 
 	// Home nodes only — see startSelfUpdateLoop's own doc comment for why
 	// this must never run on the datacenter path (its own operator-
-	// controlled image pipeline, not a curl-a-binary model).
-	go startSelfUpdateLoop(ctx)
+	// controlled image pipeline, not a curl-a-binary model). Also never in
+	// native mode: the release asset it downloads is a LINUX tarball, and
+	// swapping a macOS binary for one would brick the node.
+	if hostBinaryRuntime() {
+		log.Println("self-update: disabled in native runtime mode (release assets are linux-only)")
+	} else {
+		go startSelfUpdateLoop(ctx)
+	}
 
 	// The credential travels in the SAME metadata slot as the shared token;
 	// the control plane tries the shared token first, then resolves this as
@@ -210,7 +218,61 @@ func runEnrolledAgent(cfg *nodeConfig) {
 // k3s is not reachable yet — a node enrolled but still being set up — it
 // falls back to CPUOnly so the agent still connects and heartbeats (the node
 // shows online), it simply cannot run workloads until k3s is up.
-func homeClusterClient() cluster.Client {
+// nativeRuntimeRequested reports whether this agent should run workloads as
+// host processes (TEEPIN_RUNTIME=native) instead of Kubernetes pods.
+func nativeRuntimeRequested() bool {
+	return strings.EqualFold(getEnv("TEEPIN_RUNTIME", ""), "native")
+}
+
+// hybridRuntimeRequested reports TEEPIN_RUNTIME=hybrid: the agent runs on the
+// host and drives BOTH a Kubernetes runtime (customer containers, e.g. a k3s
+// VM) and the native runtime (MLX) under one enrollment.
+func hybridRuntimeRequested() bool {
+	return strings.EqualFold(getEnv("TEEPIN_RUNTIME", ""), "hybrid")
+}
+
+// hostBinaryRuntime is true when this agent is a host-native binary that must
+// not self-update from the linux-only release asset.
+func hostBinaryRuntime() bool {
+	return nativeRuntimeRequested() || hybridRuntimeRequested()
+}
+
+// nativeClusterClient builds the host-process backend used on a Mac Mini
+// running MLX natively. It needs no Kubernetes at all, which is the point:
+// MLX needs direct Metal access and cannot live inside the Lima VM.
+func nativeClusterClient(nodeName string) cluster.Client {
+	dir := getEnv("TEEPIN_MODELD_DIR", "")
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			log.Fatalf("native runtime: cannot determine a state directory (set TEEPIN_MODELD_DIR): %v", err)
+		}
+		dir = filepath.Join(home, ".teepin", "modeld")
+	}
+	rt, err := nativeruntime.New(nativeruntime.Config{StateDir: dir, NodeName: nodeName})
+	if err != nil {
+		log.Fatalf("native runtime: %v", err)
+	}
+	log.Printf("Native runtime enabled: workloads run as host processes (state in %s)", dir)
+	return rt
+}
+
+func homeClusterClient(nodeName string) cluster.Client {
+	switch {
+	case nativeRuntimeRequested():
+		return nativeClusterClient(nodeName)
+	case hybridRuntimeRequested():
+		// Containers via the k3s the KUBECONFIG points at (a Lima VM on a
+		// Mac); native processes for MLX. If k3s is unreachable the
+		// container side degrades to CPU-only, exactly as on a plain node.
+		return cluster.NewSplitClient(containerClusterClient(), nativeClusterClient(nodeName))
+	}
+	return containerClusterClient()
+}
+
+// containerClusterClient is the Kubernetes-backed runtime (or CPU-only when
+// no Kubernetes is reachable).
+func containerClusterClient() cluster.Client {
 	k8s, restConfig, err := newKubernetesClient()
 	if err != nil {
 		log.Printf("WARN: no Kubernetes reachable (%v); running CPU-only without execution. "+

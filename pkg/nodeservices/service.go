@@ -52,10 +52,10 @@ func (s *Service) Mount(ctx context.Context, nodeID uuid.UUID, kind Kind, config
 		INSERT INTO compute.node_services (node_id, kind, config, desired_state, observed_state, created_by)
 		VALUES ($1, $2, $3, 'mounted', 'pending', $4)
 		RETURNING id, node_id, kind, config, desired_state, observed_state,
-		          observed_error, observed_at, created_by, created_at, updated_at
+		          observed_error, observed_endpoint, observed_at, created_by, created_at, updated_at
 	`, nodeID, string(kind), []byte(config), createdBy).Scan(
 		&ns.ID, &ns.NodeID, &ns.Kind, &ns.Config, &ns.DesiredState, &ns.ObservedState,
-		&ns.ObservedError, &ns.ObservedAt, &ns.CreatedBy, &ns.CreatedAt, &ns.UpdatedAt,
+		&ns.ObservedError, &ns.ObservedEndpoint, &ns.ObservedAt, &ns.CreatedBy, &ns.CreatedAt, &ns.UpdatedAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to mount %s on node %s: %w", kind, nodeID, err)
@@ -86,12 +86,16 @@ func (s *Service) Unmount(ctx context.Context, id uuid.UUID) error {
 }
 
 // ReportObserved records what actually happened — called by whatever
-// reconciles this kind (the agent's status stream for a Linux node's pod,
+// reconciles this kind (pkg/inferencereconciler for a Linux/CUDA pod,
 // teepin-modeld's own report for a native Mac process), never by Control
-// Center directly. observedErr is cleared (stored NULL) whenever
-// observed is not ObservedError, so a stale error message can never
-// linger past the state that caused it.
-func (s *Service) ReportObserved(ctx context.Context, id uuid.UUID, observed ObservedState, observedErr *string) error {
+// Center directly. observedErr is cleared (stored NULL) whenever observed
+// is not ObservedError, so a stale error message can never linger past
+// the state that caused it. observedEndpoint is likewise cleared whenever
+// observed is not ObservedMounted — an endpoint only means something
+// while the thing it points at is actually running; keeping a mounted
+// address after that has stopped would let Teepin Inference's router
+// dispatch a request to a corpse.
+func (s *Service) ReportObserved(ctx context.Context, id uuid.UUID, observed ObservedState, observedErr, observedEndpoint *string) error {
 	if observed != ObservedPending && observed != ObservedMounted &&
 		observed != ObservedUnmounted && observed != ObservedError {
 		return fmt.Errorf("invalid observed state %q", observed)
@@ -99,11 +103,14 @@ func (s *Service) ReportObserved(ctx context.Context, id uuid.UUID, observed Obs
 	if observed != ObservedError {
 		observedErr = nil
 	}
+	if observed != ObservedMounted {
+		observedEndpoint = nil
+	}
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE compute.node_services
-		SET observed_state = $1, observed_error = $2, observed_at = NOW(), updated_at = NOW()
-		WHERE id = $3
-	`, string(observed), observedErr, id)
+		SET observed_state = $1, observed_error = $2, observed_endpoint = $3, observed_at = NOW(), updated_at = NOW()
+		WHERE id = $4
+	`, string(observed), observedErr, observedEndpoint, id)
 	if err != nil {
 		return fmt.Errorf("failed to report observed state for %s: %w", id, err)
 	}
@@ -163,7 +170,7 @@ func (s *Service) list(ctx context.Context, query string, args ...any) ([]NodeSe
 
 const selectSQL = `
 	SELECT id, node_id, kind, config, desired_state, observed_state,
-	       observed_error, observed_at, created_by, created_at, updated_at
+	       observed_error, observed_endpoint, observed_at, created_by, created_at, updated_at
 	FROM compute.node_services`
 
 // row is satisfied by both *sql.Row and *sql.Rows.
@@ -177,7 +184,7 @@ func scanOne(r row) (*NodeService, error) {
 	var config []byte
 	if err := r.Scan(
 		&ns.ID, &ns.NodeID, &kind, &config, &desired, &observed,
-		&ns.ObservedError, &ns.ObservedAt, &ns.CreatedBy, &ns.CreatedAt, &ns.UpdatedAt,
+		&ns.ObservedError, &ns.ObservedEndpoint, &ns.ObservedAt, &ns.CreatedBy, &ns.CreatedAt, &ns.UpdatedAt,
 	); err != nil {
 		return nil, err
 	}

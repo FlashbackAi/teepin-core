@@ -160,6 +160,30 @@ message CreateInstanceCommand {
   // the prior create-new-then-delete-old redeploy churned a fresh
   // hostname, TLS cert and compute.instances row on every single deploy.
   bool replace_existing = 25;
+
+  // Runs to completion before the main container starts, sharing the
+  // same /data volume (storage_gb above must be > 0 — the agent rejects
+  // this command otherwise, since there is nothing to mount an init
+  // container's output into). The standard Kubernetes pattern for a
+  // network-bound preparation step — Teepin Inference's model-mount
+  // reconciler (pkg/inferencereconciler) uses this to download model
+  // weights before the serving engine starts, rather than folding
+  // "download" and "serve" into one container's own startup script:
+  // Kubernetes tracks init-container status separately (Init:0/1 vs
+  // Running), and an init container does not re-run on a main-container
+  // restart the way a wrapper script's own idempotency check would.
+  // Unset means no init container, the behaviour every existing caller
+  // keeps unchanged.
+  InitContainerSpec init_container = 26;
+}
+
+// One container that runs to completion before CreateInstanceCommand's
+// main container starts. See init_container's own doc comment above.
+message InitContainerSpec {
+  string image            = 1;
+  repeated string command = 2;  // overrides ENTRYPOINT; empty leaves image default
+  repeated string args    = 3;  // overrides CMD
+  map<string, string> env = 4;
 }
 
 message PortMapping {
@@ -447,6 +471,11 @@ message ProxyRequest {
   // control plane, not re-derived by the agent, so a home node with
   // multiple instances proxies each to the right port without guessing.
   int32  port              = 6;
+  // Upper bound, in seconds, the agent may spend on this one request.
+  // 0 keeps the agent's short default (built for browser traffic). Set by
+  // the control plane only, for long-lived model inference; the agent
+  // clamps it to its own ceiling.
+  int32  timeout_seconds   = 7;
 }
 
 // ProxyResponse is sent once per request_id, agent -> control plane,

@@ -299,6 +299,37 @@ func TestHandleCreate_DecodesAllowFilesystemOwnershipChanges(t *testing.T) {
 	}
 }
 
+// TestHandleCreate_DecodesInitContainer is the decode-side half of
+// TestAgentClient_CreateSendsInitContainer (pkg/cluster/agent_test.go) —
+// see that test's own doc comment on why a wire field needs both
+// translation sites tested, not just one.
+func TestHandleCreate_DecodesInitContainer(t *testing.T) {
+	fc := &capturingCluster{}
+	r := New(Config{ProviderID: "test-provider", Cluster: fc})
+	s := newStubStream()
+
+	r.handleCreate(context.Background(), s, "req-1", &agentpb.CreateInstanceCommand{
+		InstanceId: "infsvc-abc123",
+		Image:      "vllm/vllm-openai:latest",
+		StorageGb:  100,
+		InitContainer: &agentpb.InitContainerSpec{
+			Image:   "curlimages/curl",
+			Command: []string{"sh", "-c", "curl -L $URL -o /data/model"},
+			Env:     map[string]string{"URL": "https://example.com/model.bin"},
+		},
+	})
+
+	if fc.captured.InitContainer == nil {
+		t.Fatal("InitContainer was not decoded onto the local InstanceSpec")
+	}
+	if fc.captured.InitContainer.Image != "curlimages/curl" {
+		t.Errorf("InitContainer.Image = %q, want curlimages/curl", fc.captured.InitContainer.Image)
+	}
+	if fc.captured.InitContainer.Env["URL"] != "https://example.com/model.bin" {
+		t.Errorf("InitContainer.Env[URL] = %q, want the download URL", fc.captured.InitContainer.Env["URL"])
+	}
+}
+
 // TestHandleCreate_ReplaceExistingRoutesToUpdateInstance is the regression
 // test for the actual point of replace_existing: a Kumbha redeploy's
 // instance ID ALREADY exists by construction (that's why it's a replace,

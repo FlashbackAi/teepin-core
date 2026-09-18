@@ -227,6 +227,16 @@ func (c *AgentClient) createOrReplace(ctx context.Context, spec InstanceSpec, re
 		})
 	}
 
+	var initContainer *agentpb.InitContainerSpec
+	if spec.InitContainer != nil {
+		initContainer = &agentpb.InitContainerSpec{
+			Image:   spec.InitContainer.Image,
+			Command: spec.InitContainer.Command,
+			Args:    spec.InitContainer.Args,
+			Env:     spec.InitContainer.Env,
+		}
+	}
+
 	cmd := &agentpb.CreateInstanceCommand{
 		InstanceId:                      spec.InstanceID,
 		AccountId:                       spec.AccountID,
@@ -253,6 +263,7 @@ func (c *AgentClient) createOrReplace(ctx context.Context, spec InstanceSpec, re
 		NeverRestart:                    spec.NeverRestart,
 		AllowFilesystemOwnershipChanges: spec.AllowFilesystemOwnershipChanges,
 		ReplaceExisting:                 replaceExisting,
+		InitContainer:                   initContainer,
 	}
 
 	// The instance ID is the idempotency key: a command redelivered after
