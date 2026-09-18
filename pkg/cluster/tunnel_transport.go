@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -70,6 +71,14 @@ func (t *TunnelTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	hasBody := req.Body != nil && req.Body != http.NoBody
+
+	// Go keeps the length in req.ContentLength, not the header map; carry it
+	// explicitly so the agent can send a sized (not chunked) request to
+	// servers that require Content-Length.
+	headers := headersToProto(req.Header)
+	if hasBody && req.ContentLength > 0 {
+		headers = append(headers, &agentpb.Header{Name: "Content-Length", Values: []string{strconv.FormatInt(req.ContentLength, 10)}})
+	}
 	if err := session.send(&agentpb.ControlMessage{
 		RequestId: requestID,
 		Payload: &agentpb.ControlMessage_ProxyRequest{
@@ -77,7 +86,7 @@ func (t *TunnelTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 				InstanceId:     t.instanceID,
 				Method:         req.Method,
 				Path:           req.URL.RequestURI(),
-				Headers:        headersToProto(req.Header),
+				Headers:        headers,
 				HasBody:        hasBody,
 				Port:           t.port,
 				TimeoutSeconds: tunnelAgentTimeoutSeconds,

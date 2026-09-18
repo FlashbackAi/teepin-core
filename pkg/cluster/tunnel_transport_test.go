@@ -128,3 +128,33 @@ func TestTunnelTransport_ResetMidStreamIsAnError(t *testing.T) {
 		t.Fatalf("read err = %v, want ErrUnexpectedEOF for a truncated stream", err)
 	}
 }
+
+// The declared body length must cross the tunnel as a Content-Length header,
+// since Go keeps it in req.ContentLength rather than the header map.
+func TestTunnelTransport_CarriesContentLength(t *testing.T) {
+	reqs := make(chan *agentpb.ControlMessage, 1)
+	session, reg := newTunnelSession(reqs)
+	seen := make(chan []*agentpb.Header, 1)
+	go func() {
+		msg := <-reqs
+		seen <- msg.GetProxyRequest().Headers
+		session.deliverProxyResponse(msg.RequestId, &agentpb.ProxyResponse{StatusCode: 204})
+		session.deliverProxyData(msg.RequestId, &agentpb.ProxyData{Eof: true})
+	}()
+	client := &http.Client{Transport: NewTunnelTransport(reg, "prov", "i", 8000)}
+	resp, err := client.Post("http://tunnel/x", "application/json", strings.NewReader(`{"a":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	var got string
+	for _, h := range <-seen {
+		if strings.EqualFold(h.Name, "Content-Length") && len(h.Values) > 0 {
+			got = h.Values[0]
+		}
+	}
+	if got != "7" {
+		t.Errorf("Content-Length header = %q, want 7", got)
+	}
+}

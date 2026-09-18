@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -345,5 +346,58 @@ func TestProxyTimeoutFor(t *testing.T) {
 		if got := proxyTimeoutFor(&agentpb.ProxyRequest{TimeoutSeconds: c.secs}); got != c.want {
 			t.Errorf("TimeoutSeconds=%d -> %v, want %v", c.secs, got, c.want)
 		}
+	}
+}
+
+// A backend that requires Content-Length (Python's stdlib HTTP server, i.e.
+// mlx_lm.server, answers 411 to a chunked body) must receive a sized request
+// when the control plane declared the length. Regression test for the 411
+// found live 2026-09-19.
+func TestHandleProxyRequest_DeclaredContentLengthIsNotChunked(t *testing.T) {
+	type seen struct {
+		contentLength int64
+		chunked       bool
+		body          string
+	}
+	got := make(chan seen, 1)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got <- seen{r.ContentLength, len(r.TransferEncoding) > 0, string(b)}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	r := New(Config{
+		ProviderID: "p", Region: "r", Version: "t",
+		Cluster: addressCluster{addr: stripScheme(backend.URL)},
+	})
+	s := newStubStream()
+
+	const payload = `{"model":"m"}`
+	done := make(chan struct{})
+	go func() {
+		r.handleProxyRequest(context.Background(), s, "req-cl-1", &agentpb.ProxyRequest{
+			InstanceId: "i", Method: http.MethodPost, Path: "/v1/chat/completions", HasBody: true, Port: 80,
+			Headers: []*agentpb.Header{{Name: "Content-Length", Values: []string{strconv.Itoa(len(payload))}}},
+		})
+		close(done)
+	}()
+	if !waitForProxyBodyRegistered(r, "req-cl-1", 2*time.Second) {
+		t.Fatal("body channel never registered")
+	}
+	r.deliverProxyBody("req-cl-1", &agentpb.ProxyData{Data: []byte(payload)})
+	r.deliverProxyBody("req-cl-1", &agentpb.ProxyData{Eof: true})
+	<-done
+
+	select {
+	case v := <-got:
+		if v.chunked || v.contentLength != int64(len(payload)) {
+			t.Errorf("backend saw ContentLength=%d chunked=%v, want %d and not chunked", v.contentLength, v.chunked, len(payload))
+		}
+		if v.body != payload {
+			t.Errorf("body = %q", v.body)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("backend never received the request")
 	}
 }

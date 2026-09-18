@@ -1,0 +1,110 @@
+# Copyright 2026 TEEPIN Project
+# Licensed under the Apache License, Version 2.0
+#
+# Publishes the teepin CLI (cmd/teepin) as prebuilt binaries — linux,
+# darwin, and windows, amd64+arm64 — bundled with its README as GitHub
+# Release assets. Modeled directly on release-agent.yml (see that file
+# for the same reasoning applied to the teepin-agent binary); the CLI
+# gets its own tag prefix and workflow since it ships to end-user
+# machines rather than home-node hosts, and needs windows/darwin
+# builds the agent doesn't.
+#
+# Triggered by pushing a tag matching cli-v* (e.g. cli-v0.2.0).
+#
+# A tag carrying a SemVer pre-release suffix (cli-v0.2.0-rc1,
+# cli-v0.2.0-beta.2, ...) publishes as a GitHub pre-release, same
+# convention as release-agent.yml.
+
+name: Release CLI
+
+on:
+  push:
+    tags:
+      - "cli-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # CGO_ENABLED=0 for a static binary on every target — the CLI must
+      # not depend on a specific glibc/libc being present on whatever
+      # machine a customer installs it on.
+      #
+      # -X sets cmd.version (see cmd/teepin/cmd/root.go's own comment on
+      # why that's a var, not a const) so `teepin version` reports the
+      # exact tag it was built from.
+      - name: Build binaries
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#cli-}"
+          LDFLAGS="-X github.com/FlashbackAi/teepin-core/cmd/teepin/cmd.version=${VERSION}"
+          declare -A TARGETS=(
+            [linux-amd64]="linux amd64"
+            [linux-arm64]="linux arm64"
+            [darwin-amd64]="darwin amd64"
+            [darwin-arm64]="darwin arm64"
+            [windows-amd64]="windows amd64"
+          )
+          for name in "${!TARGETS[@]}"; do
+            read -r goos goarch <<< "${TARGETS[$name]}"
+            outdir="dist/teepin-${name}"
+            mkdir -p "$outdir"
+            binary="teepin"
+            [ "$goos" = "windows" ] && binary="teepin.exe"
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build \
+              -ldflags "$LDFLAGS" \
+              -o "$outdir/$binary" \
+              ./cmd/teepin
+          done
+
+      - name: Package archives
+        run: |
+          set -euo pipefail
+          for name in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do
+            outdir="dist/teepin-${name}"
+            cp cmd/teepin/README.md "$outdir/"
+            chmod +x "$outdir/teepin"
+            tar -czf "teepin-${name}.tar.gz" -C "$outdir" .
+          done
+          outdir="dist/teepin-windows-amd64"
+          cp cmd/teepin/README.md "$outdir/"
+          (cd "$outdir" && zip -r "../../teepin-windows-amd64.zip" .)
+          sha256sum teepin-linux-amd64.tar.gz teepin-linux-arm64.tar.gz \
+            teepin-darwin-amd64.tar.gz teepin-darwin-arm64.tar.gz \
+            teepin-windows-amd64.zip > SHA256SUMS
+
+      # softprops/action-gh-release does NOT infer prerelease from the
+      # tag name on its own — see release-agent.yml's identical step.
+      - name: Detect pre-release tag
+        id: prerelease
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_NAME}" =~ ^cli-v[0-9]+\.[0-9]+\.[0-9]+-.+ ]]; then
+            echo "value=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            teepin-linux-amd64.tar.gz
+            teepin-linux-arm64.tar.gz
+            teepin-darwin-amd64.tar.gz
+            teepin-darwin-arm64.tar.gz
+            teepin-windows-amd64.zip
+            SHA256SUMS
+          generate_release_notes: true
+          prerelease: ${{ steps.prerelease.outputs.value }}

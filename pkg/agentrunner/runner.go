@@ -16,6 +16,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -639,6 +640,16 @@ func (r *Runner) handleProxyRequest(ctx context.Context, s stream, requestID str
 	for _, h := range req.Headers {
 		for _, v := range h.Values {
 			httpReq.Header.Add(h.Name, v)
+		}
+	}
+
+	// Go carries a request's length in a field, not the header map, and the
+	// body reader has no known length, so without this the request goes out
+	// chunked. Python's stdlib HTTP server (mlx_lm.server) rejects chunked
+	// request bodies with 411. Honour the length the sender declared.
+	if body != nil {
+		if n, perr := strconv.ParseInt(httpReq.Header.Get("Content-Length"), 10, 64); perr == nil && n >= 0 {
+			httpReq.ContentLength = n
 		}
 	}
 
