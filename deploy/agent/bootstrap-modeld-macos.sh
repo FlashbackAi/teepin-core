@@ -154,6 +154,18 @@ if $WITH_VM; then
 
     vmsh() { limactl shell "$VM_NAME" -- "$@"; }
 
+    # The VM must actually be reachable before anything below is trusted. A
+    # stale VM (host process died, e.g. after a reboot) looks exactly like "no
+    # enrollment, no k3s" to the checks that follow, and acting on that would
+    # be wrong, so an unreachable VM is an error, never "empty".
+    vm_status() { limactl list --format '{{.Status}}' "$VM_NAME" 2>/dev/null || true; }
+    if [ "$(vm_status)" != "Running" ] || ! vmsh true >/dev/null 2>&1; then
+        info "VM '$VM_NAME' is not responding (status: $(vm_status)); force-restarting it..."
+        limactl stop -f "$VM_NAME" >/dev/null 2>&1 || true
+        limactl start "$VM_NAME" || fail "could not start Lima VM '$VM_NAME'. Try: limactl stop -f $VM_NAME && limactl start $VM_NAME  (see ~/.lima/$VM_NAME/ha.stderr.log)"
+    fi
+    vmsh true >/dev/null 2>&1 || fail "Lima VM '$VM_NAME' is running but not reachable over ssh; refusing to continue."
+
     # An agent inside the VM means this Mac was enrolled the old way. Adopt
     # its credential and stop it: one enrollment, one agent per credential.
     if [ ! -f "$CONFIG" ] && vmsh test -f /etc/teepin/agent.json 2>/dev/null; then
