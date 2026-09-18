@@ -171,4 +171,39 @@ func TestGetModel_NotFound(t *testing.T) {
 	}
 }
 
+// TestListModels_EmptyCatalogReturnsEmptySliceNotNil is the regression test
+// for a real bug found live 2026-09-18: an empty result set left `out` as
+// a nil slice, which encoding/json marshals to `null` rather than `[]` —
+// crashing the console's catalog page (`models.data?.models.length`) the
+// moment the catalog was genuinely empty, the exact state a fresh
+// deployment starts in.
+func TestListModels_EmptyCatalogReturnsEmptySliceNotNil(t *testing.T) {
+	s, mock, done := newMock(t)
+	defer done()
+
+	mock.ExpectQuery(`SELECT model_route, display_name, cost_class`).
+		WillReturnRows(sqlmock.NewRows(modelRowColumns()))
+
+	models, err := s.ListModels(context.Background())
+	if err != nil {
+		t.Fatalf("ListModels: %v", err)
+	}
+	if models == nil {
+		t.Fatal("ListModels returned nil for an empty catalog — must be []Model{} so it JSON-marshals to [], not null")
+	}
+	if len(models) != 0 {
+		t.Errorf("got %d models, want 0", len(models))
+	}
+}
+
+func modelRowColumns() []string {
+	return []string{
+		"model_route", "display_name", "cost_class", "engine", "context_window",
+		"supports_tools", "supports_vision", "supports_audio",
+		"input_price_per_million", "output_price_per_million",
+		"vendor_input_cost_per_million", "vendor_output_cost_per_million",
+		"enabled", "updated_by", "created_at", "updated_at",
+	}
+}
+
 func strPtr(s string) *string { return &s }

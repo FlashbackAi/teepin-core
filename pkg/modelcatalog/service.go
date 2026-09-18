@@ -157,7 +157,11 @@ func (s *Service) ListModels(ctx context.Context) ([]Model, error) {
 	}
 	defer rows.Close()
 
-	var out []Model
+	// Initialized, not a nil slice: an empty result marshals to JSON `null`
+	// otherwise, which crashes any caller that expects an array to filter
+	// or read .length on (found live 2026-09-18 — the console's own
+	// catalog page did exactly that against a genuinely empty catalog).
+	out := []Model{}
 	for rows.Next() {
 		m, err := scanModelRow(rows)
 		if err != nil {

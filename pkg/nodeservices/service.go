@@ -146,7 +146,11 @@ func (s *Service) list(ctx context.Context, query string, args ...any) ([]NodeSe
 	}
 	defer rows.Close()
 
-	var out []NodeService
+	// Initialized, not a nil slice: an empty result marshals to JSON `null`
+	// otherwise, which crashes any caller expecting an array (found live
+	// 2026-09-18 against modelcatalog.ListModels' identical bug — same
+	// fix applied here before it could bite this package's own callers).
+	out := []NodeService{}
 	for rows.Next() {
 		ns, err := scanOne(rows)
 		if err != nil {

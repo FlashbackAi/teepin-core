@@ -171,6 +171,34 @@ func TestListByKind_ReturnsMatchingRows(t *testing.T) {
 	}
 }
 
+// TestListByKind_NoMatchesReturnsEmptySliceNotNil is the regression test
+// for a real bug found live 2026-09-18 (modelcatalog.ListModels had the
+// identical bug, fixed alongside this one): a nil slice marshals to JSON
+// `null` rather than `[]`, crashing any caller expecting an array — the
+// exact state a node with nothing mounted on it is in by default.
+func TestListByKind_NoMatchesReturnsEmptySliceNotNil(t *testing.T) {
+	s, mock, done := newMock(t)
+	defer done()
+
+	mock.ExpectQuery(`SELECT id, node_id, kind, config`).
+		WithArgs("inference_model").
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "node_id", "kind", "config", "desired_state", "observed_state",
+			"observed_error", "observed_at", "created_by", "created_at", "updated_at",
+		}))
+
+	list, err := s.ListByKind(context.Background(), KindInferenceModel)
+	if err != nil {
+		t.Fatalf("ListByKind: %v", err)
+	}
+	if list == nil {
+		t.Fatal("ListByKind returned nil for no matches — must be []NodeService{} so it JSON-marshals to [], not null")
+	}
+	if len(list) != 0 {
+		t.Errorf("got %d rows, want 0", len(list))
+	}
+}
+
 func TestGet_NotFound(t *testing.T) {
 	s, mock, done := newMock(t)
 	defer done()
