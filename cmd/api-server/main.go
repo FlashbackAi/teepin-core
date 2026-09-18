@@ -42,8 +42,10 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/harbor"
 	"github.com/FlashbackAi/teepin-core/pkg/inference"
 	"github.com/FlashbackAi/teepin-core/pkg/kumbha"
+	"github.com/FlashbackAi/teepin-core/pkg/modelcatalog"
 	"github.com/FlashbackAi/teepin-core/pkg/networking"
 	"github.com/FlashbackAi/teepin-core/pkg/nodes"
+	"github.com/FlashbackAi/teepin-core/pkg/nodeservices"
 	"github.com/FlashbackAi/teepin-core/pkg/objectstore"
 	"github.com/FlashbackAi/teepin-core/pkg/objectstore/miniobackend"
 	"github.com/FlashbackAi/teepin-core/pkg/objectstore/shelbybackend"
@@ -204,6 +206,19 @@ func main() {
 		// whether any node is currently stale.
 		metricsSweeper := nodes.NewMetricsRetentionSweeper(nodeService)
 		go metricsSweeper.Start(context.Background())
+	}
+
+	// Teepin Inference's model catalog and the generic node_services
+	// mount/unmount primitive — separate from home compute above (this is
+	// its own service, not a home-compute-only concern; node_services is
+	// meant to serve datacenter nodes and future kinds like agent binary
+	// updates too), gated only on a database existing, same as billing.
+	var modelCatalogHandler *api.ModelCatalogHandler
+	var nodeServicesHandler *api.NodeServicesHandler
+	if dbClient != nil {
+		modelCatalogHandler = api.NewModelCatalogHandler(modelcatalog.NewService(dbClient.DB()))
+		nodeServicesHandler = api.NewNodeServicesHandler(nodeservices.NewService(dbClient.DB()))
+		log.Println("Teepin Inference catalog + node-services admin API enabled")
 	}
 
 	// Initialize Kubernetes client (optional for standalone mode)
@@ -930,7 +945,7 @@ func main() {
 	}
 
 	// Setup router
-	router := setupRouter(apiServer, authHandler, accountHandler, authMiddleware, billingHandler, registryHandler, adminHandler, webhookHandler, nodeHandler, rateLimitMiddleware, proxyHandler, execHandler, kumbhaEventsHandler, getEnv("TEEPIN_DOMAIN", "teepin.com"))
+	router := setupRouter(apiServer, authHandler, accountHandler, authMiddleware, billingHandler, registryHandler, adminHandler, webhookHandler, nodeHandler, modelCatalogHandler, nodeServicesHandler, rateLimitMiddleware, proxyHandler, execHandler, kumbhaEventsHandler, getEnv("TEEPIN_DOMAIN", "teepin.com"))
 
 	// Create HTTP server
 	port := getEnv("PORT", "8080")
@@ -1153,7 +1168,7 @@ func initRateLimiting() *ratelimit.Config {
 	return config
 }
 
-func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHandler *api.AccountHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler, registryHandler *api.RegistryHandler, adminHandler *api.AdminHandler, webhookHandler *api.WebhookHandler, nodeHandler *api.NodeHandler, rateLimitMiddleware *ratelimit.Middleware, proxyHandler *cluster.ProxyHandler, execHandler *cluster.ExecHandler, kumbhaEventsHandler *kumbha.EventsHandler, instanceDomain string) *gin.Engine {
+func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHandler *api.AccountHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler, registryHandler *api.RegistryHandler, adminHandler *api.AdminHandler, webhookHandler *api.WebhookHandler, nodeHandler *api.NodeHandler, modelCatalogHandler *api.ModelCatalogHandler, nodeServicesHandler *api.NodeServicesHandler, rateLimitMiddleware *ratelimit.Middleware, proxyHandler *cluster.ProxyHandler, execHandler *cluster.ExecHandler, kumbhaEventsHandler *kumbha.EventsHandler, instanceDomain string) *gin.Engine {
 	// Set Gin to release mode in production
 	if os.Getenv("GIN_MODE") == "" {
 		gin.SetMode(gin.ReleaseMode)
@@ -1502,6 +1517,27 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 					admin.DELETE("/nodes/:id", nodeHandler.DeleteNode)
 					admin.POST("/nodes/:id/disable", nodeHandler.DisableNode)
 					admin.GET("/nodes/:id/metrics", nodeHandler.GetNodeMetrics)
+				}
+
+				// Teepin Inference: model catalog + pricing.
+				if modelCatalogHandler != nil {
+					admin.POST("/inference/models", modelCatalogHandler.RegisterModel)
+					admin.GET("/inference/models", modelCatalogHandler.ListModels)
+					admin.GET("/inference/models/one", modelCatalogHandler.GetModel)
+					admin.PUT("/inference/models/pricing", modelCatalogHandler.SetPricing)
+					admin.PUT("/inference/models/vendor-cost", modelCatalogHandler.SetVendorCost)
+					admin.PUT("/inference/models/enabled", modelCatalogHandler.SetEnabled)
+					admin.DELETE("/inference/models", modelCatalogHandler.DeleteModel)
+				}
+
+				// Generic mount/unmount primitive — inference models today,
+				// agent binary updates planned to reuse these same routes
+				// (kind=agent_binary) rather than a separate mechanism.
+				if nodeServicesHandler != nil {
+					admin.POST("/node-services", nodeServicesHandler.Mount)
+					admin.GET("/node-services", nodeServicesHandler.List)
+					admin.GET("/node-services/:id", nodeServicesHandler.Get)
+					admin.DELETE("/node-services/:id", nodeServicesHandler.Unmount)
 				}
 			}
 		}
