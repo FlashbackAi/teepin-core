@@ -77,6 +77,9 @@ type AgentSession struct {
 	inventory   []NodeInventory
 	inventoryAt time.Time
 
+	// cache is the host model cache the agent last reported; see modelcache.go.
+	cache modelCacheState
+
 	closed bool
 }
 

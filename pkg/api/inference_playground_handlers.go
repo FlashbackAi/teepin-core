@@ -75,10 +75,7 @@ func (h *InferencePlaygroundHandler) Chat(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "prompt is required"})
 		return
 	}
-	maxTokens := req.MaxTokens
-	if maxTokens <= 0 || maxTokens > 4096 {
-		maxTokens = 256
-	}
+	maxTokens := clampPlaygroundTokens(req.MaxTokens)
 
 	msg, _ := json.Marshal(map[string]string{"role": "user", "content": req.Prompt})
 
@@ -146,4 +143,27 @@ func parseReply(body json.RawMessage) reply {
 		r.Reasoning = c.Message.ReasoningContent
 	}
 	return r
+}
+
+// Playground output limits. The ceiling exists only because this endpoint
+// shares the one model slot on a machine (a runaway generation blocks every
+// other request); it is not a model or platform limit, and the public API
+// will not impose it.
+const (
+	defaultPlaygroundTokens = 512
+	maxPlaygroundTokens     = 8192
+)
+
+// clampPlaygroundTokens returns the default for an unset/invalid value and
+// the ceiling for anything above it. It clamps rather than resets: a caller
+// asking for more than the ceiling must get the ceiling, never the default.
+func clampPlaygroundTokens(requested int) int {
+	switch {
+	case requested <= 0:
+		return defaultPlaygroundTokens
+	case requested > maxPlaygroundTokens:
+		return maxPlaygroundTokens
+	default:
+		return requested
+	}
 }

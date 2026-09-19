@@ -98,7 +98,15 @@ func backendModelName(cfg ModelServiceConfig) string {
 	if cfg.BackendModel != "" {
 		return cfg.BackendModel
 	}
-	u, err := url.Parse(strings.TrimSpace(cfg.ModelSource))
+	return HuggingFaceRepoID(cfg.ModelSource)
+}
+
+// HuggingFaceRepoID returns "org/name" for a huggingface.co model URL (with or
+// without a /tree/main style suffix), or "" for anything else. Exported so
+// callers that need to know which downloaded model a mount uses (the node
+// model-cache admin API) share this one definition.
+func HuggingFaceRepoID(source string) string {
+	u, err := url.Parse(strings.TrimSpace(source))
 	if err != nil {
 		return ""
 	}

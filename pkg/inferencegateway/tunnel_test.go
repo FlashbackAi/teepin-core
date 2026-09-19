@@ -4,8 +4,12 @@
 package inferencegateway
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"testing"
+
+	"github.com/FlashbackAi/teepin-core/pkg/inference"
 )
 
 func TestTunnelEndpoint_RoundTrip(t *testing.T) {
@@ -68,5 +72,30 @@ func TestGatewayDefaultFactory_TunnelUsesDialer(t *testing.T) {
 	}
 	if gotProv != "prov" || gotInst != "infsvc-1" || gotPort != 8000 {
 		t.Errorf("dialer got (%q,%q,%d)", gotProv, gotInst, gotPort)
+	}
+}
+
+// Probe sends a one-token request through the provider the gateway would use
+// for real traffic, and surfaces the backend's failure.
+func TestGatewayProbe_PropagatesBackendFailure(t *testing.T) {
+	var lastReq inference.Request
+	failing := &fakeProvider{onComplete: func(_ context.Context, req inference.Request) (*inference.Response, error) {
+		lastReq = req
+		return nil, errors.New("model failed to load")
+	}}
+	g := New(nil, nil, func(ModelServiceConfig, string) (inference.Provider, error) { return failing, nil })
+	if err := g.Probe(context.Background(), ModelServiceConfig{ModelRoute: "r"}, "http://x"); err == nil {
+		t.Fatal("a failing backend probed healthy")
+	}
+	if lastReq.MaxTokens != 1 {
+		t.Errorf("probe MaxTokens = %d, want 1", lastReq.MaxTokens)
+	}
+
+	ok := &fakeProvider{onComplete: func(context.Context, inference.Request) (*inference.Response, error) {
+		return &inference.Response{}, nil
+	}}
+	g2 := New(nil, nil, func(ModelServiceConfig, string) (inference.Provider, error) { return ok, nil })
+	if err := g2.Probe(context.Background(), ModelServiceConfig{ModelRoute: "r"}, "http://x"); err != nil {
+		t.Fatalf("healthy backend failed the probe: %v", err)
 	}
 }

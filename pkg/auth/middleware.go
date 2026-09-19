@@ -20,6 +20,10 @@ const (
 	RoleKey      contextKey = "role"
 	ProjectIDKey contextKey = "project_id"
 	SessionIDKey contextKey = "session_id"
+	// ScopesKey / ViaAPIKeyKey carry an API key's permissions to handlers
+	// that enforce them. Set only for API-key credentials.
+	ScopesKey    contextKey = "scopes"
+	ViaAPIKeyKey contextKey = "via_api_key"
 )
 
 // SessionChecker answers whether a Kumbha session-scoped credential
@@ -61,6 +65,11 @@ type Principal struct {
 	// SessionID is set only for a Kumbha agent credential (MintSessionToken)
 	// — nil for every human login or API key.
 	SessionID uuid.UUID
+	// ViaAPIKey is true when the caller authenticated with an API key, and
+	// Scopes is that key's permission list. A signed-in user (JWT) has
+	// neither: they act with their role within the account.
+	ViaAPIKey bool
+	Scopes    []string
 }
 
 type Middleware struct {
@@ -115,6 +124,8 @@ func (m *Middleware) authenticate(c *gin.Context) *Principal {
 			// scoping lives in apiKey.Scopes.
 			Role:      RoleMember,
 			ProjectID: apiKey.ProjectID,
+			ViaAPIKey: true,
+			Scopes:    apiKey.Scopes,
 		}
 	}
 
@@ -203,6 +214,22 @@ func store(c *gin.Context, p *Principal) {
 	if p.SessionID != uuid.Nil {
 		c.Set(string(SessionIDKey), p.SessionID)
 	}
+	if p.ViaAPIKey {
+		c.Set(string(ViaAPIKeyKey), true)
+		c.Set(string(ScopesKey), p.Scopes)
+	}
+}
+
+// GetAPIKeyScopes returns the permission list of the API key the request
+// authenticated with. viaAPIKey is false for a signed-in user, who has no
+// scope list and acts with their account role.
+func GetAPIKeyScopes(c *gin.Context) (scopes []string, viaAPIKey bool) {
+	if v, ok := c.Get(string(ViaAPIKeyKey)); !ok || v != true {
+		return nil, false
+	}
+	s, _ := c.Get(string(ScopesKey))
+	scopes, _ = s.([]string)
+	return scopes, true
 }
 
 // RequireAuth rejects requests without a valid JWT or API key.

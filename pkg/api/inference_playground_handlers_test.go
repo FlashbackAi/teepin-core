@@ -54,7 +54,7 @@ func TestPlaygroundChat_ReturnsAssistantText(t *testing.T) {
 	if out.Content != "hello" || out.InputTokens != 5 || out.OutputTokens != 7 || out.Model != "org/model" {
 		t.Errorf("response = %+v", out)
 	}
-	if f.acct != playgroundAccount || f.got.Model != "teepin/k2" || f.got.MaxTokens != 256 {
+	if f.acct != playgroundAccount || f.got.Model != "teepin/k2" || f.got.MaxTokens != defaultPlaygroundTokens {
 		t.Errorf("dispatched as acct=%q req=%+v", f.acct, f.got)
 	}
 }
@@ -101,5 +101,23 @@ func TestParseReply_EmptyContentWhenCutOffWhileThinking(t *testing.T) {
 	alt := parseReply(json.RawMessage(`{"choices":[{"message":{"content":"hi","reasoning_content":"thought"}}]}`))
 	if alt.Reasoning != "thought" {
 		t.Errorf("reasoning_content not read: %+v", alt)
+	}
+}
+
+// Regression test: 8192 typed in the playground silently became 256 because
+// anything above the old 4096 limit was reset to the default.
+func TestClampPlaygroundTokens(t *testing.T) {
+	cases := []struct{ in, want int }{
+		{0, defaultPlaygroundTokens},
+		{-1, defaultPlaygroundTokens},
+		{100, 100},
+		{maxPlaygroundTokens, maxPlaygroundTokens},
+		{maxPlaygroundTokens + 1, maxPlaygroundTokens},
+		{1000000, maxPlaygroundTokens},
+	}
+	for _, c := range cases {
+		if got := clampPlaygroundTokens(c.in); got != c.want {
+			t.Errorf("clampPlaygroundTokens(%d) = %d, want %d", c.in, got, c.want)
+		}
 	}
 }

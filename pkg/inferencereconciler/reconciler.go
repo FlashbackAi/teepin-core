@@ -41,7 +41,20 @@ type Reconciler struct {
 	nodes    *nodes.Service
 	cluster  cluster.Client
 	images   EngineConfig
+
+	// prober, when set, must succeed before an MLX mount is reported Mounted.
+	prober Prober
 }
+
+// Prober verifies that a running model server can actually generate (its
+// port being open is not enough: mlx_lm.server keeps listening after a model
+// fails to load). Implemented by inferencegateway.Gateway.
+type Prober interface {
+	Probe(ctx context.Context, cfg inferencegateway.ModelServiceConfig, endpoint string) error
+}
+
+// SetProber enables readiness probing before an MLX row is marked Mounted.
+func (r *Reconciler) SetProber(p Prober) { r.prober = p }
 
 // New constructs a Reconciler. images.VLLMImage/VLLMOmniImage left blank disables
 // that engine — a mount requesting it fails clearly (see buildInstanceSpec)
@@ -165,7 +178,7 @@ func (r *Reconciler) mount(ctx context.Context, row nodeservices.NodeService, no
 	case err == nil:
 		switch st.Status {
 		case statusRunning:
-			return r.reportRunning(ctx, row, node, instanceID)
+			return r.reportRunning(ctx, row, cfg, node, instanceID)
 		case statusFailed:
 			// A crash: clear the dead instance so the next pass starts a
 			// fresh one, and surface why this one died.
@@ -202,13 +215,22 @@ func (r *Reconciler) mount(ctx context.Context, row nodeservices.NodeService, no
 }
 
 // reportRunning records Mounted with the endpoint the gateway will dial.
-func (r *Reconciler) reportRunning(ctx context.Context, row nodeservices.NodeService, node nodes.Node, instanceID string) error {
+func (r *Reconciler) reportRunning(ctx context.Context, row nodeservices.NodeService, cfg inferencegateway.ModelServiceConfig, node nodes.Node, instanceID string) error {
 	endpoint, err := r.endpointFor(ctx, node, instanceID)
 	if err != nil {
 		// Running but not yet addressable (e.g. pod has no IP): stay pending.
 		log.Printf("inferencereconciler: %s running but not addressable yet: %v", row.ID, err)
 		return r.nodeSvcs.ReportObserved(ctx, row.ID, nodeservices.ObservedPending, nil, nil)
 	}
+
+	// An open port is not a loaded model: mlx_lm.server keeps listening
+	// after a load failure. Prove it can generate before advertising it.
+	if r.prober != nil && cfg.Engine == engineMLX {
+		if perr := r.prober.Probe(ctx, cfg, endpoint); perr != nil {
+			return r.fail(ctx, row.ID, fmt.Errorf("model server is up but cannot generate: %w", perr))
+		}
+	}
+
 	log.Printf("inferencereconciler: mounted %s on node %s (instance=%s, endpoint=%s)", row.ID, node.NodeName, instanceID, endpoint)
 	return r.nodeSvcs.ReportObserved(ctx, row.ID, nodeservices.ObservedMounted, nil, &endpoint)
 }

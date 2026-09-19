@@ -26,6 +26,7 @@ import (
 	agentpb "github.com/FlashbackAi/teepin-core/pkg/agentpb"
 	"github.com/FlashbackAi/teepin-core/pkg/cluster"
 	"github.com/FlashbackAi/teepin-core/pkg/gpu"
+	"github.com/FlashbackAi/teepin-core/pkg/modelcache"
 )
 
 // inventoryInterval is how often capacity is reported.
@@ -85,6 +86,11 @@ type Config struct {
 
 	// Inventory reports GPU capacity. May be nil on CPU-only providers.
 	Inventory *gpu.Inventory
+
+	// ModelCache, when set, is reported with every inventory and can delete
+	// a downloaded model on the control plane's request. Nil on nodes that
+	// run no native models.
+	ModelCache ModelCache
 
 	// CPUCores/MemoryGB/OS/Arch are this machine's detected specs, sent
 	// once on every fresh connection (register, below) — i.e. on every
@@ -359,6 +365,9 @@ func (r *Runner) handleCommand(ctx context.Context, s stream, msg *agentpb.Contr
 
 	case *agentpb.ControlMessage_ProxyData:
 		r.deliverProxyBody(msg.RequestId, payload.ProxyData)
+
+	case *agentpb.ControlMessage_DeleteCachedModel:
+		r.handleDeleteCachedModel(s, msg.RequestId, payload.DeleteCachedModel)
 
 	case *agentpb.ControlMessage_ExecStart:
 		r.handleExecStart(ctx, s, msg.RequestId, payload.ExecStart)
@@ -1208,13 +1217,15 @@ func (r *Runner) reportInventory(ctx context.Context, s stream) {
 			// — checked fresh on every report so a home node's k3s crashing
 			// after connect is reflected within one inventoryInterval, not
 			// frozen at whatever it was when the agent started.
-			ClusterReady:     r.cfg.Cluster.Healthy(ctx),
-			CpuUsedPercent:   float32(cpuPercent),
-			MemoryUsedGb:     memUsedGB,
-			NetworkRxMbps:    netRx,
-			NetworkTxMbps:    netTx,
-			StorageReadMbps:  diskRead,
-			StorageWriteMbps: diskWrite,
+			CachedModels:      cachedModelsProto(r.cfg.ModelCache),
+			CachedModelsKnown: r.cfg.ModelCache != nil,
+			ClusterReady:      r.cfg.Cluster.Healthy(ctx),
+			CpuUsedPercent:    float32(cpuPercent),
+			MemoryUsedGb:      memUsedGB,
+			NetworkRxMbps:     netRx,
+			NetworkTxMbps:     netTx,
+			StorageReadMbps:   diskRead,
+			StorageWriteMbps:  diskWrite,
 		}},
 	})
 }
@@ -1551,4 +1562,55 @@ func (r *Runner) reportGoneAtStartup(s stream) {
 			})
 		}
 	})
+}
+
+// ModelCache is the slice of pkg/modelcache the agent needs. An interface so
+// tests can stand in for the disk.
+type ModelCache interface {
+	List() ([]modelcache.Model, error)
+	Delete(repoID string) error
+}
+
+// cachedModelsProto converts the cache listing for the inventory report. A
+// listing failure is logged and reported as "none" rather than failing the
+// whole inventory: capacity reporting must not depend on a disk scan.
+func cachedModelsProto(c ModelCache) []*agentpb.CachedModel {
+	if c == nil {
+		return nil
+	}
+	models, err := c.List()
+	if err != nil {
+		log.Printf("Model cache listing failed: %v", err)
+		return nil
+	}
+	out := make([]*agentpb.CachedModel, 0, len(models))
+	for _, m := range models {
+		out = append(out, &agentpb.CachedModel{RepoId: m.RepoID, SizeBytes: m.SizeBytes})
+	}
+	return out
+}
+
+// handleDeleteCachedModel removes one downloaded model. Whether it is safe to
+// (i.e. not currently mounted) is the control plane's decision; the agent's
+// own guarantee is that only a plain repo id inside the cache can be touched.
+func (r *Runner) handleDeleteCachedModel(s stream, requestID string, cmd *agentpb.DeleteCachedModelCommand) {
+	if r.cfg.ModelCache == nil {
+		r.replyError(s, requestID, agentpb.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "this node has no model cache")
+		return
+	}
+	switch err := r.cfg.ModelCache.Delete(cmd.RepoId); {
+	case err == nil:
+		log.Printf("Deleted cached model %s", cmd.RepoId)
+		_ = r.send(s, &agentpb.AgentMessage{
+			RequestId: requestID,
+			Payload:   &agentpb.AgentMessage_Result{Result: &agentpb.CommandResult{Success: true}},
+		})
+	case errors.Is(err, modelcache.ErrNotFound):
+		r.replyError(s, requestID, agentpb.ErrorCode_ERROR_CODE_NOT_FOUND, err.Error())
+	case errors.Is(err, modelcache.ErrInvalidRepo):
+		r.replyError(s, requestID, agentpb.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, err.Error())
+	default:
+		log.Printf("Delete cached model %s failed: %v", cmd.RepoId, err)
+		r.replyError(s, requestID, agentpb.ErrorCode_ERROR_CODE_CLUSTER_ERROR, err.Error())
+	}
 }

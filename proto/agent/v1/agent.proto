@@ -57,6 +57,7 @@ message ControlMessage {
     ProxyData             proxy_data      = 8;  // Stage 3: request body chunk(s), same request_id
     ExecStart             exec_start      = 9;  // interactive exec: open one session
     ExecInput             exec_input      = 10; // interactive exec: stdin/resize/cancel, same request_id
+    DeleteCachedModelCommand delete_cached_model = 11; // remove one downloaded model from the node's model cache
   }
 }
 
@@ -218,6 +219,21 @@ message ExecCommand {
   int32  timeout_seconds  = 3;
 }
 
+// DeleteCachedModelCommand removes one model from the agent's model cache.
+// The agent refuses anything that is not a plain "org/name" repo id resolving
+// to a direct child of its cache directory. Deleting an absent model is
+// NOT_FOUND. Whether the model is currently mounted is the control plane's
+// call (it owns the mount rows); the agent does not second-guess it.
+message DeleteCachedModelCommand {
+  string repo_id = 1;
+}
+
+// CachedModel is one downloaded model in the host's model cache.
+message CachedModel {
+  string repo_id    = 1;  // "org/name"
+  int64  size_bytes = 2;
+}
+
 message Ping { google.protobuf.Timestamp sent_at = 1; }
 
 // ---------------------------------------------------------------------
@@ -323,6 +339,14 @@ message GPUInventory {
   double network_tx_mbps     = 7;
   double storage_read_mbps   = 8;
   double storage_write_mbps  = 9;
+
+  // cached_models: model weights downloaded onto this host (the Hugging Face
+  // cache), so an operator can see what is occupying disk and remove what is
+  // unused. cached_models_known distinguishes "reported, and there are none"
+  // from "this agent does not report a model cache" (older agents, or nodes
+  // that run no native models), since an empty repeated field cannot.
+  repeated CachedModel cached_models = 10;
+  bool cached_models_known = 11;
 }
 
 // InstanceMetricsReport is one periodic sweep of every locally-running

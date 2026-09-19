@@ -42,6 +42,7 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/agentrunner"
 	"github.com/FlashbackAi/teepin-core/pkg/cluster"
 	"github.com/FlashbackAi/teepin-core/pkg/gpu"
+	"github.com/FlashbackAi/teepin-core/pkg/modelcache"
 	"github.com/FlashbackAi/teepin-core/pkg/nativeruntime"
 	"github.com/FlashbackAi/teepin-core/pkg/networking"
 )
@@ -176,6 +177,7 @@ func runEnrolledAgent(cfg *nodeConfig) {
 		Region:     getEnv("TEEPIN_REGION", "home"),
 		Version:    Version,
 		Cluster:    homeClusterClient(cfg.NodeName),
+		ModelCache: hostModelCache(),
 		Inventory:  nil, // CPU-only: no GPU inventory
 		CPUCores:   cpuCores,
 		MemoryGB:   memoryGB,
@@ -443,4 +445,20 @@ func getEnvInt(key string, fallback int) int {
 		}
 	}
 	return fallback
+}
+
+// hostModelCache is the Hugging Face model cache this agent reports and can
+// clean, only for agents that run native models (where the weights live on the
+// host). Nil elsewhere: a containerised node's model files live in pod volumes.
+func hostModelCache() agentrunner.ModelCache {
+	if !nativeRuntimeRequested() && !hybridRuntimeRequested() {
+		return nil
+	}
+	hub, err := modelcache.DefaultHub()
+	if err != nil {
+		log.Printf("WARN: model cache disabled: %v", err)
+		return nil
+	}
+	log.Printf("Model cache: %s", hub)
+	return modelcache.New(hub)
 }

@@ -300,6 +300,7 @@ func (s *AgentServer) handleMessage(session *AgentSession, msg *agentpb.AgentMes
 	case *agentpb.AgentMessage_Inventory:
 		inv := inventoryFromProto(payload.Inventory)
 		session.setInventory(inv)
+		session.cache.set(payload.Inventory)
 		// Write-through persistence: record each reported node as seen. Async
 		// and best-effort — a slow or failing DB must never stall the message
 		// pump or drop the live inventory the allocator depends on. This does

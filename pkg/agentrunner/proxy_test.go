@@ -5,6 +5,7 @@ package agentrunner
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,7 @@ import (
 
 	agentpb "github.com/FlashbackAi/teepin-core/pkg/agentpb"
 	"github.com/FlashbackAi/teepin-core/pkg/cluster"
+	"github.com/FlashbackAi/teepin-core/pkg/modelcache"
 )
 
 // addressCluster resolves ResolveInstanceAddress to a fixed address (an
@@ -497,5 +499,73 @@ func TestReportGoneAtStartup_SendsTerminatedOnce(t *testing.T) {
 	st := sent[0].GetInstanceStatus()
 	if st == nil || st.InstanceId != "infsvc-old" || st.Status != "terminated" {
 		t.Errorf("sent %+v, want terminated for infsvc-old", sent[0])
+	}
+}
+
+// fakeModelCache stands in for the disk.
+type fakeModelCache struct {
+	models  []modelcache.Model
+	deleted []string
+	err     error
+}
+
+func (f *fakeModelCache) List() ([]modelcache.Model, error) { return f.models, nil }
+func (f *fakeModelCache) Delete(id string) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.deleted = append(f.deleted, id)
+	return nil
+}
+
+func TestCachedModelsProto(t *testing.T) {
+	if cachedModelsProto(nil) != nil {
+		t.Error("nil cache must report nothing")
+	}
+	got := cachedModelsProto(&fakeModelCache{models: []modelcache.Model{{RepoID: "a/b", SizeBytes: 42}}})
+	if len(got) != 1 || got[0].RepoId != "a/b" || got[0].SizeBytes != 42 {
+		t.Errorf("got %+v", got)
+	}
+}
+
+func TestHandleDeleteCachedModel_ResultCodes(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want agentpb.ErrorCode
+		ok   bool
+	}{
+		{"success", nil, agentpb.ErrorCode_ERROR_CODE_UNSPECIFIED, true},
+		{"not found", modelcache.ErrNotFound, agentpb.ErrorCode_ERROR_CODE_NOT_FOUND, false},
+		{"invalid", modelcache.ErrInvalidRepo, agentpb.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, false},
+		{"other", errors.New("disk on fire"), agentpb.ErrorCode_ERROR_CODE_CLUSTER_ERROR, false},
+	}
+	for _, c := range cases {
+		cache := &fakeModelCache{err: c.err}
+		r := New(Config{ProviderID: "p", Region: "r", Version: "t", ModelCache: cache})
+		s := newStubStream()
+		r.handleDeleteCachedModel(s, "req-1", &agentpb.DeleteCachedModelCommand{RepoId: "org/name"})
+
+		sent := s.snapshot()
+		if len(sent) != 1 || sent[0].GetResult() == nil {
+			t.Fatalf("%s: sent %+v", c.name, sent)
+		}
+		res := sent[0].GetResult()
+		if res.Success != c.ok || res.ErrorCode != c.want {
+			t.Errorf("%s: result = %+v, want success=%v code=%v", c.name, res, c.ok, c.want)
+		}
+		if c.ok && (len(cache.deleted) != 1 || cache.deleted[0] != "org/name") {
+			t.Errorf("%s: deleted = %v", c.name, cache.deleted)
+		}
+	}
+}
+
+func TestHandleDeleteCachedModel_NoCacheConfigured(t *testing.T) {
+	r := New(Config{ProviderID: "p", Region: "r", Version: "t"})
+	s := newStubStream()
+	r.handleDeleteCachedModel(s, "req-1", &agentpb.DeleteCachedModelCommand{RepoId: "org/name"})
+	sent := s.snapshot()
+	if len(sent) != 1 || sent[0].GetResult().GetSuccess() {
+		t.Fatalf("a node with no model cache must refuse: %+v", sent)
 	}
 }

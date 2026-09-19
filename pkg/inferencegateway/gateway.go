@@ -5,6 +5,7 @@ package inferencegateway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -159,7 +160,7 @@ func defaultProviderFactory(cfg ModelServiceConfig, endpoint string) (inference.
 	case "vllm", "vllm-omni", "mlx": // mlx_lm.server speaks the same OpenAI-compatible surface
 		return inference.NewVLLM(inference.VLLMConfig{
 			BaseURL: endpoint,
-			Model:   cfg.BackendModel,
+			Model:   backendModelName(cfg),
 			APIKey:  cfg.APIKey,
 		}), nil
 	default:
@@ -435,4 +436,31 @@ func (g *Gateway) providerFor(nsID uuid.UUID, cfg ModelServiceConfig, endpoint s
 // endpoint otherwise.
 func configHash(cfg ModelServiceConfig, endpoint string) string {
 	return fmt.Sprintf("%s|%s|%s|%s|%d|%s", cfg.Engine, endpoint, cfg.BackendModel, cfg.APIKey, cfg.MaxConcurrency, cfg.ModelSource)
+}
+
+// probeTimeout bounds one readiness probe. The model is already loaded when
+// the server starts listening, so a healthy backend answers in well under a
+// minute even for its first token.
+const probeTimeout = 90 * time.Second
+
+// Probe checks that a backend at endpoint can actually generate: it sends a
+// one-token request through the same provider construction real traffic uses
+// (tunnel included). A port that is open but whose model failed to load
+// (mlx_lm.server keeps listening after a load error) fails here, which is
+// how a mount avoids being reported healthy when it is not.
+func (g *Gateway) Probe(ctx context.Context, cfg ModelServiceConfig, endpoint string) error {
+	provider, err := g.newProvider(cfg, endpoint)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+
+	msg := json.RawMessage(`{"role":"user","content":"Hi"}`)
+	_, err = provider.Complete(ctx, inference.Request{
+		Model:     cfg.ModelRoute,
+		Messages:  []json.RawMessage{msg},
+		MaxTokens: 1,
+	})
+	return err
 }

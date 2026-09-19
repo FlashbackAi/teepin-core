@@ -447,14 +447,27 @@ func main() {
 	// mounted right now. Home-node (tunnel://) backends are reached through
 	// the agent tunnel; without a registry (direct mode) they are refused.
 	var playgroundHandler *api.InferencePlaygroundHandler
+	var inferenceGateway *inferencegateway.Gateway
+	var nodeModelCacheHandler *api.NodeModelCacheHandler
+	var publicInferenceHandler *api.InferenceHandler
 	if modelCatalogService != nil && nodeServicesService != nil {
-		inferenceGateway := inferencegateway.New(modelCatalogService, nodeServicesService, nil)
+		inferenceGateway = inferencegateway.New(modelCatalogService, nodeServicesService, nil)
 		if agentRegistry != nil {
 			inferenceGateway.SetTunnelDialer(func(providerID, instanceID string, port int) http.RoundTripper {
 				return cluster.NewTunnelTransport(agentRegistry, providerID, instanceID, int32(port))
 			})
 		}
 		playgroundHandler = api.NewInferencePlaygroundHandler(inferenceGateway)
+		// The public, API-key-authenticated API. billingService may be nil
+		// (no database), in which case nothing is metered.
+		var usage api.InferenceUsageRecorder
+		if billingService != nil {
+			usage = billingService
+		}
+		publicInferenceHandler = api.NewInferenceHandler(inferenceGateway, modelCatalogService, usage)
+		if agentRegistry != nil && nodeService != nil {
+			nodeModelCacheHandler = api.NewNodeModelCacheHandler(agentRegistry, nodeService, nodeServicesService)
+		}
 		log.Println("Teepin Inference gateway + admin playground enabled")
 	}
 
@@ -466,6 +479,10 @@ func main() {
 			NodeReserveGB: getEnvInt("TEEPIN_INFERENCE_NODE_RESERVE_GB", 0),
 		}
 		reconciler := inferencereconciler.New(nodeServicesService, nodeService, clusterClient, images)
+		if inferenceGateway != nil {
+			// An MLX row is only Mounted once the model can actually generate.
+			reconciler.SetProber(inferenceGateway)
+		}
 		reconcileInterval := getEnvInt("TEEPIN_INFERENCE_RECONCILE_SECONDS", 30)
 		go func() {
 			ticker := time.NewTicker(time.Duration(reconcileInterval) * time.Second)
@@ -999,7 +1016,7 @@ func main() {
 	}
 
 	// Setup router
-	router := setupRouter(apiServer, authHandler, accountHandler, authMiddleware, billingHandler, registryHandler, adminHandler, webhookHandler, nodeHandler, modelCatalogHandler, nodeServicesHandler, playgroundHandler, rateLimitMiddleware, proxyHandler, execHandler, kumbhaEventsHandler, getEnv("TEEPIN_DOMAIN", "teepin.com"))
+	router := setupRouter(apiServer, authHandler, accountHandler, authMiddleware, billingHandler, registryHandler, adminHandler, webhookHandler, nodeHandler, modelCatalogHandler, nodeServicesHandler, playgroundHandler, nodeModelCacheHandler, publicInferenceHandler, rateLimitMiddleware, proxyHandler, execHandler, kumbhaEventsHandler, getEnv("TEEPIN_DOMAIN", "teepin.com"))
 
 	// Create HTTP server
 	port := getEnv("PORT", "8080")
@@ -1222,7 +1239,7 @@ func initRateLimiting() *ratelimit.Config {
 	return config
 }
 
-func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHandler *api.AccountHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler, registryHandler *api.RegistryHandler, adminHandler *api.AdminHandler, webhookHandler *api.WebhookHandler, nodeHandler *api.NodeHandler, modelCatalogHandler *api.ModelCatalogHandler, nodeServicesHandler *api.NodeServicesHandler, playgroundHandler *api.InferencePlaygroundHandler, rateLimitMiddleware *ratelimit.Middleware, proxyHandler *cluster.ProxyHandler, execHandler *cluster.ExecHandler, kumbhaEventsHandler *kumbha.EventsHandler, instanceDomain string) *gin.Engine {
+func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHandler *api.AccountHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler, registryHandler *api.RegistryHandler, adminHandler *api.AdminHandler, webhookHandler *api.WebhookHandler, nodeHandler *api.NodeHandler, modelCatalogHandler *api.ModelCatalogHandler, nodeServicesHandler *api.NodeServicesHandler, playgroundHandler *api.InferencePlaygroundHandler, nodeModelCacheHandler *api.NodeModelCacheHandler, publicInferenceHandler *api.InferenceHandler, rateLimitMiddleware *ratelimit.Middleware, proxyHandler *cluster.ProxyHandler, execHandler *cluster.ExecHandler, kumbhaEventsHandler *kumbha.EventsHandler, instanceDomain string) *gin.Engine {
 	// Set Gin to release mode in production
 	if os.Getenv("GIN_MODE") == "" {
 		gin.SetMode(gin.ReleaseMode)
@@ -1478,6 +1495,18 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 		// Teepin S3 (pkg/objectstore) — every handler 404s when
 		// s.objectStore is nil (feature not configured), same posture as
 		// the Kumbha group above.
+		// Teepin Inference's public, OpenAI-compatible API: one base URL for
+		// every model, chosen per request, authenticated with a project API
+		// key (permission: inference:invoke) or a signed-in session.
+		if publicInferenceHandler != nil {
+			inferenceAuth := []gin.HandlerFunc{}
+			if authMiddleware != nil {
+				inferenceAuth = append(inferenceAuth, authMiddleware.RequireAuth())
+			}
+			v1.POST("/chat/completions", append(inferenceAuth, publicInferenceHandler.ChatCompletions)...)
+			v1.GET("/models", append(inferenceAuth, publicInferenceHandler.ListModels)...)
+		}
+
 		storageGroup := v1.Group("/storage")
 		if authMiddleware != nil {
 			storageGroup.Use(authMiddleware.RequireAuth())
@@ -1576,6 +1605,10 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 				// Teepin Inference: model catalog + pricing.
 				if playgroundHandler != nil {
 					admin.POST("/inference/chat", playgroundHandler.Chat)
+				}
+				if nodeModelCacheHandler != nil {
+					admin.GET("/nodes/:id/cached-models", nodeModelCacheHandler.List)
+					admin.DELETE("/nodes/:id/cached-models", nodeModelCacheHandler.Delete)
 				}
 				if modelCatalogHandler != nil {
 					admin.POST("/inference/models", modelCatalogHandler.RegisterModel)

@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/FlashbackAi/teepin-core/pkg/cluster"
+	"github.com/FlashbackAi/teepin-core/pkg/inferencegateway"
 	"github.com/FlashbackAi/teepin-core/pkg/nodes"
 	"github.com/FlashbackAi/teepin-core/pkg/nodeservices"
 )
@@ -659,6 +660,70 @@ func TestReconcile_TerminatedInstanceIsRecreatedInSamePass(t *testing.T) {
 	}
 	if !fake.deleteCalled || !fake.createCalled {
 		t.Errorf("delete=%v create=%v, want both (stale record dropped, instance recreated)", fake.deleteCalled, fake.createCalled)
+	}
+	if err := nsMock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+type fakeProber struct {
+	err    error
+	called bool
+}
+
+func (f *fakeProber) Probe(context.Context, inferencegateway.ModelServiceConfig, string) error {
+	f.called = true
+	return f.err
+}
+
+// A running MLX instance whose model cannot generate must be reported as an
+// error, not Mounted (mlx_lm.server keeps its port open after a failed load).
+func TestReconcile_RunningMLXWithFailedProbeIsAnError(t *testing.T) {
+	nsSvc, nsMock, d1 := newNodeServicesMock(t)
+	defer d1()
+	nodesSvc, nodesMock, d2 := newNodesMock(t)
+	defer d2()
+	rowID, nodeID := uuid.New(), uuid.New()
+	expectRowAndNode(nsMock, nodesMock, rowID, nodeID, mlxConfig(), "mounted", "pending", "home")
+	nsMock.ExpectExec(`UPDATE compute\.node_services\s+SET observed_state`).
+		WithArgs("error", sqlmock.AnyArg(), nil, rowID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	prober := &fakeProber{err: errors.New("Model type k2_horizon not supported")}
+	fake := &fakeClusterClient{statusFunc: runningStatus}
+	r := New(nsSvc, nodesSvc, fake, EngineConfig{})
+	r.SetProber(prober)
+
+	if err := r.Reconcile(context.Background()); err == nil {
+		t.Fatal("a model that cannot generate was reported healthy")
+	}
+	if !prober.called {
+		t.Error("probe was never run")
+	}
+	if err := nsMock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestReconcile_RunningMLXWithPassingProbeIsMounted(t *testing.T) {
+	nsSvc, nsMock, d1 := newNodeServicesMock(t)
+	defer d1()
+	nodesSvc, nodesMock, d2 := newNodesMock(t)
+	defer d2()
+	rowID, nodeID := uuid.New(), uuid.New()
+	expectRowAndNode(nsMock, nodesMock, rowID, nodeID, mlxConfig(), "mounted", "pending", "home")
+	nsMock.ExpectExec(`UPDATE compute\.node_services\s+SET observed_state`).
+		WithArgs("mounted", nil, sqlmock.AnyArg(), rowID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	prober := &fakeProber{}
+	r := New(nsSvc, nodesSvc, &fakeClusterClient{statusFunc: runningStatus}, EngineConfig{})
+	r.SetProber(prober)
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !prober.called {
+		t.Error("probe was never run")
 	}
 	if err := nsMock.ExpectationsWereMet(); err != nil {
 		t.Error(err)
