@@ -285,9 +285,7 @@ func (r *Runner) Run(ctx context.Context, s stream) error {
 	for {
 		select {
 		case msg := <-received:
-			// Each command runs in its own goroutine: a slow image pull
-			// must not stall the delete or log request behind it.
-			go r.handleCommand(ctx, s, msg)
+			r.dispatch(ctx, s, msg)
 
 		case err := <-recvErr:
 			if err == io.EOF {
@@ -305,6 +303,30 @@ func (r *Runner) Run(ctx context.Context, s stream) error {
 			return ctx.Err()
 		}
 	}
+}
+
+// dispatch routes one incoming control message. It runs on the receive loop's
+// single goroutine, so everything before the goroutine spawn happens in
+// receive order.
+//
+// Proxy request bodies are handled here, not in handleCommand: a ProxyRequest
+// and its ProxyData chunks are separate messages, and dispatching each to its
+// own goroutine let a chunk race ahead of its handler's registration (and be
+// dropped) or overtake an earlier chunk (reordering the body).
+func (r *Runner) dispatch(ctx context.Context, s stream, msg *agentpb.ControlMessage) {
+	switch p := msg.Payload.(type) {
+	case *agentpb.ControlMessage_ProxyRequest:
+		if p.ProxyRequest.HasBody {
+			r.proxyBodyChannel(msg.RequestId)
+		}
+	case *agentpb.ControlMessage_ProxyData:
+		r.deliverProxyBody(msg.RequestId, p.ProxyData)
+		return
+	}
+
+	// Each command runs in its own goroutine: a slow image pull must not
+	// stall the delete or log request behind it.
+	go r.handleCommand(ctx, s, msg)
 }
 
 func (r *Runner) handleCommand(ctx context.Context, s stream, msg *agentpb.ControlMessage) {
@@ -598,6 +620,16 @@ func (r *Runner) deliverProxyBody(requestID string, data *agentpb.ProxyData) {
 // pkg/cluster/proxy.go's relayResponse, which turns Error into a 502 with
 // this text).
 func (r *Runner) handleProxyRequest(ctx context.Context, s stream, requestID string, req *agentpb.ProxyRequest) {
+	// A body channel may already have been registered by the receive loop
+	// (see proxyBodyChannel); make sure it is removed on EVERY exit path,
+	// including the early error returns below.
+	if req.HasBody {
+		defer func() {
+			r.proxyBodiesMu.Lock()
+			delete(r.proxyBodies, requestID)
+			r.proxyBodiesMu.Unlock()
+		}()
+	}
 	ctx, cancel := context.WithTimeout(ctx, proxyTimeoutFor(req))
 	defer cancel()
 
@@ -614,16 +646,7 @@ func (r *Runner) handleProxyRequest(ctx context.Context, s stream, requestID str
 
 	var body io.Reader
 	if req.HasBody {
-		bodyCh := make(chan *agentpb.ProxyData, 64)
-		r.proxyBodiesMu.Lock()
-		r.proxyBodies[requestID] = bodyCh
-		r.proxyBodiesMu.Unlock()
-		defer func() {
-			r.proxyBodiesMu.Lock()
-			delete(r.proxyBodies, requestID)
-			r.proxyBodiesMu.Unlock()
-		}()
-		body = newProxyBodyReader(ctx, bodyCh, proxyRequestBodyLimit)
+		body = newProxyBodyReader(ctx, r.proxyBodyChannel(requestID), proxyRequestBodyLimit)
 	}
 
 	url := fmt.Sprintf("http://%s%s", addr, req.Path)
@@ -1475,4 +1498,23 @@ func proxyTimeoutFor(req *agentpb.ProxyRequest) time.Duration {
 		return proxyMaxLongTimeout
 	}
 	return d
+}
+
+// proxyBodyBuffer is how many request-body chunks may queue for a handler.
+// Chunks are up to 32KB, so this holds ~8MB before delivery has to wait.
+const proxyBodyBuffer = 256
+
+// proxyBodyChannel returns the request-body channel for requestID, creating
+// it if this is the first caller. Called from the receive loop (so the
+// channel exists before the first ProxyData is processed) and again from
+// handleProxyRequest (which finds it already there).
+func (r *Runner) proxyBodyChannel(requestID string) chan *agentpb.ProxyData {
+	r.proxyBodiesMu.Lock()
+	defer r.proxyBodiesMu.Unlock()
+	ch, ok := r.proxyBodies[requestID]
+	if !ok {
+		ch = make(chan *agentpb.ProxyData, proxyBodyBuffer)
+		r.proxyBodies[requestID] = ch
+	}
+	return ch
 }

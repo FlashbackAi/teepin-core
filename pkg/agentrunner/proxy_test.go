@@ -401,3 +401,71 @@ func TestHandleProxyRequest_DeclaredContentLengthIsNotChunked(t *testing.T) {
 		t.Fatal("backend never received the request")
 	}
 }
+
+// slowResolveCluster delays address resolution, widening the window in which
+// body chunks arrive before the handler has looked up its target.
+type slowResolveCluster struct {
+	addressCluster
+	delay time.Duration
+}
+
+func (c slowResolveCluster) ResolveInstanceAddress(ctx context.Context, id string, port int32) (string, error) {
+	time.Sleep(c.delay)
+	return c.addressCluster.ResolveInstanceAddress(ctx, id, port)
+}
+
+// Regression test for the live failure "ContentLength=135 with Body length 0"
+// (2026-09-19): a ProxyRequest immediately followed by its ProxyData chunks,
+// delivered through the real dispatch path, must reach the backend complete
+// and IN ORDER even when the handler is slow to start. Before dispatch()
+// registered the body channel on the receive loop, chunks arriving first were
+// dropped, and each chunk ran in its own goroutine so they could reorder.
+func TestDispatch_ProxyBodyArrivesCompleteAndInOrderEvenWhenHandlerIsSlow(t *testing.T) {
+	got := make(chan string, 1)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got <- string(b)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	r := New(Config{
+		ProviderID: "p", Region: "r", Version: "t",
+		Cluster: slowResolveCluster{
+			addressCluster: addressCluster{addr: stripScheme(backend.URL)},
+			delay:          150 * time.Millisecond,
+		},
+	})
+	s := newStubStream()
+
+	const want = "chunk-one|chunk-two|chunk-three|chunk-four"
+	parts := []string{"chunk-one|", "chunk-two|", "chunk-three|", "chunk-four"}
+
+	// Exactly what the receive loop does: dispatch in wire order, no waiting.
+	r.dispatch(context.Background(), s, &agentpb.ControlMessage{
+		RequestId: "req-order-1",
+		Payload: &agentpb.ControlMessage_ProxyRequest{ProxyRequest: &agentpb.ProxyRequest{
+			InstanceId: "i", Method: http.MethodPost, Path: "/x", HasBody: true, Port: 80,
+			Headers: []*agentpb.Header{{Name: "Content-Length", Values: []string{strconv.Itoa(len(want))}}},
+		}},
+	})
+	for _, p := range parts {
+		r.dispatch(context.Background(), s, &agentpb.ControlMessage{
+			RequestId: "req-order-1",
+			Payload:   &agentpb.ControlMessage_ProxyData{ProxyData: &agentpb.ProxyData{Data: []byte(p)}},
+		})
+	}
+	r.dispatch(context.Background(), s, &agentpb.ControlMessage{
+		RequestId: "req-order-1",
+		Payload:   &agentpb.ControlMessage_ProxyData{ProxyData: &agentpb.ProxyData{Eof: true}},
+	})
+
+	select {
+	case body := <-got:
+		if body != want {
+			t.Errorf("backend body = %q, want %q", body, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("backend never received a complete request (body chunks were lost)")
+	}
+}
