@@ -133,8 +133,23 @@ func resolveAccess(c *gin.Context) (inferenceAccess, bool) {
 	return inferenceAccess{allowed: restrict}, true
 }
 
-// chatRequest is the subset of an OpenAI chat request the gateway needs. Every
-// other field is passed through to the backend untouched.
+// allowedRequestFields are the generation parameters a customer may send
+// beyond the fields the gateway models itself (model, messages, max tokens,
+// stream). An allowlist by design; see the note where it is applied.
+var allowedRequestFields = map[string]bool{
+	"temperature": true, "top_p": true, "top_k": true, "min_p": true,
+	"stop": true, "seed": true, "n": true,
+	"frequency_penalty": true, "presence_penalty": true, "repetition_penalty": true,
+	"logit_bias": true, "logprobs": true, "top_logprobs": true,
+	"tools": true, "tool_choice": true, "response_format": true,
+	"stream_options": true, "user": true,
+	// Lets a caller switch a reasoning model's thinking off
+	// ({"enable_thinking": false}); template variables only, never a path.
+	"chat_template_kwargs": true,
+}
+
+// chatRequest is the subset of an OpenAI chat request the gateway needs. Other
+// fields reach the backend only if they are in allowedRequestFields.
 type chatRequest struct {
 	model     string
 	messages  []json.RawMessage
@@ -174,7 +189,13 @@ func parseChatRequest(body []byte) (*chatRequest, error) {
 				return nil, errors.New(`"stream" must be a boolean`)
 			}
 		default:
-			req.extra[k] = v
+			// Only standard generation parameters reach the model server.
+			// Anything else is dropped: mlx_lm.server accepts fields such as
+			// draft_model and adapters that name a model to download or a path
+			// to load on the host, and a customer must never steer those.
+			if allowedRequestFields[k] {
+				req.extra[k] = v
+			}
 		}
 	}
 	if strings.TrimSpace(req.model) == "" {
@@ -245,7 +266,7 @@ func (h *InferenceHandler) ChatCompletions(c *gin.Context) {
 		return
 	}
 	h.settle(c.Request.Context(), accountID, projectID, model, &resp.Usage, start)
-	c.Data(http.StatusOK, "application/json", resp.Body)
+	c.Data(http.StatusOK, "application/json", presentBody(resp.Body, model.ModelRoute))
 }
 
 func (h *InferenceHandler) serveStream(c *gin.Context, accountID string, projectID uuid.UUID, model *modelcatalog.Model, req inference.Request) {
@@ -284,7 +305,7 @@ func (h *InferenceHandler) serveStream(c *gin.Context, accountID string, project
 		if ch.Done {
 			return write("data: [DONE]\n\n")
 		}
-		return write("data: " + string(ch.Data) + "\n\n")
+		return write("data: " + string(presentBody(ch.Data, model.ModelRoute)) + "\n\n")
 	})
 
 	// Tokens the backend generated cost real compute whether or not the client
@@ -430,3 +451,58 @@ func (h *InferenceHandler) ListModels(c *gin.Context) {
 // tokens through (implemented by *billing.Service). Exported so main.go can
 // pass a nil interface, not a nil pointer, when billing is unavailable.
 type InferenceUsageRecorder = usageRecorder
+
+// Fields a customer-facing response may carry. An allowlist, not a denylist:
+// the backend (mlx_lm.server today, anything tomorrow) adds fields of its own
+// — system_fingerprint carries its version, the macOS version and the GPU of
+// the host — and a denylist only removes what someone has already noticed.
+var (
+	responseFields = map[string]bool{
+		"id": true, "object": true, "created": true, "model": true, "choices": true, "usage": true,
+	}
+	usageFields = map[string]bool{
+		"prompt_tokens": true, "completion_tokens": true, "total_tokens": true, "completion_tokens_details": true,
+	}
+)
+
+// presentBody reduces a backend response to what the product promises. Only
+// the standard top-level fields survive; usage is cut to token counts (backend
+// details such as prompt-cache hits are dropped); and the model is reported as
+// the route the customer asked for, not the Hugging Face repo it is served
+// from. The choices (content, reasoning, tool calls, finish reason) pass
+// through untouched. A body that is not a JSON object, or fails to re-encode,
+// is returned as-is.
+func presentBody(body []byte, route string) []byte {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil || fields == nil {
+		return body
+	}
+	for k := range fields {
+		if !responseFields[k] {
+			delete(fields, k)
+		}
+	}
+	if _, has := fields["model"]; has {
+		if b, err := json.Marshal(route); err == nil {
+			fields["model"] = b
+		}
+	}
+	if raw, has := fields["usage"]; has {
+		var usage map[string]json.RawMessage
+		if json.Unmarshal(raw, &usage) == nil {
+			for k := range usage {
+				if !usageFields[k] {
+					delete(usage, k)
+				}
+			}
+			if b, err := json.Marshal(usage); err == nil {
+				fields["usage"] = b
+			}
+		}
+	}
+	out, err := json.Marshal(fields)
+	if err != nil {
+		return body
+	}
+	return out
+}

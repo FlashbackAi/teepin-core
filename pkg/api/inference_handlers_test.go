@@ -362,3 +362,103 @@ func TestParseChatRequest_MaxCompletionTokensWins(t *testing.T) {
 		t.Errorf("order of keys must not change the result: %d", req.maxTokens)
 	}
 }
+
+func TestPresentBody_HidesBackendIdentity(t *testing.T) {
+	in := []byte(`{"id":"c1","model":"mlx-community/Qwen3-30B-A3B-4bit","system_fingerprint":"0.31.3-macOS-26.5.1-applegpu_g16g","choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":1}}`)
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(presentBody(in, "teepin/qwen3-30b-a3b"), &got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got["model"]) != `"teepin/qwen3-30b-a3b"` {
+		t.Errorf("model = %s, want the requested route", got["model"])
+	}
+	if _, leaked := got["system_fingerprint"]; leaked {
+		t.Error("system_fingerprint (host/version details) was not removed")
+	}
+	if string(got["id"]) != `"c1"` || got["choices"] == nil || got["usage"] == nil {
+		t.Errorf("other fields must pass through untouched: %v", got)
+	}
+}
+
+func TestPresentBody_LeavesNonObjectsAndModelLessBodiesAlone(t *testing.T) {
+	if got := presentBody([]byte(`not json`), "r"); string(got) != `not json` {
+		t.Errorf("non-JSON changed: %q", got)
+	}
+	// A usage-only stream frame has no model; one must not be invented.
+	var m map[string]json.RawMessage
+	_ = json.Unmarshal(presentBody([]byte(`{"choices":[],"usage":{"completion_tokens":3}}`), "r"), &m)
+	if _, has := m["model"]; has {
+		t.Error("a model field was added to a body that had none")
+	}
+}
+
+func TestChat_ResponseAndStreamDoNotLeakBackendIdentity(t *testing.T) {
+	leaky := json.RawMessage(`{"model":"mlx-community/Qwen3-30B-A3B-4bit","system_fingerprint":"macOS-26.5.1-applegpu","choices":[{"message":{"content":"hi"}}]}`)
+
+	gw := &fakeGW{completeResp: &inference.Response{Body: leaky}}
+	rec := serve(t, NewInferenceHandler(gw, testCatalog(), nil), caller{}, "POST", "/v1/chat/completions", okBody)
+	if strings.Contains(rec.Body.String(), "mlx-community") || strings.Contains(rec.Body.String(), "applegpu") {
+		t.Errorf("non-streamed response leaked backend identity: %s", rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), `"teepin/a"`) {
+		t.Errorf("response should name the requested route: %s", rec.Body)
+	}
+
+	gw = &fakeGW{streamChunks: []inference.Chunk{{Data: leaky}, {Done: true}}}
+	rec = serve(t, NewInferenceHandler(gw, testCatalog(), nil), caller{}, "POST", "/v1/chat/completions", streamBody)
+	if strings.Contains(rec.Body.String(), "mlx-community") || strings.Contains(rec.Body.String(), "applegpu") {
+		t.Errorf("streamed response leaked backend identity: %s", rec.Body)
+	}
+}
+
+// Fields that steer what the model server loads or downloads must never reach
+// it, whatever a customer puts in the request body.
+func TestChat_DropsRequestFieldsOutsideTheAllowlist(t *testing.T) {
+	gw := &fakeGW{completeResp: okResponse()}
+	h := NewInferenceHandler(gw, testCatalog(), nil)
+	body := `{"model":"teepin/a","messages":[{"role":"user","content":"hi"}],
+		"temperature":0.3,"top_p":0.9,"tools":[],
+		"draft_model":"attacker/huge-model","adapters":"/etc","num_draft_tokens":5,"max_kv_size":1,"trust_remote_code":true}`
+	if rec := serve(t, h, caller{}, "POST", "/v1/chat/completions", body); rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	for _, banned := range []string{"draft_model", "adapters", "num_draft_tokens", "max_kv_size", "trust_remote_code"} {
+		if _, leaked := gw.gotReq.Extra[banned]; leaked {
+			t.Errorf("%q reached the model server", banned)
+		}
+	}
+	for _, kept := range []string{"temperature", "top_p", "tools"} {
+		if _, ok := gw.gotReq.Extra[kept]; !ok {
+			t.Errorf("standard parameter %q was dropped", kept)
+		}
+	}
+}
+
+func TestPresentBody_KeepsOnlyStandardFieldsAndTokenCounts(t *testing.T) {
+	in := []byte(`{"id":"c1","object":"chat.completion","created":1,"model":"org/backend","system_fingerprint":"macOS-applegpu",
+		"internal_debug":{"host":"mac-mini"},"choices":[{"message":{"content":"hi","reasoning":"thinking"}}],
+		"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,"prompt_tokens_details":{"cached_tokens":3},"backend_secret":1}}`)
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(presentBody(in, "teepin/a"), &got); err != nil {
+		t.Fatal(err)
+	}
+	for k := range got {
+		if !responseFields[k] {
+			t.Errorf("non-standard top-level field %q survived", k)
+		}
+	}
+	if string(got["model"]) != `"teepin/a"` || got["choices"] == nil {
+		t.Errorf("got %v", got)
+	}
+	var usage map[string]json.RawMessage
+	_ = json.Unmarshal(got["usage"], &usage)
+	if usage["prompt_tokens"] == nil || usage["completion_tokens"] == nil || usage["total_tokens"] == nil {
+		t.Errorf("token counts must survive: %v", usage)
+	}
+	if usage["prompt_tokens_details"] != nil || usage["backend_secret"] != nil {
+		t.Errorf("backend-specific usage fields survived: %v", usage)
+	}
+	if !strings.Contains(string(got["choices"]), `"reasoning":"thinking"`) {
+		t.Error("choices (including reasoning) must pass through untouched")
+	}
+}
