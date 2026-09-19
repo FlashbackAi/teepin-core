@@ -85,8 +85,21 @@ func TestPlaygroundChat_RejectsMissingFields(t *testing.T) {
 	}
 }
 
-func TestAssistantText_FallsBackToRawBody(t *testing.T) {
-	if got := assistantText(json.RawMessage(`{"unexpected":1}`)); got != `{"unexpected":1}` {
-		t.Errorf("got %q", got)
+func TestParseReply_FallsBackToRawBody(t *testing.T) {
+	if got := parseReply(json.RawMessage(`{"unexpected":1}`)); got.Content != `{"unexpected":1}` {
+		t.Errorf("got %q", got.Content)
+	}
+}
+
+// A reasoning model that runs out of tokens while thinking returns empty
+// content; the reply must still explain why (finish_reason and reasoning).
+func TestParseReply_EmptyContentWhenCutOffWhileThinking(t *testing.T) {
+	got := parseReply(json.RawMessage(`{"choices":[{"finish_reason":"length","message":{"content":"","reasoning":"Okay, the user wants AWS..."}}]}`))
+	if got.Content != "" || got.FinishReason != "length" || got.Reasoning == "" {
+		t.Errorf("got %+v", got)
+	}
+	alt := parseReply(json.RawMessage(`{"choices":[{"message":{"content":"hi","reasoning_content":"thought"}}]}`))
+	if alt.Reasoning != "thought" {
+		t.Errorf("reasoning_content not read: %+v", alt)
 	}
 }

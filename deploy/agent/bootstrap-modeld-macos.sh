@@ -248,6 +248,13 @@ cat > "$PLIST" <<PLISTEOF
 PLISTEOF
 
 launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
-launchctl bootstrap "gui/$(id -u)" "$PLIST"
+# bootout is asynchronous: bootstrapping again before the old job has fully
+# unloaded fails with "Input/output error" (seen live on an update). Retry.
+loaded=false
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null; then loaded=true; break; fi
+    sleep 1
+done
+$loaded || fail "could not load the launchd job. Try: launchctl bootout gui/$(id -u)/$LABEL; then re-run."
 info "running in '$RUNTIME' mode. Logs: tail -f $STATE_DIR/agent.log"
 info "Next: Control Center -> Inference -> register a model (engine mlx) -> mount it on this node."

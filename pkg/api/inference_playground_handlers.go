@@ -55,7 +55,13 @@ type playgroundResponse struct {
 	Model        string `json:"model"`
 	InputTokens  int    `json:"input_tokens"`
 	OutputTokens int    `json:"output_tokens"`
-	LatencyMs    int64  `json:"latency_ms"`
+	// FinishReason is the backend's own ("stop", "length", ...). "length"
+	// means the reply was cut off by max_tokens.
+	FinishReason string `json:"finish_reason,omitempty"`
+	// Reasoning is any separate "thinking" text the backend returned
+	// (reasoning models such as Qwen3), so an empty Content is explainable.
+	Reasoning string `json:"reasoning,omitempty"`
+	LatencyMs int64  `json:"latency_ms"`
 }
 
 // Chat is POST /v1/admin/inference/chat.
@@ -97,8 +103,11 @@ func (h *InferencePlaygroundHandler) Chat(c *gin.Context) {
 		return
 	}
 
+	reply := parseReply(resp.Body)
 	c.JSON(http.StatusOK, playgroundResponse{
-		Content:      assistantText(resp.Body),
+		Content:      reply.Content,
+		FinishReason: reply.FinishReason,
+		Reasoning:    reply.Reasoning,
 		Model:        resp.Model,
 		InputTokens:  resp.Usage.InputTokens,
 		OutputTokens: resp.Usage.OutputTokens,
@@ -106,19 +115,35 @@ func (h *InferencePlaygroundHandler) Chat(c *gin.Context) {
 	})
 }
 
-// assistantText pulls choices[0].message.content out of an OpenAI-shaped
-// body, falling back to the raw body so an unexpected shape is visible
-// rather than silently empty.
-func assistantText(body json.RawMessage) string {
+// reply is what the playground shows from an OpenAI-shaped body.
+type reply struct {
+	Content      string
+	Reasoning    string
+	FinishReason string
+}
+
+// parseReply pulls the first choice out of an OpenAI-shaped body. Reasoning
+// models return their thinking separately (as reasoning or reasoning_content,
+// depending on the server) or inline in content; an unexpected shape falls
+// back to the raw body so it is visible rather than silently empty.
+func parseReply(body json.RawMessage) reply {
 	var parsed struct {
 		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
+			FinishReason string `json:"finish_reason"`
+			Message      struct {
+				Content          string `json:"content"`
+				Reasoning        string `json:"reasoning"`
+				ReasoningContent string `json:"reasoning_content"`
 			} `json:"message"`
 		} `json:"choices"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil || len(parsed.Choices) == 0 {
-		return string(body)
+		return reply{Content: string(body)}
 	}
-	return parsed.Choices[0].Message.Content
+	c := parsed.Choices[0]
+	r := reply{Content: c.Message.Content, FinishReason: c.FinishReason, Reasoning: c.Message.Reasoning}
+	if r.Reasoning == "" {
+		r.Reasoning = c.Message.ReasoningContent
+	}
+	return r
 }
