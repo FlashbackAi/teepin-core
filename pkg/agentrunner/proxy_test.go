@@ -469,3 +469,33 @@ func TestDispatch_ProxyBodyArrivesCompleteAndInOrderEvenWhenHandlerIsSlow(t *tes
 		t.Fatal("backend never received a complete request (body chunks were lost)")
 	}
 }
+
+// reaperCluster is a cluster that reports instances lost across a restart.
+type reaperCluster struct {
+	nullCluster
+	gone []string
+}
+
+func (c reaperCluster) InstancesGoneAtStartup() []string { return c.gone }
+
+// After an agent restart, instances the previous run left behind must be
+// reported terminated exactly once, or the control plane keeps a stale
+// "running" entry and never remounts them (found live 2026-09-19, when an
+// agent update stopped a model server and nothing recreated it).
+func TestReportGoneAtStartup_SendsTerminatedOnce(t *testing.T) {
+	r := New(Config{ProviderID: "p", Region: "r", Version: "t",
+		Cluster: reaperCluster{gone: []string{"infsvc-old"}}})
+	s := newStubStream()
+
+	r.reportGoneAtStartup(s)
+	r.reportGoneAtStartup(s) // a later reconnect must not repeat it
+
+	sent := s.snapshot()
+	if len(sent) != 1 {
+		t.Fatalf("sent %d messages, want exactly 1", len(sent))
+	}
+	st := sent[0].GetInstanceStatus()
+	if st == nil || st.InstanceId != "infsvc-old" || st.Status != "terminated" {
+		t.Errorf("sent %+v, want terminated for infsvc-old", sent[0])
+	}
+}

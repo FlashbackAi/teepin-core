@@ -166,13 +166,19 @@ func (r *Reconciler) mount(ctx context.Context, row nodeservices.NodeService, no
 		switch st.Status {
 		case statusRunning:
 			return r.reportRunning(ctx, row, node, instanceID)
-		case statusFailed, statusTerminated:
-			// Clear the dead instance so the next pass starts a fresh one,
-			// and surface why this one died.
+		case statusFailed:
+			// A crash: clear the dead instance so the next pass starts a
+			// fresh one, and surface why this one died.
 			if delErr := r.cluster.DeleteInstance(ctx, cluster.AllTenants(), instanceID); delErr != nil {
-				log.Printf("inferencereconciler: cleanup of %s instance %s failed: %v", st.Status, instanceID, delErr)
+				log.Printf("inferencereconciler: cleanup of failed instance %s failed: %v", instanceID, delErr)
 			}
-			return r.fail(ctx, row.ID, fmt.Errorf("instance %s: %s", st.Status, st.Message))
+			return r.fail(ctx, row.ID, fmt.Errorf("instance failed: %s", st.Message))
+		case statusTerminated:
+			// Gone, not crashed (an agent restart, a reboot): drop the stale
+			// record and fall through to start it again in this same pass.
+			if delErr := r.cluster.DeleteInstance(ctx, cluster.AllTenants(), instanceID); delErr != nil {
+				log.Printf("inferencereconciler: cleanup of terminated instance %s failed: %v", instanceID, delErr)
+			}
 		default:
 			return r.nodeSvcs.ReportObserved(ctx, row.ID, nodeservices.ObservedPending, nil, nil)
 		}

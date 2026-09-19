@@ -636,3 +636,31 @@ func TestReconcile_MLXEvictsOlderModelToMakeRoom(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+// A mounted row whose instance was reported terminated (an agent restart
+// stopped it) is recreated in the SAME pass, not routed through an error.
+func TestReconcile_TerminatedInstanceIsRecreatedInSamePass(t *testing.T) {
+	nsSvc, nsMock, d1 := newNodeServicesMock(t)
+	defer d1()
+	nodesSvc, nodesMock, d2 := newNodesMock(t)
+	defer d2()
+	rowID, nodeID := uuid.New(), uuid.New()
+	expectRowAndNode(nsMock, nodesMock, rowID, nodeID, mlxConfig(), "mounted", "mounted", "home")
+	nsMock.ExpectExec(`UPDATE compute\.node_services\s+SET observed_state`).
+		WithArgs("pending", nil, nil, rowID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	fake := &fakeClusterClient{statusFunc: func() (*cluster.InstanceStatus, error) {
+		return &cluster.InstanceStatus{Status: "terminated", Message: "instance did not survive an agent restart"}, nil
+	}}
+	r := New(nsSvc, nodesSvc, fake, EngineConfig{})
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !fake.deleteCalled || !fake.createCalled {
+		t.Errorf("delete=%v create=%v, want both (stale record dropped, instance recreated)", fake.deleteCalled, fake.createCalled)
+	}
+	if err := nsMock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}

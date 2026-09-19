@@ -81,6 +81,11 @@ func (r *Runtime) reapStale() {
 		return
 	}
 	for _, rec := range records {
+		// Whether killed here or already dead, this instance did not survive
+		// the restart, and the control plane needs to be told.
+		if rec.Name != "" {
+			r.goneAtStartup = append(r.goneAtStartup, rec.Name)
+		}
 		if rec.PID <= 0 || rec.Exe == "" {
 			continue
 		}

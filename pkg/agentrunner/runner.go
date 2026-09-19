@@ -137,6 +137,9 @@ type Runner struct {
 	// chunks arrive as SEPARATE messages, each independently dispatched,
 	// so without this a body chunk would have no way to reach the
 	// goroutine actually waiting for it.
+	// startupGoneOnce makes reportGoneAtStartup fire once per process.
+	startupGoneOnce sync.Once
+
 	proxyBodies   map[string]chan *agentpb.ProxyData
 	proxyBodiesMu sync.Mutex
 
@@ -241,6 +244,8 @@ func (r *Runner) Run(ctx context.Context, s stream) error {
 	// and leak every goroutine from every past connection. Defers run in
 	// reverse order, so this is declared AFTER the WaitGroup defer.
 	ctx, cancel := context.WithCancel(ctx)
+
+	r.reportGoneAtStartup(s)
 
 	// Inventory immediately on connect: the control plane treats every
 	// reconnect as a fresh source of truth and has no capacity data
@@ -1517,4 +1522,33 @@ func (r *Runner) proxyBodyChannel(requestID string) chan *agentpb.ProxyData {
 		r.proxyBodies[requestID] = ch
 	}
 	return ch
+}
+
+// reportGoneAtStartup tells the control plane, once per process, about
+// instances a previous run of this agent had recorded that did not survive
+// the restart. The status sweep's own "gone" detection only covers instances
+// seen earlier in THIS connection, so a restart (every agent update) would
+// otherwise leave the control plane's cached "running" entry in place
+// forever. Once only, on purpose: instance IDs are deterministic, so
+// repeating it on a later reconnect could mark a freshly remounted instance
+// terminated.
+func (r *Runner) reportGoneAtStartup(s stream) {
+	sr, ok := r.cfg.Cluster.(cluster.StartupReporter)
+	if !ok {
+		return
+	}
+	r.startupGoneOnce.Do(func() {
+		for _, id := range sr.InstancesGoneAtStartup() {
+			_ = r.send(s, &agentpb.AgentMessage{
+				Payload: &agentpb.AgentMessage_InstanceStatus{
+					InstanceStatus: &agentpb.InstanceStatus{
+						InstanceId: id,
+						Status:     "terminated",
+						Message:    "instance did not survive an agent restart",
+						ObservedAt: timestamppb.Now(),
+					},
+				},
+			})
+		}
+	})
 }

@@ -115,3 +115,21 @@ func (s *SplitClient) ResolveInstanceAddress(ctx context.Context, id string, por
 	}
 	return s.containers.ResolveInstanceAddress(ctx, id, port)
 }
+
+// StartupReporter is implemented by runtimes that can tell which instances a
+// previous run of the agent left recorded but that no longer exist.
+type StartupReporter interface {
+	InstancesGoneAtStartup() []string
+}
+
+// InstancesGoneAtStartup delegates to the native runtime; container
+// instances survive an agent restart (Kubernetes owns them), so there is
+// nothing to report for them.
+func (s *SplitClient) InstancesGoneAtStartup() []string {
+	if sr, ok := s.native.(StartupReporter); ok {
+		return sr.InstancesGoneAtStartup()
+	}
+	return nil
+}
+
+var _ StartupReporter = (*SplitClient)(nil)

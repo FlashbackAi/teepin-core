@@ -288,3 +288,33 @@ func TestReapStale_OnlySignalsProcessesThatStillMatch(t *testing.T) {
 		t.Error("pid registry was not cleared after reaping")
 	}
 }
+
+// Every instance a previous run recorded is reported as gone-at-startup —
+// whether it was reaped or was already dead — so the control plane can drop
+// its stale "running" entry.
+func TestReapStale_RecordsEveryRecordedInstanceAsGone(t *testing.T) {
+	orig := processCommand
+	t.Cleanup(func() { processCommand = orig })
+	processCommand = func(pid int) string {
+		if pid == 111 {
+			return "/opt/homebrew/bin/mlx_lm.server --model x"
+		}
+		return "" // 222 is already dead (e.g. after a reboot)
+	}
+	origStop := stopPID
+	t.Cleanup(func() { stopPID = origStop })
+	stopPID = func(int) {}
+
+	rt := &Runtime{cfg: Config{StateDir: t.TempDir()}, instances: map[string]*instance{}}
+	if err := os.WriteFile(rt.pidFile(),
+		[]byte(`[{"pid":111,"exe":"/opt/homebrew/bin/mlx_lm.server","instance_id":"a"},`+
+			`{"pid":222,"exe":"/opt/homebrew/bin/mlx_lm.server","instance_id":"b"}]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rt.reapStale()
+
+	got := rt.InstancesGoneAtStartup()
+	if len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Errorf("InstancesGoneAtStartup = %v, want [a b]", got)
+	}
+}

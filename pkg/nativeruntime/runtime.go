@@ -74,6 +74,12 @@ type Runtime struct {
 
 	mu        sync.Mutex
 	instances map[string]*instance
+
+	// goneAtStartup lists instances a previous run of this agent had recorded
+	// that are no longer running (reaped as orphans, or already dead after a
+	// reboot). The control plane still believes they are running; see
+	// InstancesGoneAtStartup.
+	goneAtStartup []string
 }
 
 var _ cluster.Client = (*Runtime)(nil)
@@ -104,6 +110,17 @@ func New(cfg Config) (*Runtime, error) {
 	r := &Runtime{cfg: cfg, instances: make(map[string]*instance)}
 	r.reapStale()
 	return r, nil
+}
+
+// InstancesGoneAtStartup returns the IDs of instances the previous run left
+// recorded but that did not survive to this one. The agent reports them
+// terminated once after connecting: its own record of what it had reported is
+// per-connection, so without this the control plane keeps a stale "running"
+// entry forever and never remounts a model an agent update just stopped.
+func (r *Runtime) InstancesGoneAtStartup() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.goneAtStartup...)
 }
 
 func (r *Runtime) stopGrace() time.Duration {
