@@ -316,6 +316,44 @@ func (a *hiddenWorkloadAdapter) HiddenUsageByNode(ctx context.Context) (map[stri
 	return out, nil
 }
 
+// nodeCapacityAdapter makes *nodes.Service satisfy kumbha.NodeCapacityLister,
+// translating nodes.NodeCapacity into the neutral kumbha.CapacityCandidate —
+// so pkg/kumbha never imports pkg/nodes. Filters to home nodes currently
+// online, the same predicate HomeCapacitySummary applies internally
+// (capacity.go:268) — a datacenter node or an offline home node is never a
+// candidate for Kumbha's own agent pod placement. Exists specifically to
+// fix a live incident: LaunchAgent used to dispatch via
+// cluster.Registry.Any() (a capacity-blind, randomized pick among connected
+// sessions), which landed a build on a home node with zero free memory and
+// left the pod Pending forever with no explanation — confirmed via
+// `kubectl describe pod` showing "Insufficient memory" on 2026-09-22.
+type nodeCapacityAdapter struct {
+	svc *nodes.Service
+}
+
+func newNodeCapacityAdapter(svc *nodes.Service) *nodeCapacityAdapter {
+	return &nodeCapacityAdapter{svc: svc}
+}
+
+func (a *nodeCapacityAdapter) ListNodeCapacity(ctx context.Context) ([]kumbha.CapacityCandidate, error) {
+	all, err := a.svc.ListNodeCapacity(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]kumbha.CapacityCandidate, 0, len(all))
+	for _, c := range all {
+		if c.Class != nodes.ClassHome || c.Status != nodes.StatusOnline {
+			continue
+		}
+		out = append(out, kumbha.CapacityCandidate{
+			ProviderID: c.ProviderID,
+			FreeCPU:    c.FreeCPU,
+			FreeMemGB:  c.FreeMemGB,
+		})
+	}
+	return out, nil
+}
+
 // instanceProxyTarget makes *compute.Store (+ a *cluster.Registry for the
 // single-session fallback below) satisfy cluster.ProxyTarget — the Stage 3
 // tunnel's hostname-to-session lookup (plan B2). Lives here, not in

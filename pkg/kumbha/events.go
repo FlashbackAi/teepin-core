@@ -129,7 +129,20 @@ func (s *EventTicketStore) Reap(ctx context.Context) {
 // by mistake, this allowlist strips it before the browser ever sees a
 // byte — re-encoding from named fields, not a denylist that would need to
 // be remembered to update.
-var eventFieldAllowlist = []string{"type", "tool", "summary", "ts"}
+//
+// role/diff/reasoning/tasks/is_error were added to run.py's emitted JSON
+// (best-practices feature work: live task list, diff view, reasoning
+// display, tool success/fail state) but this allowlist was never updated
+// alongside them — found live 2026-09-22: a session's entire chat feed
+// (including the customer's own echoed message) silently rendered as
+// nothing, because the console's parseMessage(summary, role, reasoning)
+// returns [] whenever role is missing, and this allowlist was stripping
+// role from every "message" line before it ever left the control plane.
+// A field belongs here the moment the console's KumbhaEvent type
+// (teepin-console/src/lib/api/types.ts) is extended to read it — the two
+// must be kept in lockstep, since a silently-dropped field fails exactly
+// this way: the browser never sees an error, it just renders nothing.
+var eventFieldAllowlist = []string{"type", "tool", "summary", "ts", "role", "diff", "reasoning", "tasks", "is_error"}
 
 // sanitizeEventLine parses one JSON line from the agent pod's stdout and
 // re-encodes only the allowlisted fields. Returns ok=false for a blank or

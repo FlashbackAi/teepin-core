@@ -51,7 +51,35 @@ func TestSanitizeEventLine_StripsUnknownFieldsIncludingHypotheticalModelField(t 
 		}
 	}
 	if len(got) != 4 {
-		t.Errorf("got %d fields, want exactly the 4 allowlisted ones: %+v", len(got), got)
+		t.Errorf("got %d fields, want exactly the 4 allowlisted fields present in this input (type/tool/summary/ts — the allowlist itself has grown since, see TestSanitizeEventLine_PassesThroughRoleDiffReasoningTasksAndIsError): %+v", len(got), got)
+	}
+}
+
+// Regression test for a live incident (2026-09-22): role/diff/reasoning/
+// tasks/is_error were added to run.py's wire format and to the console's
+// KumbhaEvent type, but this allowlist was never updated to match — every
+// "message" event silently rendered as nothing in the browser, because
+// parseMessage(summary, role, reasoning) returns [] whenever role is
+// missing (session-panel.tsx), and role was being stripped here before it
+// ever left the control plane. The customer's own echoed "Resume" message
+// vanishing from the feed was the first visible symptom.
+func TestSanitizeEventLine_PassesThroughRoleDiffReasoningTasksAndIsError(t *testing.T) {
+	sanitized, ok := sanitizeEventLine([]byte(
+		`{"type":"message","role":"agent","summary":"done","ts":1,` +
+			`"reasoning":"thought about it","diff":"--- a\n+++ b\n","is_error":true,` +
+			`"tasks":[{"title":"t1","notes":"","status":"todo"}]}`,
+	))
+	if !ok {
+		t.Fatal("expected sanitisation to succeed")
+	}
+	var got map[string]any
+	if err := json.Unmarshal(sanitized, &got); err != nil {
+		t.Fatalf("sanitized output is not valid JSON: %v", err)
+	}
+	for _, field := range []string{"role", "diff", "reasoning", "tasks", "is_error"} {
+		if _, present := got[field]; !present {
+			t.Errorf("allowlisted field %q was dropped — this is exactly the live incident this test pins", field)
+		}
 	}
 }
 

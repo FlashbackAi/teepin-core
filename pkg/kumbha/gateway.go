@@ -139,6 +139,12 @@ type Gateway struct {
 	// for a route keeps working unchanged.
 	candidates CandidateSource
 	factory    CandidateBuilder
+
+	// nodeCapacity is OPTIONAL — nil means LaunchAgent/CaptureScreenshot
+	// fall back to cluster.Client's own placement (registry.Any() for the
+	// tunnel-based home path, a random pick among every connected node
+	// with zero regard for free CPU/memory). Set via WithNodeCapacity.
+	nodeCapacity NodeCapacityLister
 }
 
 func NewGateway(store *Store, router *Router, gate ProvisionGate, pricing PricingProvider, usage UsageRecorder) *Gateway {
@@ -168,6 +174,16 @@ func (g *Gateway) WithModelPricing(p ModelPricingProvider) *Gateway {
 func (g *Gateway) WithCandidates(store CandidateSource, factory CandidateBuilder) *Gateway {
 	g.candidates = store
 	g.factory = factory
+	return g
+}
+
+// WithNodeCapacity enables capacity-aware placement for the agent's own
+// pods (LaunchAgent, CaptureScreenshot) — picking a home node that
+// actually has room, instead of cluster.Registry.Any()'s blind random
+// pick among every connected node regardless of free CPU/memory. Returns
+// the same *Gateway for chaining, matching every other With* builder here.
+func (g *Gateway) WithNodeCapacity(lister NodeCapacityLister) *Gateway {
+	g.nodeCapacity = lister
 	return g
 }
 

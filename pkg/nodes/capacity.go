@@ -61,6 +61,14 @@ func (s *Service) SetReservation(ctx context.Context, nodeID uuid.UUID, cpuCores
 type NodeCapacity struct {
 	NodeID        uuid.UUID `json:"node_id"`
 	NodeName      string    `json:"node_name"`
+	// ProviderID is what cluster.Registry keys its live agent sessions by
+	// (see AgentSession.ProviderID) — added specifically so a capacity-
+	// aware caller (kumbha.LaunchAgent) can go from "this node has room"
+	// straight to "dispatch to THIS session", the same identifier
+	// cluster.Client.CreateInstance already accepts via
+	// InstanceSpec.ProviderID. Not previously selected here because
+	// nothing outside this package needed it before now.
+	ProviderID    string    `json:"provider_id"`
 	Class         string    `json:"class"`
 	Status        string    `json:"status"`
 	DetectedCPU   int       `json:"detected_cpu_cores"`
@@ -123,7 +131,7 @@ func (s *Service) WithHiddenWorkloadCounter(c HiddenWorkloadCounter) *Service {
 // negative number.
 func (s *Service) ListNodeCapacity(ctx context.Context) ([]NodeCapacity, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT n.id, n.node_name, n.class, n.status,
+		SELECT n.id, n.node_name, n.provider_id, n.class, n.status,
 		       COALESCE(n.cpu_cores,0), COALESCE(n.memory_gb,0),
 		       n.rentable_cpu_cores, n.rentable_memory_gb,
 		       COALESCE(u.used_cpu,0), COALESCE(u.used_mem,0)
@@ -146,7 +154,7 @@ func (s *Service) ListNodeCapacity(ctx context.Context) ([]NodeCapacity, error) 
 	out := []NodeCapacity{}
 	for rows.Next() {
 		var c NodeCapacity
-		if err := rows.Scan(&c.NodeID, &c.NodeName, &c.Class, &c.Status,
+		if err := rows.Scan(&c.NodeID, &c.NodeName, &c.ProviderID, &c.Class, &c.Status,
 			&c.DetectedCPU, &c.DetectedMemGB, &c.RentableCPU, &c.RentableMemGB,
 			&c.UsedCPU, &c.UsedMemGB); err != nil {
 			return nil, fmt.Errorf("failed to scan node capacity: %w", err)

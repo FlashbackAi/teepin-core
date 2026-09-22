@@ -194,6 +194,82 @@ func (g *Gateway) checkRouteAvailable(ctx context.Context, route string) error {
 	return nil
 }
 
+// CapacityCandidate is one node's identity plus free room — the minimum
+// pickNodeWithCapacity needs, deliberately NOT pkg/nodes.NodeCapacity
+// directly (that package's own HiddenWorkloadCounter doc comment already
+// establishes the precedent: a small local interface/type here instead of
+// importing pkg/nodes, the same reasoning NodePlacer/ProjectPolicy use
+// elsewhere in this codebase — pkg/kumbha has no other reason to know
+// pkg/nodes exists).
+type CapacityCandidate struct {
+	// ProviderID is what cluster.Registry keys live agent sessions by and
+	// what InstanceSpec.ProviderID/cluster.ByProvider expect — the exact
+	// identifier that turns "this node has room" into "dispatch here".
+	ProviderID string
+	FreeCPU    int
+	FreeMemGB  int
+}
+
+// NodeCapacityLister is the subset of nodes.Service LaunchAgent/
+// CaptureScreenshot need to place the agent's own pods on a node that
+// actually has room, instead of cluster.Registry.Any()'s blind random pick
+// among every connected home node with zero regard for free CPU/memory.
+// Implemented by *nodes.Service via a small adapter in cmd/api-server
+// (mirrors modelcatalog.Service's own ModelPricing method shape: the
+// concrete service grows one small method rather than this package
+// depending on the whole nodes package). Optional on Gateway — nil (no
+// WithNodeCapacity call) keeps today's Any()-based behaviour unchanged.
+type NodeCapacityLister interface {
+	ListNodeCapacity(ctx context.Context) ([]CapacityCandidate, error)
+}
+
+// ErrNoCapacity means no currently-connected node has enough free CPU/
+// memory for the agent's own pod — returned instead of dispatching blind
+// and letting Kubernetes discover the shortfall itself, which is how a
+// build previously sat silently Pending for however long an operator took
+// to notice (found live 2026-09-22: a build landed on a home node with
+// zero free memory purely by the luck of Go's randomized map iteration in
+// registry.Any(), a node genuinely unable to run it, while two other
+// connected nodes sat mostly idle at the same moment).
+var ErrNoCapacity = errors.New("no connected node currently has room for the build agent")
+
+// pickNodeWithCapacity returns the ProviderID of a connected node with at
+// least cpuUnits/memoryGB free, preferring the one with the MOST free CPU
+// (a simple least-loaded strategy — spreads load across nodes rather than
+// packing them one at a time, and needs no more information than
+// ListNodeCapacity already returns). Returns ("", nil) — not an error —
+// when g.nodeCapacity is not configured at all, so callers fall back to
+// cluster.Client's own placement exactly as before this existed.
+func (g *Gateway) pickNodeWithCapacity(ctx context.Context, cpuUnits, memoryGB int) (string, error) {
+	if g.nodeCapacity == nil {
+		return "", nil
+	}
+	candidates, err := g.nodeCapacity.ListNodeCapacity(ctx)
+	if err != nil {
+		// Fails open to cluster.Client's own placement rather than
+		// blocking every build launch over a capacity-lookup blip — the
+		// worst case reverts to today's pre-existing random-pick
+		// behaviour, not a new failure mode.
+		log.Printf("WARN: could not list node capacity before launch, falling back to unweighted placement: %v", err)
+		return "", nil
+	}
+	best := ""
+	bestFreeCPU := -1
+	for _, c := range candidates {
+		if c.FreeCPU < cpuUnits || c.FreeMemGB < memoryGB {
+			continue
+		}
+		if c.FreeCPU > bestFreeCPU {
+			best = c.ProviderID
+			bestFreeCPU = c.FreeCPU
+		}
+	}
+	if best == "" {
+		return "", ErrNoCapacity
+	}
+	return best, nil
+}
+
 func (g *Gateway) LaunchAgent(ctx context.Context, sess *Session, prompt string) error {
 	if g.cluster == nil || g.mintToken == nil {
 		return ErrAgentNotConfigured
@@ -218,6 +294,17 @@ func (g *Gateway) LaunchAgent(ctx context.Context, sess *Session, prompt string)
 		return fmt.Errorf("failed to mint agent credential: %w", err)
 	}
 
+	// Picks a node that actually has room instead of leaving it to
+	// cluster.Client's own Any() (a blind random pick among every
+	// connected node) — see pickNodeWithCapacity's own doc comment for
+	// the live incident this fixes. Empty providerID (nodeCapacity not
+	// configured) is passed through unchanged to InstanceSpec, which is
+	// exactly today's pre-existing behaviour.
+	providerID, err := g.pickNodeWithCapacity(ctx, g.agentConfig.CPUUnits, g.agentConfig.MemoryGB)
+	if err != nil {
+		return err
+	}
+
 	// Short and deterministic from the session id, matching the existing
 	// "inst-<short-uuid>" convention compute instances already use, so an
 	// operator recognises the shape immediately in kubectl/logs even
@@ -228,6 +315,7 @@ func (g *Gateway) LaunchAgent(ctx context.Context, sess *Session, prompt string)
 		InstanceID: podID,
 		AccountID:  sess.AccountID.String(),
 		ProjectID:  sess.ProjectID.String(),
+		ProviderID: providerID,
 		Image:      g.agentConfig.Image,
 		Env: map[string]string{
 			// The agent's own credential and everything it needs to start
@@ -424,10 +512,21 @@ func (g *Gateway) CaptureScreenshot(ctx context.Context, sess *Session, targetUR
 	podID := "kumbha-shot-" + sess.ID.String()[:8]
 	scope := cluster.ProjectScope(sess.ProjectID.String())
 
+	// Same capacity-aware placement as LaunchAgent's own pod — see
+	// pickNodeWithCapacity's doc comment. This pod is small
+	// (ScreenshotCPUUnits/ScreenshotMemoryGB), so it's a much rarer miss
+	// than the main agent pod, but there's no reason to leave it on the
+	// blind-random path just because it's usually fine.
+	providerID, err := g.pickNodeWithCapacity(ctx, ScreenshotCPUUnits, ScreenshotMemoryGB)
+	if err != nil {
+		return err
+	}
+
 	spec := cluster.InstanceSpec{
 		InstanceID: podID,
 		AccountID:  sess.AccountID.String(),
 		ProjectID:  sess.ProjectID.String(),
+		ProviderID: providerID,
 		Image:      g.agentConfig.Image,
 		Command:    []string{screenshotBinaryPath},
 		Env: map[string]string{

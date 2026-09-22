@@ -885,6 +885,18 @@ func main() {
 				kumbhaFactory := kumbha.NewProviderFactory(kumbhaSecrets, environment)
 				kumbhaGateway = kumbhaGateway.WithCandidates(kumbhaCandidateStore, kumbhaFactory)
 
+				// Capacity-aware placement for Kumbha's own agent/screenshot
+				// pods (LaunchAgent/CaptureScreenshot) — see
+				// nodeCapacityAdapter's own doc comment for the live
+				// incident this fixes. nodeService is nil only in a
+				// deployment with home-node enrollment entirely disabled,
+				// which leaves LaunchAgent falling back to its prior
+				// capacity-blind cluster.Registry.Any() dispatch exactly as
+				// before this existed.
+				if nodeService != nil {
+					kumbhaGateway = kumbhaGateway.WithNodeCapacity(newNodeCapacityAdapter(nodeService))
+				}
+
 				kumbhaRouteMonitor := kumbha.NewRouteMonitor(routes).WithCandidates(kumbhaCandidateStore, kumbhaFactory)
 				kumbhaRouteMonitor.CheckNow(context.Background()) // first reading before anything reads Statuses()
 				go kumbhaRouteMonitor.Start(context.Background(), time.Duration(getEnvInt("TEEPIN_KUMBHA_ROUTE_HEALTH_INTERVAL_SECONDS", 60))*time.Second)

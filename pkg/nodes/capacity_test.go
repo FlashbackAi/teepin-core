@@ -78,10 +78,10 @@ func TestListNodeCapacity_DerivesFree(t *testing.T) {
 	// 24 rentable CPU, two instances holding 4+8 = 12 used -> 12 free.
 	mock.ExpectQuery(`SELECT n\.id, n\.node_name.*FROM compute\.nodes n\s+LEFT JOIN`).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "node_name", "class", "status",
+			"id", "node_name", "provider_id", "class", "status",
 			"cpu_cores", "memory_gb", "rentable_cpu_cores", "rentable_memory_gb",
 			"used_cpu", "used_mem",
-		}).AddRow(id, "srialla", "home", "online", 32, 64, 24, 48, 12, 24))
+		}).AddRow(id, "srialla", "srialla", "home", "online", 32, 64, 24, 48, 12, 24))
 
 	caps, err := s.ListNodeCapacity(context.Background())
 	if err != nil {
@@ -120,10 +120,10 @@ func TestListNodeCapacity_AddsHiddenWorkloadUsage(t *testing.T) {
 	// hidden-workload addition.
 	mock.ExpectQuery(`SELECT n\.id, n\.node_name.*FROM compute\.nodes n\s+LEFT JOIN`).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "node_name", "class", "status",
+			"id", "node_name", "provider_id", "class", "status",
 			"cpu_cores", "memory_gb", "rentable_cpu_cores", "rentable_memory_gb",
 			"used_cpu", "used_mem",
-		}).AddRow(id, "srialla", "home", "online", 32, 64, 24, 48, 12, 24))
+		}).AddRow(id, "srialla", "srialla", "home", "online", 32, 64, 24, 48, 12, 24))
 
 	s.WithHiddenWorkloadCounter(&fakeHiddenCounter{
 		usage: map[string]HiddenUsage{"srialla": {CPUCores: 2, MemoryGB: 4}},
@@ -153,10 +153,10 @@ func TestListNodeCapacity_HiddenCounterErrorFailsOpen(t *testing.T) {
 
 	mock.ExpectQuery(`SELECT n\.id, n\.node_name.*FROM compute\.nodes n\s+LEFT JOIN`).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "node_name", "class", "status",
+			"id", "node_name", "provider_id", "class", "status",
 			"cpu_cores", "memory_gb", "rentable_cpu_cores", "rentable_memory_gb",
 			"used_cpu", "used_mem",
-		}).AddRow(id, "srialla", "home", "online", 32, 64, 24, 48, 12, 24))
+		}).AddRow(id, "srialla", "srialla", "home", "online", 32, 64, 24, 48, 12, 24))
 
 	s.WithHiddenWorkloadCounter(&fakeHiddenCounter{err: errors.New("agent unreachable")})
 
@@ -180,10 +180,10 @@ func TestHomeCapacitySummary_PriceFromRates(t *testing.T) {
 	// One online home node with 8 vCPU / 16 GB free.
 	mock.ExpectQuery(`SELECT n\.id, n\.node_name.*FROM compute\.nodes n`).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "node_name", "class", "status",
+			"id", "node_name", "provider_id", "class", "status",
 			"cpu_cores", "memory_gb", "rentable_cpu_cores", "rentable_memory_gb",
 			"used_cpu", "used_mem",
-		}).AddRow(uuid.New(), "n", "home", "online", 32, 64, 8, 16, 0, 0))
+		}).AddRow(uuid.New(), "n", "n", "home", "online", 32, 64, 8, 16, 0, 0))
 	// Tier table (no price column selected now — price is computed).
 	mock.ExpectQuery(`SELECT id, name, cpu_units, memory_gb\s+FROM compute\.instance_types`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "cpu_units", "memory_gb"}).
@@ -216,10 +216,10 @@ func TestListNodeCapacity_FreeClampedAtZero(t *testing.T) {
 	// Reservation lowered to 4, but 8 already in use -> free 0, not -4.
 	mock.ExpectQuery(`SELECT n\.id, n\.node_name.*FROM compute\.nodes n`).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "node_name", "class", "status",
+			"id", "node_name", "provider_id", "class", "status",
 			"cpu_cores", "memory_gb", "rentable_cpu_cores", "rentable_memory_gb",
 			"used_cpu", "used_mem",
-		}).AddRow(id, "n", "home", "online", 32, 64, 4, 8, 8, 16))
+		}).AddRow(id, "n", "n", "home", "online", 32, 64, 4, 8, 8, 16))
 
 	caps, _ := s.ListNodeCapacity(context.Background())
 	if caps[0].FreeCPU != 0 || caps[0].FreeMemGB != 0 {

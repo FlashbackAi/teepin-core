@@ -80,6 +80,16 @@ func (f *fakeCluster) ResolveInstanceAddress(context.Context, string, int32) (st
 	return "", cluster.ErrNotFound
 }
 
+// fakeCapacityLister is a canned NodeCapacityLister for placement tests.
+type fakeCapacityLister struct {
+	candidates []CapacityCandidate
+	err        error
+}
+
+func (f *fakeCapacityLister) ListNodeCapacity(context.Context) ([]CapacityCandidate, error) {
+	return f.candidates, f.err
+}
+
 // testAgentRouter satisfies LaunchAgent's route pre-flight check
 // (checkRouteAvailable) for tests exercising launch mechanics rather than
 // routing itself — teepin/fast is the implicit default when
@@ -190,6 +200,138 @@ func TestGateway_LaunchAgent_Success(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Error(err)
+	}
+}
+
+// Capacity-aware placement (WithNodeCapacity) — see pickNodeWithCapacity's
+// own doc comment for the live incident this exists to prevent: a build
+// landing on a node with zero free memory purely by the luck of Go's
+// randomized map iteration in cluster.Registry.Any().
+
+func TestGateway_LaunchAgent_PicksNodeWithEnoughCapacity(t *testing.T) {
+	store, mock := newMockStore(t)
+	fc := &fakeCluster{}
+	lister := &fakeCapacityLister{candidates: []CapacityCandidate{
+		{ProviderID: "mac-node", FreeCPU: 1, FreeMemGB: 1},  // insufficient — must be skipped
+		{ProviderID: "srialla", FreeCPU: 16, FreeMemGB: 12}, // sufficient
+	}}
+	gw := NewGateway(store, testAgentRouter(), nil, &fakePricing{}, &fakeUsageRecorder{}).
+		WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest", CPUUnits: 2, MemoryGB: 4}).
+		WithNodeCapacity(lister)
+
+	sessID := uuid.New()
+	sess := &Session{ID: sessID, AccountID: uuid.New(), ProjectID: uuid.New()}
+	mock.ExpectExec(`UPDATE billing\.inference_sessions SET agent_instance_id`).
+		WithArgs(sessID, "kumbha-agent-"+sessID.String()[:8]).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := gw.LaunchAgent(context.Background(), sess, "build me a booking app"); err != nil {
+		t.Fatalf("LaunchAgent: %v", err)
+	}
+	if len(fc.created) != 1 {
+		t.Fatalf("got %d CreateInstance calls, want 1", len(fc.created))
+	}
+	if got := fc.created[0].ProviderID; got != "srialla" {
+		t.Errorf("ProviderID = %q, want the only candidate with enough room (srialla)", got)
+	}
+}
+
+func TestGateway_LaunchAgent_PrefersNodeWithMostFreeCPU(t *testing.T) {
+	store, mock := newMockStore(t)
+	fc := &fakeCluster{}
+	lister := &fakeCapacityLister{candidates: []CapacityCandidate{
+		{ProviderID: "fblabs01", FreeCPU: 6, FreeMemGB: 8},
+		{ProviderID: "srialla", FreeCPU: 16, FreeMemGB: 12}, // most free CPU — should win
+	}}
+	gw := NewGateway(store, testAgentRouter(), nil, &fakePricing{}, &fakeUsageRecorder{}).
+		WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest", CPUUnits: 2, MemoryGB: 4}).
+		WithNodeCapacity(lister)
+
+	sessID := uuid.New()
+	sess := &Session{ID: sessID, AccountID: uuid.New(), ProjectID: uuid.New()}
+	mock.ExpectExec(`UPDATE billing\.inference_sessions SET agent_instance_id`).
+		WithArgs(sessID, "kumbha-agent-"+sessID.String()[:8]).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := gw.LaunchAgent(context.Background(), sess, "build me a booking app"); err != nil {
+		t.Fatalf("LaunchAgent: %v", err)
+	}
+	if got := fc.created[0].ProviderID; got != "srialla" {
+		t.Errorf("ProviderID = %q, want the node with the most free CPU (srialla)", got)
+	}
+}
+
+// The exact live incident: every connected node reports insufficient
+// capacity — refuse up front with ErrNoCapacity rather than dispatching
+// blind and letting the pod sit Pending forever with nothing explaining
+// why.
+func TestGateway_LaunchAgent_NoCapacityAnywhereRefusesUpFront(t *testing.T) {
+	store, _ := newMockStore(t)
+	fc := &fakeCluster{}
+	lister := &fakeCapacityLister{candidates: []CapacityCandidate{
+		{ProviderID: "mac-node", FreeCPU: 0, FreeMemGB: 0},
+		{ProviderID: "fblabs01", FreeCPU: 1, FreeMemGB: 1},
+	}}
+	gw := NewGateway(store, testAgentRouter(), nil, &fakePricing{}, &fakeUsageRecorder{}).
+		WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest", CPUUnits: 2, MemoryGB: 4}).
+		WithNodeCapacity(lister)
+
+	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), ProjectID: uuid.New()}
+	err := gw.LaunchAgent(context.Background(), sess, "build me a booking app")
+	if !errors.Is(err, ErrNoCapacity) {
+		t.Fatalf("got %v, want ErrNoCapacity", err)
+	}
+	if len(fc.created) != 0 {
+		t.Error("CreateInstance was called despite no node having capacity — should have refused up front")
+	}
+}
+
+// A capacity-lookup failure fails OPEN (falls back to cluster.Client's own
+// placement) rather than blocking every build launch over a transient
+// lookup blip — the worst case reverts to pre-existing behaviour, not a
+// new failure mode.
+func TestGateway_LaunchAgent_CapacityLookupErrorFailsOpen(t *testing.T) {
+	store, mock := newMockStore(t)
+	fc := &fakeCluster{}
+	lister := &fakeCapacityLister{err: errors.New("nodes service unreachable")}
+	gw := NewGateway(store, testAgentRouter(), nil, &fakePricing{}, &fakeUsageRecorder{}).
+		WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest", CPUUnits: 2, MemoryGB: 4}).
+		WithNodeCapacity(lister)
+
+	sessID := uuid.New()
+	sess := &Session{ID: sessID, AccountID: uuid.New(), ProjectID: uuid.New()}
+	mock.ExpectExec(`UPDATE billing\.inference_sessions SET agent_instance_id`).
+		WithArgs(sessID, "kumbha-agent-"+sessID.String()[:8]).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := gw.LaunchAgent(context.Background(), sess, "build me a booking app"); err != nil {
+		t.Fatalf("LaunchAgent should fail open on a capacity-lookup error, got: %v", err)
+	}
+	if got := fc.created[0].ProviderID; got != "" {
+		t.Errorf("ProviderID = %q, want empty (falls back to cluster.Client's own placement)", got)
+	}
+}
+
+// No WithNodeCapacity call at all keeps today's pre-existing behaviour
+// exactly as it was — an empty ProviderID, left to cluster.Client's own
+// placement (registry.Any() for the tunnel-based home path).
+func TestGateway_LaunchAgent_NoCapacityListerConfiguredLeavesProviderIDEmpty(t *testing.T) {
+	store, mock := newMockStore(t)
+	fc := &fakeCluster{}
+	gw := NewGateway(store, testAgentRouter(), nil, &fakePricing{}, &fakeUsageRecorder{}).
+		WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest", CPUUnits: 2, MemoryGB: 4})
+
+	sessID := uuid.New()
+	sess := &Session{ID: sessID, AccountID: uuid.New(), ProjectID: uuid.New()}
+	mock.ExpectExec(`UPDATE billing\.inference_sessions SET agent_instance_id`).
+		WithArgs(sessID, "kumbha-agent-"+sessID.String()[:8]).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := gw.LaunchAgent(context.Background(), sess, "build me a booking app"); err != nil {
+		t.Fatalf("LaunchAgent: %v", err)
+	}
+	if got := fc.created[0].ProviderID; got != "" {
+		t.Errorf("ProviderID = %q, want empty — no capacity lister was configured", got)
 	}
 }
 
