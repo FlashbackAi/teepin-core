@@ -92,6 +92,15 @@ var (
 	// can return a clear "nothing running" 409 rather than a confusing
 	// "not available on this deployment".
 	ErrAgentNotRunning = errors.New("no agent is currently running for this session")
+	// ErrAgentRouteUnavailable means LaunchAgent's pre-flight check found
+	// the build agent's configured route disabled or unresolvable — the
+	// launch is refused before a pod is ever created, rather than
+	// producing a pod that is guaranteed to fail its first completion
+	// silently. The HTTP layer must respond with a generic message, never
+	// this error's own %w-wrapped detail (which names the route) — same
+	// "never reveal route identity to a customer" rule as everywhere else
+	// route health is checked.
+	ErrAgentRouteUnavailable = errors.New("the build agent's configured route is not currently available")
 )
 
 // Gateway is the Kumbha Gateway's business logic — the request lifecycle

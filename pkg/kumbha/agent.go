@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/FlashbackAi/teepin-core/pkg/cluster"
+	"github.com/FlashbackAi/teepin-core/pkg/inference"
 )
 
 // AgentConfig is the fixed platform policy every session's agent pod runs
@@ -151,9 +153,64 @@ const internalScratchPathInstruction = "Keep any of your own internal working no
 	"\"" + InternalScratchDir + "/\" is ever shown to the customer, deployed, or included in their downloads " +
 	"— it exists purely for your own use across relaunches of this same session.\n\n"
 
+// defaultAgentRoute mirrors the agent image's OWN fallback when
+// AgentConfig.Route is unset — that default lives in a separate codebase
+// (the agent image itself), not here, but main.go/dev.tfvars/ecs.tf's own
+// comments already document and rely on this exact convention ("empty
+// leaves the agent image's own default (teepin/fast) untouched"). Kept as
+// one named constant, rather than a bare literal, so it's obvious this is
+// a cross-repo assumption that must move in lockstep if the image's own
+// default ever changes.
+const defaultAgentRoute = "teepin/fast"
+
+// checkRouteAvailable reports whether route currently has at least one
+// enabled, dispatchable backend — the same two checks Complete() applies
+// before every completion (resolveOrdered's candidate/static lookup, then
+// the route-level enabled flag) — run once up front by LaunchAgent so a
+// build whose configured route happens to be disabled or unconfigured
+// fails immediately with a clear error, instead of launching a pod that
+// is guaranteed to fail its very first completion silently. Found live
+// 2026-09-22: a build submitted in the exact minute teepin/fast was
+// toggled disabled (during unrelated debugging) launched its agent pod
+// successfully, then never produced any output at all, with nothing in
+// the console explaining why — the session just sat at "Idle" forever.
+func (g *Gateway) checkRouteAvailable(ctx context.Context, route string) error {
+	if _, err := g.resolveOrdered(ctx, route); err != nil {
+		return err
+	}
+	if g.routes == nil {
+		return nil
+	}
+	enabled, err := g.routes.IsEnabled(ctx, route)
+	if err != nil {
+		// Same fail-open posture Complete() uses for this exact check: a
+		// DB blip here should not block every build launch.
+		log.Printf("WARN: could not check route %q enabled before launch, allowing it: %v", route, err)
+		return nil
+	}
+	if !enabled {
+		return fmt.Errorf("%w: %q", inference.ErrUnknownModel, route)
+	}
+	return nil
+}
+
 func (g *Gateway) LaunchAgent(ctx context.Context, sess *Session, prompt string) error {
 	if g.cluster == nil || g.mintToken == nil {
 		return ErrAgentNotConfigured
+	}
+
+	route := g.agentConfig.Route
+	if route == "" {
+		route = defaultAgentRoute
+	}
+	if err := g.checkRouteAvailable(ctx, route); err != nil {
+		// The route name and underlying reason are logged (internal,
+		// operator-only) but never surfaced past this point — the HTTP
+		// layer responds to ErrAgentRouteUnavailable with a generic
+		// message, same "never reveal route identity" rule Complete()'s
+		// own disabled-route path already follows.
+		log.Printf("WARN: kumbha agent launch refused, route %q unavailable: %v", route, err)
+		return ErrAgentRouteUnavailable
 	}
 
 	token, err := g.mintToken(sess.AccountID, sess.ProjectID, sess.ID, g.agentConfig.SessionTokenTTL)

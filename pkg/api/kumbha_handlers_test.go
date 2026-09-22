@@ -1808,7 +1808,10 @@ func TestSendKumbhaMessage_SessionNotFoundIs404(t *testing.T) {
 func TestSendKumbhaMessage_ClosedSessionStillRelaunches(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
 	fc := newFakeCluster()
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{}).
+	router := kumbha.NewRouter(map[string]kumbha.Route{
+		"teepin/fast": {ProviderName: "vllm", Provider: &stubProvider{}},
+	})
+	gw := kumbha.NewGateway(kStore, router, allowGate{}, &fakeKPricing{}, noopUsageRecorder{}).
 		WithAgent(fc, fakeMintKumbhaToken, kumbha.AgentConfig{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 

@@ -138,6 +138,17 @@ func (s *Server) CreateKumbhaSession(c *gin.Context) {
 				})
 				return
 			}
+			if errors.Is(err, kumbha.ErrAgentRouteUnavailable) {
+				// Generic message deliberately — never echoes err.Error()
+				// here, which would name the internal route. Same session
+				// stays open so a retry (once the route's back) works with
+				// no new session needed.
+				c.JSON(http.StatusServiceUnavailable, gin.H{
+					"error": "the build agent is temporarily unavailable — please try again shortly",
+					"code":  "agent_route_unavailable",
+				})
+				return
+			}
 			log.Printf("WARN: kumbha session %s created but agent launch failed: %v", sess.ID, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "session created but the agent could not be started: " + err.Error()})
 			return
@@ -1996,6 +2007,14 @@ func (s *Server) SendKumbhaMessage(c *gin.Context) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha agent is not available on this deployment"})
 		case errors.Is(err, kumbha.ErrSessionClosed):
 			c.JSON(http.StatusConflict, gin.H{"error": "session is closed", "code": "session_closed"})
+		case errors.Is(err, kumbha.ErrAgentRouteUnavailable):
+			// Generic message deliberately — never echoes err.Error() here,
+			// which would name the internal route (see LaunchAgent's own
+			// doc comment on this sentinel).
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": "the build agent is temporarily unavailable — please try again shortly",
+				"code":  "agent_route_unavailable",
+			})
 		default:
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		}
