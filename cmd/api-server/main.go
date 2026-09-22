@@ -796,18 +796,99 @@ func main() {
 					log.Println("Kumbha frontier route not configured (TEEPIN_ANTHROPIC_MODEL unset) — teepin/deep unavailable")
 				}
 
+				// Register (or refresh) both routes in the model catalog so
+				// Kumbha's own gateway can price them per-route instead of
+				// off one flat platform-wide rate — see gateway.cost()'s own
+				// doc comment for why that flat rate silently mis-bills the
+				// moment a second, differently-priced backend goes live.
+				// RegisterModel preserves any pricing an admin already set
+				// (Control Center -> Inference), so re-running this on every
+				// boot is safe; it only refreshes capabilities/engine.
+				if modelCatalogService != nil {
+					registerCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					if err := modelCatalogService.RegisterModel(registerCtx, modelcatalog.Model{
+						ModelRoute:    "teepin/fast",
+						DisplayName:   "Teepin Fast",
+						CostClass:     modelcatalog.CostClassOwn, // self-hosted: no per-token vendor invoice
+						Engine:        vllmProvider.Name(),
+						ContextWindow: contextWindow,
+						SupportsTools: getEnv("TEEPIN_VLLM_SUPPORTS_TOOLS", "true") == "true",
+						Enabled:       true,
+						UpdatedBy:     strPtr("system-boot"),
+					}); err != nil {
+						log.Printf("WARN: could not register teepin/fast in model catalog: %v", err)
+					}
+					if anthropicProvider, isDeep := routes["teepin/deep"]; isDeep {
+						anthropicModel := getEnv("TEEPIN_ANTHROPIC_MODEL", "")
+						if err := modelCatalogService.RegisterModel(registerCtx, modelcatalog.Model{
+							ModelRoute:    "teepin/deep",
+							DisplayName:   "Teepin Deep",
+							CostClass:     modelcatalog.CostClassFrontier, // Anthropic bills us per token
+							Engine:        anthropicProvider.ProviderName,
+							ContextWindow: getEnvInt("TEEPIN_ANTHROPIC_CONTEXT_WINDOW", 200000),
+							SupportsTools: true,
+							Enabled:       true,
+							UpdatedBy:     strPtr("system-boot"),
+						}); err != nil {
+							log.Printf("WARN: could not register teepin/deep in model catalog: %v", err)
+						}
+						// Refresh the recorded vendor cost to match whatever
+						// model is actually configured today — a model swap
+						// (e.g. Haiku -> Opus) must not leave a stale vendor
+						// cost silently mispricing the admin's margin view.
+						// Only for models this codebase knows the published
+						// rate for; an unrecognised model leaves vendor cost
+						// as whatever an admin last set by hand rather than
+						// guessing.
+						if in, out, ok := knownAnthropicVendorCost(anthropicModel); ok {
+							if err := modelCatalogService.SetVendorCost(registerCtx, "teepin/deep", &in, &out, "system-boot"); err != nil {
+								log.Printf("WARN: could not record vendor cost for teepin/deep (%s): %v", anthropicModel, err)
+							}
+						} else {
+							log.Printf("Model catalog: no known published rate for Anthropic model %q — vendor cost for teepin/deep left as last set (Control Center -> Inference)", anthropicModel)
+						}
+					}
+					cancel()
+				}
+
 				kumbhaStore := kumbha.NewStore(dbClient.DB())
 				kumbhaRouter := kumbha.NewRouter(routes)
 				kumbhaGateway := kumbha.NewGateway(kumbhaStore, kumbhaRouter, billingService, billingService, billingService)
+				if modelCatalogService != nil {
+					kumbhaGateway = kumbhaGateway.WithModelPricing(modelCatalogService)
+				}
 
 				// Live on/off per route (Control Center, not a redeploy) and
 				// background connectivity health — see pkg/kumbha/routes.go.
 				kumbhaRouteStore := kumbha.NewRouteStore(dbClient.DB())
 				kumbhaGateway = kumbhaGateway.WithRouteControl(kumbhaRouteStore)
-				kumbhaRouteMonitor := kumbha.NewRouteMonitor(routes)
+
+				// Route candidates (billing.kumbha_route_candidates): live,
+				// Control-Center-configured backends per route, with real
+				// priority fallback and per-candidate secrets in AWS Secrets
+				// Manager. Purely ADDITIVE to the static routes above — a
+				// route with no candidate rows keeps using its static,
+				// env-var-configured Route exactly as before this existed
+				// (see Gateway.resolveOrdered's own doc comment), so nothing
+				// has to migrate off env vars for this to be useful for even
+				// one route. Secrets are optional: if AWS config can't be
+				// loaded (e.g. local dev with no AWS credentials), candidates
+				// still work, just always with an empty api_key.
+				environment := getEnv("TEEPIN_ENVIRONMENT", "dev")
+				kumbhaCandidateStore := kumbha.NewCandidateStore(dbClient.DB())
+				var kumbhaSecrets kumbha.SecretsClient
+				if awsSecrets, err := kumbha.NewAWSSecretsClient(context.Background()); err != nil {
+					log.Printf("WARN: Kumbha route candidate secrets disabled (could not load AWS config): %v — candidates still work, but their api_key fields are ignored", err)
+				} else {
+					kumbhaSecrets = awsSecrets
+				}
+				kumbhaFactory := kumbha.NewProviderFactory(kumbhaSecrets, environment)
+				kumbhaGateway = kumbhaGateway.WithCandidates(kumbhaCandidateStore, kumbhaFactory)
+
+				kumbhaRouteMonitor := kumbha.NewRouteMonitor(routes).WithCandidates(kumbhaCandidateStore, kumbhaFactory)
 				kumbhaRouteMonitor.CheckNow(context.Background()) // first reading before anything reads Statuses()
 				go kumbhaRouteMonitor.Start(context.Background(), time.Duration(getEnvInt("TEEPIN_KUMBHA_ROUTE_HEALTH_INTERVAL_SECONDS", 60))*time.Second)
-				kumbhaRouteHandler = api.NewKumbhaRouteHandler(kumbhaRouter, kumbhaRouteStore, kumbhaRouteMonitor)
+				kumbhaRouteHandler = api.NewKumbhaRouteHandler(kumbhaRouter, kumbhaRouteStore, kumbhaRouteMonitor, kumbhaCandidateStore, kumbhaSecrets, environment)
 
 				// A Kumbha agent credential (auth.MintSessionToken) is
 				// validated against session-open status on every request —
@@ -1205,6 +1286,34 @@ func initKubernetesClient() (*kubernetes.Clientset, error) {
 
 	return clientset, nil
 }
+
+// knownAnthropicVendorCost returns Anthropic's own published per-million-
+// token rate for a handful of current models, as of 2026-06-24 pricing —
+// used only to seed/refresh teepin/deep's recorded vendor cost so the
+// Control Center's margin view isn't silently stale after a model swap.
+// Never a guess: an unrecognised model id returns ok=false and this
+// codebase leaves whatever vendor cost an admin last set by hand alone.
+// Update this table (or set the rate by hand in Control Center ->
+// Inference) when Anthropic's pricing changes or a new model is adopted.
+func knownAnthropicVendorCost(model string) (input, output float64, ok bool) {
+	rates := map[string][2]float64{
+		"claude-haiku-4-5-20251001": {1.00, 5.00},
+		"claude-haiku-4-5":          {1.00, 5.00},
+		"claude-sonnet-5":           {3.00, 15.00},
+		"claude-opus-5":             {5.00, 25.00},
+		"claude-opus-4-8":           {5.00, 25.00},
+		"claude-opus-4-7":           {5.00, 25.00},
+		"claude-opus-4-6":           {5.00, 25.00},
+		"claude-sonnet-4-6":         {3.00, 15.00},
+	}
+	r, found := rates[model]
+	if !found {
+		return 0, 0, false
+	}
+	return r[0], r[1], true
+}
+
+func strPtr(s string) *string { return &s }
 
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
@@ -1646,6 +1755,11 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 					// route travels as ?route=teepin/fast — see SetEnabled's
 					// own doc comment on why a path segment cannot hold it.
 					admin.PUT("/kumbha/routes", kumbhaRouteHandler.SetEnabled)
+					// Candidate ids are UUIDs, so a path segment is fine here
+					// (no slash to collide with, unlike a route name above).
+					admin.POST("/kumbha/candidates", kumbhaRouteHandler.CreateCandidate)
+					admin.PUT("/kumbha/candidates/:id", kumbhaRouteHandler.UpdateCandidate)
+					admin.DELETE("/kumbha/candidates/:id", kumbhaRouteHandler.DeleteCandidate)
 				}
 				if modelCatalogHandler != nil {
 					admin.POST("/inference/models", modelCatalogHandler.RegisterModel)

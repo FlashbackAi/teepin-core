@@ -135,6 +135,20 @@ func (s *Service) SetEnabled(ctx context.Context, modelRoute string, enabled boo
 	return nil
 }
 
+// ModelPricing returns a route's customer-facing per-million-token rates,
+// for a caller (Kumbha's own gateway) that wants to price a completion by
+// route rather than read the whole catalog entry. ok is false when the
+// route has no catalog entry at all — the caller should fall back to
+// whatever flat default it has, rather than silently billing $0 for a real
+// backend nobody has registered yet.
+func (s *Service) ModelPricing(ctx context.Context, modelRoute string) (input, output float64, ok bool) {
+	m, err := s.GetModel(ctx, modelRoute)
+	if err != nil {
+		return 0, 0, false
+	}
+	return m.InputPricePerMillion, m.OutputPricePerMillion, true
+}
+
 // GetModel returns one catalog entry.
 func (s *Service) GetModel(ctx context.Context, modelRoute string) (*Model, error) {
 	m, err := scanModel(s.db.QueryRowContext(ctx, selectModelsSQL+` WHERE model_route = $1`, modelRoute))

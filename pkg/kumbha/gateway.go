@@ -37,6 +37,33 @@ type PricingProvider interface {
 	LLMPriceOutputPerMillion(ctx context.Context) float64
 }
 
+// ModelPricingProvider supplies per-route customer-facing rates —
+// implemented by modelcatalog.Service. Optional: a Gateway without one
+// (WithModelPricing never called) always falls back to PricingProvider's
+// single flat rate, same as before this existed. Set on one, this is
+// preferred over the flat rate for any route that has a catalog entry,
+// because different backends behind Kumbha cost wildly different real
+// amounts per token — see cost()'s own doc comment.
+type ModelPricingProvider interface {
+	ModelPricing(ctx context.Context, modelRoute string) (input, output float64, ok bool)
+}
+
+// CandidateSource lists a route's registered backend candidates, priority
+// ascending — implemented by *CandidateStore. A small interface (rather
+// than wiring *CandidateStore directly) so Complete's fallback dispatch
+// logic can be unit-tested against a fake instead of a real database.
+type CandidateSource interface {
+	ListByRoute(ctx context.Context, routeName string) ([]RouteCandidate, error)
+}
+
+// CandidateBuilder builds a Provider for one candidate, fetching its
+// secret live — implemented by *ProviderFactory. Same reasoning as
+// CandidateSource: an interface so tests can substitute a fake Provider
+// without a real HTTP client or a real Secrets Manager call.
+type CandidateBuilder interface {
+	Build(ctx context.Context, c RouteCandidate) (inference.Provider, error)
+}
+
 // UsageRecorder is the subset of billing.Service the Gateway needs at
 // session close: write the ledger rows and draw down credit against them.
 // An interface so kumbha's tests do not require a full *billing.Service.
@@ -88,6 +115,21 @@ type Gateway struct {
 	// enabled (today's behaviour before this existed). Set via
 	// WithRouteControl once a RouteStore exists.
 	routes *RouteStore
+
+	// modelPricing is OPTIONAL — nil means cost() always uses pricing's
+	// flat platform-wide rate (today's behaviour before this existed). Set
+	// via WithModelPricing once a modelcatalog.Service exists.
+	modelPricing ModelPricingProvider
+
+	// candidates/factory are OPTIONAL and travel together — nil means every
+	// route resolves through the static, env-var-configured router exactly
+	// as before this existed. Set via WithCandidates once a CandidateStore
+	// exists. A route with candidate rows uses this priority-ordered path
+	// instead of the static router; a route with none still falls back to
+	// the router, so a deployment that has never configured any candidates
+	// for a route keeps working unchanged.
+	candidates CandidateSource
+	factory    CandidateBuilder
 }
 
 func NewGateway(store *Store, router *Router, gate ProvisionGate, pricing PricingProvider, usage UsageRecorder) *Gateway {
@@ -99,6 +141,24 @@ func NewGateway(store *Store, router *Router, gate ProvisionGate, pricing Pricin
 // own shape elsewhere in this codebase.
 func (g *Gateway) WithRouteControl(routes *RouteStore) *Gateway {
 	g.routes = routes
+	return g
+}
+
+// WithModelPricing enables per-route pricing in cost(), preferred over the
+// flat platform-wide rate for any route registered in the catalog. Returns
+// the same *Gateway for chaining, matching WithRouteControl's own shape.
+func (g *Gateway) WithModelPricing(p ModelPricingProvider) *Gateway {
+	g.modelPricing = p
+	return g
+}
+
+// WithCandidates enables the live, Control-Center-configured
+// priority-fallback dispatch path in Complete, for any route that has at
+// least one candidate row. Returns the same *Gateway for chaining, matching
+// WithRouteControl/WithModelPricing's own shape.
+func (g *Gateway) WithCandidates(store CandidateSource, factory CandidateBuilder) *Gateway {
+	g.candidates = store
+	g.factory = factory
 	return g
 }
 
@@ -329,6 +389,49 @@ type CompletionResult struct {
 	Budget   float64
 }
 
+// resolveOrdered returns a route's backend candidates in the order
+// Complete should try them. The live, Control-Center-configured candidate
+// list (priority ascending) is preferred whenever the route has at least
+// one row; a route with none falls back to the single static,
+// env-var-configured Route from the router, so a deployment that has never
+// configured any candidates — or wasn't built with WithCandidates at all —
+// keeps working exactly as before this existed. A candidate this factory
+// fails to build (e.g. its secret can't currently be read) is logged and
+// skipped rather than failing the whole request, the same way one
+// unhealthy candidate should not take a whole route down when others are
+// still fine.
+func (g *Gateway) resolveOrdered(ctx context.Context, model string) ([]Route, error) {
+	if g.candidates != nil {
+		rows, err := g.candidates.ListByRoute(ctx, model)
+		if err != nil {
+			log.Printf("WARN: could not load route candidates for %q, falling back to static router: %v", model, err)
+		} else if len(rows) > 0 {
+			var out []Route
+			for _, c := range rows {
+				if !c.Enabled {
+					continue
+				}
+				p, err := g.factory.Build(ctx, c)
+				if err != nil {
+					log.Printf("WARN: could not build provider for candidate %s (route %q): %v", c.ID, model, err)
+					continue
+				}
+				out = append(out, Route{Provider: p, ProviderName: p.Name()})
+			}
+			if len(out) == 0 {
+				return nil, fmt.Errorf("%w: %q", inference.ErrUnknownModel, model)
+			}
+			return out, nil
+		}
+	}
+
+	route, err := g.router.Resolve(model)
+	if err != nil {
+		return nil, err
+	}
+	return []Route{route}, nil
+}
+
 // Complete runs stages 3-9 of the request lifecycle: check budget,
 // resolve route, dispatch, capture tokens, compute cost, accrue.
 //
@@ -345,7 +448,7 @@ func (g *Gateway) Complete(ctx context.Context, sess *Session, req inference.Req
 		return nil, ErrBudgetExhausted
 	}
 
-	route, err := g.router.Resolve(req.Model)
+	ordered, err := g.resolveOrdered(ctx, req.Model)
 	if err != nil {
 		return nil, err
 	}
@@ -370,16 +473,32 @@ func (g *Gateway) Complete(ctx context.Context, sess *Session, req inference.Req
 	}
 
 	start := time.Now()
-	resp, err := route.Provider.Complete(ctx, req)
-	if err != nil {
-		return nil, err
+	var resp *inference.Response
+	var served Route
+	for i, candidate := range ordered {
+		resp, err = candidate.Provider.Complete(ctx, req)
+		if err == nil {
+			served = candidate
+			break
+		}
+		// Complete is atomic — either a full response comes back or
+		// nothing does, so there is never partial output already handed
+		// to the customer to worry about double-sending. Falling through
+		// is only safe because of that: a Stream()-based dispatch could
+		// not do this the same way.
+		last := i == len(ordered)-1
+		if !errors.Is(err, inference.ErrProviderUnavailable) || last {
+			return nil, err
+		}
+		log.Printf("Kumbha: candidate %q for route %q unavailable, trying next (priority %d/%d): %v",
+			candidate.ProviderName, req.Model, i+1, len(ordered), err)
 	}
 	end := time.Now()
 
-	cost := g.cost(ctx, resp.Usage)
+	cost := g.cost(ctx, req.Model, resp.Usage)
 
 	newSpent, err := g.store.Accrue(ctx, sess.ID, sess.AccountID, cost,
-		req.Model, route.ProviderName, resp.Usage.InputTokens, resp.Usage.OutputTokens)
+		req.Model, served.ProviderName, resp.Usage.InputTokens, resp.Usage.OutputTokens)
 	if err != nil {
 		// The completion already happened and tokens were genuinely spent
 		// upstream — this is a recording failure, not a request failure,
@@ -402,15 +521,14 @@ func (g *Gateway) Complete(ctx context.Context, sess *Session, req inference.Req
 	// settlement failure surfaces to the CALLER (so the customer sees it,
 	// same as an accrual failure) but the tokens were already genuinely
 	// spent upstream either way.
-	inRate := g.pricing.LLMPriceInputPerMillion(ctx)
-	outRate := g.pricing.LLMPriceOutputPerMillion(ctx)
+	inRate, outRate := g.rates(ctx, req.Model)
 	var settleErrs []error
 	if resp.Usage.InputTokens > 0 {
-		settleErrs = append(settleErrs, g.settleLine(ctx, sess, req.Model+":input", route.ProviderName,
+		settleErrs = append(settleErrs, g.settleLine(ctx, sess, req.Model+":input", served.ProviderName,
 			float64(resp.Usage.InputTokens), float64(resp.Usage.InputTokens)/1e6*inRate, start, end))
 	}
 	if resp.Usage.OutputTokens > 0 {
-		settleErrs = append(settleErrs, g.settleLine(ctx, sess, req.Model+":output", route.ProviderName,
+		settleErrs = append(settleErrs, g.settleLine(ctx, sess, req.Model+":output", served.ProviderName,
 			float64(resp.Usage.OutputTokens), float64(resp.Usage.OutputTokens)/1e6*outRate, start, end))
 	}
 	if err := errors.Join(settleErrs...); err != nil {
@@ -420,10 +538,34 @@ func (g *Gateway) Complete(ctx context.Context, sess *Session, req inference.Req
 	return &CompletionResult{Response: resp, Cost: cost, Spent: newSpent, Budget: sess.Budget}, nil
 }
 
-// cost prices a completion's usage at the live admin-configured rate.
-func (g *Gateway) cost(ctx context.Context, usage inference.Usage) float64 {
-	inRate := g.pricing.LLMPriceInputPerMillion(ctx)
-	outRate := g.pricing.LLMPriceOutputPerMillion(ctx)
+// rates returns the per-million-token input/output rates to charge for a
+// completion on modelRoute. Prefers the per-route customer rate from the
+// model catalog (modelPricing, keyed by route name like "teepin/deep")
+// when that route has a catalog entry — different backends behind Kumbha
+// cost wildly different real amounts per token, so pricing every route off
+// one flat platform-wide rate silently mis-bills the moment a second,
+// differently-priced backend goes live (found live 2026-09-22: teepin/deep
+// started routing real build-session traffic to a paid Anthropic model
+// while still priced off the same flat rate as the self-hosted
+// teepin/fast). Falls back to the flat rate for a route with no catalog
+// entry, rather than charging nothing for it. Factored out of cost() so
+// the settlement lines in Complete (the actual invoice-visible credit
+// consumption) are always computed from the exact same rates as the
+// session's own spent/budget figure — those diverging would mean a
+// customer's account credit gets debited at a different rate than what
+// their build session shows.
+func (g *Gateway) rates(ctx context.Context, modelRoute string) (input, output float64) {
+	if g.modelPricing != nil {
+		if in, out, ok := g.modelPricing.ModelPricing(ctx, modelRoute); ok {
+			return in, out
+		}
+	}
+	return g.pricing.LLMPriceInputPerMillion(ctx), g.pricing.LLMPriceOutputPerMillion(ctx)
+}
+
+// cost prices a completion's usage at rates()'s per-route rate.
+func (g *Gateway) cost(ctx context.Context, modelRoute string, usage inference.Usage) float64 {
+	inRate, outRate := g.rates(ctx, modelRoute)
 	return float64(usage.InputTokens)/1e6*inRate + float64(usage.OutputTokens)/1e6*outRate
 }
 

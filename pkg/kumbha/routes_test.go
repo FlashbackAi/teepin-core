@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/google/uuid"
 
 	"github.com/FlashbackAi/teepin-core/pkg/inference"
 )
@@ -167,5 +168,80 @@ func TestRouteMonitor_StartStopsOnContextCancel(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Start did not return after its context was cancelled")
+	}
+}
+
+// --- WithCandidates: per-candidate health ---
+
+type fakeCandidateLister struct {
+	all map[string][]RouteCandidate
+	err error
+}
+
+func (f *fakeCandidateLister) ListAll(context.Context) (map[string][]RouteCandidate, error) {
+	return f.all, f.err
+}
+
+func TestRouteMonitor_WithCandidates_ChecksEachCandidateIndependently(t *testing.T) {
+	healthyID, unhealthyID := uuid.New(), uuid.New()
+	lister := &fakeCandidateLister{all: map[string][]RouteCandidate{
+		"teepin/fast": {
+			{ID: healthyID, RouteName: "teepin/fast", Model: "model-a", Enabled: true},
+			{ID: unhealthyID, RouteName: "teepin/fast", Model: "model-b", Enabled: true},
+		},
+	}}
+	builder := &fakeCandidateBuilder{byModel: map[string]inference.Provider{
+		"model-a": healthyProvider{&fakeProvider{name: "vllm"}},
+		"model-b": unhealthyProvider{&fakeProvider{name: "vllm"}, errors.New("connection refused")},
+	}}
+
+	m := NewRouteMonitor(nil).WithCandidates(lister, builder)
+	m.CheckNow(context.Background())
+
+	statuses := m.CandidateStatuses()
+	if statuses[healthyID].Status != HealthHealthy {
+		t.Errorf("healthy candidate = %+v, want healthy", statuses[healthyID])
+	}
+	if statuses[unhealthyID].Status != HealthUnhealthy || statuses[unhealthyID].Error != "connection refused" {
+		t.Errorf("unhealthy candidate = %+v, want unhealthy with the error text", statuses[unhealthyID])
+	}
+}
+
+// A disabled candidate is reported unknown, never checked at all — an
+// operator taking a backend offline for maintenance shouldn't see it
+// flip to "unhealthy" just because nothing is polling it.
+func TestRouteMonitor_WithCandidates_DisabledCandidateStaysUnknown(t *testing.T) {
+	id := uuid.New()
+	lister := &fakeCandidateLister{all: map[string][]RouteCandidate{
+		"teepin/fast": {{ID: id, RouteName: "teepin/fast", Model: "model-a", Enabled: false}},
+	}}
+	builder := &fakeCandidateBuilder{byModel: map[string]inference.Provider{
+		"model-a": unhealthyProvider{&fakeProvider{name: "vllm"}, errors.New("should never be called")},
+	}}
+
+	m := NewRouteMonitor(nil).WithCandidates(lister, builder)
+	m.CheckNow(context.Background())
+
+	if got := m.CandidateStatuses()[id].Status; got != HealthUnknown {
+		t.Errorf("disabled candidate status = %q, want unknown (never checked)", got)
+	}
+}
+
+// A candidate the factory cannot currently build (e.g. its secret can't be
+// read right now) is reported unhealthy with that reason, not silently
+// dropped from the listing.
+func TestRouteMonitor_WithCandidates_BuildFailureIsUnhealthy(t *testing.T) {
+	id := uuid.New()
+	lister := &fakeCandidateLister{all: map[string][]RouteCandidate{
+		"teepin/fast": {{ID: id, RouteName: "teepin/fast", Model: "missing-model", Enabled: true}},
+	}}
+	builder := &fakeCandidateBuilder{byModel: map[string]inference.Provider{}} // Build will error: not registered
+
+	m := NewRouteMonitor(nil).WithCandidates(lister, builder)
+	m.CheckNow(context.Background())
+
+	st := m.CandidateStatuses()[id]
+	if st.Status != HealthUnhealthy || st.Error == "" {
+		t.Errorf("build-failure candidate = %+v, want unhealthy with a non-empty error", st)
 	}
 }

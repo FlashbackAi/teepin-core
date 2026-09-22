@@ -50,7 +50,7 @@ func TestKumbhaRouteHandler_List(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/routes", nil)
-	kumbhaRouteRouter(NewKumbhaRouteHandler(router, store, monitor)).ServeHTTP(rec, req)
+	kumbhaRouteRouter(NewKumbhaRouteHandler(router, store, monitor, nil, nil, "dev")).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body)
@@ -96,7 +96,7 @@ func TestKumbhaRouteHandler_List_ReflectsLiveHealth(t *testing.T) {
 	monitor.CheckNow(context.Background())
 
 	rec := httptest.NewRecorder()
-	kumbhaRouteRouter(NewKumbhaRouteHandler(router, store, monitor)).
+	kumbhaRouteRouter(NewKumbhaRouteHandler(router, store, monitor, nil, nil, "dev")).
 		ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/routes", nil))
 
 	var out struct {
@@ -122,7 +122,7 @@ func TestKumbhaRouteHandler_SetEnabled(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPut, "/routes?route=teepin%2Ffast", strings.NewReader(`{"enabled":false}`))
 	req.Header.Set("Content-Type", "application/json")
-	kumbhaRouteRouter(NewKumbhaRouteHandler(router, store, kumbha.NewRouteMonitor(nil))).ServeHTTP(rec, req)
+	kumbhaRouteRouter(NewKumbhaRouteHandler(router, store, kumbha.NewRouteMonitor(nil), nil, nil, "dev")).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body)
@@ -143,7 +143,7 @@ func TestKumbhaRouteHandler_SetEnabled_RejectsUnknownRoute(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPut, "/routes?route=teepin%2Fnonexistent", strings.NewReader(`{"enabled":false}`))
 	req.Header.Set("Content-Type", "application/json")
-	kumbhaRouteRouter(NewKumbhaRouteHandler(router, store, kumbha.NewRouteMonitor(nil))).ServeHTTP(rec, req)
+	kumbhaRouteRouter(NewKumbhaRouteHandler(router, store, kumbha.NewRouteMonitor(nil), nil, nil, "dev")).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404 for an unconfigured route name", rec.Code)
@@ -158,7 +158,7 @@ func TestKumbhaRouteHandler_SetEnabled_RejectsMissingBody(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPut, "/routes?route=teepin%2Ffast", strings.NewReader(`{}`))
 	req.Header.Set("Content-Type", "application/json")
-	kumbhaRouteRouter(NewKumbhaRouteHandler(router, store, kumbha.NewRouteMonitor(nil))).ServeHTTP(rec, req)
+	kumbhaRouteRouter(NewKumbhaRouteHandler(router, store, kumbha.NewRouteMonitor(nil), nil, nil, "dev")).ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400 for a missing enabled field", rec.Code)

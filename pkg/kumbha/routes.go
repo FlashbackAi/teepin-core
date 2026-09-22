@@ -10,6 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/FlashbackAi/teepin-core/pkg/inference"
 )
 
@@ -116,8 +118,26 @@ type RouteHealth struct {
 type RouteMonitor struct {
 	routes map[string]Route // name -> Route, snapshotted at construction
 
-	mu     sync.RWMutex
-	status map[string]RouteHealth
+	// candidates/builder are OPTIONAL and travel together — nil means only
+	// the static routes map above is checked (today's behaviour before
+	// this existed). Set via WithCandidates once a CandidateStore exists;
+	// unlike routes, the candidate list is re-read on every check rather
+	// than snapshotted, since it is meant to change live from Control
+	// Center.
+	candidates CandidateLister
+	builder    CandidateBuilder
+
+	mu              sync.RWMutex
+	status          map[string]RouteHealth
+	candidateStatus map[uuid.UUID]RouteHealth
+}
+
+// CandidateLister is what RouteMonitor needs to enumerate every route's
+// candidates for health checking — implemented by *CandidateStore. A
+// separate small interface from CandidateSource (which only lists one
+// route at a time) since a health sweep needs every route at once.
+type CandidateLister interface {
+	ListAll(ctx context.Context) (map[string][]RouteCandidate, error)
 }
 
 // NewRouteMonitor builds a monitor over the given configured routes (the
@@ -125,14 +145,24 @@ type RouteMonitor struct {
 // first check completes — callers wanting an immediate first reading should
 // call CheckNow once at startup rather than waiting for the first tick.
 func NewRouteMonitor(routes map[string]Route) *RouteMonitor {
-	m := &RouteMonitor{routes: routes, status: make(map[string]RouteHealth, len(routes))}
+	m := &RouteMonitor{routes: routes, status: make(map[string]RouteHealth, len(routes)), candidateStatus: map[uuid.UUID]RouteHealth{}}
 	for name := range routes {
 		m.status[name] = RouteHealth{Status: HealthUnknown}
 	}
 	return m
 }
 
-// Statuses returns a snapshot of every route's last health result.
+// WithCandidates enables per-candidate health checking alongside the
+// static routes map — every enabled candidate, across every route, gets
+// its own cached health reading keyed by candidate id (CandidateStatuses).
+// Returns the same *RouteMonitor for chaining.
+func (m *RouteMonitor) WithCandidates(candidates CandidateLister, builder CandidateBuilder) *RouteMonitor {
+	m.candidates = candidates
+	m.builder = builder
+	return m
+}
+
+// Statuses returns a snapshot of every static route's last health result.
 func (m *RouteMonitor) Statuses() map[string]RouteHealth {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -143,13 +173,28 @@ func (m *RouteMonitor) Statuses() map[string]RouteHealth {
 	return out
 }
 
+// CandidateStatuses returns a snapshot of every candidate's last health
+// result, keyed by candidate id.
+func (m *RouteMonitor) CandidateStatuses() map[uuid.UUID]RouteHealth {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make(map[uuid.UUID]RouteHealth, len(m.candidateStatus))
+	for k, v := range m.candidateStatus {
+		out[k] = v
+	}
+	return out
+}
+
 // CheckNow runs one round of health checks immediately, sequentially (the
-// route count is small — two or three — so there is no value in the added
-// complexity of running them concurrently). Each route gets its own bounded
-// timeout so one hung backend cannot delay the others.
+// route/candidate count is small, so there is no value in the added
+// complexity of running them concurrently). Each check gets its own
+// bounded timeout so one hung backend cannot delay the others.
 func (m *RouteMonitor) CheckNow(ctx context.Context) {
 	for name, route := range m.routes {
 		m.checkOne(ctx, name, route)
+	}
+	if m.candidates != nil {
+		m.checkCandidates(ctx)
 	}
 }
 
@@ -171,10 +216,59 @@ func (m *RouteMonitor) checkOne(ctx context.Context, name string, route Route) {
 	m.set(name, RouteHealth{Status: HealthHealthy, CheckedAt: time.Now()})
 }
 
+// checkCandidates re-lists every route's candidates fresh on each call
+// (rather than a snapshot taken once) since Control Center can add, edit,
+// or delete one at any time — a stale candidate list here would mean a
+// newly-added or newly-disabled candidate's health never updates. A list
+// failure leaves the cached statuses untouched rather than wiping them, the
+// same posture checkOne implicitly has (a hung backend just keeps its last
+// reading until the next successful tick).
+func (m *RouteMonitor) checkCandidates(ctx context.Context) {
+	all, err := m.candidates.ListAll(ctx)
+	if err != nil {
+		return
+	}
+	for _, rows := range all {
+		for _, c := range rows {
+			if !c.Enabled {
+				m.setCandidate(c.ID, RouteHealth{Status: HealthUnknown, CheckedAt: time.Now()})
+				continue
+			}
+			m.checkOneCandidate(ctx, c)
+		}
+	}
+}
+
+func (m *RouteMonitor) checkOneCandidate(ctx context.Context, c RouteCandidate) {
+	provider, err := m.builder.Build(ctx, c)
+	if err != nil {
+		m.setCandidate(c.ID, RouteHealth{Status: HealthUnhealthy, Error: err.Error(), CheckedAt: time.Now()})
+		return
+	}
+	checker, ok := provider.(inference.HealthChecker)
+	if !ok {
+		m.setCandidate(c.ID, RouteHealth{Status: HealthUnknown, CheckedAt: time.Now()})
+		return
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, routeHealthCheckTimeout)
+	defer cancel()
+	if err := checker.CheckHealth(checkCtx); err != nil {
+		m.setCandidate(c.ID, RouteHealth{Status: HealthUnhealthy, Error: err.Error(), CheckedAt: time.Now()})
+		return
+	}
+	m.setCandidate(c.ID, RouteHealth{Status: HealthHealthy, CheckedAt: time.Now()})
+}
+
 func (m *RouteMonitor) set(name string, h RouteHealth) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.status[name] = h
+}
+
+func (m *RouteMonitor) setCandidate(id uuid.UUID, h RouteHealth) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.candidateStatus[id] = h
 }
 
 // Start runs health checks on a fixed interval until ctx is cancelled —
