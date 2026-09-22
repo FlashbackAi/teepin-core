@@ -70,6 +70,15 @@ type AgentConfig struct {
 	// until an operator has actually confirmed the hosted model supports
 	// vision.
 	VisionCapable bool
+	// Route selects which kumbha.Router entry (see router.go) the agent
+	// pod's LLM calls resolve to — "teepin/fast" or "teepin/deep" today.
+	// Empty means run.py's own default ("teepin/fast"), so leaving this
+	// unset changes nothing for an existing deployment. Sending it
+	// explicitly is what lets an operator move every NEW build session
+	// (already-running ones keep whatever they started with) onto a
+	// different backend — e.g. a frontier model for a demo — without
+	// rebuilding or redeploying the agent image itself.
+	Route string
 }
 
 // TokenMinter mints the agent's own short-lived, session-scoped
@@ -196,6 +205,14 @@ func (g *Gateway) LaunchAgent(ctx context.Context, sess *Session, prompt string)
 		// actions already completed — the tell that this had already
 		// happened before this fix).
 		NeverRestart: true,
+	}
+
+	// Left out of the map literal above deliberately: an empty string
+	// value would override run.py's own os.environ.get(..., "teepin/fast")
+	// default with an explicit empty route, which is not what "unset"
+	// should mean. Only set the var at all when Route is configured.
+	if g.agentConfig.Route != "" {
+		spec.Env["TEEPIN_ROUTE"] = g.agentConfig.Route
 	}
 
 	if _, err := g.cluster.CreateInstance(ctx, spec); err != nil {

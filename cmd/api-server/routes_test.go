@@ -26,7 +26,7 @@ func TestSetupRouter_RegistersEveryRouteWithoutConflict(t *testing.T) {
 		&api.BillingHandler{}, &api.RegistryHandler{}, &api.AdminHandler{}, &api.WebhookHandler{},
 		&api.NodeHandler{}, &api.ModelCatalogHandler{}, &api.NodeServicesHandler{},
 		&api.InferencePlaygroundHandler{}, &api.NodeModelCacheHandler{}, &api.InferenceHandler{},
-		nil, nil, nil, nil, "teepin.test",
+		&api.KumbhaRouteHandler{}, nil, nil, nil, nil, "teepin.test",
 	)
 
 	want := map[string]bool{
@@ -35,6 +35,8 @@ func TestSetupRouter_RegistersEveryRouteWithoutConflict(t *testing.T) {
 		"POST /v1/kumbha/chat/completions":         false,
 		"GET /v1/admin/nodes/:id/cached-models":    false,
 		"DELETE /v1/admin/nodes/:id/cached-models": false,
+		"GET /v1/admin/kumbha/routes":              false,
+		"PUT /v1/admin/kumbha/routes":              false,
 	}
 	for _, r := range router.Routes() {
 		key := r.Method + " " + r.Path

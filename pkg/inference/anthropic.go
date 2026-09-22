@@ -87,6 +87,18 @@ func NewAnthropic(cfg AnthropicConfig) *AnthropicProvider {
 func (p *AnthropicProvider) Name() string               { return "anthropic" }
 func (p *AnthropicProvider) Capabilities() Capabilities { return p.caps }
 
+// CheckHealth confirms the API key is valid and the configured model still
+// exists, via GET /v1/models/{id} — a metadata lookup, not a completion, so
+// it costs no tokens. An operator-visibility check, not something the
+// request path depends on.
+func (p *AnthropicProvider) CheckHealth(ctx context.Context) error {
+	_, err := p.client.Models.Get(ctx, p.model, anthropic.ModelGetParams{})
+	if err != nil {
+		return fmt.Errorf("anthropic model %q: %w", p.model, err)
+	}
+	return nil
+}
+
 // openAIMessage is the minimal shape Complete reads out of each raw
 // message in Request.Messages — just enough to translate into Anthropic's
 // message/system split, not a full re-modelling of the OpenAI schema (see

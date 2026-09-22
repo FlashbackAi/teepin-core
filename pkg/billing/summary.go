@@ -73,6 +73,7 @@ func (s *Service) GetAccountSummary(ctx context.Context, accountID uuid.UUID, st
 		         WHEN u.resource_type LIKE 'storage%'  THEN 'Storage'
 		         WHEN u.resource_type LIKE 'network%'  THEN 'Networking'
 		         WHEN u.resource_type LIKE 'kumbha/%'  THEN 'Kumbha'
+		         WHEN u.resource_type LIKE 'inference/%' THEN 'Inference'
 		         ELSE 'Other'
 		       END AS service,
 		       u.unit,

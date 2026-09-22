@@ -365,8 +365,8 @@ func (h *InferenceHandler) settle(ctx context.Context, accountID, projectID uuid
 		perMillion      float64
 		vendorPerMillon *float64
 	}{
-		{"input_tokens", usage.InputTokens, model.InputPricePerMillion, model.VendorInputCostPerMillion},
-		{"output_tokens", usage.OutputTokens, model.OutputPricePerMillion, model.VendorOutputCostPerMillion},
+		{"input", usage.InputTokens, model.InputPricePerMillion, model.VendorInputCostPerMillion},
+		{"output", usage.OutputTokens, model.OutputPricePerMillion, model.VendorOutputCostPerMillion},
 	}
 	for _, l := range lines {
 		if l.tokens <= 0 {
@@ -374,11 +374,13 @@ func (h *InferenceHandler) settle(ctx context.Context, accountID, projectID uuid
 		}
 		cost := float64(l.tokens) / 1e6 * l.perMillion
 		record := &billing.UsageRecord{
-			AccountID:    accountID,
-			ProjectID:    projectID,
-			SubjectType:  "inference_model",
-			SubjectID:    model.ModelRoute,
-			ResourceType: "inference/" + l.resource,
+			AccountID:   accountID,
+			ProjectID:   projectID,
+			SubjectType: "inference_model",
+			SubjectID:   model.ModelRoute,
+			// One resource type per model and direction ("inference/<route>:input") so
+			// an invoice can itemise usage per model instead of blending them.
+			ResourceType: "inference/" + model.ModelRoute + ":" + l.resource,
 			Quantity:     float64(l.tokens),
 			Unit:         "tokens",
 			UnitPrice:    l.perMillion,

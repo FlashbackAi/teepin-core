@@ -153,10 +153,10 @@ func TestChat_SuccessReturnsBackendBodyAndMetersTokens(t *testing.T) {
 		t.Fatalf("records = %d, want input+output lines", len(usage.records))
 	}
 	in, out := usage.records[0], usage.records[1]
-	if in.ResourceType != "inference/input_tokens" || in.Quantity != 1000 || in.TotalCost != 0.002 {
+	if in.ResourceType != "inference/teepin/a:input" || in.Quantity != 1000 || in.TotalCost != 0.002 {
 		t.Errorf("input line = %+v (1000 tok at $2/M = 0.002)", in)
 	}
-	if out.ResourceType != "inference/output_tokens" || out.Quantity != 2000 || out.TotalCost != 0.02 {
+	if out.ResourceType != "inference/teepin/a:output" || out.Quantity != 2000 || out.TotalCost != 0.02 {
 		t.Errorf("output line = %+v (2000 tok at $10/M = 0.02)", out)
 	}
 	if in.SubjectID != "teepin/a" || in.SubjectType != "inference_model" || in.Unit != "tokens" {

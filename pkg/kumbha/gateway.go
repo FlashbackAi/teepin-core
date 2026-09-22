@@ -83,10 +83,23 @@ type Gateway struct {
 	cluster     cluster.Client
 	mintToken   TokenMinter
 	agentConfig AgentConfig
+
+	// routes is OPTIONAL — nil means every configured route is always
+	// enabled (today's behaviour before this existed). Set via
+	// WithRouteControl once a RouteStore exists.
+	routes *RouteStore
 }
 
 func NewGateway(store *Store, router *Router, gate ProvisionGate, pricing PricingProvider, usage UsageRecorder) *Gateway {
 	return &Gateway{store: store, router: router, gate: gate, pricing: pricing, usage: usage}
+}
+
+// WithRouteControl enables the live enable/disable check in Complete.
+// Returns the same *Gateway for chaining, matching WithAgent/WithStripe's
+// own shape elsewhere in this codebase.
+func (g *Gateway) WithRouteControl(routes *RouteStore) *Gateway {
+	g.routes = routes
+	return g
 }
 
 // CreateSession pre-authorises a new build session, gated by the same
@@ -335,6 +348,25 @@ func (g *Gateway) Complete(ctx context.Context, sess *Session, req inference.Req
 	route, err := g.router.Resolve(req.Model)
 	if err != nil {
 		return nil, err
+	}
+	if g.routes != nil {
+		enabled, err := g.routes.IsEnabled(ctx, req.Model)
+		if err != nil {
+			// Fails OPEN (route still usable) rather than closed: a DB
+			// blip taking down every Kumbha completion is a worse outcome
+			// than an operator's disable taking a moment longer to apply.
+			// The reverse posture (fail closed) is right for payment
+			// gates, where the risk is unbilled usage; here the risk of
+			// failing closed is an unrelated DB hiccup breaking every
+			// build session at once.
+			log.Printf("WARN: could not check route %q enabled, allowing the request: %v", req.Model, err)
+		} else if !enabled {
+			// Presented identically to an unconfigured route — a customer
+			// never learns whether a route exists but was turned off, vs
+			// never existed at all (see KUMBHA-DESIGN.md's "no console
+			// page of its own": backend/route identity is operator-only).
+			return nil, fmt.Errorf("%w: %q", inference.ErrUnknownModel, req.Model)
+		}
 	}
 
 	start := time.Now()

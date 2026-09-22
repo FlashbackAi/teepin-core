@@ -34,6 +34,7 @@ var invoiceCols = []string{
 	"created_at", "updated_at", "source", "currency", "due_date", "issued_by", "notes",
 	"bill_to_name", "bill_to_email", "bill_to_address", "bill_to_tax_id", "bill_to_account_number",
 	"pdf_s3_key", "pdf_generated_at",
+	"bill_to_country", "tax_details", "payment_terms",
 }
 
 // mockInvoice queues a GetInvoice result (invoice row + empty line items)
@@ -48,11 +49,12 @@ func mockInvoice(mock sqlmock.Sqlmock, id, account uuid.UUID, status string, pdf
 			now, now, "manual", "USD", nil, nil, "",
 			"Acme Inc", "", "", "", "",
 			pdfKey, nil,
+			"", []byte("[]"), "",
 		))
 	mock.ExpectQuery(`FROM billing\.invoice_line_items`).
 		WithArgs(id).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "project_id", "name", "description", "quantity", "unit", "unit_price", "amount", "position",
+			"id", "project_id", "name", "description", "quantity", "unit", "unit_price", "amount", "position", "service",
 		}))
 }
 

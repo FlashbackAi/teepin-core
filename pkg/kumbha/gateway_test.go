@@ -5,6 +5,7 @@ package kumbha
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"testing"
 	"time"
@@ -278,4 +279,104 @@ func TestGateway_IncreaseBudget_GateDeniesIsPaymentRequired(t *testing.T) {
 	if !errors.Is(err, ErrPaymentRequired) {
 		t.Errorf("got %v, want ErrPaymentRequired", err)
 	}
+}
+
+// A disabled route is presented identically to an unconfigured one — a
+// customer never learns whether a route exists but was turned off, vs
+// never existed at all (see KUMBHA-DESIGN.md's "no console page of its
+// own": route/backend identity is operator-only).
+func TestGateway_Complete_DisabledRouteIsUnknownModel(t *testing.T) {
+	store, _ := newMockStore(t)
+	fast := &fakeProvider{name: "vllm"}
+	router := NewRouter(map[string]Route{"teepin/fast": {Provider: fast, ProviderName: "vllm"}})
+	gw := NewGateway(store, router, nil, &fakePricing{}, &fakeUsageRecorder{})
+
+	routeDB, routeMock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer routeDB.Close()
+	routeMock.ExpectQuery(`SELECT enabled FROM billing\.kumbha_routes`).
+		WithArgs("teepin/fast").
+		WillReturnRows(sqlmock.NewRows([]string{"enabled"}).AddRow(false))
+	gw = gw.WithRouteControl(NewRouteStore(routeDB))
+
+	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), Status: "open", Budget: 5.0}
+	_, err = gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/fast"})
+	if !errors.Is(err, inference.ErrUnknownModel) {
+		t.Errorf("got %v, want inference.ErrUnknownModel for a disabled route", err)
+	}
+}
+
+// A route with no explicit setting stays usable — the "ships on" default —
+// and an enabled route completes normally with route control wired in.
+func TestGateway_Complete_EnabledRouteStillWorksWithRouteControlWired(t *testing.T) {
+	store, mock := newMockStore(t)
+	fast := &fakeProvider{name: "vllm"}
+	router := NewRouter(map[string]Route{"teepin/fast": {Provider: fast, ProviderName: "vllm"}})
+	gw := NewGateway(store, router, nil, &fakePricing{}, &fakeUsageRecorder{})
+
+	routeDB, routeMock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer routeDB.Close()
+	routeMock.ExpectQuery(`SELECT enabled FROM billing\.kumbha_routes`).
+		WithArgs("teepin/fast").
+		WillReturnError(sql.ErrNoRows)
+	gw = gw.WithRouteControl(NewRouteStore(routeDB))
+
+	sessID, accountID := uuid.New(), uuid.New()
+	sess := &Session{ID: sessID, AccountID: accountID, Status: "open", Budget: 5.0}
+	expectZeroCostAccrual(mock, sessID, accountID)
+
+	if _, err := gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/fast"}); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+}
+
+// A failure to READ the enabled flag (a DB blip) must not take down every
+// Kumbha completion — it fails open, unlike a payment gate.
+func TestGateway_Complete_RouteCheckFailureFailsOpen(t *testing.T) {
+	store, mock := newMockStore(t)
+	fast := &fakeProvider{name: "vllm"}
+	router := NewRouter(map[string]Route{"teepin/fast": {Provider: fast, ProviderName: "vllm"}})
+	gw := NewGateway(store, router, nil, &fakePricing{}, &fakeUsageRecorder{})
+
+	routeDB, routeMock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer routeDB.Close()
+	routeMock.ExpectQuery(`SELECT enabled FROM billing\.kumbha_routes`).
+		WithArgs("teepin/fast").
+		WillReturnError(errors.New("connection reset"))
+	gw = gw.WithRouteControl(NewRouteStore(routeDB))
+
+	sessID, accountID := uuid.New(), uuid.New()
+	sess := &Session{ID: sessID, AccountID: accountID, Status: "open", Budget: 5.0}
+	expectZeroCostAccrual(mock, sessID, accountID)
+
+	if _, err := gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/fast"}); err != nil {
+		t.Fatalf("Complete should fail open on a route-check error, got: %v", err)
+	}
+}
+
+// expectZeroCostAccrual primes the full Accrue transaction for a completion
+// with zero usage/cost (the default fakeProvider) — status/budget/spent
+// locked, spend written unchanged, and a zero/zero usage row upserted;
+// Complete's own settleLine calls are skipped entirely for zero tokens, so
+// nothing beyond Accrue touches the DB.
+func expectZeroCostAccrual(mock sqlmock.Sqlmock, sessID, accountID uuid.UUID) {
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT status, budget, spent FROM billing\.inference_sessions`).
+		WithArgs(sessID, accountID).
+		WillReturnRows(sqlmock.NewRows([]string{"status", "budget", "spent"}).AddRow("open", 5.0, 0.0))
+	mock.ExpectExec(`UPDATE billing\.inference_sessions SET spent`).
+		WithArgs(sessID, 0.0).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`INSERT INTO billing\.inference_session_usage`).
+		WithArgs(sessID, "teepin/fast", "vllm", 0, 0).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 }

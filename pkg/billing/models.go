@@ -99,6 +99,22 @@ type Invoice struct {
 	BillToAddress string `json:"bill_to_address,omitempty"`
 	BillToTaxID   string `json:"bill_to_tax_id,omitempty"`
 	BillToAccount string `json:"bill_to_account_number,omitempty"`
+	// BillToCountry is the ISO 3166-1 alpha-2 country of the bill-to
+	// snapshot — the input tax decisions are made on.
+	BillToCountry string `json:"bill_to_country,omitempty"`
+
+	// TaxDetails itemises the tax that makes up Tax: one entry per tax
+	// (name, rate, jurisdiction, registration code). Empty means no tax
+	// was charged. Snapshotted so the invoice keeps the treatment it was
+	// issued with.
+	TaxDetails []TaxLine `json:"tax_details,omitempty"`
+	// PayURL is the link the invoice prints for paying online. Set at render
+	// time by whoever holds the payment provider; never stored on the row.
+	PayURL string `json:"-"`
+
+	// PaymentTerms is printed on the invoice verbatim ("Due on receipt —
+	// charged automatically to the card on file").
+	PaymentTerms string `json:"payment_terms,omitempty"`
 
 	// LineItems is populated by GetInvoice, not by list queries — a list
 	// of fifty invoices does not need every line of every one.
@@ -164,6 +180,11 @@ type InvoiceLineItem struct {
 	// separate concept.
 	Amount    float64 `json:"amount"`
 	SortOrder int     `json:"sort_order"`
+
+	// Service is the customer-facing section this line belongs to
+	// ("GPU compute", "Inference"), from the service catalog at issue time.
+	// Empty on invoices issued before grouping existed.
+	Service string `json:"service,omitempty"`
 
 	// ResourceType is set on computed usage breakdowns only.
 	ResourceType string `json:"resource_type,omitempty"`
@@ -250,4 +271,21 @@ type UsageSummary struct {
 	TotalCost   float64            `json:"total_cost"`
 	ByResource  map[string]float64 `json:"by_resource"` // resource_type -> cost
 	ByInstance  map[string]float64 `json:"by_instance"` // instance_id -> cost
+}
+
+// TaxLine is one itemised tax on an invoice.
+type TaxLine struct {
+	// Name as the customer knows it: "IGST", "VAT", "Sales tax".
+	Name string `json:"name"`
+	// Jurisdiction is a country or state code the tax belongs to.
+	Jurisdiction string `json:"jurisdiction,omitempty"`
+	// Rate as a fraction (0.18 = 18%).
+	Rate   float64 `json:"rate"`
+	Amount float64 `json:"amount"`
+	// Code is the classification code printed beside the charge where the
+	// jurisdiction requires one (for example a GST SAC code).
+	Code string `json:"code,omitempty"`
+	// ReverseCharge marks a line the customer, not the supplier, accounts
+	// for; Amount is then informational and excluded from the total.
+	ReverseCharge bool `json:"reverse_charge,omitempty"`
 }

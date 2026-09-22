@@ -6,6 +6,7 @@ package billing
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -49,6 +50,9 @@ type Service struct {
 	// errors, and AccountCanProvision still works off the DB (it never
 	// calls Stripe). Wired at the composition root via WithStripe.
 	stripe StripeGateway
+
+	// tax decides which taxes an invoice carries. Nil means none.
+	tax TaxPolicy
 }
 
 // NewService creates a new billing service
@@ -297,8 +301,12 @@ func (s *Service) CreateAccountUsageInvoice(ctx context.Context, accountID uuid.
 			unitPrice = u.TotalCost / u.Quantity // blended rate over the period
 		}
 		projectID := u.ProjectID
+		// Customer-facing name and section from the service catalog — never
+		// the raw internal resource type (and never blank).
+		pres := Classify(u.ResourceType)
 		lineItems = append(lineItems, InvoiceLineItem{
-			Description:  u.ResourceType,
+			Description:  pres.Title,
+			Service:      pres.Service,
 			ProjectID:    &projectID,
 			ProjectName:  u.ProjectName,
 			Quantity:     u.Quantity,
@@ -310,7 +318,12 @@ func (s *Service) CreateAccountUsageInvoice(ctx context.Context, accountID uuid.
 		subtotal += u.TotalCost
 	}
 
-	tax := 0.0 // no tax engine yet — see ROADMAP B6
+	// Tax comes from the configured policy (none by default): Teepin charges
+	// a tax only where it is registered to, which is configuration, not code.
+	taxLines := s.taxPolicy().Calculate(TaxInput{
+		Country: bill.Country, TaxID: bill.TaxID, Subtotal: subtotal, Currency: "USD",
+	})
+	tax := ChargedTax(taxLines)
 	total := subtotal + tax
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -340,6 +353,15 @@ func (s *Service) CreateAccountUsageInvoice(ctx context.Context, accountID uuid.
 		BillToAddress: bill.Address,
 		BillToTaxID:   bill.TaxID,
 		BillToAccount: bill.AccountNumber,
+		BillToCountry: bill.Country,
+		TaxDetails:    taxLines,
+		// Usage is billed in arrears and collected automatically from the
+		// card on file when the invoice is issued, the way AWS does.
+		PaymentTerms: UsagePaymentTerms,
+	}
+	taxJSON, err := json.Marshal(taxLines)
+	if err != nil || len(taxLines) == 0 {
+		taxJSON = []byte("[]")
 	}
 
 	// account-level: project_id on the INVOICE stays null; the breakdown
@@ -349,8 +371,8 @@ func (s *Service) CreateAccountUsageInvoice(ctx context.Context, accountID uuid.
 		(account_id, invoice_number, period_start, period_end,
 		 subtotal, tax, total, status, source, currency,
 		 bill_to_name, bill_to_email, bill_to_address, bill_to_tax_id,
-		 bill_to_account_number)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,'draft','usage',$8,$9,$10,$11,$12,$13)
+		 bill_to_account_number, bill_to_country, tax_details, payment_terms)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,'draft','usage',$8,$9,$10,$11,$12,$13,$14,$15,$16)
 		RETURNING id, created_at, updated_at
 	`,
 		invoice.AccountID, invoice.InvoiceNumber,
@@ -358,7 +380,8 @@ func (s *Service) CreateAccountUsageInvoice(ctx context.Context, accountID uuid.
 		invoice.Subtotal, invoice.Tax, invoice.Total, invoice.Currency,
 		nullIfEmpty(invoice.BillToName), nullIfEmpty(invoice.BillToEmail),
 		nullIfEmpty(invoice.BillToAddress), nullIfEmpty(invoice.BillToTaxID),
-		nullIfEmpty(invoice.BillToAccount),
+		nullIfEmpty(invoice.BillToAccount), nullIfEmpty(invoice.BillToCountry),
+		taxJSON, nullIfEmpty(invoice.PaymentTerms),
 	).Scan(&invoice.ID, &invoice.CreatedAt, &invoice.UpdatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create usage invoice: %w", err)
@@ -367,11 +390,11 @@ func (s *Service) CreateAccountUsageInvoice(ctx context.Context, accountID uuid.
 	for i, item := range lineItems {
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO billing.invoice_line_items
-			(invoice_id, project_id, description, quantity, unit, unit_price, amount, position)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+			(invoice_id, project_id, description, quantity, unit, unit_price, amount, position, service)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
 		`, invoice.ID, item.ProjectID, item.Description,
 			nullIfZero(item.Quantity), nullIfEmpty(item.Unit),
-			nullIfZero(item.UnitPrice), item.Amount, i,
+			nullIfZero(item.UnitPrice), item.Amount, i, item.Service,
 		); err != nil {
 			return nil, fmt.Errorf("failed to create usage line item %d: %w", i+1, err)
 		}
@@ -524,6 +547,7 @@ type billTo struct {
 	Email         string
 	Address       string
 	TaxID         string
+	Country       string // ISO 3166-1 alpha-2, the input tax decisions are made on
 }
 
 // resolveBillTo reads the billing entity behind a project.
@@ -567,7 +591,7 @@ func (s *Service) resolveBillTo(ctx context.Context, projectID uuid.UUID) (*bill
 	if b.Email == "" {
 		b.Email = ownerEml.String
 	}
-	b.Address = address.String
+	b.Address = FormatAddress(address.String)
 	b.TaxID = taxID.String
 
 	return &b, nil
@@ -589,15 +613,16 @@ func (s *Service) resolveBillToByAccount(ctx context.Context, accountID uuid.UUI
 		email   sql.NullString
 		address sql.NullString
 		taxID   sql.NullString
+		country sql.NullString
 	)
 
 	err := s.db.QueryRowContext(ctx, `
 		SELECT a.id, a.account_number, a.legal_name, a.display_name,
-		       a.billing_email, a.billing_address::text, a.tax_id
+		       a.billing_email, a.billing_address::text, a.tax_id, a.country
 		FROM auth.accounts a
 		WHERE a.id = $1
 	`, accountID).Scan(&b.AccountID, &b.AccountNumber, &legal, &display,
-		&email, &address, &taxID)
+		&email, &address, &taxID, &country)
 
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("account not found")
@@ -616,8 +641,9 @@ func (s *Service) resolveBillToByAccount(ctx context.Context, accountID uuid.UUI
 	// billing_email once set — this is a display detail, not a hard
 	// requirement to issue.
 	b.Email = email.String
-	b.Address = address.String
+	b.Address = FormatAddress(address.String)
 	b.TaxID = taxID.String
+	b.Country = strings.ToUpper(strings.TrimSpace(country.String))
 
 	return &b, nil
 }
@@ -629,12 +655,28 @@ func (s *Service) resolveBillToByAccount(ctx context.Context, accountID uuid.UUI
 // removed. The previous scheme used 8 random hex characters, which was
 // neither sequential nor collision-proof by construction.
 func (s *Service) nextInvoiceNumber(ctx context.Context, tx *sql.Tx) (string, error) {
+	return allocateInvoiceNumber(ctx, tx, time.Now().UTC().Year())
+}
+
+// allocateInvoiceNumber takes the next number for a calendar year from a
+// counter row. The upsert locks that row until the surrounding transaction
+// ends, so concurrent issuers queue rather than skip numbers, and a rollback
+// hands the number back: the sequence is gapless by construction, which most
+// tax authorities require. The year is part of the number ("INV-2026-000001")
+// so numbering restarts each year and a customer can date an invoice at a
+// glance. Separate from the time source so it can be tested for any year.
+func allocateInvoiceNumber(ctx context.Context, tx *sql.Tx, year int) (string, error) {
 	var n int64
-	if err := tx.QueryRowContext(ctx,
-		`SELECT nextval('billing.invoice_number_seq')`).Scan(&n); err != nil {
+	if err := tx.QueryRowContext(ctx, `
+		INSERT INTO billing.invoice_counters (year, last_number)
+		VALUES ($1, 1)
+		ON CONFLICT (year) DO UPDATE
+		    SET last_number = billing.invoice_counters.last_number + 1
+		RETURNING last_number
+	`, year).Scan(&n); err != nil {
 		return "", fmt.Errorf("failed to allocate invoice number: %w", err)
 	}
-	return fmt.Sprintf("INV-%06d", n), nil
+	return fmt.Sprintf("INV-%d-%06d", year, n), nil
 }
 
 // ErrNoLineItems is returned for an invoice with nothing on it.
@@ -788,11 +830,11 @@ func (s *Service) CreateManualInvoice(ctx context.Context, req ManualInvoiceRequ
 	for i, item := range req.LineItems {
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO billing.invoice_line_items
-			(invoice_id, project_id, description, quantity, unit, unit_price, amount, position)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+			(invoice_id, project_id, description, quantity, unit, unit_price, amount, position, service)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
 		`, invoice.ID, item.ProjectID, item.Description,
 			nullIfZero(item.Quantity), nullIfEmpty(item.Unit),
-			nullIfZero(item.UnitPrice), item.Amount, i,
+			nullIfZero(item.UnitPrice), item.Amount, i, item.Service,
 		); err != nil {
 			return nil, fmt.Errorf("failed to create line item %d: %w", i+1, err)
 		}
@@ -957,7 +999,7 @@ func (s *Service) lineItemsFor(ctx context.Context, invoiceID uuid.UUID) ([]Invo
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT li.id, li.project_id, COALESCE(p.name, ''), li.description,
 		       COALESCE(li.quantity,0), COALESCE(li.unit,''),
-		       COALESCE(li.unit_price,0), li.amount, li.position
+		       COALESCE(li.unit_price,0), li.amount, li.position, li.service
 		FROM billing.invoice_line_items li
 		LEFT JOIN auth.projects p ON p.id = li.project_id
 		WHERE li.invoice_id = $1
@@ -973,7 +1015,7 @@ func (s *Service) lineItemsFor(ctx context.Context, invoiceID uuid.UUID) ([]Invo
 		var item InvoiceLineItem
 		if err := rows.Scan(&item.ID, &item.ProjectID, &item.ProjectName,
 			&item.Description, &item.Quantity, &item.Unit, &item.UnitPrice,
-			&item.Amount, &item.SortOrder); err != nil {
+			&item.Amount, &item.SortOrder, &item.Service); err != nil {
 			return nil, err
 		}
 		items = append(items, item)
@@ -1005,34 +1047,8 @@ func (s *Service) GetInvoice(ctx context.Context, invoiceID uuid.UUID) (*Invoice
 
 	var invoice Invoice
 	var notes sql.NullString
-	err := s.db.QueryRowContext(ctx, query, invoiceID).Scan(
-		&invoice.ID,
-		&invoice.ProjectID,
-		&invoice.AccountID,
-		&invoice.InvoiceNumber,
-		&invoice.PeriodStart,
-		&invoice.PeriodEnd,
-		&invoice.Subtotal,
-		&invoice.Tax,
-		&invoice.Total,
-		&invoice.Status,
-		&invoice.StripeInvoiceID,
-		&invoice.PaidAt,
-		&invoice.CreatedAt,
-		&invoice.UpdatedAt,
-		&invoice.Source,
-		&invoice.Currency,
-		&invoice.DueDate,
-		&invoice.IssuedBy,
-		&notes,
-		&invoice.BillToName,
-		&invoice.BillToEmail,
-		&invoice.BillToAddress,
-		&invoice.BillToTaxID,
-		&invoice.BillToAccount,
-		&invoice.PDFS3Key,
-		&invoice.PDFGeneratedAt,
-	)
+	var taxJSON []byte
+	err := s.db.QueryRowContext(ctx, query, invoiceID).Scan(invoiceScanTargets(&invoice, &notes, &taxJSON)...)
 
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("invoice not found")
@@ -1041,6 +1057,7 @@ func (s *Service) GetInvoice(ctx context.Context, invoiceID uuid.UUID) (*Invoice
 		return nil, fmt.Errorf("failed to get invoice: %w", err)
 	}
 	invoice.Notes = notes.String
+	invoice.TaxDetails = decodeTaxDetails(taxJSON)
 
 	// Line items only on a single fetch — a list of invoices does not
 	// need every line of every one.
@@ -1062,7 +1079,8 @@ const invoiceColumns = `id, project_id, account_id, invoice_number,
 	COALESCE(bill_to_name,''), COALESCE(bill_to_email,''),
 	COALESCE(bill_to_address,''), COALESCE(bill_to_tax_id,''),
 	COALESCE(bill_to_account_number,''),
-	pdf_s3_key, pdf_generated_at`
+	pdf_s3_key, pdf_generated_at,
+	COALESCE(bill_to_country,''), tax_details, COALESCE(payment_terms,'')`
 
 // ListInvoices lists every invoice for a project.
 //
@@ -1145,38 +1163,12 @@ func scanInvoices(rows *sql.Rows) ([]Invoice, error) {
 	for rows.Next() {
 		var inv Invoice
 		var notes sql.NullString
-		err := rows.Scan(
-			&inv.ID,
-			&inv.ProjectID,
-			&inv.AccountID,
-			&inv.InvoiceNumber,
-			&inv.PeriodStart,
-			&inv.PeriodEnd,
-			&inv.Subtotal,
-			&inv.Tax,
-			&inv.Total,
-			&inv.Status,
-			&inv.StripeInvoiceID,
-			&inv.PaidAt,
-			&inv.CreatedAt,
-			&inv.UpdatedAt,
-			&inv.Source,
-			&inv.Currency,
-			&inv.DueDate,
-			&inv.IssuedBy,
-			&notes,
-			&inv.BillToName,
-			&inv.BillToEmail,
-			&inv.BillToAddress,
-			&inv.BillToTaxID,
-			&inv.BillToAccount,
-			&inv.PDFS3Key,
-			&inv.PDFGeneratedAt,
-		)
-		if err != nil {
+		var taxJSON []byte
+		if err := rows.Scan(invoiceScanTargets(&inv, &notes, &taxJSON)...); err != nil {
 			return nil, fmt.Errorf("failed to scan invoice: %w", err)
 		}
 		inv.Notes = notes.String
+		inv.TaxDetails = decodeTaxDetails(taxJSON)
 		invoices = append(invoices, inv)
 	}
 
@@ -1264,4 +1256,49 @@ func (s *Service) MarkInvoicePaid(ctx context.Context, invoiceID uuid.UUID, stri
 	}
 
 	return tx.Commit()
+}
+
+// invoiceScanTargets lists the scan destinations for invoiceColumns, in order.
+// One helper for every invoice query so the column list and the scan cannot
+// drift apart.
+func invoiceScanTargets(inv *Invoice, notes *sql.NullString, taxJSON *[]byte) []any {
+	return []any{
+		&inv.ID, &inv.ProjectID, &inv.AccountID, &inv.InvoiceNumber,
+		&inv.PeriodStart, &inv.PeriodEnd, &inv.Subtotal, &inv.Tax, &inv.Total,
+		&inv.Status, &inv.StripeInvoiceID, &inv.PaidAt, &inv.CreatedAt, &inv.UpdatedAt,
+		&inv.Source, &inv.Currency, &inv.DueDate, &inv.IssuedBy, notes,
+		&inv.BillToName, &inv.BillToEmail, &inv.BillToAddress, &inv.BillToTaxID,
+		&inv.BillToAccount, &inv.PDFS3Key, &inv.PDFGeneratedAt,
+		&inv.BillToCountry, taxJSON, &inv.PaymentTerms,
+	}
+}
+
+// decodeTaxDetails reads the stored itemised tax. A malformed or empty value
+// means no tax lines rather than a failed invoice read.
+func decodeTaxDetails(raw []byte) []TaxLine {
+	if len(raw) == 0 {
+		return nil
+	}
+	var lines []TaxLine
+	if err := json.Unmarshal(raw, &lines); err != nil || len(lines) == 0 {
+		return nil
+	}
+	return lines
+}
+
+// UsagePaymentTerms is printed on usage invoices: billed in arrears and
+// collected automatically at issue, the way AWS does.
+const UsagePaymentTerms = "Due on receipt. Charged automatically to the card on file."
+
+// WithTaxPolicy sets the tax policy. Left unset, no tax is charged.
+func (s *Service) WithTaxPolicy(p TaxPolicy) *Service {
+	s.tax = p
+	return s
+}
+
+func (s *Service) taxPolicy() TaxPolicy {
+	if s.tax == nil {
+		return NoTax{}
+	}
+	return s.tax
 }

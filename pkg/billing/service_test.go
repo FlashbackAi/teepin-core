@@ -6,6 +6,7 @@ package billing
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -23,6 +24,7 @@ var invoiceRowColumns = []string{
 	"created_at", "updated_at", "source", "currency", "due_date", "issued_by", "notes",
 	"bill_to_name", "bill_to_email", "bill_to_address", "bill_to_tax_id", "bill_to_account_number",
 	"pdf_s3_key", "pdf_generated_at",
+	"bill_to_country", "tax_details", "payment_terms",
 }
 
 // oneInvoiceRow builds a single-row result for GetInvoice's SELECT with
@@ -35,6 +37,7 @@ func oneInvoiceRow(id, account uuid.UUID, number, status string) *sqlmock.Rows {
 		now, now, "manual", "USD", nil, nil, "",
 		"Acme Inc", "billing@acme.test", "", "", "1234567890",
 		nil, nil,
+		"", []byte("[]"), "",
 	)
 }
 
@@ -234,8 +237,8 @@ func TestCreateManualInvoice_RejectsLineItemFromOtherAccount(t *testing.T) {
 	mock.ExpectQuery(`SELECT a\.id, a\.account_number.*FROM auth\.accounts`).
 		WithArgs(accountID).
 		WillReturnRows(sqlmock.NewRows(
-			[]string{"id", "account_number", "legal_name", "display_name", "billing_email", "billing_address", "tax_id"},
-		).AddRow(accountID, "1234567890", "", "Acme Inc", "", "", ""))
+			[]string{"id", "account_number", "legal_name", "display_name", "billing_email", "billing_address", "tax_id", "country"},
+		).AddRow(accountID, "1234567890", "", "Acme Inc", "", "", "", ""))
 
 	// verifyProjectsBelongToAccount finds ZERO matching rows: the
 	// referenced project belongs to someone else.
@@ -316,8 +319,8 @@ func TestCreateAccountUsageInvoice_BuildsPerResourceLines(t *testing.T) {
 	mock.ExpectQuery(`SELECT a\.id, a\.account_number.*FROM auth\.accounts`).
 		WithArgs(account).
 		WillReturnRows(sqlmock.NewRows(
-			[]string{"id", "account_number", "legal_name", "display_name", "billing_email", "billing_address", "tax_id"},
-		).AddRow(account, "1234567890", "Acme Inc", "Acme", "billing@acme.test", "", ""))
+			[]string{"id", "account_number", "legal_name", "display_name", "billing_email", "billing_address", "tax_id", "country"},
+		).AddRow(account, "1234567890", "Acme Inc", "Acme", "billing@acme.test", "", "", "US"))
 
 	// accountUsageByProjectResource: two projects, one resource each.
 	mock.ExpectQuery(`FROM billing\.usage_records u\s+JOIN auth\.projects p`).
@@ -329,8 +332,8 @@ func TestCreateAccountUsageInvoice_BuildsPerResourceLines(t *testing.T) {
 			AddRow(projB, "batch-jobs", "gpu.h100.mig-1g", "hours", 50.0, 50.0))
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT nextval`).
-		WillReturnRows(sqlmock.NewRows([]string{"nextval"}).AddRow(int64(7)))
+	mock.ExpectQuery(`INSERT INTO billing\.invoice_counters`).
+		WillReturnRows(sqlmock.NewRows([]string{"last_number"}).AddRow(int64(7)))
 	mock.ExpectQuery(`INSERT INTO billing\.invoices`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at", "updated_at"}).
 			AddRow(uuid.New(), time.Now(), time.Now()))
@@ -365,6 +368,20 @@ func TestCreateAccountUsageInvoice_BuildsPerResourceLines(t *testing.T) {
 	if l0.Amount != 240.0 || l0.UnitPrice != 2.0 {
 		t.Errorf("first line amount/unit = %.2f/%.2f, want 240.00/2.00", l0.Amount, l0.UnitPrice)
 	}
+	// The customer sees catalog names, never the raw resource type.
+	if l0.Description != "GPU H100 MIG 2g" || l0.Service != "GPU compute" {
+		t.Errorf("first line described as %q in %q, want the catalog name", l0.Description, l0.Service)
+	}
+	// Numbers are per-year and gapless: INV-<year>-<6 digits>.
+	if want := fmt.Sprintf("INV-%d-000007", time.Now().UTC().Year()); inv.InvoiceNumber != want {
+		t.Errorf("invoice number = %q, want %q", inv.InvoiceNumber, want)
+	}
+	if inv.PaymentTerms != UsagePaymentTerms {
+		t.Errorf("payment terms = %q, want the usage terms", inv.PaymentTerms)
+	}
+	if inv.BillToCountry != "US" || inv.Tax != 0 || len(inv.TaxDetails) != 0 {
+		t.Errorf("country=%q tax=%v lines=%v, want US and no tax by default", inv.BillToCountry, inv.Tax, inv.TaxDetails)
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet expectations: %v", err)
 	}
@@ -387,8 +404,8 @@ func TestCreateAccountUsageInvoice_NoUsageIsError(t *testing.T) {
 	mock.ExpectQuery(`SELECT a\.id, a\.account_number.*FROM auth\.accounts`).
 		WithArgs(account).
 		WillReturnRows(sqlmock.NewRows(
-			[]string{"id", "account_number", "legal_name", "display_name", "billing_email", "billing_address", "tax_id"},
-		).AddRow(account, "1234567890", "Acme Inc", "Acme", "", "", ""))
+			[]string{"id", "account_number", "legal_name", "display_name", "billing_email", "billing_address", "tax_id", "country"},
+		).AddRow(account, "1234567890", "Acme Inc", "Acme", "", "", "", ""))
 	mock.ExpectQuery(`FROM billing\.usage_records u\s+JOIN auth\.projects p`).
 		WithArgs(account, start, end).
 		WillReturnRows(sqlmock.NewRows(
@@ -427,7 +444,7 @@ func TestIssueInvoice_SucceedsWithoutPDFStorage(t *testing.T) {
 	mock.ExpectQuery(`FROM billing\.invoice_line_items`).
 		WithArgs(id).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "project_id", "name", "description", "quantity", "unit", "unit_price", "amount", "position",
+			"id", "project_id", "name", "description", "quantity", "unit", "unit_price", "amount", "position", "service",
 		}))
 
 	inv, err := s.IssueInvoice(context.Background(), id)
@@ -473,7 +490,7 @@ func TestIssueInvoice_RendersAndStoresPDF(t *testing.T) {
 	mock.ExpectQuery(`FROM billing\.invoice_line_items`).
 		WithArgs(id).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "project_id", "name", "description", "quantity", "unit", "unit_price", "amount", "position",
+			"id", "project_id", "name", "description", "quantity", "unit", "unit_price", "amount", "position", "service",
 		}))
 	// After a successful upload, the key is recorded on the row.
 	wantKey := account.String() + "/INV-000010.pdf"
@@ -523,7 +540,7 @@ func TestIssueInvoice_StoreFailureDoesNotFailIssue(t *testing.T) {
 	mock.ExpectQuery(`FROM billing\.invoice_line_items`).
 		WithArgs(id).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "project_id", "name", "description", "quantity", "unit", "unit_price", "amount", "position",
+			"id", "project_id", "name", "description", "quantity", "unit", "unit_price", "amount", "position", "service",
 		}))
 	// No pdf_s3_key UPDATE expected — the upload failed before it.
 

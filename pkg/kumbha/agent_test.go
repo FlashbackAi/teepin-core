@@ -75,7 +75,7 @@ func (f *fakeCluster) Inventory(context.Context) ([]cluster.NodeInventory, error
 func (f *fakeCluster) InstanceMetrics(context.Context) ([]cluster.InstanceMetric, error) {
 	return nil, nil
 }
-func (f *fakeCluster) Healthy(context.Context) bool                               { return true }
+func (f *fakeCluster) Healthy(context.Context) bool { return true }
 func (f *fakeCluster) ResolveInstanceAddress(context.Context, string, int32) (string, error) {
 	return "", cluster.ErrNotFound
 }
@@ -755,5 +755,49 @@ func TestGateway_StopAgent_KillsRunningPod(t *testing.T) {
 	}
 	if len(fc.deleted) != 1 || fc.deleted[0] != agentPodID {
 		t.Errorf("agent pod was not torn down: deleted = %v, want [%s]", fc.deleted, agentPodID)
+	}
+}
+
+// TestGateway_LaunchAgent_PropagatesRoute covers AgentConfig.Route reaching
+// the pod as TEEPIN_ROUTE, and — the more load-bearing direction — that
+// leaving Route unset sends NO env var at all rather than an empty string,
+// so run.py's own os.environ.get("TEEPIN_ROUTE", "teepin/fast") default
+// still applies (an explicit "" would silently override it).
+func TestGateway_LaunchAgent_PropagatesRoute(t *testing.T) {
+	cases := []struct {
+		route string
+		want  string
+		unset bool
+	}{
+		{route: "", unset: true},
+		{route: "teepin/deep", want: "teepin/deep"},
+	}
+	for _, c := range cases {
+		store, mock := newMockStore(t)
+		fc := &fakeCluster{}
+		gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+			WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest", Route: c.route})
+
+		sessID := uuid.New()
+		sess := &Session{ID: sessID, AccountID: uuid.New(), ProjectID: uuid.New()}
+
+		mock.ExpectExec(`UPDATE billing\.inference_sessions SET agent_instance_id`).
+			WithArgs(sessID, "kumbha-agent-"+sessID.String()[:8]).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		if err := gw.LaunchAgent(context.Background(), sess, "build me a booking app"); err != nil {
+			t.Fatalf("LaunchAgent (route=%q): %v", c.route, err)
+		}
+
+		got, ok := fc.created[0].Env["TEEPIN_ROUTE"]
+		if c.unset {
+			if ok {
+				t.Errorf("Route unset: TEEPIN_ROUTE was sent as %q, want no env var at all", got)
+			}
+			continue
+		}
+		if !ok || got != c.want {
+			t.Errorf("Route=%q: TEEPIN_ROUTE = %q (present=%v), want %q", c.route, got, ok, c.want)
+		}
 	}
 }

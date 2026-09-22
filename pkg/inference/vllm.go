@@ -371,6 +371,29 @@ func trimTrailingSlash(s string) string {
 	return s
 }
 
+// CheckHealth confirms the backend is reachable and the configured model is
+// listed in /v1/models — free (no completion is generated, so no tokens are
+// billed). Deliberately narrower than DiscoverContextWindow's own success
+// condition: a missing/zero max_model_len is a real problem for context-fit
+// checking but NOT evidence the backend is down (found live 2026-08-26 — an
+// endpoint's /v1/models response dropped that field entirely while
+// continuing to serve completions normally; reusing DiscoverContextWindow
+// here would have reported a healthy backend as unhealthy on the exact same
+// data). An operator-visibility check, not something the request path
+// depends on.
+func (p *VLLMProvider) CheckHealth(ctx context.Context) error {
+	models, err := fetchModels(ctx, p.baseURL, p.apiKey)
+	if err != nil {
+		return err
+	}
+	for _, m := range models {
+		if m.ID == p.model {
+			return nil
+		}
+	}
+	return fmt.Errorf("model %q not present in %s/v1/models response", p.model, p.baseURL)
+}
+
 // DiscoverContextWindow queries vLLM's own OpenAI-compatible /v1/models
 // endpoint for the served model's real max_model_len, rather than making
 // an operator hardcode a guess that silently goes stale the moment the
@@ -383,36 +406,11 @@ func trimTrailingSlash(s string) string {
 // vLLM server that is briefly unreachable, or one whose /v1/models response
 // shape differs, must not stop the control plane from starting.
 func DiscoverContextWindow(ctx context.Context, baseURL, model, apiKey string) (int, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, trimTrailingSlash(baseURL)+"/v1/models", nil)
+	models, err := fetchModels(ctx, baseURL, apiKey)
 	if err != nil {
-		return 0, fmt.Errorf("build /v1/models request: %w", err)
+		return 0, err
 	}
-	if apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-	}
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, fmt.Errorf("query %s/v1/models: %w", baseURL, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("query %s/v1/models: status %d", baseURL, resp.StatusCode)
-	}
-
-	var body struct {
-		Data []struct {
-			ID          string `json:"id"`
-			MaxModelLen int    `json:"max_model_len"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return 0, fmt.Errorf("decode %s/v1/models response: %w", baseURL, err)
-	}
-
-	for _, m := range body.Data {
+	for _, m := range models {
 		if m.ID != model {
 			continue
 		}
@@ -422,4 +420,41 @@ func DiscoverContextWindow(ctx context.Context, baseURL, model, apiKey string) (
 		return m.MaxModelLen, nil
 	}
 	return 0, fmt.Errorf("model %q not present in %s/v1/models response", model, baseURL)
+}
+
+// modelInfo is one entry of an OpenAI-compatible /v1/models response.
+type modelInfo struct {
+	ID          string `json:"id"`
+	MaxModelLen int    `json:"max_model_len"`
+}
+
+// fetchModels is the shared HTTP call behind CheckHealth and
+// DiscoverContextWindow — they differ only in what counts as success.
+func fetchModels(ctx context.Context, baseURL, apiKey string) ([]modelInfo, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, trimTrailingSlash(baseURL)+"/v1/models", nil)
+	if err != nil {
+		return nil, fmt.Errorf("build /v1/models request: %w", err)
+	}
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("query %s/v1/models: %w", baseURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("query %s/v1/models: status %d", baseURL, resp.StatusCode)
+	}
+
+	var body struct {
+		Data []modelInfo `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("decode %s/v1/models response: %w", baseURL, err)
+	}
+	return body.Data, nil
 }

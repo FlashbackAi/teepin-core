@@ -57,3 +57,14 @@ func (r *Router) Resolve(model string) (Route, error) {
 	}
 	return route, nil
 }
+
+// Names lists every configured route name, for building the operator-facing
+// route listing (RouteMonitor, the admin API) — never exposed to a
+// customer-facing endpoint, which only ever resolves one name at a time.
+func (r *Router) Names() []string {
+	names := make([]string, 0, len(r.routes))
+	for name := range r.routes {
+		names = append(names, name)
+	}
+	return names
+}

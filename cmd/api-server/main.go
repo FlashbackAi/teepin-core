@@ -111,6 +111,16 @@ func main() {
 	if dbClient != nil && authService != nil {
 		billingService = billing.NewService(dbClient.DB())
 
+		// Who invoices are issued by, and which taxes (if any) they carry. Both are
+		// configuration, not code: the address is supplied when known, and tax is
+		// charged only where Teepin is registered to charge it (none by default).
+		billingpdf.SetIssuer(issuerFromEnv())
+		taxPolicy, taxErr := billing.ParseTaxRules(getEnv("TEEPIN_TAX_RULES", ""))
+		if taxErr != nil {
+			log.Fatalf("TEEPIN_TAX_RULES: %v", taxErr)
+		}
+		billingService.WithTaxPolicy(taxPolicy)
+
 		// Enable invoice-PDF generation + storage when a bucket is
 		// configured. Absent (local dev with no AWS), invoices still
 		// issue — just without a stored document. Credentials come from
@@ -711,6 +721,11 @@ func main() {
 	// later, once checkOrigin exists — mirroring execTickets/execHandler's
 	// own two-stage construction for the same reason.
 	var kumbhaEventTickets *kumbha.EventTicketStore
+	// Set inside the Kumbha Gateway block below (needs the same routes map
+	// the Gateway itself is built from); declared here so it is still in
+	// scope for setupRouter's call below regardless of whether that block
+	// ran at all.
+	var kumbhaRouteHandler *api.KumbhaRouteHandler
 
 	// Kumbha Gateway: wraps the operator's own vLLM endpoint (and,
 	// optionally, Anthropic for frontier routing) in Teepin auth +
@@ -785,6 +800,15 @@ func main() {
 				kumbhaRouter := kumbha.NewRouter(routes)
 				kumbhaGateway := kumbha.NewGateway(kumbhaStore, kumbhaRouter, billingService, billingService, billingService)
 
+				// Live on/off per route (Control Center, not a redeploy) and
+				// background connectivity health — see pkg/kumbha/routes.go.
+				kumbhaRouteStore := kumbha.NewRouteStore(dbClient.DB())
+				kumbhaGateway = kumbhaGateway.WithRouteControl(kumbhaRouteStore)
+				kumbhaRouteMonitor := kumbha.NewRouteMonitor(routes)
+				kumbhaRouteMonitor.CheckNow(context.Background()) // first reading before anything reads Statuses()
+				go kumbhaRouteMonitor.Start(context.Background(), time.Duration(getEnvInt("TEEPIN_KUMBHA_ROUTE_HEALTH_INTERVAL_SECONDS", 60))*time.Second)
+				kumbhaRouteHandler = api.NewKumbhaRouteHandler(kumbhaRouter, kumbhaRouteStore, kumbhaRouteMonitor)
+
 				// A Kumbha agent credential (auth.MintSessionToken) is
 				// validated against session-open status on every request —
 				// see auth.Middleware.WithSessionChecker. Without this, a
@@ -826,6 +850,13 @@ func main() {
 						// only once the hosted route's model is confirmed to
 						// accept multimodal (image) input.
 						VisionCapable: getEnvBool("TEEPIN_KUMBHA_VISION_CAPABLE", false),
+						// Empty (default) leaves run.py's own "teepin/fast"
+						// default untouched — see AgentConfig.Route's own doc
+						// comment. Set to "teepin/deep" to move new build
+						// sessions onto the frontier route instead, e.g. for a
+						// demo where teepin/fast points at a self-hosted model
+						// not yet proven for agentic tool use.
+						Route: getEnv("TEEPIN_KUMBHA_AGENT_ROUTE", ""),
 					})
 					log.Printf("✅ Kumbha agent pod orchestration enabled (image %s)", agentImage)
 					// Deployment-thumbnail capture (console Preview tab) rides
@@ -1016,7 +1047,7 @@ func main() {
 	}
 
 	// Setup router
-	router := setupRouter(apiServer, authHandler, accountHandler, authMiddleware, billingHandler, registryHandler, adminHandler, webhookHandler, nodeHandler, modelCatalogHandler, nodeServicesHandler, playgroundHandler, nodeModelCacheHandler, publicInferenceHandler, rateLimitMiddleware, proxyHandler, execHandler, kumbhaEventsHandler, getEnv("TEEPIN_DOMAIN", "teepin.com"))
+	router := setupRouter(apiServer, authHandler, accountHandler, authMiddleware, billingHandler, registryHandler, adminHandler, webhookHandler, nodeHandler, modelCatalogHandler, nodeServicesHandler, playgroundHandler, nodeModelCacheHandler, publicInferenceHandler, kumbhaRouteHandler, rateLimitMiddleware, proxyHandler, execHandler, kumbhaEventsHandler, getEnv("TEEPIN_DOMAIN", "teepin.com"))
 
 	// Create HTTP server
 	port := getEnv("PORT", "8080")
@@ -1239,7 +1270,7 @@ func initRateLimiting() *ratelimit.Config {
 	return config
 }
 
-func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHandler *api.AccountHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler, registryHandler *api.RegistryHandler, adminHandler *api.AdminHandler, webhookHandler *api.WebhookHandler, nodeHandler *api.NodeHandler, modelCatalogHandler *api.ModelCatalogHandler, nodeServicesHandler *api.NodeServicesHandler, playgroundHandler *api.InferencePlaygroundHandler, nodeModelCacheHandler *api.NodeModelCacheHandler, publicInferenceHandler *api.InferenceHandler, rateLimitMiddleware *ratelimit.Middleware, proxyHandler *cluster.ProxyHandler, execHandler *cluster.ExecHandler, kumbhaEventsHandler *kumbha.EventsHandler, instanceDomain string) *gin.Engine {
+func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHandler *api.AccountHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler, registryHandler *api.RegistryHandler, adminHandler *api.AdminHandler, webhookHandler *api.WebhookHandler, nodeHandler *api.NodeHandler, modelCatalogHandler *api.ModelCatalogHandler, nodeServicesHandler *api.NodeServicesHandler, playgroundHandler *api.InferencePlaygroundHandler, nodeModelCacheHandler *api.NodeModelCacheHandler, publicInferenceHandler *api.InferenceHandler, kumbhaRouteHandler *api.KumbhaRouteHandler, rateLimitMiddleware *ratelimit.Middleware, proxyHandler *cluster.ProxyHandler, execHandler *cluster.ExecHandler, kumbhaEventsHandler *kumbha.EventsHandler, instanceDomain string) *gin.Engine {
 	// Set Gin to release mode in production
 	if os.Getenv("GIN_MODE") == "" {
 		gin.SetMode(gin.ReleaseMode)
@@ -1610,6 +1641,12 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 					admin.GET("/nodes/:id/cached-models", nodeModelCacheHandler.List)
 					admin.DELETE("/nodes/:id/cached-models", nodeModelCacheHandler.Delete)
 				}
+				if kumbhaRouteHandler != nil {
+					admin.GET("/kumbha/routes", kumbhaRouteHandler.List)
+					// route travels as ?route=teepin/fast — see SetEnabled's
+					// own doc comment on why a path segment cannot hold it.
+					admin.PUT("/kumbha/routes", kumbhaRouteHandler.SetEnabled)
+				}
 				if modelCatalogHandler != nil {
 					admin.POST("/inference/models", modelCatalogHandler.RegisterModel)
 					admin.GET("/inference/models", modelCatalogHandler.ListModels)
@@ -1768,4 +1805,26 @@ func tunnelMiddleware(handler *cluster.ProxyHandler, domain string) gin.HandlerF
 		handler.ServeInstance(c.Writer, c.Request, label)
 		c.Abort()
 	}
+}
+
+// issuerFromEnv builds the invoice issuer identity. Defaults are Flashback
+// Labs, Inc with its EIN; the mailing address (lines separated by |) and any
+// extra registrations are supplied through the environment once known.
+func issuerFromEnv() billingpdf.Issuer {
+	split := func(v string) []string {
+		var out []string
+		for _, p := range strings.Split(v, "|") {
+			if p = strings.TrimSpace(p); p != "" {
+				out = append(out, p)
+			}
+		}
+		return out
+	}
+	issuer := billingpdf.Issuer{
+		LegalName: getEnv("TEEPIN_ISSUER_NAME", "Flashback Labs, Inc"),
+		Address:   split(getEnv("TEEPIN_ISSUER_ADDRESS", "")),
+		TaxIDs:    split(getEnv("TEEPIN_ISSUER_TAX_IDS", "EIN 32-0780503")),
+		Email:     getEnv("TEEPIN_ISSUER_EMAIL", "contact@flashbacklabs.com"),
+	}
+	return issuer
 }

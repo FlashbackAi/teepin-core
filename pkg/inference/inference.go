@@ -165,6 +165,18 @@ type Provider interface {
 	Capabilities() Capabilities
 }
 
+// HealthChecker is an optional capability a Provider may implement: a cheap
+// connectivity check that costs no tokens (a models-list/metadata call, not
+// a completion), for an operator-facing "is this backend actually up"
+// signal. Not every Provider implements it — a caller finds out via a type
+// assertion and treats a Provider that doesn't as "health unknown", never
+// as "unhealthy": inventing a negative signal from silence is worse than
+// having no signal (see the removed object-storage health probe's own
+// postmortem for why a probe that can be wrong is worse than none).
+type HealthChecker interface {
+	CheckHealth(ctx context.Context) error
+}
+
 // EstimateTokens approximates the token count of a request for the
 // pre-dispatch fit check.
 //
