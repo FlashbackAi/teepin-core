@@ -219,6 +219,58 @@ func TestCreateInstance_ProceedsAfterApproval(t *testing.T) {
 	}
 }
 
+// createInstanceArgs/deployArgs.Env is an array of {name, value} objects,
+// not a free-form JSON object — a map[string]string's natural schema shape
+// is rejected outright by Anthropic's strict tool-calling mode (confirmed
+// live 2026-09-23: "additionalProperties: object is not supported").
+// envMap converts that array-of-objects shape back into the plain map the
+// real downstream API (POST /v1/compute/instances,
+// POST /v1/kumbha/sessions/:id/deploy) has always expected — this pins
+// that conversion, and that a duplicate name overwrites earlier ones the
+// same way a literal JSON object with a repeated key would.
+func TestEnvMap_ConvertsArrayOfObjectsToMap(t *testing.T) {
+	got := envMap([]envVar{{Name: "A", Value: "1"}, {Name: "B", Value: "2"}, {Name: "A", Value: "3"}})
+	want := map[string]string{"A": "3", "B": "2"}
+	if len(got) != len(want) || got["A"] != want["A"] || got["B"] != want["B"] {
+		t.Errorf("envMap = %v, want %v", got, want)
+	}
+	if envMap(nil) != nil {
+		t.Error("envMap(nil) should stay nil, not an empty map — env is omitempty on both request bodies")
+	}
+}
+
+// The real API call still receives a plain JSON object for "env" — the
+// reshape is scoped to how the MCP tool describes itself to the model,
+// never the wire contract POST /v1/compute/instances already has.
+func TestCreateInstance_EnvArrayReachesTheAPIAsAPlainObject(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/kumbha/sessions/sess-test", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"deploy_approved":true}`))
+	})
+	mux.HandleFunc("/v1/compute/instances", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		env, ok := body["env"].(map[string]any)
+		if !ok {
+			t.Fatalf(`body["env"] = %T(%v), want a plain JSON object`, body["env"], body["env"])
+		}
+		if env["PORT"] != "3000" {
+			t.Errorf(`env["PORT"] = %v, want "3000"`, env["PORT"])
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"inst-x","status":"running","endpoint":"https://inst-x.teepin.com","price_per_hour":0.1}`))
+	})
+	c := newTestClient(t, mux)
+
+	_, _, err := c.createInstance(context.Background(), &mcp.CallToolRequest{}, createInstanceArgs{
+		Name: "app", Image: "nginx:latest", CPUUnits: 1, MemoryGB: 1,
+		Env: []envVar{{Name: "PORT", Value: "3000"}},
+	})
+	if err != nil {
+		t.Fatalf("createInstance: %v", err)
+	}
+}
+
 func TestDeploy_HonestStubStillChecksApproval(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/kumbha/sessions/sess-test", func(w http.ResponseWriter, r *http.Request) {

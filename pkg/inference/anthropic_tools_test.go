@@ -233,6 +233,57 @@ func TestAnthropic_Complete_ReturnsToolUseAsToolCalls(t *testing.T) {
 	}
 }
 
+// strict is forwarded only when the harness explicitly sets it — never
+// invented — since Anthropic enforces additionalProperties:false at every
+// schema level (confirmed live 2026-09-23) and a tool whose schema doesn't
+// already meet that bar must not have it silently turned on.
+func TestAnthropic_Complete_ForwardsStrictOnlyWhenHarnessSetsIt(t *testing.T) {
+	cases := []struct {
+		name  string
+		extra string
+		want  *bool
+	}{
+		{name: "unset", extra: `[{"type":"function","function":{"name":"t","parameters":{"type":"object"}}}]`, want: nil},
+		{name: "explicit true", extra: `[{"type":"function","function":{"name":"t","strict":true,"parameters":{"type":"object"}}}]`, want: boolPtr(true)},
+		{name: "explicit false", extra: `[{"type":"function","function":{"name":"t","strict":false,"parameters":{"type":"object"}}}]`, want: boolPtr(false)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, _ := newTestAnthropic(t, func(w http.ResponseWriter, r *http.Request) {
+				var got struct {
+					Tools []struct {
+						Strict *bool `json:"strict"`
+					} `json:"tools"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				gotStrict := got.Tools[0].Strict
+				if (gotStrict == nil) != (tc.want == nil) || (gotStrict != nil && *gotStrict != *tc.want) {
+					t.Errorf("upstream strict = %v, want %v", derefBool(gotStrict), derefBool(tc.want))
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(okAnthropicReply))
+			})
+			_, err := p.Complete(context.Background(), Request{
+				Messages: rawMessages(`{"role":"user","content":"hi"}`),
+				Extra:    map[string]json.RawMessage{"tools": json.RawMessage(tc.extra)},
+			})
+			if err != nil {
+				t.Fatalf("Complete: %v", err)
+			}
+		})
+	}
+}
+
+func boolPtr(b bool) *bool { return &b }
+func derefBool(b *bool) any {
+	if b == nil {
+		return nil
+	}
+	return *b
+}
+
 // Dropping a declared tool silently is the exact failure this translation
 // exists to end, so a tool type it cannot translate is refused up front.
 func TestAnthropic_Complete_RejectsUntranslatableToolBeforeDispatch(t *testing.T) {

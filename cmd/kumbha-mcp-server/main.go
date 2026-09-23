@@ -322,16 +322,49 @@ type portArg struct {
 	Protocol  string `json:"protocol,omitempty" jsonschema:"tcp or udp; defaults to tcp"`
 }
 
+// envVar is one environment variable, array-of-objects rather than a
+// free-form map — see its own package-level doc comment for why.
+type envVar struct {
+	Name  string `json:"name" jsonschema:"the environment variable's name"`
+	Value string `json:"value" jsonschema:"the environment variable's value"`
+}
+
+// envMap converts the tool-facing []envVar shape into the plain
+// map[string]string every downstream API (POST /v1/compute/instances,
+// POST /v1/kumbha/sessions/:id/deploy) already expects — the reshape below
+// is scoped entirely to how the MCP tool describes its own arguments to
+// the model; nothing about the real API contract changes. A later
+// duplicate name overwrites an earlier one, the same behavior a literal
+// JSON object with a repeated key would have.
+func envMap(vars []envVar) map[string]string {
+	if len(vars) == 0 {
+		return nil
+	}
+	m := make(map[string]string, len(vars))
+	for _, v := range vars {
+		m[v.Name] = v.Value
+	}
+	return m
+}
+
 type createInstanceArgs struct {
-	Name      string            `json:"name"`
-	Image     string            `json:"image" jsonschema:"a container image reference already pushed somewhere pullable"`
-	CPUUnits  int               `json:"cpu_units"`
-	MemoryGB  int               `json:"memory_gb"`
-	StorageGB int               `json:"storage_gb,omitempty"`
-	Ports     []portArg         `json:"ports,omitempty"`
-	Env       map[string]string `json:"env,omitempty"`
-	Command   []string          `json:"command,omitempty"`
-	Args      []string          `json:"args,omitempty"`
+	Name      string    `json:"name"`
+	Image     string    `json:"image" jsonschema:"a container image reference already pushed somewhere pullable"`
+	CPUUnits  int       `json:"cpu_units"`
+	MemoryGB  int       `json:"memory_gb"`
+	StorageGB int       `json:"storage_gb,omitempty"`
+	Ports     []portArg `json:"ports,omitempty"`
+	// Env is an array of {name, value} objects, not a free-form JSON
+	// object: Anthropic's strict tool-calling mode rejects a schema that
+	// uses "additionalProperties" as a nested schema (the shape a
+	// map[string]string naturally produces) rather than the literal
+	// boolean false — confirmed live 2026-09-23 against the real API,
+	// which returned a 400 for exactly that shape. An array of
+	// well-defined objects is fully strict-mode-compatible, the same
+	// pattern Ports (above) already used successfully.
+	Env     []envVar `json:"env,omitempty" jsonschema:"environment variables to set in the container"`
+	Command []string `json:"command,omitempty"`
+	Args    []string `json:"args,omitempty"`
 }
 
 func (c *teepinClient) createInstance(ctx context.Context, req *mcp.CallToolRequest, args createInstanceArgs) (*mcp.CallToolResult, any, error) {
@@ -343,7 +376,7 @@ func (c *teepinClient) createInstance(ctx context.Context, req *mcp.CallToolRequ
 		return textResult(notApprovedMessage)
 	}
 
-	instance, err := c.provisionInstance(ctx, args.Name, args.Image, args.CPUUnits, args.MemoryGB, args.StorageGB, args.Ports, args.Env, args.Command, args.Args)
+	instance, err := c.provisionInstance(ctx, args.Name, args.Image, args.CPUUnits, args.MemoryGB, args.StorageGB, args.Ports, envMap(args.Env), args.Command, args.Args)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -393,13 +426,15 @@ type provisionedInstance struct {
 // --- deploy ---
 
 type deployArgs struct {
-	Name           string            `json:"name"`
-	DockerfilePath string            `json:"dockerfile_path,omitempty" jsonschema:"path to the Dockerfile within the workspace; defaults to Dockerfile"`
-	CPUUnits       int               `json:"cpu_units"`
-	MemoryGB       int               `json:"memory_gb"`
-	StorageGB      int               `json:"storage_gb,omitempty"`
-	Ports          []portArg         `json:"ports,omitempty"`
-	Env            map[string]string `json:"env,omitempty"`
+	Name           string    `json:"name"`
+	DockerfilePath string    `json:"dockerfile_path,omitempty" jsonschema:"path to the Dockerfile within the workspace; defaults to Dockerfile"`
+	CPUUnits       int       `json:"cpu_units"`
+	MemoryGB       int       `json:"memory_gb"`
+	StorageGB      int       `json:"storage_gb,omitempty"`
+	Ports          []portArg `json:"ports,omitempty"`
+	// See createInstanceArgs.Env's own doc comment — same array-of-objects
+	// shape, same strict-tool-calling reason.
+	Env []envVar `json:"env,omitempty" jsonschema:"environment variables to set in the container"`
 }
 
 // deploy builds the session's current workspace version and runs it as a
@@ -441,7 +476,7 @@ func (c *teepinClient) deploy(ctx context.Context, req *mcp.CallToolRequest, arg
 		"cpu_units":       args.CPUUnits,
 		"memory_gb":       args.MemoryGB,
 		"storage_gb":      args.StorageGB,
-		"env":             args.Env,
+		"env":             envMap(args.Env),
 	}
 	if len(args.Ports) > 0 {
 		portsOut := make([]map[string]any, len(args.Ports))

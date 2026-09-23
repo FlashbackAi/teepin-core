@@ -31,6 +31,18 @@ type openAITool struct {
 		Name        string          `json:"name"`
 		Description string          `json:"description"`
 		Parameters  json.RawMessage `json:"parameters"`
+		// Strict requests Anthropic's grammar-constrained tool-call
+		// sampling (see anthropic.ToolParam.Strict's own field) — forwarded
+		// only when the harness explicitly sets it, never invented here.
+		// Confirmed live 2026-09-23 against the real API: Anthropic
+		// enforces additionalProperties:false at every nesting level,
+		// including rejecting a map-typed field (additionalProperties as
+		// a schema, e.g. a free-form string-to-string env map) outright
+		// with a 400 — so a tool whose schema doesn't already meet that
+		// bar must not have Strict forwarded as true, or every call
+		// through it starts failing outright instead of just occasionally
+		// getting malformed arguments.
+		Strict *bool `json:"strict,omitempty"`
 	} `json:"function"`
 }
 
@@ -73,6 +85,9 @@ func toAnthropicTools(extra map[string]json.RawMessage) ([]anthropic.ToolUnionPa
 		tool := anthropic.ToolParam{Name: t.Function.Name, InputSchema: schema}
 		if t.Function.Description != "" {
 			tool.Description = anthropic.String(t.Function.Description)
+		}
+		if t.Function.Strict != nil {
+			tool.Strict = anthropic.Bool(*t.Function.Strict)
 		}
 		out = append(out, anthropic.ToolUnionParam{OfTool: &tool})
 	}
