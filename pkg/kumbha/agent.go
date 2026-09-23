@@ -15,7 +15,6 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/FlashbackAi/teepin-core/pkg/cluster"
-	"github.com/FlashbackAi/teepin-core/pkg/inference"
 )
 
 // AgentConfig is the fixed platform policy every session's agent pod runs
@@ -72,15 +71,6 @@ type AgentConfig struct {
 	// until an operator has actually confirmed the hosted model supports
 	// vision.
 	VisionCapable bool
-	// Route selects which kumbha.Router entry (see router.go) the agent
-	// pod's LLM calls resolve to — "teepin/fast" or "teepin/deep" today.
-	// Empty means run.py's own default ("teepin/fast"), so leaving this
-	// unset changes nothing for an existing deployment. Sending it
-	// explicitly is what lets an operator move every NEW build session
-	// (already-running ones keep whatever they started with) onto a
-	// different backend — e.g. a frontier model for a demo — without
-	// rebuilding or redeploying the agent image itself.
-	Route string
 }
 
 // TokenMinter mints the agent's own short-lived, session-scoped
@@ -153,43 +143,25 @@ const internalScratchPathInstruction = "Keep any of your own internal working no
 	"\"" + InternalScratchDir + "/\" is ever shown to the customer, deployed, or included in their downloads " +
 	"— it exists purely for your own use across relaunches of this same session.\n\n"
 
-// defaultAgentRoute mirrors the agent image's OWN fallback when
-// AgentConfig.Route is unset — that default lives in a separate codebase
-// (the agent image itself), not here, but main.go/dev.tfvars/ecs.tf's own
-// comments already document and rely on this exact convention ("empty
-// leaves the agent image's own default (teepin/fast) untouched"). Kept as
-// one named constant, rather than a bare literal, so it's obvious this is
-// a cross-repo assumption that must move in lockstep if the image's own
-// default ever changes.
-const defaultAgentRoute = "teepin/fast"
-
-// checkRouteAvailable reports whether route currently has at least one
-// enabled, dispatchable backend — the same two checks Complete() applies
-// before every completion (resolveOrdered's candidate/static lookup, then
-// the route-level enabled flag) — run once up front by LaunchAgent so a
-// build whose configured route happens to be disabled or unconfigured
-// fails immediately with a clear error, instead of launching a pod that
-// is guaranteed to fail its very first completion silently. Found live
-// 2026-09-22: a build submitted in the exact minute teepin/fast was
-// toggled disabled (during unrelated debugging) launched its agent pod
-// successfully, then never produced any output at all, with nothing in
-// the console explaining why — the session just sat at "Idle" forever.
-func (g *Gateway) checkRouteAvailable(ctx context.Context, route string) error {
-	if _, err := g.resolveOrdered(ctx, route); err != nil {
+// checkModelsAvailable reports whether the catalog has at least one model
+// enabled for Kumbha — run once up front by LaunchAgent so a build fails
+// immediately with a clear error when there is nothing to serve it,
+// instead of launching a pod that is guaranteed to fail its very first
+// completion silently. Found live 2026-09-22: a build submitted while
+// Kumbha's only backend was disabled launched its agent pod successfully,
+// then never produced any output at all, with nothing in the console
+// explaining why — the session just sat at "Idle" forever.
+//
+// Only an empty list refuses the launch. A failure to read the list fails
+// open: a database blip should not block every build launch, and the
+// agent's own first completion will surface a real outage anyway.
+func (g *Gateway) checkModelsAvailable(ctx context.Context) error {
+	_, err := g.kumbhaModels(ctx)
+	if errors.Is(err, errNoKumbhaModels) {
 		return err
 	}
-	if g.routes == nil {
-		return nil
-	}
-	enabled, err := g.routes.IsEnabled(ctx, route)
 	if err != nil {
-		// Same fail-open posture Complete() uses for this exact check: a
-		// DB blip here should not block every build launch.
-		log.Printf("WARN: could not check route %q enabled before launch, allowing it: %v", route, err)
-		return nil
-	}
-	if !enabled {
-		return fmt.Errorf("%w: %q", inference.ErrUnknownModel, route)
+		log.Printf("WARN: could not list Kumbha's models before launch, allowing it: %v", err)
 	}
 	return nil
 }
@@ -275,17 +247,10 @@ func (g *Gateway) LaunchAgent(ctx context.Context, sess *Session, prompt string)
 		return ErrAgentNotConfigured
 	}
 
-	route := g.agentConfig.Route
-	if route == "" {
-		route = defaultAgentRoute
-	}
-	if err := g.checkRouteAvailable(ctx, route); err != nil {
-		// The route name and underlying reason are logged (internal,
-		// operator-only) but never surfaced past this point — the HTTP
-		// layer responds to ErrAgentRouteUnavailable with a generic
-		// message, same "never reveal route identity" rule Complete()'s
-		// own disabled-route path already follows.
-		log.Printf("WARN: kumbha agent launch refused, route %q unavailable: %v", route, err)
+	if err := g.checkModelsAvailable(ctx); err != nil {
+		// Logged for the operator; the HTTP layer answers
+		// ErrAgentRouteUnavailable with a generic message.
+		log.Printf("WARN: kumbha agent launch refused: %v", err)
 		return ErrAgentRouteUnavailable
 	}
 
@@ -350,14 +315,6 @@ func (g *Gateway) LaunchAgent(ctx context.Context, sess *Session, prompt string)
 		// actions already completed — the tell that this had already
 		// happened before this fix).
 		NeverRestart: true,
-	}
-
-	// Left out of the map literal above deliberately: an empty string
-	// value would override run.py's own os.environ.get(..., "teepin/fast")
-	// default with an explicit empty route, which is not what "unset"
-	// should mean. Only set the var at all when Route is configured.
-	if g.agentConfig.Route != "" {
-		spec.Env["TEEPIN_ROUTE"] = g.agentConfig.Route
 	}
 
 	if _, err := g.cluster.CreateInstance(ctx, spec); err != nil {

@@ -22,13 +22,13 @@ type Service struct {
 // NewService constructs the catalog service.
 func NewService(db *sql.DB) *Service { return &Service{db: db} }
 
-// RegisterModel creates or updates a catalog entry's capabilities and
-// engine. Pricing is intentionally NOT part of this call — SetPricing and
-// SetVendorCost are separate, mirroring billing.pricing's own convention of
-// one endpoint per rate-pair so setting capabilities can never accidentally
-// disturb a price an admin already configured (an upsert here preserves
-// existing pricing columns rather than resetting them to 0).
-func (s *Service) RegisterModel(ctx context.Context, m Model) error {
+// defaultMaxOutputTokens is used when a registration leaves
+// MaxOutputTokens unset — the same default the column itself carries.
+const defaultMaxOutputTokens = 4096
+
+// validate checks a registration and fills in defaults for the fields a
+// caller may leave empty.
+func (m *Model) validate() error {
 	if m.ModelRoute == "" {
 		return fmt.Errorf("model_route is required")
 	}
@@ -41,30 +41,120 @@ func (s *Service) RegisterModel(ctx context.Context, m Model) error {
 	if m.ContextWindow < 0 {
 		return fmt.Errorf("context_window must be non-negative")
 	}
+	if m.Provider == "" {
+		m.Provider = ProviderNode
+	}
+	switch m.Provider {
+	case ProviderNode:
+	case ProviderAnthropic:
+		if m.ProviderModel == "" {
+			return fmt.Errorf("provider_model is required for an anthropic model")
+		}
+	case ProviderOpenAICompatible:
+		if m.ProviderModel == "" || m.BaseURL == "" {
+			return fmt.Errorf("provider_model and base_url are required for an openai_compatible model")
+		}
+	default:
+		return fmt.Errorf("invalid provider %q", m.Provider)
+	}
+	if m.MaxOutputTokens <= 0 {
+		m.MaxOutputTokens = defaultMaxOutputTokens
+	}
+	return nil
+}
+
+// RegisterModel creates or updates a catalog entry's capabilities and how
+// it is served. Pricing, availability and the API key are intentionally
+// NOT part of this call — SetPricing, SetVendorCost, SetAvailability and
+// SetAPIKeyRef are separate, so editing a model's capabilities can never
+// disturb a price, a Kumbha ordering, or a stored key an admin already set
+// (the upsert below leaves those columns alone).
+func (s *Service) RegisterModel(ctx context.Context, m Model) error {
+	if err := m.validate(); err != nil {
+		return err
+	}
 
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO inference.models
 			(model_route, display_name, cost_class, engine, context_window,
-			 supports_tools, supports_vision, supports_audio, enabled, updated_by, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+			 supports_tools, supports_vision, supports_audio, enabled,
+			 provider, provider_model, base_url, max_output_tokens, updated_by, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
 		ON CONFLICT (model_route) DO UPDATE SET
-			display_name    = EXCLUDED.display_name,
-			cost_class      = EXCLUDED.cost_class,
-			engine          = EXCLUDED.engine,
-			context_window  = EXCLUDED.context_window,
-			supports_tools  = EXCLUDED.supports_tools,
-			supports_vision = EXCLUDED.supports_vision,
-			supports_audio  = EXCLUDED.supports_audio,
-			enabled         = EXCLUDED.enabled,
-			updated_by      = EXCLUDED.updated_by,
-			updated_at      = NOW()
+			display_name      = EXCLUDED.display_name,
+			cost_class        = EXCLUDED.cost_class,
+			engine            = EXCLUDED.engine,
+			context_window    = EXCLUDED.context_window,
+			supports_tools    = EXCLUDED.supports_tools,
+			supports_vision   = EXCLUDED.supports_vision,
+			supports_audio    = EXCLUDED.supports_audio,
+			enabled           = EXCLUDED.enabled,
+			provider          = EXCLUDED.provider,
+			provider_model    = EXCLUDED.provider_model,
+			base_url          = EXCLUDED.base_url,
+			max_output_tokens = EXCLUDED.max_output_tokens,
+			updated_by        = EXCLUDED.updated_by,
+			updated_at        = NOW()
 	`, m.ModelRoute, m.DisplayName, string(m.CostClass), m.Engine, m.ContextWindow,
-		m.SupportsTools, m.SupportsVision, m.SupportsAudio, m.Enabled, m.UpdatedBy)
+		m.SupportsTools, m.SupportsVision, m.SupportsAudio, m.Enabled,
+		string(m.Provider), m.ProviderModel, m.BaseURL, m.MaxOutputTokens, m.UpdatedBy)
 	if err != nil {
 		return fmt.Errorf("failed to register model %q: %w", m.ModelRoute, err)
 	}
-	log.Printf("Model catalog: registered %q (%s, cost_class=%s)", m.ModelRoute, m.Engine, m.CostClass)
+	log.Printf("Model catalog: registered %q (%s via %s, cost_class=%s)", m.ModelRoute, m.Engine, m.Provider, m.CostClass)
 	return nil
+}
+
+// Availability is a partial update of where a model may be used; a nil
+// field is left as it is.
+type Availability struct {
+	OfferedToCustomers *bool
+	KumbhaEnabled      *bool
+	KumbhaPriority     *int
+}
+
+// SetAvailability updates whether a model is offered to customers and
+// whether (and in what order) the Kumbha build agent may use it.
+func (s *Service) SetAvailability(ctx context.Context, modelRoute string, a Availability, updatedBy string) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE inference.models
+		SET offered_to_customers = COALESCE($1, offered_to_customers),
+		    kumbha_enabled       = COALESCE($2, kumbha_enabled),
+		    kumbha_priority      = COALESCE($3, kumbha_priority),
+		    updated_by = $4, updated_at = NOW()
+		WHERE model_route = $5
+	`, a.OfferedToCustomers, a.KumbhaEnabled, a.KumbhaPriority, updatedBy, modelRoute)
+	if err != nil {
+		return fmt.Errorf("failed to set availability for %q: %w", modelRoute, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetAPIKeyRef records which secret holds the model's API key (see
+// Model.APIKeyRef), or clears it with "". The caller writes the secret
+// itself; the catalog only ever stores where it is.
+func (s *Service) SetAPIKeyRef(ctx context.Context, modelRoute, ref, updatedBy string) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE inference.models
+		SET api_key_ref = NULLIF($1, ''), updated_by = $2, updated_at = NOW()
+		WHERE model_route = $3
+	`, ref, updatedBy, modelRoute)
+	if err != nil {
+		return fmt.Errorf("failed to set api key for %q: %w", modelRoute, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ListKumbhaModels returns the models the Kumbha build agent may use right
+// now — enabled and Kumbha-enabled — in the order it should try them.
+func (s *Service) ListKumbhaModels(ctx context.Context) ([]Model, error) {
+	return s.queryModels(ctx, selectModelsSQL+` WHERE enabled AND kumbha_enabled ORDER BY kumbha_priority, model_route`)
 }
 
 // SetPricing updates a model's customer-facing per-million-token rates.
@@ -165,7 +255,11 @@ func (s *Service) GetModel(ctx context.Context, modelRoute string) (*Model, erro
 // that only want routable models should filter on Enabled themselves (the
 // admin catalog page wants to show disabled entries too).
 func (s *Service) ListModels(ctx context.Context) ([]Model, error) {
-	rows, err := s.db.QueryContext(ctx, selectModelsSQL+` ORDER BY model_route`)
+	return s.queryModels(ctx, selectModelsSQL+` ORDER BY model_route`)
+}
+
+func (s *Service) queryModels(ctx context.Context, query string) ([]Model, error) {
+	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list models: %w", err)
 	}
@@ -205,7 +299,9 @@ const selectModelsSQL = `
 	       supports_tools, supports_vision, supports_audio,
 	       input_price_per_million, output_price_per_million,
 	       vendor_input_cost_per_million, vendor_output_cost_per_million,
-	       enabled, updated_by, created_at, updated_at
+	       enabled, provider, provider_model, base_url, max_output_tokens,
+	       COALESCE(api_key_ref, ''), offered_to_customers, kumbha_enabled, kumbha_priority,
+	       updated_by, created_at, updated_at
 	FROM inference.models`
 
 // row is satisfied by both *sql.Row and *sql.Rows, so scanModel/scanModelRow
@@ -218,16 +314,20 @@ func scanModel(r row) (*Model, error) { return scanModelRow(r) }
 
 func scanModelRow(r row) (*Model, error) {
 	var m Model
-	var costClass string
+	var costClass, provider string
 	if err := r.Scan(
 		&m.ModelRoute, &m.DisplayName, &costClass, &m.Engine, &m.ContextWindow,
 		&m.SupportsTools, &m.SupportsVision, &m.SupportsAudio,
 		&m.InputPricePerMillion, &m.OutputPricePerMillion,
 		&m.VendorInputCostPerMillion, &m.VendorOutputCostPerMillion,
-		&m.Enabled, &m.UpdatedBy, &m.CreatedAt, &m.UpdatedAt,
+		&m.Enabled, &provider, &m.ProviderModel, &m.BaseURL, &m.MaxOutputTokens,
+		&m.APIKeyRef, &m.OfferedToCustomers, &m.KumbhaEnabled, &m.KumbhaPriority,
+		&m.UpdatedBy, &m.CreatedAt, &m.UpdatedAt,
 	); err != nil {
 		return nil, err
 	}
 	m.CostClass = CostClass(costClass)
+	m.Provider = Provider(provider)
+	m.HasAPIKey = m.APIKeyRef != ""
 	return &m, nil
 }

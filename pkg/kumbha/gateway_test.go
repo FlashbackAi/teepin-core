@@ -5,9 +5,9 @@ package kumbha
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -59,7 +59,7 @@ func (f *fakeUsageRecorder) ConsumeCredit(_ context.Context, _, _ uuid.UUID, cos
 
 func TestGateway_CreateSession_GateDeniesIsPaymentRequired(t *testing.T) {
 	store, _ := newMockStore(t)
-	gw := NewGateway(store, NewRouter(nil), &fakeGate{allowed: false, reason: "no card on file"}, &fakePricing{}, &fakeUsageRecorder{})
+	gw := NewGateway(store, nil, &fakeGate{allowed: false, reason: "no card on file"}, &fakePricing{}, &fakeUsageRecorder{})
 
 	_, err := gw.CreateSession(context.Background(), uuid.New(), uuid.New(), 5.0, "test")
 	if !errors.Is(err, ErrPaymentRequired) {
@@ -69,7 +69,7 @@ func TestGateway_CreateSession_GateDeniesIsPaymentRequired(t *testing.T) {
 
 func TestGateway_CreateSession_GateErrorIsGateUnavailable(t *testing.T) {
 	store, _ := newMockStore(t)
-	gw := NewGateway(store, NewRouter(nil), &fakeGate{err: errors.New("db down")}, &fakePricing{}, &fakeUsageRecorder{})
+	gw := NewGateway(store, nil, &fakeGate{err: errors.New("db down")}, &fakePricing{}, &fakeUsageRecorder{})
 
 	_, err := gw.CreateSession(context.Background(), uuid.New(), uuid.New(), 5.0, "test")
 	if !errors.Is(err, ErrGateUnavailable) {
@@ -86,7 +86,7 @@ func TestGateway_CreateSession_GateAllowsDelegatesToStore(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"id", "spent", "status", "started_at"}).
 			AddRow(uuid.New(), 0.0, "open", time.Now()))
 
-	gw := NewGateway(store, NewRouter(nil), &fakeGate{allowed: true}, &fakePricing{}, &fakeUsageRecorder{})
+	gw := NewGateway(store, nil, &fakeGate{allowed: true}, &fakePricing{}, &fakeUsageRecorder{})
 	sess, err := gw.CreateSession(context.Background(), accountID, projectID, 5.0, "test")
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
@@ -98,7 +98,7 @@ func TestGateway_CreateSession_GateAllowsDelegatesToStore(t *testing.T) {
 
 func TestGateway_Complete_RefusesClosedSession(t *testing.T) {
 	store, _ := newMockStore(t)
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{})
+	gw := NewGateway(store, nil, nil, &fakePricing{}, &fakeUsageRecorder{})
 
 	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), Status: "closed", Budget: 5.0}
 	_, err := gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/fast"})
@@ -109,7 +109,7 @@ func TestGateway_Complete_RefusesClosedSession(t *testing.T) {
 
 func TestGateway_Complete_RefusesAlreadyExhaustedBudget(t *testing.T) {
 	store, _ := newMockStore(t)
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{})
+	gw := NewGateway(store, nil, nil, &fakePricing{}, &fakeUsageRecorder{})
 
 	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), Status: "open", Budget: 5.0, Spent: 5.0}
 	_, err := gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/fast"})
@@ -120,7 +120,7 @@ func TestGateway_Complete_RefusesAlreadyExhaustedBudget(t *testing.T) {
 
 func TestGateway_Complete_UnknownRoutePropagates(t *testing.T) {
 	store, _ := newMockStore(t)
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{})
+	gw := NewGateway(store, nil, nil, &fakePricing{}, &fakeUsageRecorder{})
 
 	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), Status: "open", Budget: 5.0}
 	_, err := gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/nonexistent"})
@@ -132,8 +132,8 @@ func TestGateway_Complete_UnknownRoutePropagates(t *testing.T) {
 func TestGateway_Complete_ProviderErrorPropagatesUnaccrued(t *testing.T) {
 	store, mock := newMockStore(t)
 	failing := &fakeProvider{name: "vllm", err: errors.New("upstream 500")}
-	router := NewRouter(map[string]Route{"teepin/fast": {Provider: failing, ProviderName: "vllm"}})
-	gw := NewGateway(store, router, nil, &fakePricing{in: 1, out: 1}, &fakeUsageRecorder{})
+	models := StaticModels{{Route: "teepin/fast", Engine: "vllm", Provider: failing}}
+	gw := NewGateway(store, models, nil, &fakePricing{in: 1, out: 1}, &fakeUsageRecorder{})
 
 	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), Status: "open", Budget: 5.0}
 	_, err := gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/fast"})
@@ -167,9 +167,9 @@ func TestGateway_Complete_SuccessPricesAndAccrues(t *testing.T) {
 	mock.ExpectCommit()
 
 	provider := &fakeProvider{name: "vllm", usage: inference.Usage{InputTokens: 1000, OutputTokens: 500}}
-	router := NewRouter(map[string]Route{"teepin/fast": {Provider: provider, ProviderName: "vllm"}})
+	models := StaticModels{{Route: "teepin/fast", Engine: "vllm", Provider: provider}}
 	usage := &fakeUsageRecorder{}
-	gw := NewGateway(store, router, nil, &fakePricing{in: 2.0, out: 8.0}, usage)
+	gw := NewGateway(store, models, nil, &fakePricing{in: 2.0, out: 8.0}, usage)
 
 	sess := &Session{ID: sessID, AccountID: accountID, Status: "open", Budget: 5.0, Spent: 0}
 	result, err := gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/fast"})
@@ -227,7 +227,7 @@ func TestGateway_IncreaseBudget_Success(t *testing.T) {
 		WithArgs(15.0, sessID, accountID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{})
+	gw := NewGateway(store, nil, nil, &fakePricing{}, &fakeUsageRecorder{})
 	if err := gw.IncreaseBudget(context.Background(), sessID, accountID, 15.0); err != nil {
 		t.Fatalf("IncreaseBudget: %v", err)
 	}
@@ -244,7 +244,7 @@ func TestGateway_IncreaseBudget_NotHigherIsErrBudgetNotIncreased(t *testing.T) {
 		WithArgs(sessID, accountID).
 		WillReturnRows(getSessionRow(sessID, accountID, projectID, 5.0, "open"))
 
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{})
+	gw := NewGateway(store, nil, nil, &fakePricing{}, &fakeUsageRecorder{})
 	err := gw.IncreaseBudget(context.Background(), sessID, accountID, 5.0)
 	if !errors.Is(err, ErrBudgetNotIncreased) {
 		t.Errorf("got %v, want ErrBudgetNotIncreased for a value equal to the current budget", err)
@@ -265,7 +265,7 @@ func TestGateway_IncreaseBudget_ClosedSessionIsErrSessionClosed(t *testing.T) {
 		WithArgs(sessID, accountID).
 		WillReturnRows(getSessionRow(sessID, accountID, projectID, 5.0, "closed"))
 
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{})
+	gw := NewGateway(store, nil, nil, &fakePricing{}, &fakeUsageRecorder{})
 	err := gw.IncreaseBudget(context.Background(), sessID, accountID, 15.0)
 	if !errors.Is(err, ErrSessionClosed) {
 		t.Errorf("got %v, want ErrSessionClosed", err)
@@ -274,7 +274,7 @@ func TestGateway_IncreaseBudget_ClosedSessionIsErrSessionClosed(t *testing.T) {
 
 func TestGateway_IncreaseBudget_GateDeniesIsPaymentRequired(t *testing.T) {
 	store, _ := newMockStore(t)
-	gw := NewGateway(store, NewRouter(nil), &fakeGate{allowed: false, reason: "no card on file"}, &fakePricing{}, &fakeUsageRecorder{})
+	gw := NewGateway(store, nil, &fakeGate{allowed: false, reason: "no card on file"}, &fakePricing{}, &fakeUsageRecorder{})
 
 	err := gw.IncreaseBudget(context.Background(), uuid.New(), uuid.New(), 15.0)
 	if !errors.Is(err, ErrPaymentRequired) {
@@ -282,84 +282,66 @@ func TestGateway_IncreaseBudget_GateDeniesIsPaymentRequired(t *testing.T) {
 	}
 }
 
-// A disabled route is presented identically to an unconfigured one — a
-// customer never learns whether a route exists but was turned off, vs
-// never existed at all (see KUMBHA-DESIGN.md's "no console page of its
-// own": route/backend identity is operator-only).
-func TestGateway_Complete_DisabledRouteIsUnknownModel(t *testing.T) {
+// With no model enabled for Kumbha, a completion is refused as a
+// (retryable) outage rather than dispatched anywhere.
+func TestGateway_Complete_NoKumbhaModelsIsUnavailable(t *testing.T) {
 	store, _ := newMockStore(t)
-	fast := &fakeProvider{name: "vllm"}
-	router := NewRouter(map[string]Route{"teepin/fast": {Provider: fast, ProviderName: "vllm"}})
-	gw := NewGateway(store, router, nil, &fakePricing{}, &fakeUsageRecorder{})
-
-	routeDB, routeMock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer routeDB.Close()
-	routeMock.ExpectQuery(`SELECT enabled FROM billing\.kumbha_routes`).
-		WithArgs("teepin/fast").
-		WillReturnRows(sqlmock.NewRows([]string{"enabled"}).AddRow(false))
-	gw = gw.WithRouteControl(NewRouteStore(routeDB))
+	gw := NewGateway(store, StaticModels{}, nil, &fakePricing{}, &fakeUsageRecorder{})
 
 	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), Status: "open", Budget: 5.0}
-	_, err = gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/fast"})
-	if !errors.Is(err, inference.ErrUnknownModel) {
-		t.Errorf("got %v, want inference.ErrUnknownModel for a disabled route", err)
+	_, err := gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/fast"})
+	if !errors.Is(err, inference.ErrProviderUnavailable) {
+		t.Errorf("got %v, want ErrProviderUnavailable when no model is enabled for Kumbha", err)
 	}
 }
 
-// A route with no explicit setting stays usable — the "ships on" default —
-// and an enabled route completes normally with route control wired in.
-func TestGateway_Complete_EnabledRouteStillWorksWithRouteControlWired(t *testing.T) {
+// The alias is served by the catalog model: the backend is asked for the
+// model's own route, while the session records the alias the customer sees.
+func TestGateway_Complete_ServesAliasWithCatalogModel(t *testing.T) {
 	store, mock := newMockStore(t)
-	fast := &fakeProvider{name: "vllm"}
-	router := NewRouter(map[string]Route{"teepin/fast": {Provider: fast, ProviderName: "vllm"}})
-	gw := NewGateway(store, router, nil, &fakePricing{}, &fakeUsageRecorder{})
-
-	routeDB, routeMock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer routeDB.Close()
-	routeMock.ExpectQuery(`SELECT enabled FROM billing\.kumbha_routes`).
-		WithArgs("teepin/fast").
-		WillReturnError(sql.ErrNoRows)
-	gw = gw.WithRouteControl(NewRouteStore(routeDB))
-
 	sessID, accountID := uuid.New(), uuid.New()
+	var askedFor string
+	provider := &recordingProvider{onComplete: func(req inference.Request) { askedFor = req.Model }}
+	models := StaticModels{{Route: "anthropic/claude-haiku-4-5", Engine: "vllm", Provider: provider}}
+	gw := NewGateway(store, models, nil, &fakePricing{}, &fakeUsageRecorder{})
+
 	sess := &Session{ID: sessID, AccountID: accountID, Status: "open", Budget: 5.0}
 	expectZeroCostAccrual(mock, sessID, accountID)
 
 	if _, err := gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/fast"}); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
+	if askedFor != "anthropic/claude-haiku-4-5" {
+		t.Errorf("backend asked for %q, want the catalog model's route", askedFor)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
 }
 
-// A failure to READ the enabled flag (a DB blip) must not take down every
-// Kumbha completion — it fails open, unlike a payment gate.
-func TestGateway_Complete_RouteCheckFailureFailsOpen(t *testing.T) {
+// The legacy frontier alias still works (an agent image or harness
+// configured with it must not break), served by the same Kumbha models.
+func TestGateway_Complete_LegacyDeepAliasIsServed(t *testing.T) {
 	store, mock := newMockStore(t)
-	fast := &fakeProvider{name: "vllm"}
-	router := NewRouter(map[string]Route{"teepin/fast": {Provider: fast, ProviderName: "vllm"}})
-	gw := NewGateway(store, router, nil, &fakePricing{}, &fakeUsageRecorder{})
-
-	routeDB, routeMock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer routeDB.Close()
-	routeMock.ExpectQuery(`SELECT enabled FROM billing\.kumbha_routes`).
-		WithArgs("teepin/fast").
-		WillReturnError(errors.New("connection reset"))
-	gw = gw.WithRouteControl(NewRouteStore(routeDB))
-
 	sessID, accountID := uuid.New(), uuid.New()
-	sess := &Session{ID: sessID, AccountID: accountID, Status: "open", Budget: 5.0}
-	expectZeroCostAccrual(mock, sessID, accountID)
+	models := StaticModels{{Route: "teepin/qwen3-30b-a3b", Engine: "vllm", Provider: &fakeProvider{name: "vllm"}}}
+	gw := NewGateway(store, models, nil, &fakePricing{}, &fakeUsageRecorder{})
 
-	if _, err := gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/fast"}); err != nil {
-		t.Fatalf("Complete should fail open on a route-check error, got: %v", err)
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT status, budget, spent FROM billing\.inference_sessions`).
+		WithArgs(sessID, accountID).
+		WillReturnRows(sqlmock.NewRows([]string{"status", "budget", "spent"}).AddRow("open", 5.0, 0.0))
+	mock.ExpectExec(`UPDATE billing\.inference_sessions SET spent`).
+		WithArgs(sessID, 0.0).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`INSERT INTO billing\.inference_session_usage`).
+		WithArgs(sessID, "teepin/deep", "vllm", 0, 0).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	sess := &Session{ID: sessID, AccountID: accountID, Status: "open", Budget: 5.0}
+	if _, err := gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/deep"}); err != nil {
+		t.Fatalf("Complete: %v", err)
 	}
 }
 
@@ -382,37 +364,10 @@ func expectZeroCostAccrual(mock sqlmock.Sqlmock, sessID, accountID uuid.UUID) {
 	mock.ExpectCommit()
 }
 
-// --- Candidate priority-fallback dispatch (WithCandidates) ---
-
-type fakeCandidateSource struct {
-	byRoute map[string][]RouteCandidate
-	err     error
-}
-
-func (f *fakeCandidateSource) ListByRoute(_ context.Context, route string) ([]RouteCandidate, error) {
-	if f.err != nil {
-		return nil, f.err
-	}
-	return f.byRoute[route], nil
-}
-
-// fakeCandidateBuilder maps a candidate's Model field to a pre-built
-// Provider, so a test controls exactly what each candidate does without a
-// real HTTP client or a real Secrets Manager call.
-type fakeCandidateBuilder struct {
-	byModel map[string]inference.Provider
-}
-
-func (f *fakeCandidateBuilder) Build(_ context.Context, c RouteCandidate) (inference.Provider, error) {
-	p, ok := f.byModel[c.Model]
-	if !ok {
-		return nil, fmt.Errorf("no fake provider registered for model %q", c.Model)
-	}
-	return p, nil
-}
+// --- Priority fallthrough across Kumbha's models ---
 
 // countingProvider is like fakeProvider but records how many times
-// Complete was called, so a test can assert a candidate was never tried.
+// Complete was called, so a test can assert a model was never tried.
 type countingProvider struct {
 	name  string
 	err   error
@@ -433,23 +388,32 @@ func (c *countingProvider) Stream(context.Context, inference.Request, func(infer
 }
 func (c *countingProvider) Capabilities() inference.Capabilities { return inference.Capabilities{} }
 
-func candidateRow(route, model string, priority int, enabled bool) RouteCandidate {
-	return RouteCandidate{ID: uuid.New(), RouteName: route, Priority: priority, ProviderType: "vllm", Model: model, Enabled: enabled}
+// recordingProvider reports each request it receives.
+type recordingProvider struct {
+	onComplete func(inference.Request)
 }
 
-func TestGateway_Complete_FallsThroughToNextCandidateOnProviderUnavailable(t *testing.T) {
+func (r *recordingProvider) Name() string { return "vllm" }
+func (r *recordingProvider) Complete(_ context.Context, req inference.Request) (*inference.Response, error) {
+	r.onComplete(req)
+	return &inference.Response{}, nil
+}
+func (r *recordingProvider) Stream(context.Context, inference.Request, func(inference.Chunk) error) error {
+	return nil
+}
+func (r *recordingProvider) Capabilities() inference.Capabilities { return inference.Capabilities{} }
+
+func TestGateway_Complete_FallsThroughToNextModelOnProviderUnavailable(t *testing.T) {
 	store, mock := newMockStore(t)
 	sessID, accountID := uuid.New(), uuid.New()
 
 	failing := &countingProvider{name: "vllm-a", err: fmt.Errorf("connect: %w", inference.ErrProviderUnavailable)}
-	healthy := &countingProvider{name: "vllm"} // matches expectZeroCostAccrual's expected provider name
-
-	candidates := &fakeCandidateSource{byRoute: map[string][]RouteCandidate{
-		"teepin/fast": {candidateRow("teepin/fast", "model-a", 0, true), candidateRow("teepin/fast", "model-b", 1, true)},
-	}}
-	builder := &fakeCandidateBuilder{byModel: map[string]inference.Provider{"model-a": failing, "model-b": healthy}}
-
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).WithCandidates(candidates, builder)
+	healthy := &countingProvider{name: "vllm"}
+	models := StaticModels{
+		{Route: "model-a", Engine: "vllm-a", Provider: failing},
+		{Route: "model-b", Engine: "vllm", Provider: healthy}, // matches expectZeroCostAccrual's engine
+	}
+	gw := NewGateway(store, models, nil, &fakePricing{}, &fakeUsageRecorder{})
 
 	sess := &Session{ID: sessID, AccountID: accountID, Status: "open", Budget: 5.0}
 	expectZeroCostAccrual(mock, sessID, accountID)
@@ -457,109 +421,77 @@ func TestGateway_Complete_FallsThroughToNextCandidateOnProviderUnavailable(t *te
 	if _, err := gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/fast"}); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
-	if failing.calls != 1 {
-		t.Errorf("first candidate called %d times, want 1", failing.calls)
-	}
-	if healthy.calls != 1 {
-		t.Errorf("second candidate called %d times, want 1", healthy.calls)
+	if failing.calls != 1 || healthy.calls != 1 {
+		t.Errorf("calls = %d then %d, want 1 and 1", failing.calls, healthy.calls)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Error(err)
 	}
 }
 
-// A non-ErrProviderUnavailable error (a real rejection: bad request,
-// content policy, etc.) must surface immediately — it is not a reason to
-// silently try a different, unrelated backend.
-func TestGateway_Complete_DoesNotFallThroughOnNonProviderUnavailableError(t *testing.T) {
+// A model disabled between listing and dispatch reads as unknown to the
+// backend — that is a reason to try the next model, not to fail the turn.
+func TestGateway_Complete_FallsThroughWhenModelDisappearedSinceListing(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessID, accountID := uuid.New(), uuid.New()
+	gone := &countingProvider{name: "vllm-a", err: fmt.Errorf("%w: %q", inference.ErrUnknownModel, "model-a")}
+	models := StaticModels{
+		{Route: "model-a", Engine: "vllm-a", Provider: gone},
+		{Route: "model-b", Engine: "vllm", Provider: &countingProvider{name: "vllm"}},
+	}
+	gw := NewGateway(store, models, nil, &fakePricing{}, &fakeUsageRecorder{})
+
+	sess := &Session{ID: sessID, AccountID: accountID, Status: "open", Budget: 5.0}
+	expectZeroCostAccrual(mock, sessID, accountID)
+	if _, err := gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/fast"}); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+}
+
+// A real rejection (bad request, content policy, ...) must surface
+// immediately — it is not a reason to silently try a different model.
+func TestGateway_Complete_DoesNotFallThroughOnRejection(t *testing.T) {
 	store, mock := newMockStore(t)
 	rejected := &countingProvider{name: "vllm-a", err: errors.New("400: prompt violates content policy")}
 	neverCalled := &countingProvider{name: "vllm-b"}
-
-	candidates := &fakeCandidateSource{byRoute: map[string][]RouteCandidate{
-		"teepin/fast": {candidateRow("teepin/fast", "model-a", 0, true), candidateRow("teepin/fast", "model-b", 1, true)},
-	}}
-	builder := &fakeCandidateBuilder{byModel: map[string]inference.Provider{"model-a": rejected, "model-b": neverCalled}}
-
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).WithCandidates(candidates, builder)
+	models := StaticModels{
+		{Route: "model-a", Engine: "vllm-a", Provider: rejected},
+		{Route: "model-b", Engine: "vllm-b", Provider: neverCalled},
+	}
+	gw := NewGateway(store, models, nil, &fakePricing{}, &fakeUsageRecorder{})
 
 	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), Status: "open", Budget: 5.0}
 	_, err := gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/fast"})
 	if err == nil || err.Error() != rejected.err.Error() {
-		t.Errorf("got %v, want the first candidate's own error surfaced directly", err)
+		t.Errorf("got %v, want the first model's own error surfaced directly", err)
 	}
 	if neverCalled.calls != 0 {
-		t.Errorf("second candidate was called %d times, want 0", neverCalled.calls)
+		t.Errorf("second model was called %d times, want 0", neverCalled.calls)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unexpected DB interaction on a failed completion: %v", err)
 	}
 }
 
-// A disabled candidate is skipped, same as a disabled route — an operator
-// taking one backend offline for maintenance without deleting its config.
-func TestGateway_Complete_SkipsDisabledCandidates(t *testing.T) {
-	store, mock := newMockStore(t)
-	sessID, accountID := uuid.New(), uuid.New()
-	disabled := &countingProvider{name: "vllm-a"}
-	enabled := &countingProvider{name: "vllm"}
-
-	candidates := &fakeCandidateSource{byRoute: map[string][]RouteCandidate{
-		"teepin/fast": {candidateRow("teepin/fast", "model-a", 0, false), candidateRow("teepin/fast", "model-b", 1, true)},
-	}}
-	builder := &fakeCandidateBuilder{byModel: map[string]inference.Provider{"model-a": disabled, "model-b": enabled}}
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).WithCandidates(candidates, builder)
-
-	sess := &Session{ID: sessID, AccountID: accountID, Status: "open", Budget: 5.0}
-	expectZeroCostAccrual(mock, sessID, accountID)
-
-	if _, err := gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/fast"}); err != nil {
-		t.Fatalf("Complete: %v", err)
-	}
-	if disabled.calls != 0 {
-		t.Errorf("disabled candidate was called %d times, want 0", disabled.calls)
-	}
-}
-
-// Every candidate disabled reads identically to a route with none at all —
-// same "operator-only, never distinguishable to a customer" posture as a
-// disabled route.
-func TestGateway_Complete_AllCandidatesDisabledIsUnknownModel(t *testing.T) {
+// When every model is unavailable the caller learns only that — never
+// which models back Kumbha, which is operator-only.
+func TestGateway_Complete_AllModelsUnavailableHidesModelIdentity(t *testing.T) {
 	store, _ := newMockStore(t)
-	candidates := &fakeCandidateSource{byRoute: map[string][]RouteCandidate{
-		"teepin/fast": {candidateRow("teepin/fast", "model-a", 0, false)},
-	}}
-	builder := &fakeCandidateBuilder{byModel: map[string]inference.Provider{}}
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).WithCandidates(candidates, builder)
+	down := fmt.Errorf("connect anthropic/claude-haiku-4-5: %w", inference.ErrProviderUnavailable)
+	models := StaticModels{{Route: "anthropic/claude-haiku-4-5", Engine: "anthropic", Provider: &countingProvider{err: down}}}
+	gw := NewGateway(store, models, nil, &fakePricing{}, &fakeUsageRecorder{})
 
 	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), Status: "open", Budget: 5.0}
 	_, err := gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/fast"})
-	if !errors.Is(err, inference.ErrUnknownModel) {
-		t.Errorf("got %v, want inference.ErrUnknownModel", err)
+	if !errors.Is(err, inference.ErrProviderUnavailable) {
+		t.Fatalf("got %v, want ErrProviderUnavailable", err)
+	}
+	if strings.Contains(err.Error(), "claude") {
+		t.Errorf("error %q names the backing model", err)
 	}
 }
 
-// A route with no candidate rows at all falls back to the static,
-// env-var-configured router unchanged — WithCandidates must not break a
-// deployment that has never registered any candidates.
-func TestGateway_Complete_NoCandidatesFallsBackToStaticRouter(t *testing.T) {
-	store, mock := newMockStore(t)
-	sessID, accountID := uuid.New(), uuid.New()
-	static := &fakeProvider{name: "vllm"}
-	router := NewRouter(map[string]Route{"teepin/fast": {Provider: static, ProviderName: "vllm"}})
-	candidates := &fakeCandidateSource{byRoute: map[string][]RouteCandidate{}} // nothing registered
-	builder := &fakeCandidateBuilder{byModel: map[string]inference.Provider{}}
-	gw := NewGateway(store, router, nil, &fakePricing{}, &fakeUsageRecorder{}).WithCandidates(candidates, builder)
-
-	sess := &Session{ID: sessID, AccountID: accountID, Status: "open", Budget: 5.0}
-	expectZeroCostAccrual(mock, sessID, accountID)
-
-	if _, err := gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/fast"}); err != nil {
-		t.Fatalf("Complete: %v", err)
-	}
-}
-
-// --- Per-route pricing (WithModelPricing) ---
+// --- Per-model pricing (WithModelPricing) ---
 
 type fakeModelPricing struct {
 	byRoute map[string][2]float64
@@ -570,11 +502,11 @@ func (f *fakeModelPricing) ModelPricing(_ context.Context, route string) (float6
 	return r[0], r[1], ok
 }
 
-// A route registered in the model catalog is priced off ITS OWN rate, not
-// the flat platform-wide one — this is the fix for the real bug found live
-// 2026-09-22: teepin/deep routing to a paid Anthropic model while still
-// priced identically to the free self-hosted teepin/fast.
-func TestGateway_Complete_PrefersModelCatalogPricingOverFlatRate(t *testing.T) {
+// A completion is priced at the rate of the model that actually served it,
+// not the flat platform-wide one — the fix for the real bug found live
+// 2026-09-22: build traffic on a paid Anthropic model priced identically to
+// the free self-hosted one. The session still records the alias.
+func TestGateway_Complete_PricesAtTheServingModelsCatalogRate(t *testing.T) {
 	store, mock := newMockStore(t)
 	sessID, accountID := uuid.New(), uuid.New()
 
@@ -591,31 +523,34 @@ func TestGateway_Complete_PrefersModelCatalogPricingOverFlatRate(t *testing.T) {
 		WithArgs(sessID, wantCost).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`INSERT INTO billing\.inference_session_usage`).
-		WithArgs(sessID, "teepin/deep", "anthropic", 1000, 500).
+		WithArgs(sessID, "teepin/fast", "anthropic", 1000, 500).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
 	provider := &fakeProvider{name: "anthropic", usage: inference.Usage{InputTokens: 1000, OutputTokens: 500}}
-	router := NewRouter(map[string]Route{"teepin/deep": {Provider: provider, ProviderName: "anthropic"}})
-	modelPricing := &fakeModelPricing{byRoute: map[string][2]float64{"teepin/deep": {10.0, 50.0}}}
-	gw := NewGateway(store, router, nil, &fakePricing{in: 1.0, out: 1.0}, &fakeUsageRecorder{}).WithModelPricing(modelPricing)
+	models := StaticModels{{Route: "anthropic/claude-haiku-4-5", Engine: "anthropic", Provider: provider}}
+	modelPricing := &fakeModelPricing{byRoute: map[string][2]float64{"anthropic/claude-haiku-4-5": {10.0, 50.0}}}
+	usage := &fakeUsageRecorder{}
+	gw := NewGateway(store, models, nil, &fakePricing{in: 1.0, out: 1.0}, usage).WithModelPricing(modelPricing)
 
 	sess := &Session{ID: sessID, AccountID: accountID, Status: "open", Budget: 5.0}
-	result, err := gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/deep"})
+	result, err := gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/fast"})
 	if err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
 	if result.Cost != wantCost {
 		t.Errorf("Cost = %v, want %v (catalog rate)", result.Cost, wantCost)
 	}
+	if len(usage.records) != 2 || usage.records[0].ResourceType != "kumbha/teepin/fast:input" {
+		t.Errorf("usage records must name the alias, got %+v", usage.records)
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Error(err)
 	}
 }
 
-// A route with NO catalog entry falls back to the flat platform-wide rate
-// — the pre-existing behaviour, unaffected by WithModelPricing being wired
-// in for routes that do have one.
+// A model with NO catalog entry falls back to the flat platform-wide rate
+// rather than charging nothing.
 func TestGateway_Complete_FallsBackToFlatRateWithNoCatalogEntry(t *testing.T) {
 	store, mock := newMockStore(t)
 	sessID, accountID := uuid.New(), uuid.New()
@@ -634,9 +569,9 @@ func TestGateway_Complete_FallsBackToFlatRateWithNoCatalogEntry(t *testing.T) {
 	mock.ExpectCommit()
 
 	provider := &fakeProvider{name: "vllm", usage: inference.Usage{InputTokens: 1000, OutputTokens: 500}}
-	router := NewRouter(map[string]Route{"teepin/fast": {Provider: provider, ProviderName: "vllm"}})
-	modelPricing := &fakeModelPricing{byRoute: map[string][2]float64{}} // teepin/fast not registered
-	gw := NewGateway(store, router, nil, &fakePricing{in: 2.0, out: 8.0}, &fakeUsageRecorder{}).WithModelPricing(modelPricing)
+	models := StaticModels{{Route: "teepin/qwen3-30b-a3b", Engine: "vllm", Provider: provider}}
+	modelPricing := &fakeModelPricing{byRoute: map[string][2]float64{}} // not registered
+	gw := NewGateway(store, models, nil, &fakePricing{in: 2.0, out: 8.0}, &fakeUsageRecorder{}).WithModelPricing(modelPricing)
 
 	sess := &Session{ID: sessID, AccountID: accountID, Status: "open", Budget: 5.0}
 	result, err := gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/fast"})

@@ -178,10 +178,10 @@ func (fakeGithubStore) PushSnapshot(context.Context, uuid.UUID, []kumbha.Workspa
 // requireScope actually resolves tenancy from the gin context instead of
 // short-circuiting into "standalone mode", which requireScope treats a
 // nil store as meaning) plus a wired Kumbha Gateway.
-func newTestServerWithKumbha(t *testing.T, gate kumbha.ProvisionGate, router *kumbha.Router) *Server {
+func newTestServerWithKumbha(t *testing.T, gate kumbha.ProvisionGate, models kumbha.ModelBackend) *Server {
 	t.Helper()
 	_, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, router, gate, &fakeKPricing{in: 1, out: 1}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, models, gate, &fakeKPricing{in: 1, out: 1}, noopUsageRecorder{})
 	return (&Server{store: cStore}).WithKumbha(gw)
 }
 
@@ -195,7 +195,7 @@ func TestCreateKumbhaSession_NotAvailableWhenKumbhaNil(t *testing.T) {
 }
 
 func TestCreateKumbhaSession_RequiresProjectScope(t *testing.T) {
-	server := newTestServerWithKumbha(t, allowGate{}, kumbha.NewRouter(nil))
+	server := newTestServerWithKumbha(t, allowGate{}, nil)
 	w := kumbhaRequest(server.CreateKumbhaSession, http.MethodPost, "/v1/kumbha/sessions", nil,
 		uuid.Nil, createKumbhaSessionRequest{Budget: 5}, nil)
 	if w.Code != http.StatusUnauthorized {
@@ -204,7 +204,7 @@ func TestCreateKumbhaSession_RequiresProjectScope(t *testing.T) {
 }
 
 func TestCreateKumbhaSession_PaymentRequiredMapsTo402(t *testing.T) {
-	server := newTestServerWithKumbha(t, denyGate{reason: "no card on file"}, kumbha.NewRouter(nil))
+	server := newTestServerWithKumbha(t, denyGate{reason: "no card on file"}, nil)
 	w := kumbhaRequest(server.CreateKumbhaSession, http.MethodPost, "/v1/kumbha/sessions", nil,
 		uuid.New(), createKumbhaSessionRequest{Budget: 5}, nil)
 	if w.Code != http.StatusPaymentRequired {
@@ -218,7 +218,7 @@ func TestCreateKumbhaSession_PaymentRequiredMapsTo402(t *testing.T) {
 }
 
 func TestCreateKumbhaSession_InvalidBudgetIs400(t *testing.T) {
-	server := newTestServerWithKumbha(t, allowGate{}, kumbha.NewRouter(nil))
+	server := newTestServerWithKumbha(t, allowGate{}, nil)
 	w := kumbhaRequest(server.CreateKumbhaSession, http.MethodPost, "/v1/kumbha/sessions", nil,
 		uuid.New(), createKumbhaSessionRequest{Budget: 0}, nil)
 	if w.Code != http.StatusBadRequest {
@@ -228,7 +228,7 @@ func TestCreateKumbhaSession_InvalidBudgetIs400(t *testing.T) {
 
 func TestCreateKumbhaSession_Success(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	projectID := uuid.New()
@@ -258,7 +258,7 @@ func TestCreateKumbhaSession_Success(t *testing.T) {
 // success for a build that never actually started.
 func TestCreateKumbhaSession_PromptWithoutAgentConfiguredIs503(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	projectID := uuid.New()
@@ -290,7 +290,7 @@ func TestKumbhaChatCompletions_NotAvailableWhenKumbhaNil(t *testing.T) {
 }
 
 func TestKumbhaChatCompletions_MissingSessionHeaderIs400(t *testing.T) {
-	server := newTestServerWithKumbha(t, allowGate{}, kumbha.NewRouter(nil))
+	server := newTestServerWithKumbha(t, allowGate{}, nil)
 	w := kumbhaRequest(server.KumbhaChatCompletions, http.MethodPost, "/v1/kumbha/chat/completions", nil,
 		uuid.New(), map[string]any{"model": "teepin/fast", "messages": []any{map[string]string{"role": "user", "content": "hi"}}}, nil)
 	if w.Code != http.StatusBadRequest {
@@ -299,7 +299,7 @@ func TestKumbhaChatCompletions_MissingSessionHeaderIs400(t *testing.T) {
 }
 
 func TestKumbhaChatCompletions_InvalidSessionHeaderIs400(t *testing.T) {
-	server := newTestServerWithKumbha(t, allowGate{}, kumbha.NewRouter(nil))
+	server := newTestServerWithKumbha(t, allowGate{}, nil)
 	w := kumbhaRequest(server.KumbhaChatCompletions, http.MethodPost, "/v1/kumbha/chat/completions", nil,
 		uuid.New(), map[string]any{"model": "teepin/fast", "messages": []any{map[string]string{"role": "user", "content": "hi"}}},
 		map[string]string{"X-Teepin-Session": "not-a-uuid"})
@@ -309,7 +309,7 @@ func TestKumbhaChatCompletions_InvalidSessionHeaderIs400(t *testing.T) {
 }
 
 func TestKumbhaChatCompletions_MissingModelIs400(t *testing.T) {
-	server := newTestServerWithKumbha(t, allowGate{}, kumbha.NewRouter(nil))
+	server := newTestServerWithKumbha(t, allowGate{}, nil)
 	w := kumbhaRequest(server.KumbhaChatCompletions, http.MethodPost, "/v1/kumbha/chat/completions", nil,
 		uuid.New(), map[string]any{"messages": []any{map[string]string{"role": "user", "content": "hi"}}},
 		map[string]string{"X-Teepin-Session": uuid.New().String()})
@@ -319,7 +319,7 @@ func TestKumbhaChatCompletions_MissingModelIs400(t *testing.T) {
 }
 
 func TestKumbhaChatCompletions_EmptyMessagesIs400(t *testing.T) {
-	server := newTestServerWithKumbha(t, allowGate{}, kumbha.NewRouter(nil))
+	server := newTestServerWithKumbha(t, allowGate{}, nil)
 	w := kumbhaRequest(server.KumbhaChatCompletions, http.MethodPost, "/v1/kumbha/chat/completions", nil,
 		uuid.New(), map[string]any{"model": "teepin/fast", "messages": []any{}},
 		map[string]string{"X-Teepin-Session": uuid.New().String()})
@@ -329,7 +329,7 @@ func TestKumbhaChatCompletions_EmptyMessagesIs400(t *testing.T) {
 }
 
 func TestKumbhaChatCompletions_StreamingRefusedExplicitly(t *testing.T) {
-	server := newTestServerWithKumbha(t, allowGate{}, kumbha.NewRouter(nil))
+	server := newTestServerWithKumbha(t, allowGate{}, nil)
 	w := kumbhaRequest(server.KumbhaChatCompletions, http.MethodPost, "/v1/kumbha/chat/completions", nil,
 		uuid.New(), map[string]any{"model": "teepin/fast", "stream": true,
 			"messages": []any{map[string]string{"role": "user", "content": "hi"}}},
@@ -341,7 +341,7 @@ func TestKumbhaChatCompletions_StreamingRefusedExplicitly(t *testing.T) {
 
 func TestKumbhaChatCompletions_SessionNotFoundIs404(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{in: 1, out: 1}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{in: 1, out: 1}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	sessionID := uuid.New()
@@ -362,8 +362,8 @@ func TestKumbhaChatCompletions_Success(t *testing.T) {
 
 	provider := &stubProvider{body: []byte(`{"model":"qwen3-coder-30b","choices":[{"message":{"content":"hi"}}]}`),
 		usage: inference.Usage{InputTokens: 100, OutputTokens: 20}}
-	router := kumbha.NewRouter(map[string]kumbha.Route{"teepin/fast": {Provider: provider, ProviderName: "vllm"}})
-	gw := kumbha.NewGateway(kStore, router, allowGate{}, &fakeKPricing{in: 2, out: 8}, noopUsageRecorder{})
+	models := kumbha.StaticModels{{Route: "teepin/fast", Engine: "vllm", Provider: provider}}
+	gw := kumbha.NewGateway(kStore, models, allowGate{}, &fakeKPricing{in: 2, out: 8}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	sessionID := uuid.New()
@@ -536,7 +536,7 @@ func newTestBuildService() *build.Service {
 
 func TestBuildKumbhaSession_NoBuildServiceIs404(t *testing.T) {
 	_, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw) // no WithKumbhaBuild
 
 	sessionID, projectID := uuid.New(), uuid.New()
@@ -549,7 +549,7 @@ func TestBuildKumbhaSession_NoBuildServiceIs404(t *testing.T) {
 
 func TestBuildKumbhaSession_SessionNotFoundIs404(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw).WithKumbhaBuild(newTestBuildService())
 
 	sessionID, projectID := uuid.New(), uuid.New()
@@ -589,7 +589,7 @@ func TestBuildKumbhaSession_SessionNotFoundIs404(t *testing.T) {
 // MCP tool description alone), same posture as the deploy-approval gate.
 func TestCreateInstance_RefusesSecondInstanceForSessionThatAlreadyHasOne(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	fc := newFakeCluster()
 	server := (&Server{store: cStore, cluster: fc}).WithKumbha(gw)
 
@@ -627,7 +627,7 @@ func TestCreateInstance_RefusesSecondInstanceForSessionThatAlreadyHasOne(t *test
 
 func TestDeployKumbhaSession_NoBuildServiceIs404(t *testing.T) {
 	_, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw) // no WithKumbhaBuild
 
 	sessionID, projectID := uuid.New(), uuid.New()
@@ -640,7 +640,7 @@ func TestDeployKumbhaSession_NoBuildServiceIs404(t *testing.T) {
 
 func TestDeployKumbhaSession_SessionNotFoundIs404(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw).WithKumbhaBuild(newTestBuildService())
 
 	sessionID, projectID := uuid.New(), uuid.New()
@@ -657,7 +657,7 @@ func TestDeployKumbhaSession_SessionNotFoundIs404(t *testing.T) {
 
 func TestDeployKumbhaSession_NotApprovedIs403(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw).WithKumbhaBuild(newTestBuildService())
 
 	sessionID, projectID := uuid.New(), uuid.New()
@@ -674,7 +674,7 @@ func TestDeployKumbhaSession_NotApprovedIs403(t *testing.T) {
 
 func TestDeployKumbhaSession_NoWorkspaceIs409(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw).WithKumbhaBuild(newTestBuildService())
 
 	sessionID, projectID := uuid.New(), uuid.New()
@@ -705,7 +705,7 @@ func TestDeployKumbhaSession_NoWorkspaceIs409(t *testing.T) {
 // build starts, rather than letting two attempts race each other.
 func TestDeployKumbhaSession_ConcurrentDeployIsRefused(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw).WithKumbhaBuild(newTestBuildService())
 
 	sessionID, projectID := uuid.New(), uuid.New()
@@ -781,7 +781,7 @@ func instanceRecordRow(id string, accountID, projectID uuid.UUID, name, image st
 
 func TestRedeployKumbhaInstance_UpdatesExistingInstanceInPlace(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 
 	projectID, sessionID := uuid.New(), uuid.New()
 	existingID := "inst-existing1"
@@ -853,7 +853,7 @@ func TestRedeployKumbhaInstance_UpdatesExistingInstanceInPlace(t *testing.T) {
 // redeploy, rather than merely left unchanged.
 func TestRedeployKumbhaInstance_ThreadsHomeNodeClassAndProviderOntoSpec(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 
 	projectID, sessionID := uuid.New(), uuid.New()
 	existingID := "inst-existing5"
@@ -916,7 +916,7 @@ func TestRedeployKumbhaInstance_ThreadsHomeNodeClassAndProviderOntoSpec(t *testi
 // comment) is empty here specifically to simulate that unresolved state.
 func TestRedeployKumbhaInstance_ProviderSetButNodeUnlinkedRepairsNodeID(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 
 	projectID, sessionID := uuid.New(), uuid.New()
 	existingID := "inst-existing5"
@@ -988,7 +988,7 @@ func TestRedeployKumbhaInstance_ProviderSetButNodeUnlinkedRepairsNodeID(t *testi
 // persisted afterward so this never needs rediscovering.
 func TestRedeployKumbhaInstance_RecoversMissingProviderFromLiveStatus(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 
 	projectID, sessionID := uuid.New(), uuid.New()
 	existingID := "inst-existing5"
@@ -1068,7 +1068,7 @@ func TestRedeployKumbhaInstance_RecoversMissingProviderFromLiveStatus(t *testing
 // UpdateNodePlacement backfills provider_id/node_id just above it.
 func TestRedeployKumbhaInstance_BackfillsMissingInstanceType(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 
 	projectID, sessionID := uuid.New(), uuid.New()
 	existingID := "inst-existing5"
@@ -1141,7 +1141,7 @@ func TestRedeployKumbhaInstance_BackfillsMissingInstanceType(t *testing.T) {
 // returns a distinct, loggable error instead of silently no-op'ing.
 func TestRedeployKumbhaInstance_RecoveredProviderMatchesNoNodeStillSucceeds(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 
 	projectID, sessionID := uuid.New(), uuid.New()
 	existingID := "inst-existing5"
@@ -1203,7 +1203,7 @@ func TestRedeployKumbhaInstance_RecoveredProviderMatchesNoNodeStillSucceeds(t *t
 // redeploy to fail.
 func TestRedeployKumbhaInstance_NoLiveProviderLeavesRecoveryOff(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 
 	projectID, sessionID := uuid.New(), uuid.New()
 	existingID := "inst-existing5"
@@ -1270,7 +1270,7 @@ func TestRedeployKumbhaInstance_NoLiveProviderLeavesRecoveryOff(t *testing.T) {
 // LaunchAgent/CaptureScreenshot already use for their own pods.
 func TestRedeployKumbhaInstance_AlwaysForcesFreshImagePull(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 
 	projectID, sessionID := uuid.New(), uuid.New()
 	existingID := "inst-existing7"
@@ -1314,7 +1314,7 @@ func TestRedeployKumbhaInstance_AlwaysForcesFreshImagePull(t *testing.T) {
 // would already trivially skip the whole code path, proving nothing).
 func TestRedeployKumbhaInstance_GithubPushFailureDoesNotBlockRedeploy(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 
 	projectID, sessionID := uuid.New(), uuid.New()
 	existingID := "inst-existing6"
@@ -1365,7 +1365,7 @@ func TestRedeployKumbhaInstance_GithubPushFailureDoesNotBlockRedeploy(t *testing
 // than ever asking the cluster to redeploy with no ports at all.
 func TestRedeployKumbhaInstance_EmptyPortsFallsBackToExistingContainerPort(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 
 	projectID, sessionID := uuid.New(), uuid.New()
 	existingID := "inst-existing2"
@@ -1416,7 +1416,7 @@ func TestRedeployKumbhaInstance_EmptyPortsFallsBackToExistingContainerPort(t *te
 // an unreachable instance with nothing anywhere to explain why.
 func TestRedeployKumbhaInstance_NoResolvablePortIs422(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 
 	projectID, sessionID := uuid.New(), uuid.New()
 	existingID := "inst-existing3"
@@ -1463,7 +1463,7 @@ func TestRedeployKumbhaInstance_NoResolvablePortIs422(t *testing.T) {
 // than reporting a stale empty one it could see was wrong.
 func TestRedeployKumbhaInstance_FallsBackToFreshEndpointWhenExistingIsEmpty(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 
 	projectID, sessionID := uuid.New(), uuid.New()
 	existingID := "inst-existing4"
@@ -1503,7 +1503,7 @@ func TestRedeployKumbhaInstance_FallsBackToFreshEndpointWhenExistingIsEmpty(t *t
 
 func TestRedeployKumbhaInstance_InstanceGoneIs404(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore, cluster: newFakeCluster()}).WithKumbha(gw)
 
 	projectID, sessionID := uuid.New(), uuid.New()
@@ -1536,7 +1536,7 @@ func TestRedeployKumbhaInstance_InstanceGoneIs404(t *testing.T) {
 // DeleteInstance already enforce elsewhere in this file.
 func TestRedeployKumbhaInstance_WrongAccountIsNotFound(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore, cluster: newFakeCluster()}).WithKumbha(gw)
 
 	projectID, sessionID := uuid.New(), uuid.New()
@@ -1557,7 +1557,7 @@ func TestRedeployKumbhaInstance_WrongAccountIsNotFound(t *testing.T) {
 
 func TestRedeployKumbhaInstance_ClusterUnavailableMapsTo503(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 
 	projectID, sessionID := uuid.New(), uuid.New()
 	existingID := "inst-existing2"
@@ -1602,7 +1602,7 @@ func echoIdentityHandler(c *gin.Context) {
 
 func TestInvokeInternally_CarriesIdentityParamsAndBodyThrough(t *testing.T) {
 	_, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	accountID, projectID, userID := uuid.New(), uuid.New(), uuid.New()
@@ -1641,7 +1641,7 @@ func TestInvokeInternally_CarriesIdentityParamsAndBodyThrough(t *testing.T) {
 
 func TestInvokeInternally_OmitsUserIDFromContextWhenNil(t *testing.T) {
 	_, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	_, body := server.invokeInternally(echoIdentityHandler, http.MethodPost, "/v1/internal/echo",
@@ -1666,7 +1666,7 @@ func TestInvokeInternally_OmitsUserIDFromContextWhenNil(t *testing.T) {
 // instances from one build) this closes.
 func TestInvokeInternally_CarriesKumbhaSessionIDThrough(t *testing.T) {
 	_, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	sessionID := uuid.New()
@@ -1687,7 +1687,7 @@ func TestInvokeInternally_CarriesKumbhaSessionIDThrough(t *testing.T) {
 
 func TestBuildKumbhaSession_NotApprovedIs403(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw).WithKumbhaBuild(newTestBuildService())
 
 	sessionID, projectID := uuid.New(), uuid.New()
@@ -1715,7 +1715,7 @@ func deployApprovedSessionRow(sessionID uuid.UUID) *sqlmock.Rows {
 
 func TestBuildKumbhaSession_NoWorkspaceIs409(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw).WithKumbhaBuild(newTestBuildService())
 
 	sessionID, projectID := uuid.New(), uuid.New()
@@ -1741,7 +1741,7 @@ func TestBuildKumbhaSession_NoWorkspaceIs409(t *testing.T) {
 // session it did not itself trigger the build from.
 func TestBuildKumbhaSession_FailurePersistsLastDeployStatus(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw).WithKumbhaBuild(newTestBuildService())
 
 	sessionID, projectID := uuid.New(), uuid.New()
@@ -1783,7 +1783,7 @@ func TestSendKumbhaMessage_NotAvailableWhenKumbhaNil(t *testing.T) {
 
 func TestSendKumbhaMessage_SessionNotFoundIs404(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	sessionID, projectID := uuid.New(), uuid.New()
@@ -1808,10 +1808,8 @@ func TestSendKumbhaMessage_SessionNotFoundIs404(t *testing.T) {
 func TestSendKumbhaMessage_ClosedSessionStillRelaunches(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
 	fc := newFakeCluster()
-	router := kumbha.NewRouter(map[string]kumbha.Route{
-		"teepin/fast": {ProviderName: "vllm", Provider: &stubProvider{}},
-	})
-	gw := kumbha.NewGateway(kStore, router, allowGate{}, &fakeKPricing{}, noopUsageRecorder{}).
+	models := kumbha.StaticModels{{Route: "teepin/fast", Engine: "vllm", Provider: &stubProvider{}}}
+	gw := kumbha.NewGateway(kStore, models, allowGate{}, &fakeKPricing{}, noopUsageRecorder{}).
 		WithAgent(fc, fakeMintKumbhaToken, kumbha.AgentConfig{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
@@ -1860,7 +1858,7 @@ func TestSendKumbhaMessage_QueuesWhenAgentRunning(t *testing.T) {
 	sessionID, projectID := uuid.New(), uuid.New()
 	fc.add("kumbha-agent-abc", projectID.String(), "running")
 
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{}).
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{}).
 		WithAgent(fc, fakeMintKumbhaToken, kumbha.AgentConfig{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
@@ -1901,7 +1899,7 @@ func TestSendKumbhaMessage_EmptyContentIs400(t *testing.T) {
 	sessionID, projectID := uuid.New(), uuid.New()
 	fc.add("kumbha-agent-abc", projectID.String(), "running")
 
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{}).
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{}).
 		WithAgent(fc, fakeMintKumbhaToken, kumbha.AgentConfig{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
@@ -1922,7 +1920,7 @@ func TestSendKumbhaMessage_EmptyContentIs400(t *testing.T) {
 
 func TestPollKumbhaMessages_RequiresSessionCredential(t *testing.T) {
 	_, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	sessionID := uuid.New()
@@ -1935,7 +1933,7 @@ func TestPollKumbhaMessages_RequiresSessionCredential(t *testing.T) {
 
 func TestPollKumbhaMessages_RejectsMismatchedSession(t *testing.T) {
 	_, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	credentialSession, pathSession := uuid.New(), uuid.New()
@@ -1948,7 +1946,7 @@ func TestPollKumbhaMessages_RejectsMismatchedSession(t *testing.T) {
 
 func TestPollKumbhaMessages_Success(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	sessionID := uuid.New()
@@ -1988,7 +1986,7 @@ func TestPollKumbhaMessages_Success(t *testing.T) {
 // 500.
 func TestBuildKumbhaSession_AgentNotConfiguredIs404(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw).WithKumbhaBuild(newTestBuildService())
 
 	sessionID, projectID := uuid.New(), uuid.New()
@@ -2020,7 +2018,7 @@ func TestBuildKumbhaSession_AgentNotConfiguredIs404(t *testing.T) {
 // up in "skipped" — existence-must-not-leak, same as everywhere else.
 func TestDeleteKumbhaSessions_ClosesAnOpenOneThenDeletesBoth(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	openID, notOwnedID, projectID := uuid.New(), uuid.New(), uuid.New()
@@ -2091,7 +2089,7 @@ func liveSessionRow(sessionID uuid.UUID, agentInstanceID, appInstanceID string) 
 
 func TestGetKumbhaSession_ExposesAppInstanceID(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw) // no cluster wired
 
 	sessionID, projectID := uuid.New(), uuid.New()
@@ -2117,7 +2115,7 @@ func TestGetKumbhaSession_ExposesAppInstanceID(t *testing.T) {
 
 func TestGetKumbhaSession_LiveAgentRunningOverridesTheCheapProxy(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	fc := newFakeCluster()
 	server := (&Server{store: cStore, cluster: fc}).WithKumbha(gw)
 
@@ -2147,7 +2145,7 @@ func TestGetKumbhaSession_LiveAgentRunningOverridesTheCheapProxy(t *testing.T) {
 
 func TestGetKumbhaSession_ReportsLiveAppStatus(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	fc := newFakeCluster()
 	appID := "inst-deployed2"
 
@@ -2178,7 +2176,7 @@ func TestGetKumbhaSession_ReportsLiveAppStatus(t *testing.T) {
 // button — without parsing a URL out of an activity-feed event summary.
 func TestGetKumbhaSession_ReportsLiveAppEndpoint(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	fc := newFakeCluster()
 	appID := "inst-deployed3"
 
@@ -2214,7 +2212,7 @@ func TestGetKumbhaSession_ReportsLiveAppEndpoint(t *testing.T) {
 
 func TestUpdateKumbhaBudget_Success(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	sessionID, projectID := uuid.New(), uuid.New()
@@ -2249,7 +2247,7 @@ func TestUpdateKumbhaBudget_Success(t *testing.T) {
 
 func TestUpdateKumbhaBudget_NotHigherIs400(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	sessionID, projectID := uuid.New(), uuid.New()
@@ -2275,7 +2273,7 @@ func TestUpdateKumbhaBudget_NotAvailableWhenKumbhaNil(t *testing.T) {
 
 func TestDeleteKumbhaSessions_EmptyIDsIs400(t *testing.T) {
 	_, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	w := kumbhaRequest(server.DeleteKumbhaSessions, http.MethodPost, "/v1/kumbha/sessions/bulk-delete", nil,
@@ -2298,7 +2296,7 @@ func TestDeleteKumbhaSessions_EmptyIDsIs400(t *testing.T) {
 // GetKumbhaSession response would include them.
 func TestListKumbhaSessions_LiveAgentRunningNotStuckTrue(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	fc := newFakeCluster()
 	appID := "inst-listed01"
 	sessID, projectID := uuid.New(), uuid.New()
@@ -2349,7 +2347,7 @@ func TestStopKumbhaAgent_KillsRunningPod(t *testing.T) {
 	agentID := "kumbha-agent-abcd1234"
 	fc.add(agentID, projectID.String(), "running")
 
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{}).
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{}).
 		WithAgent(fc, fakeMintKumbhaToken, kumbha.AgentConfig{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
@@ -2384,7 +2382,7 @@ func TestStopKumbhaAgent_NothingRunningIs409(t *testing.T) {
 	fc := newFakeCluster()
 	sessionID, projectID := uuid.New(), uuid.New()
 
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{}).
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{}).
 		WithAgent(fc, fakeMintKumbhaToken, kumbha.AgentConfig{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 

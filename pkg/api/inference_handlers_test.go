@@ -80,9 +80,11 @@ func (f *fakeUsage) ConsumeCredit(_ context.Context, _, _ uuid.UUID, cost float6
 
 func testCatalog() fakeCatalog {
 	return fakeCatalog{models: map[string]modelcatalog.Model{
-		"teepin/a":        {ModelRoute: "teepin/a", DisplayName: "A", Engine: "mlx", Enabled: true, InputPricePerMillion: 2, OutputPricePerMillion: 10},
-		"teepin/b":        {ModelRoute: "teepin/b", DisplayName: "B", Engine: "mlx", Enabled: true},
+		"teepin/a":        {ModelRoute: "teepin/a", DisplayName: "A", Engine: "mlx", Enabled: true, OfferedToCustomers: true, InputPricePerMillion: 2, OutputPricePerMillion: 10},
+		"teepin/b":        {ModelRoute: "teepin/b", DisplayName: "B", Engine: "mlx", Enabled: true, OfferedToCustomers: true},
 		"teepin/disabled": {ModelRoute: "teepin/disabled", Enabled: false},
+		// Enabled but reserved for the Kumbha build agent: invisible here.
+		"anthropic/kumbha-only": {ModelRoute: "anthropic/kumbha-only", Enabled: true, KumbhaEnabled: true},
 	}}
 }
 
@@ -207,7 +209,7 @@ func TestChat_UnknownDisabledAndRestrictedModelsAreIndistinguishable(t *testing.
 	h := NewInferenceHandler(&fakeGW{completeResp: okResponse()}, testCatalog(), nil)
 	key := caller{viaKey: true, scopes: []string{ScopeInferenceInvoke, scopeInferenceModel + "teepin/a"}}
 
-	for name, model := range map[string]string{"unknown": "teepin/nope", "disabled": "teepin/disabled", "not permitted to this key": "teepin/b"} {
+	for name, model := range map[string]string{"unknown": "teepin/nope", "disabled": "teepin/disabled", "not offered to customers": "anthropic/kumbha-only", "not permitted to this key": "teepin/b"} {
 		body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"x"}]}`, model)
 		rec := serve(t, h, key, "POST", "/v1/chat/completions", body)
 		if rec.Code != 404 || errCode(t, rec) != "model_not_found" {
@@ -336,7 +338,7 @@ func TestListModels_FiltersToEnabledAndPermitted(t *testing.T) {
 	rec := serve(t, h, caller{}, "GET", "/v1/models", "")
 	_ = json.Unmarshal(rec.Body.Bytes(), &out)
 	if rec.Code != 200 || out.Object != "list" || len(out.Data) != 2 {
-		t.Fatalf("status=%d list=%+v, want the 2 enabled models", rec.Code, out)
+		t.Fatalf("status=%d list=%+v, want the 2 enabled, customer-offered models", rec.Code, out)
 	}
 
 	restricted := caller{viaKey: true, scopes: []string{ScopeInferenceInvoke, scopeInferenceModel + "teepin/a"}}

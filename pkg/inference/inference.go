@@ -60,8 +60,9 @@ var (
 // Messages stay as raw JSON on purpose. The gateway counts and sizes them
 // but has no reason to interpret their contents, and a message can carry
 // tool_calls, multimodal content parts, or provider-specific extensions
-// that a struct would quietly discard. The Anthropic adapter will parse
-// them properly when it lands, because it genuinely must translate.
+// that a struct would quietly discard. The Anthropic adapter is the one
+// provider that parses them, because it genuinely must translate — see
+// anthropic_tools.go.
 type Request struct {
 	// Model is the ROUTE key the caller asked for ("teepin/fast"), not the
 	// backend's own model identifier. Providers substitute their own.

@@ -40,7 +40,6 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/githubstore"
 	"github.com/FlashbackAi/teepin-core/pkg/gpu"
 	"github.com/FlashbackAi/teepin-core/pkg/harbor"
-	"github.com/FlashbackAi/teepin-core/pkg/inference"
 	"github.com/FlashbackAi/teepin-core/pkg/inferencegateway"
 	"github.com/FlashbackAi/teepin-core/pkg/inferencereconciler"
 	"github.com/FlashbackAi/teepin-core/pkg/kumbha"
@@ -467,6 +466,24 @@ func main() {
 				return cluster.NewTunnelTransport(agentRegistry, providerID, instanceID, int32(port))
 			})
 		}
+		// External (third-party API) models read their API keys live from
+		// Secrets Manager. Optional: without AWS config (local dev) they are
+		// built with no key, and the Anthropic SDK falls back to its own
+		// ANTHROPIC_API_KEY.
+		environment := getEnv("TEEPIN_ENVIRONMENT", "dev")
+		if secrets, err := inferencegateway.NewAWSSecretsClient(context.Background()); err != nil {
+			log.Printf("WARN: model API keys disabled (could not load AWS config): %v", err)
+		} else {
+			inferenceGateway.SetSecrets(secrets, environment)
+			if modelCatalogHandler != nil {
+				modelCatalogHandler.WithAPIKeys(secrets, environment)
+			}
+		}
+		if modelCatalogHandler != nil {
+			modelCatalogHandler.WithModelStatus(inferenceGateway)
+		}
+		go inferenceGateway.StartHealthChecks(context.Background(),
+			time.Duration(getEnvInt("TEEPIN_MODEL_HEALTH_INTERVAL_SECONDS", 60))*time.Second)
 		playgroundHandler = api.NewInferencePlaygroundHandler(inferenceGateway)
 		// The public, API-key-authenticated API. billingService may be nil
 		// (no database), in which case nothing is metered.
@@ -721,344 +738,185 @@ func main() {
 	// later, once checkOrigin exists — mirroring execTickets/execHandler's
 	// own two-stage construction for the same reason.
 	var kumbhaEventTickets *kumbha.EventTicketStore
-	// Set inside the Kumbha Gateway block below (needs the same routes map
-	// the Gateway itself is built from); declared here so it is still in
-	// scope for setupRouter's call below regardless of whether that block
-	// ran at all.
-	var kumbhaRouteHandler *api.KumbhaRouteHandler
 
-	// Kumbha Gateway: wraps the operator's own vLLM endpoint (and,
-	// optionally, Anthropic for frontier routing) in Teepin auth +
-	// sessions + credits (KUMBHA-DESIGN.md). Requires a database (sessions,
-	// credits, pricing all live there — billingService doubles as
-	// PricingProvider and UsageRecorder, same "one service, two
-	// interfaces" pattern as the compute pricing/gate above) and at least
-	// the vLLM endpoint to route to; either being unconfigured leaves every
-	// Kumbha endpoint returning 404, same as execTickets when home compute
-	// is off.
-	if billingService != nil {
-		if vllmBaseURL := os.Getenv("TEEPIN_VLLM_BASE_URL"); vllmBaseURL != "" {
-			vllmModel := getEnv("TEEPIN_VLLM_MODEL", "")
-			if vllmModel == "" {
-				log.Println("WARN: TEEPIN_VLLM_BASE_URL is set but TEEPIN_VLLM_MODEL is not — Kumbha Gateway disabled")
+	// Kumbha Gateway: Teepin auth + sessions + credits around the build
+	// agent's model calls (KUMBHA-DESIGN.md). Kumbha has no models of its
+	// own: it uses whichever catalog models are enabled for it (Control
+	// Center -> Kumbha), served through Teepin Inference's gateway exactly
+	// like a customer's own API call. Needs the database (sessions, credits,
+	// pricing — billingService doubles as PricingProvider and UsageRecorder,
+	// same "one service, two interfaces" pattern as the compute pricing/gate
+	// above) and Teepin Inference; off unless TEEPIN_KUMBHA_ENABLED=true,
+	// leaving every Kumbha endpoint returning 404, same as execTickets when
+	// home compute is off.
+	if !getEnvBool("TEEPIN_KUMBHA_ENABLED", false) {
+		log.Println("Kumbha Gateway not enabled (TEEPIN_KUMBHA_ENABLED unset)")
+	} else if billingService == nil || inferenceGateway == nil {
+		log.Println("WARN: TEEPIN_KUMBHA_ENABLED is set, but Kumbha needs the database and Teepin Inference — Kumbha Gateway disabled")
+	} else {
+		kumbhaStore := kumbha.NewStore(dbClient.DB())
+		kumbhaGateway := kumbha.NewGateway(kumbhaStore, newKumbhaModelBackend(modelCatalogService, inferenceGateway),
+			billingService, billingService, billingService).
+			WithModelPricing(modelCatalogService)
+
+		// Capacity-aware placement for Kumbha's own agent/screenshot
+		// pods (LaunchAgent/CaptureScreenshot) — see
+		// nodeCapacityAdapter's own doc comment for the live
+		// incident this fixes. nodeService is nil only in a
+		// deployment with home-node enrollment entirely disabled,
+		// which leaves LaunchAgent falling back to its prior
+		// capacity-blind cluster.Registry.Any() dispatch exactly as
+		// before this existed.
+		if nodeService != nil {
+			kumbhaGateway = kumbhaGateway.WithNodeCapacity(newNodeCapacityAdapter(nodeService))
+		}
+
+		// A Kumbha agent credential (auth.MintSessionToken) is
+		// validated against session-open status on every request —
+		// see auth.Middleware.WithSessionChecker. Without this, a
+		// deployment with Kumbha enabled would still reject every
+		// agent credential outright (fail-closed default), so this
+		// is not optional the way WithAgent below is.
+		if authMiddleware != nil {
+			authMiddleware.WithSessionChecker(kumbhaStore)
+		}
+
+		// Agent pod orchestration (LaunchAgent) stays off until a
+		// real Kumbha agent image exists to run — see the Kumbha
+		// plan's M3. Configuring TEEPIN_KUMBHA_AGENT_IMAGE turns it
+		// on; until then LaunchAgent returns ErrAgentNotConfigured
+		// cleanly rather than launching pods with no image to run.
+		if agentImage := getEnv("TEEPIN_KUMBHA_AGENT_IMAGE", ""); agentImage != "" && os.Getenv("TEEPIN_KUMBHA_AGENT_API_BASE_URL") == "" {
+			log.Println("WARN: TEEPIN_KUMBHA_AGENT_IMAGE is set but TEEPIN_KUMBHA_AGENT_API_BASE_URL is not — agent pods would have no way to call back; Kumbha agent orchestration disabled")
+		} else if agentImage != "" {
+			mintToken := func(accountID, projectID, sessionID uuid.UUID, ttl time.Duration) (string, error) {
+				return auth.MintSessionToken(accountID, projectID, sessionID, ttl, jwtSecret)
+			}
+			kumbhaGateway = kumbhaGateway.WithAgent(clusterClient, mintToken, kumbha.AgentConfig{
+				Image:              agentImage,
+				CPUUnits:           getEnvInt("TEEPIN_KUMBHA_AGENT_CPU_UNITS", 2),
+				MemoryGB:           getEnvInt("TEEPIN_KUMBHA_AGENT_MEMORY_GB", 4),
+				StorageGB:          getEnvInt("TEEPIN_KUMBHA_AGENT_STORAGE_GB", 10),
+				EphemeralStorageGB: getEnvInt("TEEPIN_KUMBHA_AGENT_EPHEMERAL_STORAGE_GB", 10),
+				SessionTokenTTL:    time.Duration(getEnvInt("TEEPIN_KUMBHA_AGENT_TOKEN_TTL_MINUTES", 120)) * time.Minute,
+				APIBaseURL:         getEnv("TEEPIN_KUMBHA_AGENT_API_BASE_URL", ""),
+				// Set once a Harbor project + robot account for the
+				// agent image itself has been provisioned directly
+				// against the target cluster (see AgentConfig's own
+				// doc comment) — empty leaves Image expected to be
+				// publicly pullable, same as before this existed.
+				ImagePullSecret: getEnv("TEEPIN_KUMBHA_AGENT_IMAGE_PULL_SECRET", ""),
+				// Off by default — see AgentConfig.VisionCapable's own
+				// doc comment on why this is operator-confirmed, not
+				// auto-detected. Set TEEPIN_KUMBHA_VISION_CAPABLE=true
+				// only once the hosted route's model is confirmed to
+				// accept multimodal (image) input.
+				VisionCapable: getEnvBool("TEEPIN_KUMBHA_VISION_CAPABLE", false),
+			})
+			log.Printf("✅ Kumbha agent pod orchestration enabled (image %s)", agentImage)
+			// Deployment-thumbnail capture (console Preview tab) rides
+			// along on this SAME image — no separate image/registry/
+			// deploy pipeline: deploy/kumbha-agent/Dockerfile already
+			// installs Chromium for the agent's own browser tool and
+			// now also builds the small kumbha-screenshot binary
+			// (CaptureScreenshot launches it via a Command override,
+			// see that method's own doc comment). Automatically
+			// available whenever agent orchestration is, nothing
+			// further to configure.
+			log.Println("Kumbha deployment screenshot capture enabled (reuses the agent image)")
+		} else {
+			log.Println("Kumbha agent pod orchestration not configured (TEEPIN_KUMBHA_AGENT_IMAGE unset) — LaunchAgent unavailable")
+		}
+
+		apiServer = apiServer.WithKumbha(kumbhaGateway)
+
+		kumbhaEventTickets = kumbha.NewEventTicketStore()
+		go kumbhaEventTickets.Reap(context.Background())
+		apiServer = apiServer.WithKumbhaEventTickets(kumbhaEventTickets)
+
+		// The "deploy" MCP verb's build step (Kaniko) — needs a
+		// registry to push to, Harbor or ECR (pkg/build.RegistryProvider
+		// abstracts over either). pkg/build itself goes through
+		// cluster.Client (the same abstraction LaunchAgent/
+		// CreateInstance/DeleteInstance already use), so it works in
+		// EITHER cluster mode regardless of which registry backs it.
+		// Harbor takes priority when configured (existing behaviour,
+		// unchanged); TEEPIN_ECR_BUILD_REPOSITORY is the fallback for
+		// a deployment with no Harbor server at all — reusing ECR,
+		// already live for the control-plane and kumbha-agent images
+		// themselves, rather than standing up a second registry (see
+		// ROADMAP.md's 2026-08-25 (night) decision). Absent both, the
+		// verb stays an honest stub (teepin-mcp-server's own
+		// fallback message), not a broken endpoint.
+		var kumbhaRegistry build.RegistryProvider
+		switch {
+		case harborService != nil:
+			kumbhaRegistry = harborService
+		case getEnv("TEEPIN_ECR_BUILD_REPOSITORY", "") != "":
+			ecrRepo := getEnv("TEEPIN_ECR_BUILD_REPOSITORY", "")
+			ecrSvc, err := ecrregistry.NewService(context.Background(), ecrRepo)
+			if err != nil {
+				log.Printf("⚠️  ECR build registry initialization failed: %v", err)
 			} else {
-				vllmAPIKey := os.Getenv("TEEPIN_VLLM_API_KEY")
+				kumbhaRegistry = ecrSvc
 
-				// TEEPIN_VLLM_CONTEXT_WINDOW is an explicit override, not the
-				// primary source of truth — 0 (unset) means "ask vLLM itself
-				// via /v1/models" rather than falling back straight to a
-				// hardcoded guess. This is what actually stops the guess from
-				// going stale every time the underlying model changes; see
-				// DiscoverContextWindow's own doc comment for the live
-				// incident (a hardcoded 32768 rejecting requests a
-				// 1,010,000-token model could handle easily) that this
-				// exists to prevent for good, not just once.
-				contextWindow := getEnvInt("TEEPIN_VLLM_CONTEXT_WINDOW", 0)
-				if contextWindow == 0 {
-					discoverCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-					discovered, err := inference.DiscoverContextWindow(discoverCtx, vllmBaseURL, vllmModel, vllmAPIKey)
-					cancel()
+				// A deployed Kumbha app's own instance must be able to
+				// PULL the image Kaniko just PUSHED — a different
+				// credential (see WithKumbhaBuildImagePullSecret's own
+				// doc comment for why this is resolved here, once, from
+				// the image's own registry prefix, rather than a
+				// customer-settable field). Found live 2026-08-26: a
+				// real deploy built and pushed cleanly, then failed
+				// instance creation with "pull access denied ... no
+				// basic auth credentials" — nothing had ever wired this.
+				// Best-effort: a failure here disables auto-attach
+				// (deploys keep working for a public image, fail
+				// exactly as they did before this fix for a private
+				// one) rather than blocking the whole build pipeline
+				// from starting.
+				if secretName := getEnv("TEEPIN_KUMBHA_BUILD_IMAGE_PULL_SECRET", ""); secretName != "" {
+					prefix, err := ecrSvc.ImagePrefix(context.Background(), uuid.Nil, "")
 					if err != nil {
-						log.Printf("WARN: could not auto-discover vLLM context window (%v) — falling back to 32768", err)
-						contextWindow = 32768
+						log.Printf("⚠️  could not resolve the Kumbha build registry's own URI (deploys of a Kumbha-built private image will fail to pull): %v", err)
 					} else {
-						contextWindow = discovered
-						log.Printf("Kumbha Gateway: discovered context window %d tokens for model %s at %s", contextWindow, vllmModel, vllmBaseURL)
+						apiServer = apiServer.WithKumbhaBuildImagePullSecret(prefix, secretName)
 					}
 				}
+			}
+		}
+		if kumbhaRegistry != nil {
+			kumbhaBuildService := build.NewService(clusterClient, kumbhaRegistry, build.DefaultConfig())
+			apiServer = apiServer.WithKumbhaBuild(kumbhaBuildService)
+			log.Println("✅ Kumbha build pipeline enabled (Kaniko -> registry)")
+		} else {
+			log.Println("Kumbha build pipeline not configured (no registry available — set HARBOR_ADMIN_PASSWORD or TEEPIN_ECR_BUILD_REPOSITORY) — the deploy MCP verb stays a stub")
+		}
 
-				vllmProvider := inference.NewVLLM(inference.VLLMConfig{
-					BaseURL:       vllmBaseURL,
-					Model:         vllmModel,
-					APIKey:        vllmAPIKey,
-					ContextWindow: contextWindow,
-					SupportsTools: getEnv("TEEPIN_VLLM_SUPPORTS_TOOLS", "true") == "true",
-				})
-				routes := map[string]kumbha.Route{
-					"teepin/fast": {Provider: vllmProvider, ProviderName: vllmProvider.Name()},
-				}
-
-				// teepin/deep (frontier routing) is optional: an operator who
-				// has not set an Anthropic key still gets teepin/fast working
-				// end to end, and a request routed to teepin/deep gets a
-				// clean "unknown model" (Router.Resolve treats an absent
-				// route that way) rather than a nil-Provider panic.
-				if anthropicModel := getEnv("TEEPIN_ANTHROPIC_MODEL", ""); anthropicModel != "" {
-					anthropicProvider := inference.NewAnthropic(inference.AnthropicConfig{
-						Model:           anthropicModel,
-						APIKey:          os.Getenv("ANTHROPIC_API_KEY"),
-						ContextWindow:   getEnvInt("TEEPIN_ANTHROPIC_CONTEXT_WINDOW", 200000),
-						MaxOutputTokens: getEnvInt("TEEPIN_ANTHROPIC_MAX_OUTPUT_TOKENS", 4096),
-					})
-					routes["teepin/deep"] = kumbha.Route{Provider: anthropicProvider, ProviderName: anthropicProvider.Name()}
-					log.Printf("Kumbha frontier route enabled (teepin/deep -> anthropic %s)", anthropicModel)
-				} else {
-					log.Println("Kumbha frontier route not configured (TEEPIN_ANTHROPIC_MODEL unset) — teepin/deep unavailable")
-				}
-
-				// Register (or refresh) both routes in the model catalog so
-				// Kumbha's own gateway can price them per-route instead of
-				// off one flat platform-wide rate — see gateway.cost()'s own
-				// doc comment for why that flat rate silently mis-bills the
-				// moment a second, differently-priced backend goes live.
-				// RegisterModel preserves any pricing an admin already set
-				// (Control Center -> Inference), so re-running this on every
-				// boot is safe; it only refreshes capabilities/engine.
-				if modelCatalogService != nil {
-					registerCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-					if err := modelCatalogService.RegisterModel(registerCtx, modelcatalog.Model{
-						ModelRoute:    "teepin/fast",
-						DisplayName:   "Teepin Fast",
-						CostClass:     modelcatalog.CostClassOwn, // self-hosted: no per-token vendor invoice
-						Engine:        vllmProvider.Name(),
-						ContextWindow: contextWindow,
-						SupportsTools: getEnv("TEEPIN_VLLM_SUPPORTS_TOOLS", "true") == "true",
-						Enabled:       true,
-						UpdatedBy:     strPtr("system-boot"),
-					}); err != nil {
-						log.Printf("WARN: could not register teepin/fast in model catalog: %v", err)
-					}
-					if anthropicProvider, isDeep := routes["teepin/deep"]; isDeep {
-						anthropicModel := getEnv("TEEPIN_ANTHROPIC_MODEL", "")
-						if err := modelCatalogService.RegisterModel(registerCtx, modelcatalog.Model{
-							ModelRoute:    "teepin/deep",
-							DisplayName:   "Teepin Deep",
-							CostClass:     modelcatalog.CostClassFrontier, // Anthropic bills us per token
-							Engine:        anthropicProvider.ProviderName,
-							ContextWindow: getEnvInt("TEEPIN_ANTHROPIC_CONTEXT_WINDOW", 200000),
-							SupportsTools: true,
-							Enabled:       true,
-							UpdatedBy:     strPtr("system-boot"),
-						}); err != nil {
-							log.Printf("WARN: could not register teepin/deep in model catalog: %v", err)
-						}
-						// Refresh the recorded vendor cost to match whatever
-						// model is actually configured today — a model swap
-						// (e.g. Haiku -> Opus) must not leave a stale vendor
-						// cost silently mispricing the admin's margin view.
-						// Only for models this codebase knows the published
-						// rate for; an unrecognised model leaves vendor cost
-						// as whatever an admin last set by hand rather than
-						// guessing.
-						if in, out, ok := knownAnthropicVendorCost(anthropicModel); ok {
-							if err := modelCatalogService.SetVendorCost(registerCtx, "teepin/deep", &in, &out, "system-boot"); err != nil {
-								log.Printf("WARN: could not record vendor cost for teepin/deep (%s): %v", anthropicModel, err)
-							}
-						} else {
-							log.Printf("Model catalog: no known published rate for Anthropic model %q — vendor cost for teepin/deep left as last set (Control Center -> Inference)", anthropicModel)
-						}
-					}
-					cancel()
-				}
-
-				kumbhaStore := kumbha.NewStore(dbClient.DB())
-				kumbhaRouter := kumbha.NewRouter(routes)
-				kumbhaGateway := kumbha.NewGateway(kumbhaStore, kumbhaRouter, billingService, billingService, billingService)
-				if modelCatalogService != nil {
-					kumbhaGateway = kumbhaGateway.WithModelPricing(modelCatalogService)
-				}
-
-				// Live on/off per route (Control Center, not a redeploy) and
-				// background connectivity health — see pkg/kumbha/routes.go.
-				kumbhaRouteStore := kumbha.NewRouteStore(dbClient.DB())
-				kumbhaGateway = kumbhaGateway.WithRouteControl(kumbhaRouteStore)
-
-				// Route candidates (billing.kumbha_route_candidates): live,
-				// Control-Center-configured backends per route, with real
-				// priority fallback and per-candidate secrets in AWS Secrets
-				// Manager. Purely ADDITIVE to the static routes above — a
-				// route with no candidate rows keeps using its static,
-				// env-var-configured Route exactly as before this existed
-				// (see Gateway.resolveOrdered's own doc comment), so nothing
-				// has to migrate off env vars for this to be useful for even
-				// one route. Secrets are optional: if AWS config can't be
-				// loaded (e.g. local dev with no AWS credentials), candidates
-				// still work, just always with an empty api_key.
-				environment := getEnv("TEEPIN_ENVIRONMENT", "dev")
-				kumbhaCandidateStore := kumbha.NewCandidateStore(dbClient.DB())
-				var kumbhaSecrets kumbha.SecretsClient
-				if awsSecrets, err := kumbha.NewAWSSecretsClient(context.Background()); err != nil {
-					log.Printf("WARN: Kumbha route candidate secrets disabled (could not load AWS config): %v — candidates still work, but their api_key fields are ignored", err)
-				} else {
-					kumbhaSecrets = awsSecrets
-				}
-				kumbhaFactory := kumbha.NewProviderFactory(kumbhaSecrets, environment)
-				kumbhaGateway = kumbhaGateway.WithCandidates(kumbhaCandidateStore, kumbhaFactory)
-
-				// Capacity-aware placement for Kumbha's own agent/screenshot
-				// pods (LaunchAgent/CaptureScreenshot) — see
-				// nodeCapacityAdapter's own doc comment for the live
-				// incident this fixes. nodeService is nil only in a
-				// deployment with home-node enrollment entirely disabled,
-				// which leaves LaunchAgent falling back to its prior
-				// capacity-blind cluster.Registry.Any() dispatch exactly as
-				// before this existed.
-				if nodeService != nil {
-					kumbhaGateway = kumbhaGateway.WithNodeCapacity(newNodeCapacityAdapter(nodeService))
-				}
-
-				kumbhaRouteMonitor := kumbha.NewRouteMonitor(routes).WithCandidates(kumbhaCandidateStore, kumbhaFactory)
-				kumbhaRouteMonitor.CheckNow(context.Background()) // first reading before anything reads Statuses()
-				go kumbhaRouteMonitor.Start(context.Background(), time.Duration(getEnvInt("TEEPIN_KUMBHA_ROUTE_HEALTH_INTERVAL_SECONDS", 60))*time.Second)
-				kumbhaRouteHandler = api.NewKumbhaRouteHandler(kumbhaRouter, kumbhaRouteStore, kumbhaRouteMonitor, kumbhaCandidateStore, kumbhaSecrets, environment)
-
-				// A Kumbha agent credential (auth.MintSessionToken) is
-				// validated against session-open status on every request —
-				// see auth.Middleware.WithSessionChecker. Without this, a
-				// deployment with Kumbha enabled would still reject every
-				// agent credential outright (fail-closed default), so this
-				// is not optional the way WithAgent below is.
-				if authMiddleware != nil {
-					authMiddleware.WithSessionChecker(kumbhaStore)
-				}
-
-				// Agent pod orchestration (LaunchAgent) stays off until a
-				// real Kumbha agent image exists to run — see the Kumbha
-				// plan's M3. Configuring TEEPIN_KUMBHA_AGENT_IMAGE turns it
-				// on; until then LaunchAgent returns ErrAgentNotConfigured
-				// cleanly rather than launching pods with no image to run.
-				if agentImage := getEnv("TEEPIN_KUMBHA_AGENT_IMAGE", ""); agentImage != "" && os.Getenv("TEEPIN_KUMBHA_AGENT_API_BASE_URL") == "" {
-					log.Println("WARN: TEEPIN_KUMBHA_AGENT_IMAGE is set but TEEPIN_KUMBHA_AGENT_API_BASE_URL is not — agent pods would have no way to call back; Kumbha agent orchestration disabled")
-				} else if agentImage != "" {
-					mintToken := func(accountID, projectID, sessionID uuid.UUID, ttl time.Duration) (string, error) {
-						return auth.MintSessionToken(accountID, projectID, sessionID, ttl, jwtSecret)
-					}
-					kumbhaGateway = kumbhaGateway.WithAgent(clusterClient, mintToken, kumbha.AgentConfig{
-						Image:              agentImage,
-						CPUUnits:           getEnvInt("TEEPIN_KUMBHA_AGENT_CPU_UNITS", 2),
-						MemoryGB:           getEnvInt("TEEPIN_KUMBHA_AGENT_MEMORY_GB", 4),
-						StorageGB:          getEnvInt("TEEPIN_KUMBHA_AGENT_STORAGE_GB", 10),
-						EphemeralStorageGB: getEnvInt("TEEPIN_KUMBHA_AGENT_EPHEMERAL_STORAGE_GB", 10),
-						SessionTokenTTL:    time.Duration(getEnvInt("TEEPIN_KUMBHA_AGENT_TOKEN_TTL_MINUTES", 120)) * time.Minute,
-						APIBaseURL:         getEnv("TEEPIN_KUMBHA_AGENT_API_BASE_URL", ""),
-						// Set once a Harbor project + robot account for the
-						// agent image itself has been provisioned directly
-						// against the target cluster (see AgentConfig's own
-						// doc comment) — empty leaves Image expected to be
-						// publicly pullable, same as before this existed.
-						ImagePullSecret: getEnv("TEEPIN_KUMBHA_AGENT_IMAGE_PULL_SECRET", ""),
-						// Off by default — see AgentConfig.VisionCapable's own
-						// doc comment on why this is operator-confirmed, not
-						// auto-detected. Set TEEPIN_KUMBHA_VISION_CAPABLE=true
-						// only once the hosted route's model is confirmed to
-						// accept multimodal (image) input.
-						VisionCapable: getEnvBool("TEEPIN_KUMBHA_VISION_CAPABLE", false),
-						// Empty (default) leaves run.py's own "teepin/fast"
-						// default untouched — see AgentConfig.Route's own doc
-						// comment. Set to "teepin/deep" to move new build
-						// sessions onto the frontier route instead, e.g. for a
-						// demo where teepin/fast points at a self-hosted model
-						// not yet proven for agentic tool use.
-						Route: getEnv("TEEPIN_KUMBHA_AGENT_ROUTE", ""),
-					})
-					log.Printf("✅ Kumbha agent pod orchestration enabled (image %s)", agentImage)
-					// Deployment-thumbnail capture (console Preview tab) rides
-					// along on this SAME image — no separate image/registry/
-					// deploy pipeline: deploy/kumbha-agent/Dockerfile already
-					// installs Chromium for the agent's own browser tool and
-					// now also builds the small kumbha-screenshot binary
-					// (CaptureScreenshot launches it via a Command override,
-					// see that method's own doc comment). Automatically
-					// available whenever agent orchestration is, nothing
-					// further to configure.
-					log.Println("Kumbha deployment screenshot capture enabled (reuses the agent image)")
-				} else {
-					log.Println("Kumbha agent pod orchestration not configured (TEEPIN_KUMBHA_AGENT_IMAGE unset) — LaunchAgent unavailable")
-				}
-
-				apiServer = apiServer.WithKumbha(kumbhaGateway)
-
-				kumbhaEventTickets = kumbha.NewEventTicketStore()
-				go kumbhaEventTickets.Reap(context.Background())
-				apiServer = apiServer.WithKumbhaEventTickets(kumbhaEventTickets)
-
-				// The "deploy" MCP verb's build step (Kaniko) — needs a
-				// registry to push to, Harbor or ECR (pkg/build.RegistryProvider
-				// abstracts over either). pkg/build itself goes through
-				// cluster.Client (the same abstraction LaunchAgent/
-				// CreateInstance/DeleteInstance already use), so it works in
-				// EITHER cluster mode regardless of which registry backs it.
-				// Harbor takes priority when configured (existing behaviour,
-				// unchanged); TEEPIN_ECR_BUILD_REPOSITORY is the fallback for
-				// a deployment with no Harbor server at all — reusing ECR,
-				// already live for the control-plane and kumbha-agent images
-				// themselves, rather than standing up a second registry (see
-				// ROADMAP.md's 2026-08-25 (night) decision). Absent both, the
-				// verb stays an honest stub (teepin-mcp-server's own
-				// fallback message), not a broken endpoint.
-				var kumbhaRegistry build.RegistryProvider
-				switch {
-				case harborService != nil:
-					kumbhaRegistry = harborService
-				case getEnv("TEEPIN_ECR_BUILD_REPOSITORY", "") != "":
-					ecrRepo := getEnv("TEEPIN_ECR_BUILD_REPOSITORY", "")
-					ecrSvc, err := ecrregistry.NewService(context.Background(), ecrRepo)
-					if err != nil {
-						log.Printf("⚠️  ECR build registry initialization failed: %v", err)
-					} else {
-						kumbhaRegistry = ecrSvc
-
-						// A deployed Kumbha app's own instance must be able to
-						// PULL the image Kaniko just PUSHED — a different
-						// credential (see WithKumbhaBuildImagePullSecret's own
-						// doc comment for why this is resolved here, once, from
-						// the image's own registry prefix, rather than a
-						// customer-settable field). Found live 2026-08-26: a
-						// real deploy built and pushed cleanly, then failed
-						// instance creation with "pull access denied ... no
-						// basic auth credentials" — nothing had ever wired this.
-						// Best-effort: a failure here disables auto-attach
-						// (deploys keep working for a public image, fail
-						// exactly as they did before this fix for a private
-						// one) rather than blocking the whole build pipeline
-						// from starting.
-						if secretName := getEnv("TEEPIN_KUMBHA_BUILD_IMAGE_PULL_SECRET", ""); secretName != "" {
-							prefix, err := ecrSvc.ImagePrefix(context.Background(), uuid.Nil, "")
-							if err != nil {
-								log.Printf("⚠️  could not resolve the Kumbha build registry's own URI (deploys of a Kumbha-built private image will fail to pull): %v", err)
-							} else {
-								apiServer = apiServer.WithKumbhaBuildImagePullSecret(prefix, secretName)
-							}
-						}
-					}
-				}
-				if kumbhaRegistry != nil {
-					kumbhaBuildService := build.NewService(clusterClient, kumbhaRegistry, build.DefaultConfig())
-					apiServer = apiServer.WithKumbhaBuild(kumbhaBuildService)
-					log.Println("✅ Kumbha build pipeline enabled (Kaniko -> registry)")
-				} else {
-					log.Println("Kumbha build pipeline not configured (no registry available — set HARBOR_ADMIN_PASSWORD or TEEPIN_ECR_BUILD_REPOSITORY) — the deploy MCP verb stays a stub")
-				}
-
-				// GitHub-backed code storage (pkg/githubstore): pushes each
-				// checkpointed deploy to a Teepin-owned repo, invisible to
-				// the customer — see that package's own doc comment.
-				// Optional, same fully-off-when-unconfigured posture as
-				// every other Kumbha capability above.
-				githubAppID := getEnvInt("TEEPIN_GITHUB_APP_ID", 0)
-				githubInstallationID := getEnvInt("TEEPIN_GITHUB_APP_INSTALLATION_ID", 0)
-				githubPrivateKey := getEnv("TEEPIN_GITHUB_APP_PRIVATE_KEY", "")
-				if githubAppID != 0 && githubInstallationID != 0 && githubPrivateKey != "" {
-					githubStoreService, err := githubstore.NewService(
-						int64(githubAppID), int64(githubInstallationID),
-						[]byte(githubPrivateKey),
-						getEnv("TEEPIN_GITHUB_STORAGE_ORG", "TeepinWebServices"),
-					)
-					if err != nil {
-						log.Printf("⚠️  GitHub code storage initialization failed: %v", err)
-					} else {
-						apiServer = apiServer.WithGithubStore(githubStoreService)
-						log.Println("✅ GitHub code storage enabled (checkpoint pushes -> TeepinWebServices)")
-					}
-				} else {
-					log.Println("GitHub code storage not configured (set TEEPIN_GITHUB_APP_ID, TEEPIN_GITHUB_APP_INSTALLATION_ID, TEEPIN_GITHUB_APP_PRIVATE_KEY) — deploys are not backed up to GitHub")
-				}
-
-				log.Printf("✅ Kumbha Gateway enabled (teepin/fast -> vLLM at %s)", vllmBaseURL)
+		// GitHub-backed code storage (pkg/githubstore): pushes each
+		// checkpointed deploy to a Teepin-owned repo, invisible to
+		// the customer — see that package's own doc comment.
+		// Optional, same fully-off-when-unconfigured posture as
+		// every other Kumbha capability above.
+		githubAppID := getEnvInt("TEEPIN_GITHUB_APP_ID", 0)
+		githubInstallationID := getEnvInt("TEEPIN_GITHUB_APP_INSTALLATION_ID", 0)
+		githubPrivateKey := getEnv("TEEPIN_GITHUB_APP_PRIVATE_KEY", "")
+		if githubAppID != 0 && githubInstallationID != 0 && githubPrivateKey != "" {
+			githubStoreService, err := githubstore.NewService(
+				int64(githubAppID), int64(githubInstallationID),
+				[]byte(githubPrivateKey),
+				getEnv("TEEPIN_GITHUB_STORAGE_ORG", "TeepinWebServices"),
+			)
+			if err != nil {
+				log.Printf("⚠️  GitHub code storage initialization failed: %v", err)
+			} else {
+				apiServer = apiServer.WithGithubStore(githubStoreService)
+				log.Println("✅ GitHub code storage enabled (checkpoint pushes -> TeepinWebServices)")
 			}
 		} else {
-			log.Println("Kumbha Gateway not configured (TEEPIN_VLLM_BASE_URL unset)")
+			log.Println("GitHub code storage not configured (set TEEPIN_GITHUB_APP_ID, TEEPIN_GITHUB_APP_INSTALLATION_ID, TEEPIN_GITHUB_APP_PRIVATE_KEY) — deploys are not backed up to GitHub")
 		}
+
+		log.Println("✅ Kumbha Gateway enabled (models: catalog entries enabled for Kumbha)")
 	}
 
 	// Admin API (pricing management): only enabled with an explicit
@@ -1140,7 +998,7 @@ func main() {
 	}
 
 	// Setup router
-	router := setupRouter(apiServer, authHandler, accountHandler, authMiddleware, billingHandler, registryHandler, adminHandler, webhookHandler, nodeHandler, modelCatalogHandler, nodeServicesHandler, playgroundHandler, nodeModelCacheHandler, publicInferenceHandler, kumbhaRouteHandler, rateLimitMiddleware, proxyHandler, execHandler, kumbhaEventsHandler, getEnv("TEEPIN_DOMAIN", "teepin.com"))
+	router := setupRouter(apiServer, authHandler, accountHandler, authMiddleware, billingHandler, registryHandler, adminHandler, webhookHandler, nodeHandler, modelCatalogHandler, nodeServicesHandler, playgroundHandler, nodeModelCacheHandler, publicInferenceHandler, rateLimitMiddleware, proxyHandler, execHandler, kumbhaEventsHandler, getEnv("TEEPIN_DOMAIN", "teepin.com"))
 
 	// Create HTTP server
 	port := getEnv("PORT", "8080")
@@ -1299,34 +1157,6 @@ func initKubernetesClient() (*kubernetes.Clientset, error) {
 	return clientset, nil
 }
 
-// knownAnthropicVendorCost returns Anthropic's own published per-million-
-// token rate for a handful of current models, as of 2026-06-24 pricing —
-// used only to seed/refresh teepin/deep's recorded vendor cost so the
-// Control Center's margin view isn't silently stale after a model swap.
-// Never a guess: an unrecognised model id returns ok=false and this
-// codebase leaves whatever vendor cost an admin last set by hand alone.
-// Update this table (or set the rate by hand in Control Center ->
-// Inference) when Anthropic's pricing changes or a new model is adopted.
-func knownAnthropicVendorCost(model string) (input, output float64, ok bool) {
-	rates := map[string][2]float64{
-		"claude-haiku-4-5-20251001": {1.00, 5.00},
-		"claude-haiku-4-5":          {1.00, 5.00},
-		"claude-sonnet-5":           {3.00, 15.00},
-		"claude-opus-5":             {5.00, 25.00},
-		"claude-opus-4-8":           {5.00, 25.00},
-		"claude-opus-4-7":           {5.00, 25.00},
-		"claude-opus-4-6":           {5.00, 25.00},
-		"claude-sonnet-4-6":         {3.00, 15.00},
-	}
-	r, found := rates[model]
-	if !found {
-		return 0, 0, false
-	}
-	return r[0], r[1], true
-}
-
-func strPtr(s string) *string { return &s }
-
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
@@ -1391,7 +1221,7 @@ func initRateLimiting() *ratelimit.Config {
 	return config
 }
 
-func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHandler *api.AccountHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler, registryHandler *api.RegistryHandler, adminHandler *api.AdminHandler, webhookHandler *api.WebhookHandler, nodeHandler *api.NodeHandler, modelCatalogHandler *api.ModelCatalogHandler, nodeServicesHandler *api.NodeServicesHandler, playgroundHandler *api.InferencePlaygroundHandler, nodeModelCacheHandler *api.NodeModelCacheHandler, publicInferenceHandler *api.InferenceHandler, kumbhaRouteHandler *api.KumbhaRouteHandler, rateLimitMiddleware *ratelimit.Middleware, proxyHandler *cluster.ProxyHandler, execHandler *cluster.ExecHandler, kumbhaEventsHandler *kumbha.EventsHandler, instanceDomain string) *gin.Engine {
+func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHandler *api.AccountHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler, registryHandler *api.RegistryHandler, adminHandler *api.AdminHandler, webhookHandler *api.WebhookHandler, nodeHandler *api.NodeHandler, modelCatalogHandler *api.ModelCatalogHandler, nodeServicesHandler *api.NodeServicesHandler, playgroundHandler *api.InferencePlaygroundHandler, nodeModelCacheHandler *api.NodeModelCacheHandler, publicInferenceHandler *api.InferenceHandler, rateLimitMiddleware *ratelimit.Middleware, proxyHandler *cluster.ProxyHandler, execHandler *cluster.ExecHandler, kumbhaEventsHandler *kumbha.EventsHandler, instanceDomain string) *gin.Engine {
 	// Set Gin to release mode in production
 	if os.Getenv("GIN_MODE") == "" {
 		gin.SetMode(gin.ReleaseMode)
@@ -1762,17 +1592,6 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 					admin.GET("/nodes/:id/cached-models", nodeModelCacheHandler.List)
 					admin.DELETE("/nodes/:id/cached-models", nodeModelCacheHandler.Delete)
 				}
-				if kumbhaRouteHandler != nil {
-					admin.GET("/kumbha/routes", kumbhaRouteHandler.List)
-					// route travels as ?route=teepin/fast — see SetEnabled's
-					// own doc comment on why a path segment cannot hold it.
-					admin.PUT("/kumbha/routes", kumbhaRouteHandler.SetEnabled)
-					// Candidate ids are UUIDs, so a path segment is fine here
-					// (no slash to collide with, unlike a route name above).
-					admin.POST("/kumbha/candidates", kumbhaRouteHandler.CreateCandidate)
-					admin.PUT("/kumbha/candidates/:id", kumbhaRouteHandler.UpdateCandidate)
-					admin.DELETE("/kumbha/candidates/:id", kumbhaRouteHandler.DeleteCandidate)
-				}
 				if modelCatalogHandler != nil {
 					admin.POST("/inference/models", modelCatalogHandler.RegisterModel)
 					admin.GET("/inference/models", modelCatalogHandler.ListModels)
@@ -1780,6 +1599,7 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 					admin.PUT("/inference/models/pricing", modelCatalogHandler.SetPricing)
 					admin.PUT("/inference/models/vendor-cost", modelCatalogHandler.SetVendorCost)
 					admin.PUT("/inference/models/enabled", modelCatalogHandler.SetEnabled)
+					admin.PUT("/inference/models/availability", modelCatalogHandler.SetAvailability)
 					admin.DELETE("/inference/models", modelCatalogHandler.DeleteModel)
 				}
 

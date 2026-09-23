@@ -90,16 +90,11 @@ func (f *fakeCapacityLister) ListNodeCapacity(context.Context) ([]CapacityCandid
 	return f.candidates, f.err
 }
 
-// testAgentRouter satisfies LaunchAgent's route pre-flight check
-// (checkRouteAvailable) for tests exercising launch mechanics rather than
-// routing itself — teepin/fast is the implicit default when
-// AgentConfig.Route is unset, teepin/deep covers tests that set Route
-// explicitly.
-func testAgentRouter() *Router {
-	return NewRouter(map[string]Route{
-		"teepin/fast": {Provider: &fakeProvider{name: "vllm"}, ProviderName: "vllm"},
-		"teepin/deep": {Provider: &fakeProvider{name: "anthropic"}, ProviderName: "anthropic"},
-	})
+// testAgentModels satisfies LaunchAgent's pre-flight check (at least one
+// model enabled for Kumbha) for tests exercising launch mechanics rather
+// than model selection itself.
+func testAgentModels() StaticModels {
+	return StaticModels{{Route: "teepin/qwen3-30b-a3b", Engine: "vllm", Provider: &fakeProvider{name: "vllm"}}}
 }
 
 func fakeMintToken(_, _, _ uuid.UUID, _ time.Duration) (string, error) {
@@ -108,7 +103,7 @@ func fakeMintToken(_, _, _ uuid.UUID, _ time.Duration) (string, error) {
 
 func TestGateway_LaunchAgent_NotConfiguredWithoutWithAgent(t *testing.T) {
 	store, _ := newMockStore(t)
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{})
+	gw := NewGateway(store, nil, nil, &fakePricing{}, &fakeUsageRecorder{})
 
 	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), ProjectID: uuid.New()}
 	err := gw.LaunchAgent(context.Background(), sess, "build me a booking app")
@@ -119,7 +114,7 @@ func TestGateway_LaunchAgent_NotConfiguredWithoutWithAgent(t *testing.T) {
 
 func TestGateway_MintWorkspaceFetchToken_NotConfiguredWithoutWithAgent(t *testing.T) {
 	store, _ := newMockStore(t)
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{})
+	gw := NewGateway(store, nil, nil, &fakePricing{}, &fakeUsageRecorder{})
 
 	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), ProjectID: uuid.New()}
 	_, _, err := gw.MintWorkspaceFetchToken(sess, time.Minute)
@@ -134,7 +129,7 @@ func TestGateway_MintWorkspaceFetchToken_NotConfiguredWithoutWithAgent(t *testin
 // sync.
 func TestGateway_MintWorkspaceFetchToken_ReturnsTokenAndArchiveURL(t *testing.T) {
 	store, _ := newMockStore(t)
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+	gw := NewGateway(store, nil, nil, &fakePricing{}, &fakeUsageRecorder{}).
 		WithAgent(&fakeCluster{}, fakeMintToken, AgentConfig{
 			Image:      "kumbha-agent:latest",
 			APIBaseURL: "http://teepin-api.default.svc.cluster.local:8080/",
@@ -158,7 +153,7 @@ func TestGateway_MintWorkspaceFetchToken_ReturnsTokenAndArchiveURL(t *testing.T)
 func TestGateway_LaunchAgent_Success(t *testing.T) {
 	store, mock := newMockStore(t)
 	fc := &fakeCluster{}
-	gw := NewGateway(store, testAgentRouter(), nil, &fakePricing{}, &fakeUsageRecorder{}).
+	gw := NewGateway(store, testAgentModels(), nil, &fakePricing{}, &fakeUsageRecorder{}).
 		WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest", CPUUnits: 2, MemoryGB: 4})
 
 	sessID, accountID, projectID := uuid.New(), uuid.New(), uuid.New()
@@ -215,7 +210,7 @@ func TestGateway_LaunchAgent_PicksNodeWithEnoughCapacity(t *testing.T) {
 		{ProviderID: "mac-node", FreeCPU: 1, FreeMemGB: 1},  // insufficient — must be skipped
 		{ProviderID: "srialla", FreeCPU: 16, FreeMemGB: 12}, // sufficient
 	}}
-	gw := NewGateway(store, testAgentRouter(), nil, &fakePricing{}, &fakeUsageRecorder{}).
+	gw := NewGateway(store, testAgentModels(), nil, &fakePricing{}, &fakeUsageRecorder{}).
 		WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest", CPUUnits: 2, MemoryGB: 4}).
 		WithNodeCapacity(lister)
 
@@ -243,7 +238,7 @@ func TestGateway_LaunchAgent_PrefersNodeWithMostFreeCPU(t *testing.T) {
 		{ProviderID: "fblabs01", FreeCPU: 6, FreeMemGB: 8},
 		{ProviderID: "srialla", FreeCPU: 16, FreeMemGB: 12}, // most free CPU — should win
 	}}
-	gw := NewGateway(store, testAgentRouter(), nil, &fakePricing{}, &fakeUsageRecorder{}).
+	gw := NewGateway(store, testAgentModels(), nil, &fakePricing{}, &fakeUsageRecorder{}).
 		WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest", CPUUnits: 2, MemoryGB: 4}).
 		WithNodeCapacity(lister)
 
@@ -272,7 +267,7 @@ func TestGateway_LaunchAgent_NoCapacityAnywhereRefusesUpFront(t *testing.T) {
 		{ProviderID: "mac-node", FreeCPU: 0, FreeMemGB: 0},
 		{ProviderID: "fblabs01", FreeCPU: 1, FreeMemGB: 1},
 	}}
-	gw := NewGateway(store, testAgentRouter(), nil, &fakePricing{}, &fakeUsageRecorder{}).
+	gw := NewGateway(store, testAgentModels(), nil, &fakePricing{}, &fakeUsageRecorder{}).
 		WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest", CPUUnits: 2, MemoryGB: 4}).
 		WithNodeCapacity(lister)
 
@@ -294,7 +289,7 @@ func TestGateway_LaunchAgent_CapacityLookupErrorFailsOpen(t *testing.T) {
 	store, mock := newMockStore(t)
 	fc := &fakeCluster{}
 	lister := &fakeCapacityLister{err: errors.New("nodes service unreachable")}
-	gw := NewGateway(store, testAgentRouter(), nil, &fakePricing{}, &fakeUsageRecorder{}).
+	gw := NewGateway(store, testAgentModels(), nil, &fakePricing{}, &fakeUsageRecorder{}).
 		WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest", CPUUnits: 2, MemoryGB: 4}).
 		WithNodeCapacity(lister)
 
@@ -318,7 +313,7 @@ func TestGateway_LaunchAgent_CapacityLookupErrorFailsOpen(t *testing.T) {
 func TestGateway_LaunchAgent_NoCapacityListerConfiguredLeavesProviderIDEmpty(t *testing.T) {
 	store, mock := newMockStore(t)
 	fc := &fakeCluster{}
-	gw := NewGateway(store, testAgentRouter(), nil, &fakePricing{}, &fakeUsageRecorder{}).
+	gw := NewGateway(store, testAgentModels(), nil, &fakePricing{}, &fakeUsageRecorder{}).
 		WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest", CPUUnits: 2, MemoryGB: 4})
 
 	sessID := uuid.New()
@@ -346,7 +341,7 @@ func TestGateway_LaunchAgent_PropagatesVisionCapableFlag(t *testing.T) {
 	for _, visionCapable := range []bool{false, true} {
 		store, mock := newMockStore(t)
 		fc := &fakeCluster{}
-		gw := NewGateway(store, testAgentRouter(), nil, &fakePricing{}, &fakeUsageRecorder{}).
+		gw := NewGateway(store, testAgentModels(), nil, &fakePricing{}, &fakeUsageRecorder{}).
 			WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest", VisionCapable: visionCapable})
 
 		sessID := uuid.New()
@@ -370,7 +365,7 @@ func TestGateway_LaunchAgent_PropagatesVisionCapableFlag(t *testing.T) {
 func TestGateway_LaunchAgent_RecordingFailureCleansUpThePod(t *testing.T) {
 	store, mock := newMockStore(t)
 	fc := &fakeCluster{}
-	gw := NewGateway(store, testAgentRouter(), nil, &fakePricing{}, &fakeUsageRecorder{}).
+	gw := NewGateway(store, testAgentModels(), nil, &fakePricing{}, &fakeUsageRecorder{}).
 		WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest"})
 
 	sessID := uuid.New()
@@ -405,7 +400,7 @@ func TestGateway_CloseSession_TearsDownAgentPod(t *testing.T) {
 		}).AddRow(sessID, accountID, projectID, 5.0, 0.0, "closed", nil, agentPodID, nil, false, startedAt, startedAt))
 
 	fc := &fakeCluster{}
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+	gw := NewGateway(store, nil, nil, &fakePricing{}, &fakeUsageRecorder{}).
 		WithAgent(fc, fakeMintToken, AgentConfig{})
 
 	if _, err := gw.CloseSession(context.Background(), sessID, accountID, "closed"); err != nil {
@@ -432,7 +427,7 @@ func TestGateway_CloseSession_NoAgentPodMeansNoDeleteCall(t *testing.T) {
 		}).AddRow(sessID, accountID, projectID, 5.0, 0.0, "closed", nil, nil, nil, false, startedAt, startedAt))
 
 	fc := &fakeCluster{}
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+	gw := NewGateway(store, nil, nil, &fakePricing{}, &fakeUsageRecorder{}).
 		WithAgent(fc, fakeMintToken, AgentConfig{})
 
 	if _, err := gw.CloseSession(context.Background(), sessID, accountID, "closed"); err != nil {
@@ -463,7 +458,7 @@ func TestGateway_CloseSession_NeverSettlesAnything(t *testing.T) {
 		}).AddRow(sessID, accountID, projectID, 5.0, 3.5, "closed", nil, nil, nil, false, startedAt, startedAt))
 
 	usage := &fakeUsageRecorder{}
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{in: 2.0, out: 8.0}, usage)
+	gw := NewGateway(store, nil, nil, &fakePricing{in: 2.0, out: 8.0}, usage)
 
 	if _, err := gw.CloseSession(context.Background(), sessID, accountID, "closed"); err != nil {
 		t.Fatalf("CloseSession: %v", err)
@@ -488,7 +483,7 @@ func TestGateway_CloseSession_NeverSettlesAnything(t *testing.T) {
 func TestGateway_IsAgentRunning_ExportedWrapperMatchesInternal(t *testing.T) {
 	store, _ := newMockStore(t)
 	fc := &fakeCluster{statusResult: &cluster.InstanceStatus{Status: "running"}}
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+	gw := NewGateway(store, nil, nil, &fakePricing{}, &fakeUsageRecorder{}).
 		WithAgent(fc, fakeMintToken, AgentConfig{})
 	sess := &Session{ID: uuid.New(), ProjectID: uuid.New(), AgentInstanceID: "kumbha-agent-abc"}
 
@@ -503,7 +498,7 @@ func TestGateway_IsAgentRunning_ExportedWrapperMatchesInternal(t *testing.T) {
 
 func TestIsAgentRunning_NoClusterConfiguredIsFalse(t *testing.T) {
 	store, _ := newMockStore(t)
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{})
+	gw := NewGateway(store, nil, nil, &fakePricing{}, &fakeUsageRecorder{})
 	sess := &Session{ID: uuid.New(), ProjectID: uuid.New(), AgentInstanceID: "kumbha-agent-abc"}
 
 	running, err := gw.isAgentRunning(context.Background(), sess)
@@ -518,7 +513,7 @@ func TestIsAgentRunning_NoClusterConfiguredIsFalse(t *testing.T) {
 func TestIsAgentRunning_NoAgentInstanceIDIsFalse(t *testing.T) {
 	store, _ := newMockStore(t)
 	fc := &fakeCluster{statusResult: &cluster.InstanceStatus{Status: "running"}}
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+	gw := NewGateway(store, nil, nil, &fakePricing{}, &fakeUsageRecorder{}).
 		WithAgent(fc, fakeMintToken, AgentConfig{})
 	sess := &Session{ID: uuid.New(), ProjectID: uuid.New()} // AgentInstanceID empty
 
@@ -535,7 +530,7 @@ func TestIsAgentRunning_RunningOrPendingStatusIsTrue(t *testing.T) {
 	for _, status := range []string{"running", "pending"} {
 		store, _ := newMockStore(t)
 		fc := &fakeCluster{statusResult: &cluster.InstanceStatus{Status: status}}
-		gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+		gw := NewGateway(store, nil, nil, &fakePricing{}, &fakeUsageRecorder{}).
 			WithAgent(fc, fakeMintToken, AgentConfig{})
 		sess := &Session{ID: uuid.New(), ProjectID: uuid.New(), AgentInstanceID: "kumbha-agent-abc"}
 
@@ -553,7 +548,7 @@ func TestIsAgentRunning_TerminatedOrFailedStatusIsFalse(t *testing.T) {
 	for _, status := range []string{"terminated", "failed"} {
 		store, _ := newMockStore(t)
 		fc := &fakeCluster{statusResult: &cluster.InstanceStatus{Status: status}}
-		gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+		gw := NewGateway(store, nil, nil, &fakePricing{}, &fakeUsageRecorder{}).
 			WithAgent(fc, fakeMintToken, AgentConfig{})
 		sess := &Session{ID: uuid.New(), ProjectID: uuid.New(), AgentInstanceID: "kumbha-agent-abc"}
 
@@ -570,7 +565,7 @@ func TestIsAgentRunning_TerminatedOrFailedStatusIsFalse(t *testing.T) {
 func TestIsAgentRunning_NotFoundIsFalseWithNoError(t *testing.T) {
 	store, _ := newMockStore(t)
 	fc := &fakeCluster{statusErr: cluster.ErrNotFound}
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+	gw := NewGateway(store, nil, nil, &fakePricing{}, &fakeUsageRecorder{}).
 		WithAgent(fc, fakeMintToken, AgentConfig{})
 	sess := &Session{ID: uuid.New(), ProjectID: uuid.New(), AgentInstanceID: "kumbha-agent-abc"}
 
@@ -587,7 +582,7 @@ func TestIsAgentRunning_AmbiguousErrorPropagates(t *testing.T) {
 	store, _ := newMockStore(t)
 	boom := errors.New("cluster unreachable")
 	fc := &fakeCluster{statusErr: boom}
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+	gw := NewGateway(store, nil, nil, &fakePricing{}, &fakeUsageRecorder{}).
 		WithAgent(fc, fakeMintToken, AgentConfig{})
 	sess := &Session{ID: uuid.New(), ProjectID: uuid.New(), AgentInstanceID: "kumbha-agent-abc"}
 
@@ -599,7 +594,7 @@ func TestIsAgentRunning_AmbiguousErrorPropagates(t *testing.T) {
 
 func TestGateway_DeliverMessage_NotConfiguredWithoutWithAgent(t *testing.T) {
 	store, _ := newMockStore(t)
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{})
+	gw := NewGateway(store, nil, nil, &fakePricing{}, &fakeUsageRecorder{})
 	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), ProjectID: uuid.New()}
 
 	_, err := gw.DeliverMessage(context.Background(), sess, "hello")
@@ -613,7 +608,7 @@ func TestGateway_DeliverMessage_NotConfiguredWithoutWithAgent(t *testing.T) {
 func TestGateway_DeliverMessage_QueuesWhenAgentRunning(t *testing.T) {
 	store, mock := newMockStore(t)
 	fc := &fakeCluster{statusResult: &cluster.InstanceStatus{Status: "running"}}
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+	gw := NewGateway(store, nil, nil, &fakePricing{}, &fakeUsageRecorder{}).
 		WithAgent(fc, fakeMintToken, AgentConfig{})
 
 	sessID := uuid.New()
@@ -645,7 +640,7 @@ func TestGateway_DeliverMessage_QueuesWhenAgentRunning(t *testing.T) {
 func TestGateway_DeliverMessage_RelaunchesWhenAgentNotRunning(t *testing.T) {
 	store, mock := newMockStore(t)
 	fc := &fakeCluster{statusErr: cluster.ErrNotFound}
-	gw := NewGateway(store, testAgentRouter(), nil, &fakePricing{}, &fakeUsageRecorder{}).
+	gw := NewGateway(store, testAgentModels(), nil, &fakePricing{}, &fakeUsageRecorder{}).
 		WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest"})
 
 	sessID := uuid.New()
@@ -714,7 +709,7 @@ func TestGateway_DeleteSessions_StopsAnOpenSessionThenDeletesIt(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(sessID))
 
 	fc := &fakeCluster{}
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+	gw := NewGateway(store, nil, nil, &fakePricing{}, &fakeUsageRecorder{}).
 		WithAgent(fc, fakeMintToken, AgentConfig{})
 
 	deleted, err := gw.DeleteSessions(context.Background(), accountID, []uuid.UUID{sessID})
@@ -751,7 +746,7 @@ func TestGateway_DeleteSessions_AlreadyClosedSessionSkipsCloseCall(t *testing.T)
 		WithArgs(accountID, pq.Array([]uuid.UUID{sessID})).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(sessID))
 
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{})
+	gw := NewGateway(store, nil, nil, &fakePricing{}, &fakeUsageRecorder{})
 
 	deleted, err := gw.DeleteSessions(context.Background(), accountID, []uuid.UUID{sessID})
 	if err != nil {
@@ -771,7 +766,7 @@ func TestGateway_CaptureScreenshot_NotConfiguredWithoutWithAgent(t *testing.T) {
 	// own image) — there is no separate "screenshots configured"
 	// capability to enable, so WithAgent alone is both necessary and
 	// sufficient.
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{})
+	gw := NewGateway(store, nil, nil, &fakePricing{}, &fakeUsageRecorder{})
 
 	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), ProjectID: uuid.New()}
 	err := gw.CaptureScreenshot(context.Background(), sess, "https://inst-abc123.teepin.com")
@@ -790,7 +785,7 @@ func TestGateway_CaptureScreenshot_NotConfiguredWithoutWithAgent(t *testing.T) {
 func TestGateway_CaptureScreenshot_Success(t *testing.T) {
 	store, _ := newMockStore(t)
 	fc := &fakeCluster{statusResult: &cluster.InstanceStatus{Status: "terminated"}}
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+	gw := NewGateway(store, nil, nil, &fakePricing{}, &fakeUsageRecorder{}).
 		WithAgent(fc, fakeMintToken, AgentConfig{
 			Image:           "kumbha-agent:latest",
 			APIBaseURL:      "http://teepin-api.default.svc.cluster.local:8080",
@@ -845,7 +840,7 @@ func TestGateway_CaptureScreenshot_Success(t *testing.T) {
 func TestGateway_CaptureScreenshot_FailurePropagatesAndStillCleansUp(t *testing.T) {
 	store, _ := newMockStore(t)
 	fc := &fakeCluster{statusResult: &cluster.InstanceStatus{Status: "failed", Message: "chrome crashed"}}
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+	gw := NewGateway(store, nil, nil, &fakePricing{}, &fakeUsageRecorder{}).
 		WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest", APIBaseURL: "http://api.internal"})
 
 	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), ProjectID: uuid.New()}
@@ -865,7 +860,7 @@ func TestGateway_CaptureScreenshot_FailurePropagatesAndStillCleansUp(t *testing.
 
 func TestGateway_StopAgent_NotConfiguredWithoutWithAgent(t *testing.T) {
 	store, _ := newMockStore(t)
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{})
+	gw := NewGateway(store, nil, nil, &fakePricing{}, &fakeUsageRecorder{})
 
 	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), ProjectID: uuid.New(), AgentInstanceID: "kumbha-agent-abcd1234"}
 	if err := gw.StopAgent(context.Background(), sess); !errors.Is(err, ErrAgentNotConfigured) {
@@ -879,7 +874,7 @@ func TestGateway_StopAgent_NoAgentRunningIsErrAgentNotRunning(t *testing.T) {
 	// set) reports cluster.ErrNotFound, which isAgentRunning maps to
 	// (false, nil) — no pod to interrupt.
 	fc := &fakeCluster{}
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+	gw := NewGateway(store, nil, nil, &fakePricing{}, &fakeUsageRecorder{}).
 		WithAgent(fc, fakeMintToken, AgentConfig{})
 
 	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), ProjectID: uuid.New(), AgentInstanceID: "kumbha-agent-abcd1234"}
@@ -900,7 +895,7 @@ func TestGateway_StopAgent_KillsRunningPod(t *testing.T) {
 	store, _ := newMockStore(t)
 	agentPodID := "kumbha-agent-abcd1234"
 	fc := &fakeCluster{statusResult: &cluster.InstanceStatus{Status: "running"}}
-	gw := NewGateway(store, NewRouter(nil), nil, &fakePricing{}, &fakeUsageRecorder{}).
+	gw := NewGateway(store, nil, nil, &fakePricing{}, &fakeUsageRecorder{}).
 		WithAgent(fc, fakeMintToken, AgentConfig{})
 
 	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), ProjectID: uuid.New(), AgentInstanceID: agentPodID}
@@ -912,46 +907,21 @@ func TestGateway_StopAgent_KillsRunningPod(t *testing.T) {
 	}
 }
 
-// TestGateway_LaunchAgent_PropagatesRoute covers AgentConfig.Route reaching
-// the pod as TEEPIN_ROUTE, and — the more load-bearing direction — that
-// leaving Route unset sends NO env var at all rather than an empty string,
-// so run.py's own os.environ.get("TEEPIN_ROUTE", "teepin/fast") default
-// still applies (an explicit "" would silently override it).
-func TestGateway_LaunchAgent_PropagatesRoute(t *testing.T) {
-	cases := []struct {
-		route string
-		want  string
-		unset bool
-	}{
-		{route: "", unset: true},
-		{route: "teepin/deep", want: "teepin/deep"},
+// With no model enabled for Kumbha, a launch is refused up front and no
+// pod is created — rather than a pod that would sit idle forever because
+// its first completion can never be served.
+func TestGateway_LaunchAgent_RefusedWhenNoModelIsEnabled(t *testing.T) {
+	store, _ := newMockStore(t)
+	fc := &fakeCluster{}
+	gw := NewGateway(store, StaticModels{}, nil, &fakePricing{}, &fakeUsageRecorder{}).
+		WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest"})
+
+	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), ProjectID: uuid.New()}
+	err := gw.LaunchAgent(context.Background(), sess, "build me a booking app")
+	if !errors.Is(err, ErrAgentRouteUnavailable) {
+		t.Fatalf("got %v, want ErrAgentRouteUnavailable", err)
 	}
-	for _, c := range cases {
-		store, mock := newMockStore(t)
-		fc := &fakeCluster{}
-		gw := NewGateway(store, testAgentRouter(), nil, &fakePricing{}, &fakeUsageRecorder{}).
-			WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest", Route: c.route})
-
-		sessID := uuid.New()
-		sess := &Session{ID: sessID, AccountID: uuid.New(), ProjectID: uuid.New()}
-
-		mock.ExpectExec(`UPDATE billing\.inference_sessions SET agent_instance_id`).
-			WithArgs(sessID, "kumbha-agent-"+sessID.String()[:8]).
-			WillReturnResult(sqlmock.NewResult(0, 1))
-
-		if err := gw.LaunchAgent(context.Background(), sess, "build me a booking app"); err != nil {
-			t.Fatalf("LaunchAgent (route=%q): %v", c.route, err)
-		}
-
-		got, ok := fc.created[0].Env["TEEPIN_ROUTE"]
-		if c.unset {
-			if ok {
-				t.Errorf("Route unset: TEEPIN_ROUTE was sent as %q, want no env var at all", got)
-			}
-			continue
-		}
-		if !ok || got != c.want {
-			t.Errorf("Route=%q: TEEPIN_ROUTE = %q (present=%v), want %q", c.route, got, ok, c.want)
-		}
+	if len(fc.created) != 0 {
+		t.Errorf("created %d pods, want none", len(fc.created))
 	}
 }

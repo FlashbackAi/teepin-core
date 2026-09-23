@@ -231,15 +231,16 @@ func (h *InferenceHandler) ChatCompletions(c *gin.Context) {
 		return
 	}
 
-	// Same answer whether the model does not exist or this key may not use it:
-	// a key restricted to some models must not learn what else exists.
+	// Same answer whether the model does not exist, is not offered to
+	// customers (e.g. one reserved for the Kumbha build agent), or this key
+	// may not use it: a caller must not learn what else exists.
 	model, err := h.catalog.GetModel(c.Request.Context(), req.model)
 	if err != nil && !errors.Is(err, modelcatalog.ErrNotFound) {
 		log.Printf("inference: catalog lookup for %q: %v", req.model, err)
 		writeInferenceError(c, http.StatusInternalServerError, "api_error", "internal_error", "could not look up the model")
 		return
 	}
-	if err != nil || !model.Enabled || !access.permits(req.model) {
+	if err != nil || !model.Enabled || !model.OfferedToCustomers || !access.permits(req.model) {
 		writeInferenceError(c, http.StatusNotFound, "invalid_request_error", "model_not_found",
 			fmt.Sprintf("the model %q does not exist or you do not have access to it", req.model))
 		return
@@ -422,8 +423,9 @@ type pricing struct {
 	OutputPerMillion float64 `json:"output_per_million_tokens"`
 }
 
-// ListModels is GET /v1/models: the enabled models this credential may call,
-// in the OpenAI list shape plus Teepin's capability and price fields.
+// ListModels is GET /v1/models: the enabled, customer-offered models this
+// credential may call, in the OpenAI list shape plus Teepin's capability
+// and price fields.
 func (h *InferenceHandler) ListModels(c *gin.Context) {
 	access, ok := resolveAccess(c)
 	if !ok {
@@ -437,7 +439,7 @@ func (h *InferenceHandler) ListModels(c *gin.Context) {
 	}
 	out := make([]modelView, 0, len(models))
 	for _, m := range models {
-		if !m.Enabled || !access.permits(m.ModelRoute) {
+		if !m.Enabled || !m.OfferedToCustomers || !access.permits(m.ModelRoute) {
 			continue
 		}
 		out = append(out, modelView{

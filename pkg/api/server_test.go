@@ -1274,7 +1274,7 @@ func TestCreateInstance_PersistsEndpointFields(t *testing.T) {
 // migration 032's instance/session linkage already introduced.
 func TestCreateInstance_CheckspointsKumbhaWorkspaceWhenSessionLinked(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{in: 1, out: 1}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{in: 1, out: 1}, noopUsageRecorder{})
 	server := NewServer(newFakeCluster(), nil, cStore, nil, allowGate{}).WithKumbha(gw)
 
 	sessionID := uuid.New()

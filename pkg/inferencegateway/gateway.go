@@ -56,12 +56,22 @@ type Gateway struct {
 	// override the default.
 	QueueWait time.Duration
 
+	// newExternal builds a Provider for an external (third-party API)
+	// catalog model; see external.go.
+	newExternal externalFactory
+
 	mu sync.Mutex
-	// frontier holds pre-wired third-party providers, keyed by catalog
-	// model_route — registered at construction (main.go's job, not this
-	// package's), never looked up via node_services at all: a proxied
-	// model has no home-node routing question to answer.
-	frontier map[string]inference.Provider
+	// externals caches a built Provider per external model_route, rebuilt
+	// when the model's config or API key changes (see externalProviderFor).
+	// External models are never looked up via node_services: a third-party
+	// API has no node-routing question to answer.
+	externals map[string]cachedProvider
+	// secrets/environment resolve external models' API keys; nil until
+	// SetSecrets.
+	secrets     SecretsClient
+	environment string
+	// health is each external model's last health-check result.
+	health map[string]ModelStatus
 	// providers caches a constructed Provider per node_service id, keyed
 	// further by a hash of its config so a config change (a re-mount with
 	// a different base_url/model) invalidates the cache entry instead of
@@ -102,8 +112,10 @@ func New(catalog *modelcatalog.Service, nodeSvcs *nodeservices.Service, newProvi
 		catalog:         catalog,
 		nodeSvcs:        nodeSvcs,
 		newProvider:     newProvider,
+		newExternal:     newExternalProvider,
 		QueueWait:       defaultQueueWait,
-		frontier:        make(map[string]inference.Provider),
+		externals:       make(map[string]cachedProvider),
+		health:          make(map[string]ModelStatus),
 		providers:       make(map[uuid.UUID]cachedProvider),
 		backendSem:      make(map[uuid.UUID]chan struct{}),
 		inFlight:        make(map[uuid.UUID]int),
@@ -168,15 +180,6 @@ func defaultProviderFactory(cfg ModelServiceConfig, endpoint string) (inference.
 	}
 }
 
-// RegisterFrontierProvider wires a pre-configured third-party Provider
-// (e.g. Anthropic) to a catalog model_route. Call sites own the vendor
-// credential; this package never sees it.
-func (g *Gateway) RegisterFrontierProvider(modelRoute string, p inference.Provider) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.frontier[modelRoute] = p
-}
-
 // Complete resolves req.Model, picks a backend, and dispatches — the
 // stateless request/response path (see the roadmap's product-boundary
 // decision: Teepin Inference never owns conversation state, only this one
@@ -203,7 +206,7 @@ func (g *Gateway) Stream(ctx context.Context, accountID string, req inference.Re
 }
 
 // resolve does everything short of actually calling the provider: catalog
-// lookup, frontier-vs-self-hosted branch, least-loaded backend selection,
+// lookup, external-vs-self-hosted branch, least-loaded backend selection,
 // and concurrency gating. Returns a release func that MUST be called
 // exactly once (via defer) regardless of outcome, to free the slots it
 // acquired.
@@ -221,13 +224,11 @@ func (g *Gateway) resolve(ctx context.Context, accountID, modelRoute string) (in
 		return nil, nil, noop, err
 	}
 
-	if model.CostClass == modelcatalog.CostClassFrontier {
-		g.mu.Lock()
-		p, ok := g.frontier[modelRoute]
-		g.mu.Unlock()
-		if !ok {
+	if model.Provider.IsExternal() {
+		p, err := g.externalProviderFor(ctx, *model)
+		if err != nil {
 			releaseAccount()
-			return nil, nil, noop, fmt.Errorf("%w: %q has no registered frontier provider", inference.ErrProviderUnavailable, modelRoute)
+			return nil, nil, noop, err
 		}
 		return p, nil, releaseAccount, nil
 	}

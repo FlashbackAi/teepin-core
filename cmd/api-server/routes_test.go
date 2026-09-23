@@ -26,20 +26,16 @@ func TestSetupRouter_RegistersEveryRouteWithoutConflict(t *testing.T) {
 		&api.BillingHandler{}, &api.RegistryHandler{}, &api.AdminHandler{}, &api.WebhookHandler{},
 		&api.NodeHandler{}, &api.ModelCatalogHandler{}, &api.NodeServicesHandler{},
 		&api.InferencePlaygroundHandler{}, &api.NodeModelCacheHandler{}, &api.InferenceHandler{},
-		&api.KumbhaRouteHandler{}, nil, nil, nil, nil, "teepin.test",
+		nil, nil, nil, nil, "teepin.test",
 	)
 
 	want := map[string]bool{
-		"POST /v1/chat/completions":                false,
-		"GET /v1/models":                           false,
-		"POST /v1/kumbha/chat/completions":         false,
-		"GET /v1/admin/nodes/:id/cached-models":    false,
-		"DELETE /v1/admin/nodes/:id/cached-models": false,
-		"GET /v1/admin/kumbha/routes":              false,
-		"PUT /v1/admin/kumbha/routes":              false,
-		"POST /v1/admin/kumbha/candidates":         false,
-		"PUT /v1/admin/kumbha/candidates/:id":      false,
-		"DELETE /v1/admin/kumbha/candidates/:id":   false,
+		"POST /v1/chat/completions":                   false,
+		"GET /v1/models":                              false,
+		"POST /v1/kumbha/chat/completions":            false,
+		"GET /v1/admin/nodes/:id/cached-models":       false,
+		"DELETE /v1/admin/nodes/:id/cached-models":    false,
+		"PUT /v1/admin/inference/models/availability": false,
 	}
 	for _, r := range router.Routes() {
 		key := r.Method + " " + r.Path

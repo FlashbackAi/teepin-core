@@ -106,6 +106,10 @@ func (p *AnthropicProvider) CheckHealth(ctx context.Context) error {
 type openAIMessage struct {
 	Role    string          `json:"role"`
 	Content json.RawMessage `json:"content"`
+	// ToolCalls is set on an assistant turn that called tools; ToolCallID
+	// on the "tool" turn carrying one call's result. See anthropic_tools.go.
+	ToolCalls  []openAIToolCall `json:"tool_calls"`
+	ToolCallID string           `json:"tool_call_id"`
 }
 
 // extractText pulls plain text out of an OpenAI-shaped content field,
@@ -117,6 +121,11 @@ type openAIMessage struct {
 // Claude on this path. Full multimodal support is not needed to prove the
 // adapter property this provider exists for.
 func extractText(content json.RawMessage) (string, error) {
+	// An assistant turn that only called tools carries "content": null (or
+	// omits it entirely) — that is no text, not an unsupported shape.
+	if len(content) == 0 || isJSONNull(content) {
+		return "", nil
+	}
 	var s string
 	if err := json.Unmarshal(content, &s); err == nil {
 		return s, nil
@@ -137,22 +146,20 @@ func extractText(content json.RawMessage) (string, error) {
 	return b.String(), nil
 }
 
-// Complete performs a non-streaming completion.
-func (p *AnthropicProvider) Complete(ctx context.Context, req Request) (*Response, error) {
-	if err := FitsContext(req, p.caps); err != nil {
-		return nil, err
-	}
-
+// toAnthropicMessages splits OpenAI-shaped messages into Anthropic's
+// top-level system blocks and its alternating user/assistant turn list,
+// translating tool calls and tool results along the way.
+func toAnthropicMessages(raws []json.RawMessage) ([]anthropic.TextBlockParam, []anthropic.MessageParam, error) {
 	var system []anthropic.TextBlockParam
 	var messages []anthropic.MessageParam
-	for _, raw := range req.Messages {
+	for _, raw := range raws {
 		var m openAIMessage
 		if err := json.Unmarshal(raw, &m); err != nil {
-			return nil, fmt.Errorf("%w: invalid message: %v", ErrProviderRejected, err)
+			return nil, nil, fmt.Errorf("invalid message: %v", err)
 		}
 		text, err := extractText(m.Content)
 		if err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrProviderRejected, err)
+			return nil, nil, err
 		}
 
 		switch m.Role {
@@ -163,14 +170,80 @@ func (p *AnthropicProvider) Complete(ctx context.Context, req Request) (*Respons
 			// system-role sequence.
 			system = append(system, anthropic.TextBlockParam{Text: text})
 		case "assistant":
-			messages = append(messages, anthropic.NewAssistantMessage(anthropic.NewTextBlock(text)))
+			blocks := textBlocks(text)
+			calls, err := toolUseBlocks(m.ToolCalls)
+			if err != nil {
+				return nil, nil, err
+			}
+			messages = appendTurn(messages, anthropic.MessageParamRoleAssistant, append(blocks, calls...))
+		case "tool":
+			// A tool's result belongs to the USER side of Anthropic's
+			// conversation, as a tool_result block that names the call it
+			// answers.
+			messages = appendTurn(messages, anthropic.MessageParamRoleUser,
+				[]anthropic.ContentBlockParamUnion{toolResultBlock(m.ToolCallID, text)})
 		default:
 			// "user" and anything unrecognised default to user — the safe
 			// direction, since treating an unknown role as assistant could
 			// let untrusted content masquerade as the model's own prior
 			// turn.
-			messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(text)))
+			messages = appendTurn(messages, anthropic.MessageParamRoleUser, textBlocks(text))
 		}
+	}
+	return system, messages, nil
+}
+
+// appendTurn adds blocks as a turn, merging into the previous turn when it
+// has the same role. OpenAI sends one "tool" message per call result while
+// Anthropic wants every result for an assistant turn inside one user turn,
+// and merging also keeps any other same-role run valid. A turn with no
+// blocks is dropped — Anthropic rejects empty content.
+func appendTurn(messages []anthropic.MessageParam, role anthropic.MessageParamRole, blocks []anthropic.ContentBlockParamUnion) []anthropic.MessageParam {
+	if len(blocks) == 0 {
+		return messages
+	}
+	if n := len(messages); n > 0 && messages[n-1].Role == role {
+		messages[n-1].Content = append(messages[n-1].Content, blocks...)
+		return messages
+	}
+	return append(messages, anthropic.MessageParam{Role: role, Content: blocks})
+}
+
+// textBlocks is a single text block, or none for empty text (Anthropic
+// rejects an empty text block).
+func textBlocks(text string) []anthropic.ContentBlockParamUnion {
+	if text == "" {
+		return nil
+	}
+	return []anthropic.ContentBlockParamUnion{anthropic.NewTextBlock(text)}
+}
+
+// toolResultBlock is a tool_result for toolUseID. A tool that printed
+// nothing gets a result with no content rather than an empty text block.
+func toolResultBlock(toolUseID, text string) anthropic.ContentBlockParamUnion {
+	if text == "" {
+		return anthropic.ContentBlockParamUnion{OfToolResult: &anthropic.ToolResultBlockParam{ToolUseID: toolUseID}}
+	}
+	return anthropic.NewToolResultBlock(toolUseID, text, false)
+}
+
+// Complete performs a non-streaming completion.
+func (p *AnthropicProvider) Complete(ctx context.Context, req Request) (*Response, error) {
+	if err := FitsContext(req, p.caps); err != nil {
+		return nil, err
+	}
+
+	system, messages, err := toAnthropicMessages(req.Messages)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrProviderRejected, err)
+	}
+	tools, err := toAnthropicTools(req.Extra)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrProviderRejected, err)
+	}
+	toolChoice, err := toAnthropicToolChoice(req.Extra)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrProviderRejected, err)
 	}
 
 	maxTokens := req.MaxTokens
@@ -179,19 +252,25 @@ func (p *AnthropicProvider) Complete(ctx context.Context, req Request) (*Respons
 	}
 
 	resp, err := p.client.Messages.New(ctx, anthropic.MessageNewParams{
-		Model:     anthropic.Model(p.model),
-		MaxTokens: int64(maxTokens),
-		System:    system,
-		Messages:  messages,
+		Model:      anthropic.Model(p.model),
+		MaxTokens:  int64(maxTokens),
+		System:     system,
+		Messages:   messages,
+		Tools:      tools,
+		ToolChoice: toolChoice,
 	})
 	if err != nil {
 		return nil, classifyAnthropicError(ctx, err)
 	}
 
 	var text strings.Builder
+	var toolCalls []openAIToolCall
 	for _, block := range resp.Content {
-		if tb, ok := block.AsAny().(anthropic.TextBlock); ok {
-			text.WriteString(tb.Text)
+		switch b := block.AsAny().(type) {
+		case anthropic.TextBlock:
+			text.WriteString(b.Text)
+		case anthropic.ToolUseBlock:
+			toolCalls = append(toolCalls, fromAnthropicToolUse(b))
 		}
 	}
 
@@ -205,10 +284,17 @@ func (p *AnthropicProvider) Complete(ctx context.Context, req Request) (*Respons
 	// passed through — because that shape is the one contract every
 	// harness on the other side of the gateway already speaks (see the
 	// package doc comment: "OpenAI-compatible on both sides").
+	// A turn that only called tools has content null, per OpenAI's shape —
+	// not "", which some harnesses would render as an empty reply.
+	var content *string
+	if s := text.String(); s != "" || len(toolCalls) == 0 {
+		content = &s
+	}
+
 	body, err := json.Marshal(openAICompletionBody{
 		Model: string(resp.Model),
 		Choices: []openAIChoice{{
-			Message:      openAIResponseMessage{Role: "assistant", Content: text.String()},
+			Message:      openAIResponseMessage{Role: "assistant", Content: content, ToolCalls: toolCalls},
 			FinishReason: mapAnthropicStopReason(resp.StopReason),
 		}},
 		Usage: openAIUsageBody{
@@ -275,8 +361,9 @@ type openAIChoice struct {
 }
 
 type openAIResponseMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role      string           `json:"role"`
+	Content   *string          `json:"content"`
+	ToolCalls []openAIToolCall `json:"tool_calls,omitempty"`
 }
 
 type openAIUsageBody struct {

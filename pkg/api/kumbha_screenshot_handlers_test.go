@@ -48,7 +48,7 @@ func rawSessionRequest(handler gin.HandlerFunc, method, path string, params gin.
 
 func TestUploadKumbhaScreenshot_RequiresSessionCredential(t *testing.T) {
 	_, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	sessionID := uuid.New()
@@ -66,7 +66,7 @@ func TestUploadKumbhaScreenshot_RequiresSessionCredential(t *testing.T) {
 // overwritten.
 func TestUploadKumbhaScreenshot_RejectsMismatchedSession(t *testing.T) {
 	_, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	credentialSession := uuid.New()
@@ -81,7 +81,7 @@ func TestUploadKumbhaScreenshot_RejectsMismatchedSession(t *testing.T) {
 
 func TestUploadKumbhaScreenshot_RejectsEmptyBody(t *testing.T) {
 	_, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	sessionID := uuid.New()
@@ -94,7 +94,7 @@ func TestUploadKumbhaScreenshot_RejectsEmptyBody(t *testing.T) {
 
 func TestUploadKumbhaScreenshot_StoresBytes(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	sessionID := uuid.New()
@@ -116,7 +116,7 @@ func TestUploadKumbhaScreenshot_StoresBytes(t *testing.T) {
 
 func TestGetKumbhaScreenshot_ReturnsStoredPNG(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	sessionID, projectID := uuid.New(), uuid.New()
@@ -145,7 +145,7 @@ func TestGetKumbhaScreenshot_ReturnsStoredPNG(t *testing.T) {
 // the console can tell "capture pending" apart from a genuine thumbnail.
 func TestGetKumbhaScreenshot_NoCaptureYetIs404(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	sessionID, projectID := uuid.New(), uuid.New()

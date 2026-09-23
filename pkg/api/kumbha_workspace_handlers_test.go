@@ -57,7 +57,7 @@ func sessionRow(sessionID uuid.UUID) *sqlmock.Rows {
 
 func TestUploadKumbhaWorkspace_RequiresSessionCredential(t *testing.T) {
 	_, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	sessionID := uuid.New()
@@ -75,7 +75,7 @@ func TestUploadKumbhaWorkspace_RequiresSessionCredential(t *testing.T) {
 // parameter alone must not decide whose row gets overwritten.
 func TestUploadKumbhaWorkspace_RejectsMismatchedSession(t *testing.T) {
 	_, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	credentialSession := uuid.New()
@@ -90,7 +90,7 @@ func TestUploadKumbhaWorkspace_RejectsMismatchedSession(t *testing.T) {
 
 func TestUploadKumbhaWorkspace_Success(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	sessionID := uuid.New()
@@ -131,7 +131,7 @@ func TestUploadKumbhaWorkspace_Success(t *testing.T) {
 
 func TestUploadKumbhaWorkspace_InvalidPayloadIs400(t *testing.T) {
 	_, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	sessionID := uuid.New()
@@ -148,7 +148,7 @@ func TestUploadKumbhaWorkspace_InvalidPayloadIs400(t *testing.T) {
 // the caller's own account before writing a version.
 func TestSaveKumbhaWorkspace_Success(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	sessionID, projectID := uuid.New(), uuid.New()
@@ -189,7 +189,7 @@ func TestSaveKumbhaWorkspace_Success(t *testing.T) {
 
 func TestSaveKumbhaWorkspace_UnknownSessionIs404(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	sessionID, projectID := uuid.New(), uuid.New()
@@ -207,7 +207,7 @@ func TestSaveKumbhaWorkspace_UnknownSessionIs404(t *testing.T) {
 
 func TestGetKumbhaWorkspace_NoWorkspaceIs404(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	sessionID, projectID := uuid.New(), uuid.New()
@@ -224,7 +224,7 @@ func TestGetKumbhaWorkspace_NoWorkspaceIs404(t *testing.T) {
 
 func TestGetKumbhaWorkspace_Success(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	sessionID, projectID := uuid.New(), uuid.New()
@@ -259,7 +259,7 @@ func TestGetKumbhaWorkspace_Success(t *testing.T) {
 
 func TestListKumbhaWorkspaceVersions_Success(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	sessionID, projectID := uuid.New(), uuid.New()
@@ -287,7 +287,7 @@ func TestListKumbhaWorkspaceVersions_Success(t *testing.T) {
 
 func TestRollbackKumbhaWorkspace_Success(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	sessionID, projectID := uuid.New(), uuid.New()
@@ -304,7 +304,7 @@ func TestRollbackKumbhaWorkspace_Success(t *testing.T) {
 
 func TestRollbackKumbhaWorkspace_UnknownVersionIs404(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	sessionID, projectID := uuid.New(), uuid.New()
@@ -321,7 +321,7 @@ func TestRollbackKumbhaWorkspace_UnknownVersionIs404(t *testing.T) {
 
 func TestDownloadKumbhaWorkspace_StreamsAValidZip(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, kumbha.NewRouter(nil), allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	sessionID, projectID := uuid.New(), uuid.New()

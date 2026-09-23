@@ -1,7 +1,7 @@
 // Copyright 2026 TEEPIN Project
 // Licensed under the Apache License, Version 2.0
 
-package kumbha
+package inferencegateway
 
 import (
 	"context"
@@ -16,7 +16,7 @@ import (
 	"github.com/google/uuid"
 )
 
-// SecretsClient is the narrow surface Kumbha's route candidates need from
+// SecretsClient is the narrow surface external models' API keys need from
 // Secrets Manager: read the current value (live, not the one-time env-var
 // snapshot ECS's own `valueFrom` gives every other secret in this
 // platform), and write a new one from Control Center with no redeploy.
@@ -28,21 +28,27 @@ type SecretsClient interface {
 	Delete(ctx context.Context, secretID string) error
 }
 
-// CandidateSecretName derives a route candidate's Secrets Manager name
-// deterministically from its id — nothing about a candidate's config or
-// secret value is ever stored as an ARN, so renaming/reconstructing this
-// string is the only way anything (including this codebase) addresses the
-// secret. Scoped under its own kumbha-candidate- prefix specifically so the
-// IAM policy that grants this process write access can be scoped to that
-// prefix alone, never the platform's other secrets (DB password, JWT
-// signing key, Shelby/Stripe credentials) — see iam.tf.
-func CandidateSecretName(environment string, candidateID uuid.UUID) string {
-	return fmt.Sprintf("teepin/%s/kumbha-candidate-%s-api-key", environment, candidateID)
+// SecretName is the full Secrets Manager name for a catalog model's API
+// key reference (modelcatalog.Model.APIKeyRef, which omits the environment
+// prefix so a database migration can record one without knowing which
+// environment it runs in).
+func SecretName(environment, ref string) string {
+	return fmt.Sprintf("teepin/%s/%s", environment, ref)
 }
 
-// secretCacheTTL bounds how stale a candidate's API key can be after an
+// NewAPIKeyRef returns a fresh reference for a model's API key. The
+// inference-model-key- prefix is what the IAM policy granting this process
+// write access is scoped to — never the platform's other secrets (DB
+// password, JWT signing key, Shelby/Stripe credentials); see iam.tf. Keys
+// migrated from Kumbha's old route candidates keep their original
+// kumbha-candidate- names, which that policy also covers.
+func NewAPIKeyRef() string {
+	return "inference-model-key-" + uuid.NewString()
+}
+
+// secretCacheTTL bounds how stale a model's API key can be after an
 // operator rotates it from Control Center — short enough that "no
-// redeploy needed" is true in practice, long enough that a busy route
+// redeploy needed" is true in practice, long enough that a busy model
 // isn't making a live AWS call on every single completion.
 const secretCacheTTL = 30 * time.Second
 
@@ -53,7 +59,7 @@ type secretCacheEntry struct {
 }
 
 // AWSSecretsClient is the real Secrets Manager-backed implementation, with
-// a short per-secret TTL cache so a hot route doesn't call GetSecretValue
+// a short per-secret TTL cache so a busy model doesn't call GetSecretValue
 // on every completion. Mirrors pkg/database's passwordCache almost exactly
 // — same problem (a value that can change out from under a long-running
 // process, where ECS's own secret injection only resolves once at
@@ -73,7 +79,7 @@ type AWSSecretsClient struct {
 func NewAWSSecretsClient(ctx context.Context) (*AWSSecretsClient, error) {
 	cfg, err := awsconfig.LoadDefaultConfig(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load AWS config for Kumbha route secrets: %w", err)
+		return nil, fmt.Errorf("failed to load AWS config for model API key secrets: %w", err)
 	}
 	return &AWSSecretsClient{
 		client: secretsmanager.NewFromConfig(cfg),
@@ -124,7 +130,7 @@ func (c *AWSSecretsClient) Get(ctx context.Context, secretID string) (string, bo
 }
 
 // Put writes secretID's value, creating the secret first if it doesn't
-// exist yet (a brand-new candidate has no secret to update). The cache
+// exist yet (a model getting its first key has no secret to update). The cache
 // entry is refreshed immediately so a Get that follows in the same request
 // (e.g. the admin handler round-tripping to confirm the write) sees the
 // new value without waiting out the TTL.
@@ -154,11 +160,11 @@ func (c *AWSSecretsClient) Put(ctx context.Context, secretID, value string) erro
 	return nil
 }
 
-// Delete removes a candidate's secret entirely, with Secrets Manager's own
+// Delete removes a model's secret entirely, with Secrets Manager's own
 // recovery window (same posture as every other secret this platform
 // creates — see e.g. security.tf's recovery_window_in_days) rather than an
 // immediate force-delete. Deleting an already-absent secret is treated as
-// success, so this is safe to call unconditionally when a candidate row is
+// success, so this is safe to call unconditionally when a model is
 // removed (never leaves the caller needing to check existence first).
 func (c *AWSSecretsClient) Delete(ctx context.Context, secretID string) error {
 	_, err := c.client.DeleteSecret(ctx, &secretsmanager.DeleteSecretInput{SecretId: &secretID})

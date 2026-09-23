@@ -48,22 +48,6 @@ type ModelPricingProvider interface {
 	ModelPricing(ctx context.Context, modelRoute string) (input, output float64, ok bool)
 }
 
-// CandidateSource lists a route's registered backend candidates, priority
-// ascending — implemented by *CandidateStore. A small interface (rather
-// than wiring *CandidateStore directly) so Complete's fallback dispatch
-// logic can be unit-tested against a fake instead of a real database.
-type CandidateSource interface {
-	ListByRoute(ctx context.Context, routeName string) ([]RouteCandidate, error)
-}
-
-// CandidateBuilder builds a Provider for one candidate, fetching its
-// secret live — implemented by *ProviderFactory. Same reasoning as
-// CandidateSource: an interface so tests can substitute a fake Provider
-// without a real HTTP client or a real Secrets Manager call.
-type CandidateBuilder interface {
-	Build(ctx context.Context, c RouteCandidate) (inference.Provider, error)
-}
-
 // UsageRecorder is the subset of billing.Service the Gateway needs at
 // session close: write the ledger rows and draw down credit against them.
 // An interface so kumbha's tests do not require a full *billing.Service.
@@ -92,15 +76,15 @@ var (
 	// can return a clear "nothing running" 409 rather than a confusing
 	// "not available on this deployment".
 	ErrAgentNotRunning = errors.New("no agent is currently running for this session")
-	// ErrAgentRouteUnavailable means LaunchAgent's pre-flight check found
-	// the build agent's configured route disabled or unresolvable — the
-	// launch is refused before a pod is ever created, rather than
-	// producing a pod that is guaranteed to fail its first completion
-	// silently. The HTTP layer must respond with a generic message, never
-	// this error's own %w-wrapped detail (which names the route) — same
-	// "never reveal route identity to a customer" rule as everywhere else
-	// route health is checked.
-	ErrAgentRouteUnavailable = errors.New("the build agent's configured route is not currently available")
+	// ErrAgentRouteUnavailable means LaunchAgent's pre-flight check found no
+	// model enabled for Kumbha in the catalog — the launch is refused before
+	// a pod is ever created, rather than producing a pod that is guaranteed
+	// to fail its first completion silently. The HTTP layer responds with a
+	// generic message: which models back Kumbha is operator-only.
+	ErrAgentRouteUnavailable = errors.New("no model is currently available for the build agent")
+
+	// errNoKumbhaModels means the catalog has no model enabled for Kumbha.
+	errNoKumbhaModels = fmt.Errorf("%w: no model is enabled for Kumbha", inference.ErrProviderUnavailable)
 )
 
 // Gateway is the Kumbha Gateway's business logic — the request lifecycle
@@ -108,7 +92,7 @@ var (
 // owns stages 1-2 and 10-11; this is stages 3-9).
 type Gateway struct {
 	store   *Store
-	router  *Router
+	models  ModelBackend
 	gate    ProvisionGate
 	pricing PricingProvider
 	usage   UsageRecorder
@@ -120,25 +104,10 @@ type Gateway struct {
 	mintToken   TokenMinter
 	agentConfig AgentConfig
 
-	// routes is OPTIONAL — nil means every configured route is always
-	// enabled (today's behaviour before this existed). Set via
-	// WithRouteControl once a RouteStore exists.
-	routes *RouteStore
-
 	// modelPricing is OPTIONAL — nil means cost() always uses pricing's
-	// flat platform-wide rate (today's behaviour before this existed). Set
-	// via WithModelPricing once a modelcatalog.Service exists.
+	// flat platform-wide rate. Set via WithModelPricing once a
+	// modelcatalog.Service exists.
 	modelPricing ModelPricingProvider
-
-	// candidates/factory are OPTIONAL and travel together — nil means every
-	// route resolves through the static, env-var-configured router exactly
-	// as before this existed. Set via WithCandidates once a CandidateStore
-	// exists. A route with candidate rows uses this priority-ordered path
-	// instead of the static router; a route with none still falls back to
-	// the router, so a deployment that has never configured any candidates
-	// for a route keeps working unchanged.
-	candidates CandidateSource
-	factory    CandidateBuilder
 
 	// nodeCapacity is OPTIONAL — nil means LaunchAgent/CaptureScreenshot
 	// fall back to cluster.Client's own placement (registry.Any() for the
@@ -147,33 +116,18 @@ type Gateway struct {
 	nodeCapacity NodeCapacityLister
 }
 
-func NewGateway(store *Store, router *Router, gate ProvisionGate, pricing PricingProvider, usage UsageRecorder) *Gateway {
-	return &Gateway{store: store, router: router, gate: gate, pricing: pricing, usage: usage}
+// NewGateway builds a Gateway. models may be nil for a deployment that only
+// manages sessions (every completion and agent launch then reports no model
+// available).
+func NewGateway(store *Store, models ModelBackend, gate ProvisionGate, pricing PricingProvider, usage UsageRecorder) *Gateway {
+	return &Gateway{store: store, models: models, gate: gate, pricing: pricing, usage: usage}
 }
 
-// WithRouteControl enables the live enable/disable check in Complete.
-// Returns the same *Gateway for chaining, matching WithAgent/WithStripe's
-// own shape elsewhere in this codebase.
-func (g *Gateway) WithRouteControl(routes *RouteStore) *Gateway {
-	g.routes = routes
-	return g
-}
-
-// WithModelPricing enables per-route pricing in cost(), preferred over the
-// flat platform-wide rate for any route registered in the catalog. Returns
-// the same *Gateway for chaining, matching WithRouteControl's own shape.
+// WithModelPricing enables per-model pricing in cost(), preferred over the
+// flat platform-wide rate for any model registered in the catalog. Returns
+// the same *Gateway for chaining, matching WithAgent's own shape.
 func (g *Gateway) WithModelPricing(p ModelPricingProvider) *Gateway {
 	g.modelPricing = p
-	return g
-}
-
-// WithCandidates enables the live, Control-Center-configured
-// priority-fallback dispatch path in Complete, for any route that has at
-// least one candidate row. Returns the same *Gateway for chaining, matching
-// WithRouteControl/WithModelPricing's own shape.
-func (g *Gateway) WithCandidates(store CandidateSource, factory CandidateBuilder) *Gateway {
-	g.candidates = store
-	g.factory = factory
 	return g
 }
 
@@ -414,51 +368,32 @@ type CompletionResult struct {
 	Budget   float64
 }
 
-// resolveOrdered returns a route's backend candidates in the order
-// Complete should try them. The live, Control-Center-configured candidate
-// list (priority ascending) is preferred whenever the route has at least
-// one row; a route with none falls back to the single static,
-// env-var-configured Route from the router, so a deployment that has never
-// configured any candidates — or wasn't built with WithCandidates at all —
-// keeps working exactly as before this existed. A candidate this factory
-// fails to build (e.g. its secret can't currently be read) is logged and
-// skipped rather than failing the whole request, the same way one
-// unhealthy candidate should not take a whole route down when others are
-// still fine.
-func (g *Gateway) resolveOrdered(ctx context.Context, model string) ([]Route, error) {
-	if g.candidates != nil {
-		rows, err := g.candidates.ListByRoute(ctx, model)
-		if err != nil {
-			log.Printf("WARN: could not load route candidates for %q, falling back to static router: %v", model, err)
-		} else if len(rows) > 0 {
-			var out []Route
-			for _, c := range rows {
-				if !c.Enabled {
-					continue
-				}
-				p, err := g.factory.Build(ctx, c)
-				if err != nil {
-					log.Printf("WARN: could not build provider for candidate %s (route %q): %v", c.ID, model, err)
-					continue
-				}
-				out = append(out, Route{Provider: p, ProviderName: p.Name()})
-			}
-			if len(out) == 0 {
-				return nil, fmt.Errorf("%w: %q", inference.ErrUnknownModel, model)
-			}
-			return out, nil
-		}
+// kumbhaModels returns the catalog models to try for a completion, in
+// order, or errNoKumbhaModels when there are none.
+func (g *Gateway) kumbhaModels(ctx context.Context) ([]Model, error) {
+	if g.models == nil {
+		return nil, errNoKumbhaModels
 	}
-
-	route, err := g.router.Resolve(model)
+	models, err := g.models.KumbhaModels(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: listing Kumbha's models: %v", inference.ErrProviderUnavailable, err)
 	}
-	return []Route{route}, nil
+	if len(models) == 0 {
+		return nil, errNoKumbhaModels
+	}
+	return models, nil
 }
 
-// Complete runs stages 3-9 of the request lifecycle: check budget,
-// resolve route, dispatch, capture tokens, compute cost, accrue.
+// Complete runs stages 3-9 of the request lifecycle: check budget, pick a
+// model, dispatch, capture tokens, compute cost, accrue.
+//
+// req.Model must be one of Kumbha's aliases; the catalog's Kumbha models
+// are tried in priority order, falling through to the next only when one
+// is unavailable (unreachable, not mounted, throttled, or disabled since
+// it was listed) — never on an application-level error like a rejected
+// request. Falling through is safe because Complete is atomic: either a
+// full response comes back or nothing does, so there is no partial output
+// to double-send.
 //
 // A pre-flight budget check happens here (sess.Spent >= sess.Budget) so an
 // already-exhausted session is refused before spending a round trip on a
@@ -472,58 +407,45 @@ func (g *Gateway) Complete(ctx context.Context, sess *Session, req inference.Req
 	if sess.Spent >= sess.Budget {
 		return nil, ErrBudgetExhausted
 	}
+	if !isModelAlias(req.Model) {
+		return nil, fmt.Errorf("%w: %q", inference.ErrUnknownModel, req.Model)
+	}
 
-	ordered, err := g.resolveOrdered(ctx, req.Model)
+	models, err := g.kumbhaModels(ctx)
 	if err != nil {
 		return nil, err
-	}
-	if g.routes != nil {
-		enabled, err := g.routes.IsEnabled(ctx, req.Model)
-		if err != nil {
-			// Fails OPEN (route still usable) rather than closed: a DB
-			// blip taking down every Kumbha completion is a worse outcome
-			// than an operator's disable taking a moment longer to apply.
-			// The reverse posture (fail closed) is right for payment
-			// gates, where the risk is unbilled usage; here the risk of
-			// failing closed is an unrelated DB hiccup breaking every
-			// build session at once.
-			log.Printf("WARN: could not check route %q enabled, allowing the request: %v", req.Model, err)
-		} else if !enabled {
-			// Presented identically to an unconfigured route — a customer
-			// never learns whether a route exists but was turned off, vs
-			// never existed at all (see KUMBHA-DESIGN.md's "no console
-			// page of its own": backend/route identity is operator-only).
-			return nil, fmt.Errorf("%w: %q", inference.ErrUnknownModel, req.Model)
-		}
 	}
 
 	start := time.Now()
 	var resp *inference.Response
-	var served Route
-	for i, candidate := range ordered {
-		resp, err = candidate.Provider.Complete(ctx, req)
+	var served Model
+	for i, m := range models {
+		attempt := req
+		attempt.Model = m.Route
+		resp, err = g.models.Complete(ctx, sess.AccountID.String(), attempt)
 		if err == nil {
-			served = candidate
+			served = m
 			break
 		}
-		// Complete is atomic — either a full response comes back or
-		// nothing does, so there is never partial output already handed
-		// to the customer to worry about double-sending. Falling through
-		// is only safe because of that: a Stream()-based dispatch could
-		// not do this the same way.
-		last := i == len(ordered)-1
-		if !errors.Is(err, inference.ErrProviderUnavailable) || last {
+		if !errors.Is(err, inference.ErrProviderUnavailable) && !errors.Is(err, inference.ErrUnknownModel) {
 			return nil, err
 		}
-		log.Printf("Kumbha: candidate %q for route %q unavailable, trying next (priority %d/%d): %v",
-			candidate.ProviderName, req.Model, i+1, len(ordered), err)
+		log.Printf("Kumbha: model %q unavailable (%d/%d): %v", m.Route, i+1, len(models), err)
+		if i == len(models)-1 {
+			// The alias, not the last model's route: which models back
+			// Kumbha is operator-only, and this reaches the caller.
+			return nil, fmt.Errorf("%w: no model for %q is available right now", inference.ErrProviderUnavailable, req.Model)
+		}
 	}
 	end := time.Now()
 
-	cost := g.cost(ctx, req.Model, resp.Usage)
+	// Priced at the model that actually served it. Recorded under the
+	// alias, which is what the customer sees on their session and invoice;
+	// the serving engine goes only to the operator-only provider column.
+	cost := g.cost(ctx, served.Route, resp.Usage)
 
 	newSpent, err := g.store.Accrue(ctx, sess.ID, sess.AccountID, cost,
-		req.Model, served.ProviderName, resp.Usage.InputTokens, resp.Usage.OutputTokens)
+		req.Model, served.Engine, resp.Usage.InputTokens, resp.Usage.OutputTokens)
 	if err != nil {
 		// The completion already happened and tokens were genuinely spent
 		// upstream — this is a recording failure, not a request failure,
@@ -546,14 +468,14 @@ func (g *Gateway) Complete(ctx context.Context, sess *Session, req inference.Req
 	// settlement failure surfaces to the CALLER (so the customer sees it,
 	// same as an accrual failure) but the tokens were already genuinely
 	// spent upstream either way.
-	inRate, outRate := g.rates(ctx, req.Model)
+	inRate, outRate := g.rates(ctx, served.Route)
 	var settleErrs []error
 	if resp.Usage.InputTokens > 0 {
-		settleErrs = append(settleErrs, g.settleLine(ctx, sess, req.Model+":input", served.ProviderName,
+		settleErrs = append(settleErrs, g.settleLine(ctx, sess, req.Model+":input", served.Engine,
 			float64(resp.Usage.InputTokens), float64(resp.Usage.InputTokens)/1e6*inRate, start, end))
 	}
 	if resp.Usage.OutputTokens > 0 {
-		settleErrs = append(settleErrs, g.settleLine(ctx, sess, req.Model+":output", served.ProviderName,
+		settleErrs = append(settleErrs, g.settleLine(ctx, sess, req.Model+":output", served.Engine,
 			float64(resp.Usage.OutputTokens), float64(resp.Usage.OutputTokens)/1e6*outRate, start, end))
 	}
 	if err := errors.Join(settleErrs...); err != nil {
@@ -564,16 +486,14 @@ func (g *Gateway) Complete(ctx context.Context, sess *Session, req inference.Req
 }
 
 // rates returns the per-million-token input/output rates to charge for a
-// completion on modelRoute. Prefers the per-route customer rate from the
-// model catalog (modelPricing, keyed by route name like "teepin/deep")
-// when that route has a catalog entry — different backends behind Kumbha
-// cost wildly different real amounts per token, so pricing every route off
-// one flat platform-wide rate silently mis-bills the moment a second,
-// differently-priced backend goes live (found live 2026-09-22: teepin/deep
-// started routing real build-session traffic to a paid Anthropic model
-// while still priced off the same flat rate as the self-hosted
-// teepin/fast). Falls back to the flat rate for a route with no catalog
-// entry, rather than charging nothing for it. Factored out of cost() so
+// completion served by the catalog model modelRoute. Prefers that model's
+// own customer rate from the catalog — different models behind Kumbha cost
+// wildly different real amounts per token, so pricing them all off one
+// flat platform-wide rate silently mis-bills the moment a second,
+// differently-priced model goes live (found live 2026-09-22: build-session
+// traffic moved to a paid Anthropic model while still priced off the same
+// flat rate as the self-hosted one). Falls back to the flat rate for a
+// model with no catalog entry, rather than charging nothing for it. Factored out of cost() so
 // the settlement lines in Complete (the actual invoice-visible credit
 // consumption) are always computed from the exact same rates as the
 // session's own spent/budget figure — those diverging would mean a

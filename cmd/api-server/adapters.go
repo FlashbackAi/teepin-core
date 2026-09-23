@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"strings"
 
@@ -16,7 +17,10 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/build"
 	"github.com/FlashbackAi/teepin-core/pkg/cluster"
 	"github.com/FlashbackAi/teepin-core/pkg/compute"
+	"github.com/FlashbackAi/teepin-core/pkg/inference"
+	"github.com/FlashbackAi/teepin-core/pkg/inferencegateway"
 	"github.com/FlashbackAi/teepin-core/pkg/kumbha"
+	"github.com/FlashbackAi/teepin-core/pkg/modelcatalog"
 	"github.com/FlashbackAi/teepin-core/pkg/nodes"
 	"github.com/FlashbackAi/teepin-core/pkg/payments"
 )
@@ -314,6 +318,42 @@ func (a *hiddenWorkloadAdapter) HiddenUsageByNode(ctx context.Context) (map[stri
 		out[st.NodeName] = u
 	}
 	return out, nil
+}
+
+// kumbhaModelBackend makes the model catalog plus Teepin Inference's gateway
+// satisfy kumbha.ModelBackend: Kumbha's completions are served exactly like
+// a customer's own API call, from whichever catalog models are enabled for
+// Kumbha. Lives here so pkg/kumbha imports neither package.
+type kumbhaModelBackend struct {
+	catalog *modelcatalog.Service
+	gateway *inferencegateway.Gateway
+}
+
+func newKumbhaModelBackend(catalog *modelcatalog.Service, gateway *inferencegateway.Gateway) *kumbhaModelBackend {
+	return &kumbhaModelBackend{catalog: catalog, gateway: gateway}
+}
+
+func (b *kumbhaModelBackend) KumbhaModels(ctx context.Context) ([]kumbha.Model, error) {
+	models, err := b.catalog.ListKumbhaModels(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]kumbha.Model, 0, len(models))
+	for _, m := range models {
+		out = append(out, kumbha.Model{Route: m.ModelRoute, Engine: m.Engine})
+	}
+	return out, nil
+}
+
+func (b *kumbhaModelBackend) Complete(ctx context.Context, accountID string, req inference.Request) (*inference.Response, error) {
+	resp, err := b.gateway.Complete(ctx, accountID, req)
+	// The gateway declining to dispatch (a concurrency ceiling already
+	// full) is, to Kumbha, one more reason this model is unavailable right
+	// now — the signal to try its next model.
+	if errors.Is(err, inferencegateway.ErrThrottled) {
+		return nil, fmt.Errorf("%w: %v", inference.ErrProviderUnavailable, err)
+	}
+	return resp, err
 }
 
 // nodeCapacityAdapter makes *nodes.Service satisfy kumbha.NodeCapacityLister,

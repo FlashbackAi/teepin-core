@@ -28,7 +28,7 @@ func TestRegisterModel_UpsertsCatalogFieldsOnly(t *testing.T) {
 
 	mock.ExpectExec(`INSERT INTO inference\.models`).
 		WithArgs("teepin/qwen3-omni-7b", "Qwen3 Omni 7B", "own", "vllm-omni", 32768,
-			true, true, true, true, "op").
+			true, true, true, true, "node", "", "", 4096, "op").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	err := s.RegisterModel(context.Background(), Model{
@@ -65,6 +65,91 @@ func TestRegisterModel_Validation(t *testing.T) {
 	}
 	if err := s.RegisterModel(context.Background(), Model{ModelRoute: "x", Engine: "vllm", CostClass: CostClassOwn, ContextWindow: -1}); err == nil {
 		t.Error("negative context_window accepted")
+	}
+	if err := s.RegisterModel(context.Background(), Model{ModelRoute: "x", Engine: "anthropic", CostClass: CostClassFrontier, Provider: ProviderAnthropic}); err == nil {
+		t.Error("anthropic model without provider_model accepted")
+	}
+	if err := s.RegisterModel(context.Background(), Model{ModelRoute: "x", Engine: "vllm", CostClass: CostClassOwn, Provider: ProviderOpenAICompatible, ProviderModel: "m"}); err == nil {
+		t.Error("openai_compatible model without base_url accepted")
+	}
+	if err := s.RegisterModel(context.Background(), Model{ModelRoute: "x", Engine: "vllm", CostClass: CostClassOwn, Provider: "bogus"}); err == nil {
+		t.Error("invalid provider accepted")
+	}
+}
+
+func TestRegisterModel_ExternalModelCarriesProviderFields(t *testing.T) {
+	s, mock, done := newMock(t)
+	defer done()
+
+	mock.ExpectExec(`INSERT INTO inference\.models`).
+		WithArgs("anthropic/claude-haiku-4-5", "Claude Haiku 4.5", "frontier", "anthropic", 200000,
+			true, false, false, true, "anthropic", "claude-haiku-4-5-20251001", "", 4096, "op").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	err := s.RegisterModel(context.Background(), Model{
+		ModelRoute:    "anthropic/claude-haiku-4-5",
+		DisplayName:   "Claude Haiku 4.5",
+		CostClass:     CostClassFrontier,
+		Engine:        "anthropic",
+		ContextWindow: 200000,
+		SupportsTools: true,
+		Enabled:       true,
+		Provider:      ProviderAnthropic,
+		ProviderModel: "claude-haiku-4-5-20251001",
+		UpdatedBy:     strPtr("op"),
+	})
+	if err != nil {
+		t.Fatalf("RegisterModel: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
+	}
+}
+
+// A nil field in an availability update must leave that column untouched
+// — toggling Kumbha on must never also flip customer exposure.
+func TestSetAvailability_PartialUpdateLeavesNilFieldsAlone(t *testing.T) {
+	s, mock, done := newMock(t)
+	defer done()
+
+	on := true
+	mock.ExpectExec(`SET offered_to_customers = COALESCE\(\$1, offered_to_customers\)`).
+		WithArgs(nil, &on, nil, "op", "anthropic/claude-haiku-4-5").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := s.SetAvailability(context.Background(), "anthropic/claude-haiku-4-5", Availability{KumbhaEnabled: &on}, "op"); err != nil {
+		t.Fatalf("SetAvailability: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
+	}
+}
+
+func TestSetAvailability_NotFound(t *testing.T) {
+	s, mock, done := newMock(t)
+	defer done()
+
+	mock.ExpectExec(`UPDATE inference\.models`).WillReturnResult(sqlmock.NewResult(0, 0))
+	on := true
+	if err := s.SetAvailability(context.Background(), "missing", Availability{KumbhaEnabled: &on}, "op"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("got %v, want ErrNotFound", err)
+	}
+}
+
+// Kumbha's list must only contain models that are both enabled and
+// Kumbha-enabled, in priority order — the order the build agent tries them.
+func TestListKumbhaModels_FiltersAndOrdersByPriority(t *testing.T) {
+	s, mock, done := newMock(t)
+	defer done()
+
+	mock.ExpectQuery(`WHERE enabled AND kumbha_enabled ORDER BY kumbha_priority, model_route`).
+		WillReturnRows(sqlmock.NewRows(modelRowColumns()))
+
+	if _, err := s.ListKumbhaModels(context.Background()); err != nil {
+		t.Fatalf("ListKumbhaModels: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
 	}
 }
 
@@ -138,13 +223,17 @@ func TestGetModel_ReturnsFullRow(t *testing.T) {
 			"supports_tools", "supports_vision", "supports_audio",
 			"input_price_per_million", "output_price_per_million",
 			"vendor_input_cost_per_million", "vendor_output_cost_per_million",
-			"enabled", "updated_by", "created_at", "updated_at",
+			"enabled", "provider", "provider_model", "base_url", "max_output_tokens",
+			"api_key_ref", "offered_to_customers", "kumbha_enabled", "kumbha_priority",
+			"updated_by", "created_at", "updated_at",
 		}).AddRow(
 			"anthropic/claude-sonnet-5", "Claude Sonnet 5", "frontier", "anthropic", 1000000,
 			true, true, false,
 			4.5, 18.0,
 			&vendorIn, &vendorOut,
-			true, "op", now, now,
+			true, "anthropic", "claude-sonnet-5", "", 8192,
+			"inference-model-key-abc", false, true, 1,
+			"op", now, now,
 		))
 
 	m, err := s.GetModel(context.Background(), "anthropic/claude-sonnet-5")
@@ -156,6 +245,15 @@ func TestGetModel_ReturnsFullRow(t *testing.T) {
 	}
 	if m.VendorInputCostPerMillion == nil || *m.VendorInputCostPerMillion != 3.0 {
 		t.Errorf("VendorInputCostPerMillion = %v, want 3.0", m.VendorInputCostPerMillion)
+	}
+	if m.Provider != ProviderAnthropic || m.ProviderModel != "claude-sonnet-5" || m.MaxOutputTokens != 8192 {
+		t.Errorf("provider fields = %q %q %d", m.Provider, m.ProviderModel, m.MaxOutputTokens)
+	}
+	if !m.HasAPIKey || m.APIKeyRef != "inference-model-key-abc" {
+		t.Errorf("HasAPIKey = %v, APIKeyRef = %q", m.HasAPIKey, m.APIKeyRef)
+	}
+	if m.OfferedToCustomers || !m.KumbhaEnabled || m.KumbhaPriority != 1 {
+		t.Errorf("availability = customers %v, kumbha %v/%d", m.OfferedToCustomers, m.KumbhaEnabled, m.KumbhaPriority)
 	}
 }
 
@@ -202,7 +300,9 @@ func modelRowColumns() []string {
 		"supports_tools", "supports_vision", "supports_audio",
 		"input_price_per_million", "output_price_per_million",
 		"vendor_input_cost_per_million", "vendor_output_cost_per_million",
-		"enabled", "updated_by", "created_at", "updated_at",
+		"enabled", "provider", "provider_model", "base_url", "max_output_tokens",
+		"api_key_ref", "offered_to_customers", "kumbha_enabled", "kumbha_priority",
+		"updated_by", "created_at", "updated_at",
 	}
 }
 

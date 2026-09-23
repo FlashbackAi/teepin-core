@@ -53,14 +53,25 @@ func expectGetModel(mock sqlmock.Sqlmock, route string, m modelcatalog.Model) {
 			"supports_tools", "supports_vision", "supports_audio",
 			"input_price_per_million", "output_price_per_million",
 			"vendor_input_cost_per_million", "vendor_output_cost_per_million",
-			"enabled", "updated_by", "created_at", "updated_at",
+			"enabled", "provider", "provider_model", "base_url", "max_output_tokens",
+			"api_key_ref", "offered_to_customers", "kumbha_enabled", "kumbha_priority",
+			"updated_by", "created_at", "updated_at",
 		}).AddRow(
 			m.ModelRoute, m.DisplayName, string(m.CostClass), m.Engine, m.ContextWindow,
 			m.SupportsTools, m.SupportsVision, m.SupportsAudio,
 			m.InputPricePerMillion, m.OutputPricePerMillion,
 			m.VendorInputCostPerMillion, m.VendorOutputCostPerMillion,
-			m.Enabled, m.UpdatedBy, time.Now(), time.Now(),
+			m.Enabled, providerOrNode(m.Provider), m.ProviderModel, m.BaseURL, 4096,
+			m.APIKeyRef, m.OfferedToCustomers, m.KumbhaEnabled, m.KumbhaPriority,
+			m.UpdatedBy, time.Now(), time.Now(),
 		))
+}
+
+func providerOrNode(p modelcatalog.Provider) string {
+	if p == "" {
+		return string(modelcatalog.ProviderNode)
+	}
+	return string(p)
 }
 
 func expectGetModelNotFound(mock sqlmock.Sqlmock, route string) {
@@ -124,47 +135,131 @@ func TestComplete_DisabledModelRejected(t *testing.T) {
 	}
 }
 
-// TestComplete_FrontierNeverQueriesNodeServices proves a proxied model's
-// request never touches node_services at all — there is no home-node
-// routing question to answer for a third party. If the code regressed to
-// always calling ListByKind, sqlmock's unmet/unexpected-query check below
-// would catch it.
-func TestComplete_FrontierNeverQueriesNodeServices(t *testing.T) {
+// fakeSecrets serves fixed secret values, recording which names were read.
+type fakeSecrets struct {
+	values map[string]string
+	err    error
+	read   []string
+}
+
+func (f *fakeSecrets) Get(_ context.Context, id string) (string, bool, error) {
+	f.read = append(f.read, id)
+	if f.err != nil {
+		return "", false, f.err
+	}
+	v, ok := f.values[id]
+	return v, ok, nil
+}
+func (f *fakeSecrets) Put(context.Context, string, string) error { return nil }
+func (f *fakeSecrets) Delete(context.Context, string) error      { return nil }
+
+var haiku = modelcatalog.Model{
+	ModelRoute: "anthropic/claude-haiku-4-5", CostClass: modelcatalog.CostClassFrontier, Engine: "anthropic",
+	Enabled: true, Provider: modelcatalog.ProviderAnthropic, ProviderModel: "claude-haiku-4-5-20251001",
+	APIKeyRef: "inference-model-key-1",
+}
+
+// An external model is built from its catalog row and served directly —
+// it never touches node_services (sqlmock would flag an unexpected
+// ListByKind query), and its API key is read from Secrets Manager under
+// the environment prefix.
+func TestComplete_ExternalModelServedFromCatalogWithItsKey(t *testing.T) {
 	catalog, nodeSvcs, mock, done := newTestServices(t)
 	defer done()
-	expectGetModel(mock, "anthropic/claude-sonnet-5", modelcatalog.Model{
-		ModelRoute: "anthropic/claude-sonnet-5", CostClass: modelcatalog.CostClassFrontier, Engine: "anthropic", Enabled: true,
-	})
+	expectGetModel(mock, haiku.ModelRoute, haiku)
 
 	g := New(catalog, nodeSvcs, nil)
-	fake := &fakeProvider{name: "anthropic", onComplete: func(ctx context.Context, req inference.Request) (*inference.Response, error) {
-		return &inference.Response{Model: "claude-sonnet-5"}, nil
-	}}
-	g.RegisterFrontierProvider("anthropic/claude-sonnet-5", fake)
+	secrets := &fakeSecrets{values: map[string]string{"teepin/dev/inference-model-key-1": "sk-test"}}
+	g.SetSecrets(secrets, "dev")
+	var gotKey string
+	var gotModel modelcatalog.Model
+	g.newExternal = func(m modelcatalog.Model, apiKey string) (inference.Provider, error) {
+		gotModel, gotKey = m, apiKey
+		return &fakeProvider{name: "anthropic", onComplete: func(context.Context, inference.Request) (*inference.Response, error) {
+			return &inference.Response{Model: "claude-haiku-4-5-20251001"}, nil
+		}}, nil
+	}
 
-	resp, err := g.Complete(context.Background(), "acct1", inference.Request{Model: "anthropic/claude-sonnet-5"})
+	resp, err := g.Complete(context.Background(), "acct1", inference.Request{Model: haiku.ModelRoute})
 	if err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
-	if resp.Model != "claude-sonnet-5" {
-		t.Errorf("resp.Model = %q, want claude-sonnet-5", resp.Model)
+	if resp.Model != "claude-haiku-4-5-20251001" {
+		t.Errorf("resp.Model = %q", resp.Model)
+	}
+	if gotKey != "sk-test" || gotModel.ProviderModel != "claude-haiku-4-5-20251001" {
+		t.Errorf("factory got key %q, model %q", gotKey, gotModel.ProviderModel)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet (or unexpected) DB calls: %v", err)
 	}
 }
 
-func TestComplete_FrontierNoProviderRegistered(t *testing.T) {
+// A key that cannot be read is a retryable outage for that model, not a
+// silent keyless call.
+func TestComplete_ExternalKeyReadFailureIsUnavailable(t *testing.T) {
 	catalog, nodeSvcs, mock, done := newTestServices(t)
 	defer done()
-	expectGetModel(mock, "anthropic/claude-sonnet-5", modelcatalog.Model{
-		ModelRoute: "anthropic/claude-sonnet-5", CostClass: modelcatalog.CostClassFrontier, Engine: "anthropic", Enabled: true,
-	})
+	expectGetModel(mock, haiku.ModelRoute, haiku)
 
 	g := New(catalog, nodeSvcs, nil)
-	_, err := g.Complete(context.Background(), "acct1", inference.Request{Model: "anthropic/claude-sonnet-5"})
+	g.SetSecrets(&fakeSecrets{err: errors.New("throttled")}, "dev")
+	g.newExternal = func(modelcatalog.Model, string) (inference.Provider, error) {
+		t.Error("provider built despite the key read failing")
+		return nil, errors.New("unreachable")
+	}
+
+	_, err := g.Complete(context.Background(), "acct1", inference.Request{Model: haiku.ModelRoute})
 	if !errors.Is(err, inference.ErrProviderUnavailable) {
 		t.Fatalf("got %v, want ErrProviderUnavailable", err)
+	}
+}
+
+// A rotated key must take effect on the next request: the cached provider
+// is rebuilt only when the model config or key actually changed.
+func TestExternalProviderFor_RebuildsOnlyWhenKeyChanges(t *testing.T) {
+	g := New(nil, nil, nil)
+	secrets := &fakeSecrets{values: map[string]string{"teepin/dev/inference-model-key-1": "v1"}}
+	g.SetSecrets(secrets, "dev")
+	builds := 0
+	g.newExternal = func(modelcatalog.Model, string) (inference.Provider, error) {
+		builds++
+		return &fakeProvider{name: "anthropic"}, nil
+	}
+
+	for i := 0; i < 2; i++ {
+		if _, err := g.externalProviderFor(context.Background(), haiku); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if builds != 1 {
+		t.Fatalf("built %d times for an unchanged model, want 1", builds)
+	}
+	secrets.values["teepin/dev/inference-model-key-1"] = "v2"
+	if _, err := g.externalProviderFor(context.Background(), haiku); err != nil {
+		t.Fatal(err)
+	}
+	if builds != 2 {
+		t.Errorf("built %d times after a key rotation, want 2", builds)
+	}
+}
+
+func TestStatus_SelfHostedWithNothingMountedIsNoBackend(t *testing.T) {
+	catalog, nodeSvcs, mock, done := newTestServices(t)
+	defer done()
+	expectListByKindEmpty(mock)
+
+	g := New(catalog, nodeSvcs, nil)
+	st := g.Status(context.Background(), modelcatalog.Model{ModelRoute: "teepin/qwen3-30b-a3b", Provider: modelcatalog.ProviderNode})
+	if st.State != StateNoBackend {
+		t.Errorf("State = %q, want %q", st.State, StateNoBackend)
+	}
+}
+
+func TestStatus_ExternalBeforeAnyCheckIsUnknown(t *testing.T) {
+	g := New(nil, nil, nil)
+	if st := g.Status(context.Background(), haiku); st.State != StateUnknown {
+		t.Errorf("State = %q, want %q — an unchecked model must not look unhealthy", st.State, StateUnknown)
 	}
 }
 
