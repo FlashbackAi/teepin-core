@@ -291,6 +291,19 @@ func (g *Gateway) LaunchAgent(ctx context.Context, sess *Session, prompt string)
 			"TEEPIN_PROMPT":         internalScratchPathInstruction + prompt,
 			"TEEPIN_API_BASE_URL":   g.agentConfig.APIBaseURL,
 			"TEEPIN_VISION_CAPABLE": strconv.FormatBool(g.agentConfig.VisionCapable),
+			// run.py's own working directory defaults to "/workspace" — the
+			// pod's ephemeral, non-persistent root filesystem — while the
+			// PVC this spec mounts (below, via StorageGB) lands at /data.
+			// Without this, EVERY file the agent ever writes is gone the
+			// instant its pod dies, regardless of NeverRestart or how
+			// deliberately DeliverMessage's relaunch preserves the PVC:
+			// there was never anything on it to preserve. Found live
+			// 2026-09-23, the true root cause behind this session's whole
+			// run of "workspace empty on resume" reports — a relaunched
+			// agent's own `ls /workspace` came back genuinely empty while
+			// the console still showed a saved version with real files,
+			// proving the two were never the same storage.
+			"TEEPIN_WORKSPACE": "/data",
 		},
 		Labels:             map[string]string{agentLabel: "true"},
 		CPUUnits:           g.agentConfig.CPUUnits,

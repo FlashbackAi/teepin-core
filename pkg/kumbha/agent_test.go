@@ -193,6 +193,16 @@ func TestGateway_LaunchAgent_Success(t *testing.T) {
 	if sess.AgentInstanceID == "" {
 		t.Error("session's AgentInstanceID was not updated in memory")
 	}
+	// run.py's own working directory defaults to "/workspace", the pod's
+	// ephemeral root filesystem — while StorageGB above mounts the PVC at
+	// /data. Without TEEPIN_WORKSPACE pointed at /data, every file the
+	// agent writes is gone the instant its pod dies, no matter how
+	// carefully a relaunch preserves the PVC (found live 2026-09-23: a
+	// relaunched agent's own `ls /workspace` came back genuinely empty
+	// while the console still showed a saved version with real files).
+	if spec.Env["TEEPIN_WORKSPACE"] != "/data" {
+		t.Errorf("TEEPIN_WORKSPACE = %q, want /data (the PVC mount) so the agent's work actually persists", spec.Env["TEEPIN_WORKSPACE"])
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Error(err)
 	}
