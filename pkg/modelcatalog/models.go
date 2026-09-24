@@ -34,6 +34,15 @@ const (
 	// ProviderOpenAICompatible is any third-party endpoint speaking the
 	// OpenAI chat-completions API, at BaseURL.
 	ProviderOpenAICompatible Provider = "openai_compatible"
+	// ProviderTinfoilConfidential is a hardware-attested confidential-
+	// inference enclave reached via the Tinfoil client (see
+	// pkg/inference.TinfoilConfidentialProvider) rather than plain TLS — a
+	// distinct Provider from ProviderOpenAICompatible even though both speak
+	// the OpenAI chat-completions shape on the wire, because this one's
+	// BaseURL is a bare enclave hostname attested against a fixed,
+	// hardcoded repo, not an arbitrary endpoint an operator can point
+	// anywhere.
+	ProviderTinfoilConfidential Provider = "tinfoil_confidential"
 )
 
 // IsExternal reports whether the model is served by a third-party API

@@ -41,6 +41,13 @@ func newExternalProvider(m modelcatalog.Model, apiKey string) (inference.Provide
 			ContextWindow: m.ContextWindow,
 			SupportsTools: m.SupportsTools,
 		}), nil
+	case modelcatalog.ProviderTinfoilConfidential:
+		return inference.NewTinfoilConfidential(inference.TinfoilConfidentialConfig{
+			Enclave:       m.BaseURL,
+			Model:         m.ProviderModel,
+			APIKey:        apiKey,
+			ContextWindow: m.ContextWindow,
+		})
 	default:
 		return nil, fmt.Errorf("model %q is not served by an external provider", m.ModelRoute)
 	}
