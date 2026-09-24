@@ -27,7 +27,7 @@ func newMockStore(t *testing.T) (*Store, sqlmock.Sqlmock) {
 
 func TestStore_Create_RejectsNonPositiveBudget(t *testing.T) {
 	store, _ := newMockStore(t)
-	_, err := store.Create(context.Background(), uuid.New(), uuid.New(), 0, "test")
+	_, err := store.Create(context.Background(), uuid.New(), uuid.New(), 0, "test", DefaultModelAlias)
 	if err == nil {
 		t.Error("budget 0 accepted, want error")
 	}
@@ -35,7 +35,7 @@ func TestStore_Create_RejectsNonPositiveBudget(t *testing.T) {
 
 func TestStore_Create_RejectsOverCapBudget(t *testing.T) {
 	store, _ := newMockStore(t)
-	_, err := store.Create(context.Background(), uuid.New(), uuid.New(), maxSessionBudget+0.01, "test")
+	_, err := store.Create(context.Background(), uuid.New(), uuid.New(), maxSessionBudget+0.01, "test", DefaultModelAlias)
 	if err == nil {
 		t.Error("over-cap budget accepted, want error")
 	}
@@ -48,11 +48,11 @@ func TestStore_Create_InsertsAndReturnsSession(t *testing.T) {
 	now := time.Now()
 
 	mock.ExpectQuery(`INSERT INTO billing\.inference_sessions`).
-		WithArgs(accountID, projectID, 5.0, "build booking app").
+		WithArgs(accountID, projectID, 5.0, "build booking app", DefaultModelAlias).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "spent", "status", "started_at"}).
 			AddRow(sessionID, 0.0, "open", now))
 
-	sess, err := store.Create(context.Background(), accountID, projectID, 5.0, "build booking app")
+	sess, err := store.Create(context.Background(), accountID, projectID, 5.0, "build booking app", DefaultModelAlias)
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}

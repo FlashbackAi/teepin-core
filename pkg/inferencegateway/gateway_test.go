@@ -70,7 +70,7 @@ func expectGetModel(mock sqlmock.Sqlmock, route string, m modelcatalog.Model) {
 			"input_price_per_million", "output_price_per_million",
 			"vendor_input_cost_per_million", "vendor_output_cost_per_million",
 			"enabled", "provider", "provider_model", "base_url", "max_output_tokens",
-			"api_key_ref", "offered_to_customers", "kumbha_enabled", "kumbha_priority",
+			"api_key_ref", "offered_to_customers", "kumbha_enabled", "kumbha_priority", "kumbha_alias",
 			"updated_by", "created_at", "updated_at",
 		}).AddRow(
 			m.ModelRoute, m.DisplayName, string(m.CostClass), m.Engine, m.ContextWindow,
@@ -78,7 +78,7 @@ func expectGetModel(mock sqlmock.Sqlmock, route string, m modelcatalog.Model) {
 			m.InputPricePerMillion, m.OutputPricePerMillion,
 			m.VendorInputCostPerMillion, m.VendorOutputCostPerMillion,
 			m.Enabled, providerOrNode(m.Provider), m.ProviderModel, m.BaseURL, 4096,
-			m.APIKeyRef, m.OfferedToCustomers, m.KumbhaEnabled, m.KumbhaPriority,
+			m.APIKeyRef, m.OfferedToCustomers, m.KumbhaEnabled, m.KumbhaPriority, kumbhaAliasOrFast(m.KumbhaAlias),
 			m.UpdatedBy, time.Now(), time.Now(),
 		))
 }
@@ -88,6 +88,13 @@ func providerOrNode(p modelcatalog.Provider) string {
 		return string(modelcatalog.ProviderNode)
 	}
 	return string(p)
+}
+
+func kumbhaAliasOrFast(alias string) string {
+	if alias == "" {
+		return "teepin/fast"
+	}
+	return alias
 }
 
 func expectGetModelNotFound(mock sqlmock.Sqlmock, route string) {

@@ -144,7 +144,17 @@ func (g *Gateway) WithNodeCapacity(lister NodeCapacityLister) *Gateway {
 // CreateSession pre-authorises a new build session, gated by the same
 // payment check compute provisioning already enforces: an account that
 // cannot create an instance cannot start a Kumbha session either.
-func (g *Gateway) CreateSession(ctx context.Context, accountID, projectID uuid.UUID, budget float64, label string) (*Session, error) {
+//
+// modelAlias must be one of ModelAliases; "" means DefaultModelAlias (a
+// customer who never sees a tier picker, or an older console build,
+// behaves exactly as before this parameter existed).
+func (g *Gateway) CreateSession(ctx context.Context, accountID, projectID uuid.UUID, budget float64, label, modelAlias string) (*Session, error) {
+	if modelAlias == "" {
+		modelAlias = DefaultModelAlias
+	}
+	if !isModelAlias(modelAlias) {
+		return nil, fmt.Errorf("%w: %q", inference.ErrUnknownModel, modelAlias)
+	}
 	if g.gate != nil {
 		allowed, reason, err := g.gate.AccountCanProvision(ctx, accountID)
 		if err != nil {
@@ -154,7 +164,7 @@ func (g *Gateway) CreateSession(ctx context.Context, accountID, projectID uuid.U
 			return nil, fmt.Errorf("%w: %s", ErrPaymentRequired, reason)
 		}
 	}
-	return g.store.Create(ctx, accountID, projectID, budget, label)
+	return g.store.Create(ctx, accountID, projectID, budget, label, modelAlias)
 }
 
 // GetSession loads a session scoped to its owning account.
@@ -368,13 +378,13 @@ type CompletionResult struct {
 	Budget   float64
 }
 
-// kumbhaModels returns the catalog models to try for a completion, in
-// order, or errNoKumbhaModels when there are none.
-func (g *Gateway) kumbhaModels(ctx context.Context) ([]Model, error) {
+// kumbhaModels returns the catalog models backing alias, in order, or
+// errNoKumbhaModels when there are none.
+func (g *Gateway) kumbhaModels(ctx context.Context, alias string) ([]Model, error) {
 	if g.models == nil {
 		return nil, errNoKumbhaModels
 	}
-	models, err := g.models.KumbhaModels(ctx)
+	models, err := g.models.KumbhaModels(ctx, alias)
 	if err != nil {
 		return nil, fmt.Errorf("%w: listing Kumbha's models: %v", inference.ErrProviderUnavailable, err)
 	}
@@ -411,7 +421,7 @@ func (g *Gateway) Complete(ctx context.Context, sess *Session, req inference.Req
 		return nil, fmt.Errorf("%w: %q", inference.ErrUnknownModel, req.Model)
 	}
 
-	models, err := g.kumbhaModels(ctx)
+	models, err := g.kumbhaModels(ctx, req.Model)
 	if err != nil {
 		return nil, err
 	}

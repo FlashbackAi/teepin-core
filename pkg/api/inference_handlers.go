@@ -21,6 +21,7 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/billing"
 	"github.com/FlashbackAi/teepin-core/pkg/inference"
 	"github.com/FlashbackAi/teepin-core/pkg/inferencegateway"
+	"github.com/FlashbackAi/teepin-core/pkg/kumbha"
 	"github.com/FlashbackAi/teepin-core/pkg/modelcatalog"
 )
 
@@ -508,6 +509,69 @@ func (h *InferenceHandler) GetAttestation(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, doc)
+}
+
+// tierView describes one Kumbha alias for the build composer's tier picker:
+// enough to show a price and capability subtext without exposing which
+// backend model or vendor actually serves it (Kumbha's own "never shown to
+// a customer" rule for model identity — see pkg/kumbha/models.go).
+type tierView struct {
+	Alias         string  `json:"alias"`
+	DisplayName   string  `json:"display_name"`
+	Available     bool    `json:"available"`
+	SupportsTools bool    `json:"supports_tools"`
+	Vision        bool    `json:"supports_vision"`
+	Audio         bool    `json:"supports_audio"`
+	Pricing       pricing `json:"pricing"`
+}
+
+// GetKumbhaTiers is GET /v1/kumbha/tiers: what the Kumbha build composer's
+// tier picker shows for each alias — its highest-priority backing model's
+// display name, capabilities, and price, per
+// pkg/kumbha/gateway.go's own Complete() (that model is what a build gets
+// almost all the time; failover to a lower-priority model is the rare
+// exception, not something a customer's tier choice can name up front).
+// Available is false when an alias currently has no enabled, Kumbha-enabled
+// model at all — the composer should disable, not hide, that choice, so a
+// customer can see it exists without being able to pick something that
+// would fail immediately.
+func (h *InferenceHandler) GetKumbhaTiers(c *gin.Context) {
+	if _, ok := resolveAccess(c); !ok {
+		return
+	}
+	models, err := h.catalog.ListModels(c.Request.Context())
+	if err != nil {
+		log.Printf("inference: list models for kumbha tiers: %v", err)
+		writeInferenceError(c, http.StatusInternalServerError, "api_error", "internal_error", "could not list tiers")
+		return
+	}
+
+	// The lowest KumbhaPriority per alias among enabled, Kumbha-enabled
+	// models — same selection Complete() itself tries first.
+	best := map[string]modelcatalog.Model{}
+	for _, m := range models {
+		if !m.Enabled || !m.KumbhaEnabled {
+			continue
+		}
+		if cur, ok := best[m.KumbhaAlias]; !ok || m.KumbhaPriority < cur.KumbhaPriority {
+			best[m.KumbhaAlias] = m
+		}
+	}
+
+	out := make([]tierView, 0, len(kumbha.ModelAliases))
+	for _, alias := range kumbha.ModelAliases {
+		m, ok := best[alias]
+		if !ok {
+			out = append(out, tierView{Alias: alias})
+			continue
+		}
+		out = append(out, tierView{
+			Alias: alias, DisplayName: m.DisplayName, Available: true,
+			SupportsTools: m.SupportsTools, Vision: m.SupportsVision, Audio: m.SupportsAudio,
+			Pricing: pricing{InputPerMillion: m.InputPricePerMillion, OutputPerMillion: m.OutputPricePerMillion},
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"object": "list", "data": out})
 }
 
 // InferenceUsageRecorder is the billing surface the inference handler meters

@@ -333,8 +333,8 @@ func newKumbhaModelBackend(catalog *modelcatalog.Service, gateway *inferencegate
 	return &kumbhaModelBackend{catalog: catalog, gateway: gateway}
 }
 
-func (b *kumbhaModelBackend) KumbhaModels(ctx context.Context) ([]kumbha.Model, error) {
-	models, err := b.catalog.ListKumbhaModels(ctx)
+func (b *kumbhaModelBackend) KumbhaModels(ctx context.Context, alias string) ([]kumbha.Model, error) {
+	models, err := b.catalog.ListKumbhaModels(ctx, alias)
 	if err != nil {
 		return nil, err
 	}

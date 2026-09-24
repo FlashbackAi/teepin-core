@@ -5,6 +5,7 @@ package kumbha
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -155,8 +156,8 @@ const internalScratchPathInstruction = "Keep any of your own internal working no
 // Only an empty list refuses the launch. A failure to read the list fails
 // open: a database blip should not block every build launch, and the
 // agent's own first completion will surface a real outage anyway.
-func (g *Gateway) checkModelsAvailable(ctx context.Context) error {
-	_, err := g.kumbhaModels(ctx)
+func (g *Gateway) checkModelsAvailable(ctx context.Context, alias string) error {
+	_, err := g.kumbhaModels(ctx, alias)
 	if errors.Is(err, errNoKumbhaModels) {
 		return err
 	}
@@ -242,12 +243,23 @@ func (g *Gateway) pickNodeWithCapacity(ctx context.Context, cpuUnits, memoryGB i
 	return best, nil
 }
 
-func (g *Gateway) LaunchAgent(ctx context.Context, sess *Session, prompt string) error {
+func (g *Gateway) LaunchAgent(ctx context.Context, sess *Session, prompt string, attachments []Attachment) error {
 	if g.cluster == nil || g.mintToken == nil {
 		return ErrAgentNotConfigured
 	}
+	if err := validateAttachments(attachments); err != nil {
+		return err
+	}
+	var attachmentsJSON string
+	if len(attachments) > 0 {
+		encoded, err := json.Marshal(attachments)
+		if err != nil {
+			return fmt.Errorf("failed to encode attachments: %w", err)
+		}
+		attachmentsJSON = string(encoded)
+	}
 
-	if err := g.checkModelsAvailable(ctx); err != nil {
+	if err := g.checkModelsAvailable(ctx, sess.ModelAlias); err != nil {
 		// Logged for the operator; the HTTP layer answers
 		// ErrAgentRouteUnavailable with a generic message.
 		log.Printf("WARN: kumbha agent launch refused: %v", err)
@@ -291,6 +303,21 @@ func (g *Gateway) LaunchAgent(ctx context.Context, sess *Session, prompt string)
 			"TEEPIN_PROMPT":         internalScratchPathInstruction + prompt,
 			"TEEPIN_API_BASE_URL":   g.agentConfig.APIBaseURL,
 			"TEEPIN_VISION_CAPABLE": strconv.FormatBool(g.agentConfig.VisionCapable),
+			// JSON-encoded []Attachment, empty string when there are none —
+			// run.py decodes this once at startup to build the initial
+			// prompt's real Message (with ImageContent) or to materialize
+			// files into the workspace before the agent's first turn. See
+			// Attachment's own doc comment for why images and files are
+			// handled completely differently downstream.
+			"TEEPIN_PROMPT_ATTACHMENTS": attachmentsJSON,
+			// Was never actually set before this — run.py's own
+			// "teepin/fast" default silently stood in for every session
+			// ever launched, since nothing here provided a value. sess.
+			// ModelAlias is always one of ModelAliases by the time a
+			// Session exists (Gateway.CreateSession validates it, and
+			// defaults empty to DefaultModelAlias), so this always carries
+			// the customer's actual choice.
+			"TEEPIN_ROUTE": sess.ModelAlias,
 			// run.py's own working directory defaults to "/workspace" — the
 			// pod's ephemeral, non-persistent root filesystem — while the
 			// PVC this spec mounts (below, via StorageGB) lands at /data.
@@ -615,13 +642,13 @@ func (g *Gateway) IsAgentRunning(ctx context.Context, sess *Session) (bool, erro
 // existing one resuming — the caller (SendMessage's HTTP handler) surfaces
 // this so the console can explain a longer-than-usual wait before the
 // activity feed picks back up.
-func (g *Gateway) DeliverMessage(ctx context.Context, sess *Session, content string) (relaunched bool, err error) {
+func (g *Gateway) DeliverMessage(ctx context.Context, sess *Session, content string, attachments []Attachment) (relaunched bool, err error) {
 	running, err := g.isAgentRunning(ctx, sess)
 	if err != nil {
 		return false, err
 	}
 	if running {
-		if _, err := g.store.SendMessage(ctx, sess.ID, content); err != nil {
+		if _, err := g.store.SendMessage(ctx, sess.ID, content, attachments); err != nil {
 			return false, err
 		}
 		return false, nil
@@ -634,7 +661,11 @@ func (g *Gateway) DeliverMessage(ctx context.Context, sess *Session, content str
 		"Your workspace already contains what you built before this message — inspect its current " +
 		"contents before making any change, and do not discard or rewrite existing work unless the " +
 		"customer explicitly asks you to."
-	if err := g.LaunchAgent(ctx, sess, resumePrompt); err != nil {
+	// The relaunch path never queues via the messages table (there is no
+	// still-running poll loop to deliver to) — attachments are handed
+	// straight to the fresh pod's own launch env, same as the initial
+	// prompt's own attachments.
+	if err := g.LaunchAgent(ctx, sess, resumePrompt, attachments); err != nil {
 		return false, err
 	}
 	return true, nil

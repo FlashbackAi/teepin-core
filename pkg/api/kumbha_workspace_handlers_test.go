@@ -51,8 +51,8 @@ func sessionRow(sessionID uuid.UUID) *sqlmock.Rows {
 	return sqlmock.NewRows([]string{
 		"id", "account_id", "project_id", "budget", "spent", "status", "label",
 		"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
-		"last_deploy_failed", "last_deploy_error", "last_deploy_at",
-	}).AddRow(sessionID, testAccountID, uuid.New(), 5.0, 0.0, "open", nil, nil, nil, false, nowStub(), nil, false, nil, nil)
+		"last_deploy_failed", "last_deploy_error", "last_deploy_at", "model_alias",
+	}).AddRow(sessionID, testAccountID, uuid.New(), 5.0, 0.0, "open", nil, nil, nil, false, nowStub(), nil, false, nil, nil, "teepin/fast")
 }
 
 func TestUploadKumbhaWorkspace_RequiresSessionCredential(t *testing.T) {

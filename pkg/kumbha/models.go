@@ -32,22 +32,42 @@ type Model struct {
 // inferencegateway (cmd/api-server/adapters.go), which keeps this package
 // free of both.
 type ModelBackend interface {
-	// KumbhaModels returns the models the build agent may use right now, in
-	// the order they should be tried.
-	KumbhaModels(ctx context.Context) ([]Model, error)
+	// KumbhaModels returns the models backing ONE alias, in the order they
+	// should be tried. Before the alias parameter existed (migration 055),
+	// every alias silently resolved to the same list — see
+	// pkg/modelcatalog.Service.ListKumbhaModels's own doc comment.
+	KumbhaModels(ctx context.Context, alias string) ([]Model, error)
 	// Complete serves req against the catalog model named by req.Model.
 	Complete(ctx context.Context, accountID string, req inference.Request) (*inference.Response, error)
 }
 
-// DefaultModelAlias is the model name the agent image addresses Kumbha by.
+// DefaultModelAlias is the model name the agent image addresses Kumbha by
+// absent an explicit customer choice.
+//
 // Kumbha's aliases are not models: whichever alias a request names, it is
-// served by the catalog's Kumbha models in priority order. "teepin/deep" is
-// still accepted so an agent image or harness configured with the old
-// frontier-route name keeps working.
+// served by that alias's own catalog models in priority order (an
+// operator-controlled list — pkg/modelcatalog's kumbha_alias column, not
+// something a customer's choice bypasses). "teepin/deep" is still accepted
+// so an agent image or harness configured with the old frontier-route name
+// keeps working. "teepin/confidential" is the one alias with a real,
+// customer-visible meaning today (hardware-attested inference, chosen
+// explicitly in the Kumbha composer) rather than an internal fast/deep
+// distinction the catalog alone decides.
 const DefaultModelAlias = "teepin/fast"
 
+// ModelAliases is every alias a session may be created with, and the only
+// values TEEPIN_ROUTE (the agent pod env var) is ever set to. Exported so
+// the API layer can validate a customer-supplied choice against the exact
+// same set this package resolves, rather than duplicating the list.
+var ModelAliases = []string{DefaultModelAlias, "teepin/deep", "teepin/confidential"}
+
 func isModelAlias(name string) bool {
-	return name == DefaultModelAlias || name == "teepin/deep"
+	for _, a := range ModelAliases {
+		if name == a {
+			return true
+		}
+	}
+	return false
 }
 
 // StaticModel is one entry of a StaticModels backend.
@@ -62,7 +82,12 @@ type StaticModel struct {
 // Kumbha without a model catalog.
 type StaticModels []StaticModel
 
-func (s StaticModels) KumbhaModels(context.Context) ([]Model, error) {
+// KumbhaModels ignores alias: StaticModels is a fixed test/no-catalog
+// fallback with no per-alias tagging of its own, so it serves every alias
+// identically — the pre-migration-055 behavior, acceptable here since this
+// backend exists for tests and running without a real catalog, not for
+// exercising alias-specific routing.
+func (s StaticModels) KumbhaModels(_ context.Context, _ string) ([]Model, error) {
 	out := make([]Model, 0, len(s))
 	for _, m := range s {
 		out = append(out, Model{Route: m.Route, Engine: m.Engine})

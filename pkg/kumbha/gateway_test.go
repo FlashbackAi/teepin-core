@@ -61,7 +61,7 @@ func TestGateway_CreateSession_GateDeniesIsPaymentRequired(t *testing.T) {
 	store, _ := newMockStore(t)
 	gw := NewGateway(store, nil, &fakeGate{allowed: false, reason: "no card on file"}, &fakePricing{}, &fakeUsageRecorder{})
 
-	_, err := gw.CreateSession(context.Background(), uuid.New(), uuid.New(), 5.0, "test")
+	_, err := gw.CreateSession(context.Background(), uuid.New(), uuid.New(), 5.0, "test", "")
 	if !errors.Is(err, ErrPaymentRequired) {
 		t.Errorf("got %v, want ErrPaymentRequired", err)
 	}
@@ -71,7 +71,7 @@ func TestGateway_CreateSession_GateErrorIsGateUnavailable(t *testing.T) {
 	store, _ := newMockStore(t)
 	gw := NewGateway(store, nil, &fakeGate{err: errors.New("db down")}, &fakePricing{}, &fakeUsageRecorder{})
 
-	_, err := gw.CreateSession(context.Background(), uuid.New(), uuid.New(), 5.0, "test")
+	_, err := gw.CreateSession(context.Background(), uuid.New(), uuid.New(), 5.0, "test", "")
 	if !errors.Is(err, ErrGateUnavailable) {
 		t.Errorf("got %v, want ErrGateUnavailable", err)
 	}
@@ -82,12 +82,12 @@ func TestGateway_CreateSession_GateAllowsDelegatesToStore(t *testing.T) {
 	accountID, projectID := uuid.New(), uuid.New()
 
 	mock.ExpectQuery(`INSERT INTO billing\.inference_sessions`).
-		WithArgs(accountID, projectID, 5.0, "test").
+		WithArgs(accountID, projectID, 5.0, "test", DefaultModelAlias).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "spent", "status", "started_at"}).
 			AddRow(uuid.New(), 0.0, "open", time.Now()))
 
 	gw := NewGateway(store, nil, &fakeGate{allowed: true}, &fakePricing{}, &fakeUsageRecorder{})
-	sess, err := gw.CreateSession(context.Background(), accountID, projectID, 5.0, "test")
+	sess, err := gw.CreateSession(context.Background(), accountID, projectID, 5.0, "test", "")
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -212,8 +212,8 @@ func getSessionRow(sessID, accountID, projectID uuid.UUID, budget float64, statu
 	return sqlmock.NewRows([]string{
 		"id", "account_id", "project_id", "budget", "spent", "status", "label",
 		"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
-		"last_deploy_failed", "last_deploy_error", "last_deploy_at",
-	}).AddRow(sessID, accountID, projectID, budget, 0.0, status, nil, nil, nil, false, time.Now(), nil, false, nil, nil)
+		"last_deploy_failed", "last_deploy_error", "last_deploy_at", "model_alias",
+	}).AddRow(sessID, accountID, projectID, budget, 0.0, status, nil, nil, nil, false, time.Now(), nil, false, nil, nil, "teepin/fast")
 }
 
 func TestGateway_IncreaseBudget_Success(t *testing.T) {

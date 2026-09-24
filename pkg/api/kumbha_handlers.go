@@ -38,10 +38,40 @@ import (
 // launches it as part of this same call (see LaunchAgent below) so the
 // console's flow is a single request: "start building" is one API call,
 // not "create a session" then a separate "now start it".
+// attachmentRequest is the wire shape of one image or file a customer
+// attached — the URL a prior CreateKumbhaAttachment call minted, echoed
+// back by the console. Shared between the initial prompt and follow-up
+// chat messages, which both carry attachments the same way.
+type attachmentRequest struct {
+	URL      string `json:"url" binding:"required"`
+	Type     string `json:"type" binding:"required"`
+	Filename string `json:"filename,omitempty"`
+}
+
+func toKumbhaAttachments(reqs []attachmentRequest) []kumbha.Attachment {
+	if len(reqs) == 0 {
+		return nil
+	}
+	out := make([]kumbha.Attachment, len(reqs))
+	for i, r := range reqs {
+		out[i] = kumbha.Attachment{URL: r.URL, Type: kumbha.AttachmentType(r.Type), Filename: r.Filename}
+	}
+	return out
+}
+
 type createKumbhaSessionRequest struct {
 	Budget float64 `json:"budget"`
 	Label  string  `json:"label,omitempty"`
 	Prompt string  `json:"prompt,omitempty"`
+	// Model is one of kumbha.ModelAliases ("teepin/fast", "teepin/deep",
+	// "teepin/confidential"). Empty means kumbha.DefaultModelAlias — an
+	// older console build, or a caller that never shows a tier picker,
+	// behaves exactly as it always has.
+	Model string `json:"model,omitempty"`
+	// Attachments backs the initial prompt only — ignored entirely unless
+	// Prompt is also set (there is no session to launch an agent into
+	// otherwise, so nothing would ever use them).
+	Attachments []attachmentRequest `json:"attachments,omitempty"`
 }
 
 // kumbhaSessionResponse is the shared JSON shape for every endpoint that
@@ -59,6 +89,7 @@ func kumbhaSessionResponse(sess *kumbha.Session) gin.H {
 		"spent":           sess.Spent,
 		"status":          sess.Status,
 		"label":           sess.Label,
+		"model_alias":     sess.ModelAlias,
 		"deploy_approved": sess.DeployApproved,
 		// agent_running is derived rather than exposing agent_instance_id
 		// directly — the console needs to know whether a build is
@@ -107,7 +138,7 @@ func (s *Server) CreateKumbhaSession(c *gin.Context) {
 		return
 	}
 
-	sess, err := s.kumbha.CreateSession(c.Request.Context(), accountID, projectID, req.Budget, req.Label)
+	sess, err := s.kumbha.CreateSession(c.Request.Context(), accountID, projectID, req.Budget, req.Label, req.Model)
 	if err != nil {
 		switch {
 		case errors.Is(err, kumbha.ErrPaymentRequired):
@@ -115,17 +146,17 @@ func (s *Server) CreateKumbhaSession(c *gin.Context) {
 		case errors.Is(err, kumbha.ErrGateUnavailable):
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "unable to verify billing status, please retry"})
 		default:
-			// Budget validation errors (non-positive, over the per-session
-			// cap) are the only other failure mode from CreateSession, and
-			// both are the customer's request being wrong, not the
-			// platform's — 400 either way.
+			// Budget validation errors and an unknown model alias are the
+			// other failure modes from CreateSession, and both are the
+			// customer's request being wrong, not the platform's — 400
+			// either way.
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		}
 		return
 	}
 
 	if req.Prompt != "" {
-		if err := s.kumbha.LaunchAgent(c.Request.Context(), sess, req.Prompt); err != nil {
+		if err := s.kumbha.LaunchAgent(c.Request.Context(), sess, req.Prompt, toKumbhaAttachments(req.Attachments)); err != nil {
 			if errors.Is(err, kumbha.ErrAgentNotConfigured) {
 				// The session itself is valid and stays open (a customer
 				// can still close it, or a future retry could launch the
@@ -147,6 +178,10 @@ func (s *Server) CreateKumbhaSession(c *gin.Context) {
 					"error": "the build agent is temporarily unavailable — please try again shortly",
 					"code":  "agent_route_unavailable",
 				})
+				return
+			}
+			if errors.Is(err, kumbha.ErrInvalidAttachment) || errors.Is(err, kumbha.ErrTooManyAttachments) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 				return
 			}
 			log.Printf("WARN: kumbha session %s created but agent launch failed: %v", sess.ID, err)
@@ -1949,7 +1984,8 @@ func (s *Server) KumbhaChatCompletions(c *gin.Context) {
 
 // sendKumbhaMessageRequest is the console chat input's body.
 type sendKumbhaMessageRequest struct {
-	Content string `json:"content"`
+	Content     string              `json:"content"`
+	Attachments []attachmentRequest `json:"attachments,omitempty"`
 }
 
 // SendKumbhaMessage is "chat + resume" from the customer's side — the
@@ -1998,10 +2034,11 @@ func (s *Server) SendKumbhaMessage(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	relaunched, err := s.kumbha.DeliverMessage(c.Request.Context(), sess, req.Content)
+	relaunched, err := s.kumbha.DeliverMessage(c.Request.Context(), sess, req.Content, toKumbhaAttachments(req.Attachments))
 	if err != nil {
 		switch {
-		case errors.Is(err, kumbha.ErrEmptyMessage), errors.Is(err, kumbha.ErrMessageTooLong):
+		case errors.Is(err, kumbha.ErrEmptyMessage), errors.Is(err, kumbha.ErrMessageTooLong),
+			errors.Is(err, kumbha.ErrInvalidAttachment), errors.Is(err, kumbha.ErrTooManyAttachments):
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		case errors.Is(err, kumbha.ErrAgentNotConfigured):
 			c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha agent is not available on this deployment"})
@@ -2060,7 +2097,7 @@ func (s *Server) PollKumbhaMessages(c *gin.Context) {
 
 	out := make([]gin.H, len(messages))
 	for i, m := range messages {
-		out[i] = gin.H{"id": m.ID, "content": m.Content, "created_at": m.CreatedAt}
+		out[i] = gin.H{"id": m.ID, "content": m.Content, "attachments": m.Attachments, "created_at": m.CreatedAt}
 	}
 	c.JSON(http.StatusOK, gin.H{"messages": out})
 }

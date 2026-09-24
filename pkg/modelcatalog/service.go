@@ -115,19 +115,31 @@ type Availability struct {
 	OfferedToCustomers *bool
 	KumbhaEnabled      *bool
 	KumbhaPriority     *int
+	// KumbhaAlias is validated against the same closed set the database
+	// CHECK constraint enforces (migration 055) — checked here too so a
+	// bad value is a clear 400 from RegisterModel-adjacent callers, not a
+	// bare Postgres constraint-violation error.
+	KumbhaAlias *string
 }
 
+var validKumbhaAliases = map[string]bool{"teepin/fast": true, "teepin/deep": true, "teepin/confidential": true}
+
 // SetAvailability updates whether a model is offered to customers and
-// whether (and in what order) the Kumbha build agent may use it.
+// whether (and under which Kumbha alias, and in what order) the Kumbha
+// build agent may use it.
 func (s *Service) SetAvailability(ctx context.Context, modelRoute string, a Availability, updatedBy string) error {
+	if a.KumbhaAlias != nil && !validKumbhaAliases[*a.KumbhaAlias] {
+		return fmt.Errorf("invalid kumbha_alias %q", *a.KumbhaAlias)
+	}
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE inference.models
 		SET offered_to_customers = COALESCE($1, offered_to_customers),
 		    kumbha_enabled       = COALESCE($2, kumbha_enabled),
 		    kumbha_priority      = COALESCE($3, kumbha_priority),
-		    updated_by = $4, updated_at = NOW()
-		WHERE model_route = $5
-	`, a.OfferedToCustomers, a.KumbhaEnabled, a.KumbhaPriority, updatedBy, modelRoute)
+		    kumbha_alias         = COALESCE($4, kumbha_alias),
+		    updated_by = $5, updated_at = NOW()
+		WHERE model_route = $6
+	`, a.OfferedToCustomers, a.KumbhaEnabled, a.KumbhaPriority, a.KumbhaAlias, updatedBy, modelRoute)
 	if err != nil {
 		return fmt.Errorf("failed to set availability for %q: %w", modelRoute, err)
 	}
@@ -155,10 +167,15 @@ func (s *Service) SetAPIKeyRef(ctx context.Context, modelRoute, ref, updatedBy s
 	return nil
 }
 
-// ListKumbhaModels returns the models the Kumbha build agent may use right
-// now — enabled and Kumbha-enabled — in the order it should try them.
-func (s *Service) ListKumbhaModels(ctx context.Context) ([]Model, error) {
-	return s.queryModels(ctx, selectModelsSQL+` WHERE enabled AND kumbha_enabled ORDER BY kumbha_priority, model_route`)
+// ListKumbhaModels returns the models backing one Kumbha alias
+// ("teepin/fast", "teepin/deep", "teepin/confidential") right now —
+// enabled, Kumbha-enabled, and tagged for THIS alias — in the order they
+// should be tried. Before migration 055 this had no alias filter at all,
+// which is why every alias silently resolved to the same list.
+func (s *Service) ListKumbhaModels(ctx context.Context, alias string) ([]Model, error) {
+	return s.queryModels(ctx,
+		selectModelsSQL+` WHERE enabled AND kumbha_enabled AND kumbha_alias = $1 ORDER BY kumbha_priority, model_route`,
+		alias)
 }
 
 // SetPricing updates a model's customer-facing per-million-token rates.
@@ -262,8 +279,8 @@ func (s *Service) ListModels(ctx context.Context) ([]Model, error) {
 	return s.queryModels(ctx, selectModelsSQL+` ORDER BY model_route`)
 }
 
-func (s *Service) queryModels(ctx context.Context, query string) ([]Model, error) {
-	rows, err := s.db.QueryContext(ctx, query)
+func (s *Service) queryModels(ctx context.Context, query string, args ...any) ([]Model, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list models: %w", err)
 	}
@@ -304,7 +321,7 @@ const selectModelsSQL = `
 	       input_price_per_million, output_price_per_million,
 	       vendor_input_cost_per_million, vendor_output_cost_per_million,
 	       enabled, provider, provider_model, base_url, max_output_tokens,
-	       COALESCE(api_key_ref, ''), offered_to_customers, kumbha_enabled, kumbha_priority,
+	       COALESCE(api_key_ref, ''), offered_to_customers, kumbha_enabled, kumbha_priority, kumbha_alias,
 	       updated_by, created_at, updated_at
 	FROM inference.models`
 
@@ -325,7 +342,7 @@ func scanModelRow(r row) (*Model, error) {
 		&m.InputPricePerMillion, &m.OutputPricePerMillion,
 		&m.VendorInputCostPerMillion, &m.VendorOutputCostPerMillion,
 		&m.Enabled, &provider, &m.ProviderModel, &m.BaseURL, &m.MaxOutputTokens,
-		&m.APIKeyRef, &m.OfferedToCustomers, &m.KumbhaEnabled, &m.KumbhaPriority,
+		&m.APIKeyRef, &m.OfferedToCustomers, &m.KumbhaEnabled, &m.KumbhaPriority, &m.KumbhaAlias,
 		&m.UpdatedBy, &m.CreatedAt, &m.UpdatedAt,
 	); err != nil {
 		return nil, err

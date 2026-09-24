@@ -106,7 +106,7 @@ func TestGateway_LaunchAgent_NotConfiguredWithoutWithAgent(t *testing.T) {
 	gw := NewGateway(store, nil, nil, &fakePricing{}, &fakeUsageRecorder{})
 
 	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), ProjectID: uuid.New()}
-	err := gw.LaunchAgent(context.Background(), sess, "build me a booking app")
+	err := gw.LaunchAgent(context.Background(), sess, "build me a booking app", nil)
 	if !errors.Is(err, ErrAgentNotConfigured) {
 		t.Errorf("got %v, want ErrAgentNotConfigured", err)
 	}
@@ -163,7 +163,7 @@ func TestGateway_LaunchAgent_Success(t *testing.T) {
 		WithArgs(sessID, "kumbha-agent-"+sessID.String()[:8]).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	if err := gw.LaunchAgent(context.Background(), sess, "build me a booking app"); err != nil {
+	if err := gw.LaunchAgent(context.Background(), sess, "build me a booking app", nil); err != nil {
 		t.Fatalf("LaunchAgent: %v", err)
 	}
 
@@ -230,7 +230,7 @@ func TestGateway_LaunchAgent_PicksNodeWithEnoughCapacity(t *testing.T) {
 		WithArgs(sessID, "kumbha-agent-"+sessID.String()[:8]).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	if err := gw.LaunchAgent(context.Background(), sess, "build me a booking app"); err != nil {
+	if err := gw.LaunchAgent(context.Background(), sess, "build me a booking app", nil); err != nil {
 		t.Fatalf("LaunchAgent: %v", err)
 	}
 	if len(fc.created) != 1 {
@@ -258,7 +258,7 @@ func TestGateway_LaunchAgent_PrefersNodeWithMostFreeCPU(t *testing.T) {
 		WithArgs(sessID, "kumbha-agent-"+sessID.String()[:8]).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	if err := gw.LaunchAgent(context.Background(), sess, "build me a booking app"); err != nil {
+	if err := gw.LaunchAgent(context.Background(), sess, "build me a booking app", nil); err != nil {
 		t.Fatalf("LaunchAgent: %v", err)
 	}
 	if got := fc.created[0].ProviderID; got != "srialla" {
@@ -282,7 +282,7 @@ func TestGateway_LaunchAgent_NoCapacityAnywhereRefusesUpFront(t *testing.T) {
 		WithNodeCapacity(lister)
 
 	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), ProjectID: uuid.New()}
-	err := gw.LaunchAgent(context.Background(), sess, "build me a booking app")
+	err := gw.LaunchAgent(context.Background(), sess, "build me a booking app", nil)
 	if !errors.Is(err, ErrNoCapacity) {
 		t.Fatalf("got %v, want ErrNoCapacity", err)
 	}
@@ -309,7 +309,7 @@ func TestGateway_LaunchAgent_CapacityLookupErrorFailsOpen(t *testing.T) {
 		WithArgs(sessID, "kumbha-agent-"+sessID.String()[:8]).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	if err := gw.LaunchAgent(context.Background(), sess, "build me a booking app"); err != nil {
+	if err := gw.LaunchAgent(context.Background(), sess, "build me a booking app", nil); err != nil {
 		t.Fatalf("LaunchAgent should fail open on a capacity-lookup error, got: %v", err)
 	}
 	if got := fc.created[0].ProviderID; got != "" {
@@ -332,7 +332,7 @@ func TestGateway_LaunchAgent_NoCapacityListerConfiguredLeavesProviderIDEmpty(t *
 		WithArgs(sessID, "kumbha-agent-"+sessID.String()[:8]).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	if err := gw.LaunchAgent(context.Background(), sess, "build me a booking app"); err != nil {
+	if err := gw.LaunchAgent(context.Background(), sess, "build me a booking app", nil); err != nil {
 		t.Fatalf("LaunchAgent: %v", err)
 	}
 	if got := fc.created[0].ProviderID; got != "" {
@@ -361,7 +361,7 @@ func TestGateway_LaunchAgent_PropagatesVisionCapableFlag(t *testing.T) {
 			WithArgs(sessID, "kumbha-agent-"+sessID.String()[:8]).
 			WillReturnResult(sqlmock.NewResult(0, 1))
 
-		if err := gw.LaunchAgent(context.Background(), sess, "build me a booking app"); err != nil {
+		if err := gw.LaunchAgent(context.Background(), sess, "build me a booking app", nil); err != nil {
 			t.Fatalf("LaunchAgent: %v", err)
 		}
 
@@ -384,7 +384,7 @@ func TestGateway_LaunchAgent_RecordingFailureCleansUpThePod(t *testing.T) {
 	mock.ExpectExec(`UPDATE billing\.inference_sessions SET agent_instance_id`).
 		WillReturnError(errors.New("db write failed"))
 
-	err := gw.LaunchAgent(context.Background(), sess, "prompt")
+	err := gw.LaunchAgent(context.Background(), sess, "prompt", nil)
 	if err == nil {
 		t.Fatal("expected an error when recording the agent instance id fails")
 	}
@@ -607,7 +607,7 @@ func TestGateway_DeliverMessage_NotConfiguredWithoutWithAgent(t *testing.T) {
 	gw := NewGateway(store, nil, nil, &fakePricing{}, &fakeUsageRecorder{})
 	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), ProjectID: uuid.New()}
 
-	_, err := gw.DeliverMessage(context.Background(), sess, "hello")
+	_, err := gw.DeliverMessage(context.Background(), sess, "hello", nil)
 	if !errors.Is(err, ErrAgentNotConfigured) {
 		t.Errorf("got %v, want ErrAgentNotConfigured", err)
 	}
@@ -625,10 +625,10 @@ func TestGateway_DeliverMessage_QueuesWhenAgentRunning(t *testing.T) {
 	sess := &Session{ID: sessID, AccountID: uuid.New(), ProjectID: uuid.New(), AgentInstanceID: "kumbha-agent-abc"}
 
 	mock.ExpectQuery(`INSERT INTO billing\.kumbha_messages`).
-		WithArgs(sessID, "add a footer").
+		WithArgs(sessID, "add a footer", []byte(nil)).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(1), time.Now()))
 
-	relaunched, err := gw.DeliverMessage(context.Background(), sess, "add a footer")
+	relaunched, err := gw.DeliverMessage(context.Background(), sess, "add a footer", nil)
 	if err != nil {
 		t.Fatalf("DeliverMessage: %v", err)
 	}
@@ -660,7 +660,7 @@ func TestGateway_DeliverMessage_RelaunchesWhenAgentNotRunning(t *testing.T) {
 		WithArgs(sessID, "kumbha-agent-"+sessID.String()[:8]).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	relaunched, err := gw.DeliverMessage(context.Background(), sess, "add a footer")
+	relaunched, err := gw.DeliverMessage(context.Background(), sess, "add a footer", nil)
 	if err != nil {
 		t.Fatalf("DeliverMessage: %v", err)
 	}
@@ -701,8 +701,8 @@ func TestGateway_DeleteSessions_StopsAnOpenSessionThenDeletesIt(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "account_id", "project_id", "budget", "spent", "status", "label",
 			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
-			"last_deploy_failed", "last_deploy_error", "last_deploy_at",
-		}).AddRow(sessID, accountID, projectID, 5.0, 0.0, "open", nil, agentPodID, nil, false, startedAt, nil, false, nil, nil))
+			"last_deploy_failed", "last_deploy_error", "last_deploy_at", "model_alias",
+		}).AddRow(sessID, accountID, projectID, 5.0, 0.0, "open", nil, agentPodID, nil, false, startedAt, nil, false, nil, nil, "teepin/fast"))
 
 	// CloseSession: Close + tear down the agent pod (no settlement any
 	// more — see Gateway.CloseSession's own doc comment).
@@ -747,8 +747,8 @@ func TestGateway_DeleteSessions_AlreadyClosedSessionSkipsCloseCall(t *testing.T)
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "account_id", "project_id", "budget", "spent", "status", "label",
 			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
-			"last_deploy_failed", "last_deploy_error", "last_deploy_at",
-		}).AddRow(sessID, accountID, projectID, 5.0, 0.0, "closed", nil, nil, nil, false, startedAt, startedAt, false, nil, nil))
+			"last_deploy_failed", "last_deploy_error", "last_deploy_at", "model_alias",
+		}).AddRow(sessID, accountID, projectID, 5.0, 0.0, "closed", nil, nil, nil, false, startedAt, startedAt, false, nil, nil, "teepin/fast"))
 
 	// No Close-related queries expected — already closed, nothing to stop.
 
@@ -927,7 +927,7 @@ func TestGateway_LaunchAgent_RefusedWhenNoModelIsEnabled(t *testing.T) {
 		WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest"})
 
 	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), ProjectID: uuid.New()}
-	err := gw.LaunchAgent(context.Background(), sess, "build me a booking app")
+	err := gw.LaunchAgent(context.Background(), sess, "build me a booking app", nil)
 	if !errors.Is(err, ErrAgentRouteUnavailable) {
 		t.Fatalf("got %v, want ErrAgentRouteUnavailable", err)
 	}

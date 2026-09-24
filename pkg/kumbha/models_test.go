@@ -37,7 +37,7 @@ func TestStaticModels_ListsInOrderAndServesByRoute(t *testing.T) {
 		{Route: "b", Engine: "anthropic", Provider: &fakeProvider{name: "second"}},
 	}
 
-	listed, err := models.KumbhaModels(context.Background())
+	listed, err := models.KumbhaModels(context.Background(), "teepin/fast")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -160,6 +160,25 @@ type Server struct {
 	// egress simply isn't billed — downloads still work identically,
 	// same "feature off when unconfigured" posture as everything else.
 	objectStoreEgress *objectstore.EgressTracker
+	// publicBaseURL is Teepin's own internet-reachable API host (e.g.
+	// "https://dev-api.teepin.com") — deliberately NOT the same value as
+	// TEEPIN_KUMBHA_AGENT_API_BASE_URL, which is cluster-internal and
+	// unreachable from outside (the agent pod's own callback address).
+	// Needed wherever a URL is handed to something OUTSIDE Teepin's own
+	// network that must fetch it back over the public internet — today,
+	// only the signed image-attachment URLs Kumbha embeds in a message
+	// sent to an external LLM provider (see CreateKumbhaAttachment).
+	// Empty disables attachment uploads outright rather than minting a
+	// URL nothing outside the cluster could ever actually fetch.
+	publicBaseURL string
+}
+
+// WithPublicBaseURL sets Teepin's own internet-reachable API host, used to
+// build absolute URLs for anything handed to a party outside Teepin's own
+// network. Returns the same *Server for chaining.
+func (s *Server) WithPublicBaseURL(url string) *Server {
+	s.publicBaseURL = strings.TrimSuffix(url, "/")
+	return s
 }
 
 // WithObjectStore enables the Teepin S3 endpoints. Returns the same

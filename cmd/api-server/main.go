@@ -715,6 +715,19 @@ func main() {
 				log.Println("Teepin S3 signed download links not configured (set TEEPIN_OBJECTSTORE_URL_SIGNING_KEY)")
 			}
 
+			// Teepin's own internet-reachable API host — needed wherever a
+			// URL is handed to a party OUTSIDE Teepin's network that must
+			// fetch it back (today: Kumbha's image-attachment URLs, sent to
+			// whichever external LLM provider serves the customer's
+			// chosen tier). Deliberately distinct from
+			// TEEPIN_KUMBHA_AGENT_API_BASE_URL, which is cluster-internal.
+			if publicBaseURL := getEnv("TEEPIN_PUBLIC_API_BASE_URL", ""); publicBaseURL != "" {
+				apiServer = apiServer.WithPublicBaseURL(publicBaseURL)
+				log.Println("✅ Kumbha attachments enabled")
+			} else {
+				log.Println("Kumbha attachments not configured (set TEEPIN_PUBLIC_API_BASE_URL)")
+			}
+
 			// Billing/metering — GB-stored (hourly, all buckets) and
 			// GB-transferred (batched from real download traffic). Both
 			// require billingService, which itself requires authService
@@ -1451,6 +1464,10 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 			kumbhaGroup.POST("/sessions/:id/messages", apiServer.SendKumbhaMessage)
 			kumbhaGroup.GET("/sessions/:id/messages/poll", apiServer.PollKumbhaMessages)
 			kumbhaGroup.POST("/chat/completions", apiServer.KumbhaChatCompletions)
+			// Attachments: project-scoped, not session-scoped — the composer
+			// uploads before a session exists (the initial prompt has no
+			// session id yet). See CreateKumbhaAttachment's own doc comment.
+			kumbhaGroup.POST("/attachments", apiServer.CreateKumbhaAttachment)
 			// Workspace: versioned, not overwrite-in-place — every save (agent
 			// or customer) creates a new version and moves the "current"
 			// pointer, so an editable IDE with a Deploy button that can break
@@ -1488,6 +1505,7 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 			v1.POST("/chat/completions", append(inferenceAuth, publicInferenceHandler.ChatCompletions)...)
 			v1.GET("/models", append(inferenceAuth, publicInferenceHandler.ListModels)...)
 			v1.GET("/models/attestation", append(inferenceAuth, publicInferenceHandler.GetAttestation)...)
+			v1.GET("/kumbha/tiers", append(inferenceAuth, publicInferenceHandler.GetKumbhaTiers)...)
 		}
 
 		storageGroup := v1.Group("/storage")
