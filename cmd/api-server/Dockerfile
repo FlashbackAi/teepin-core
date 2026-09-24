@@ -1,9 +1,15 @@
 # Build stage
 #
-# Must be >= the `go` directive in go.mod (1.25), which grpc 1.83 pushed
-# up. An older toolchain fails the build outright rather than degrading,
-# so this pin and go.mod have to move together.
-FROM golang:1.25-alpine AS builder
+# Must be >= the `go` directive in go.mod (1.26.6), which the tinfoil-go
+# dependency's own module graph pushed up (2026-09-24) — grpc 1.83 did the
+# same thing once before, at 1.25. An older toolchain fails the build
+# outright rather than degrading, so this pin and go.mod have to move
+# together. Caught late here because `go mod tidy` silently
+# auto-downloads a satisfying local toolchain (GOTOOLCHAIN=auto), so a
+# local go build/vet/test all stayed green while this pin quietly fell
+# behind — this image build is what actually enforces the two staying in
+# sync, since it runs with no toolchain auto-download.
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /app
 
