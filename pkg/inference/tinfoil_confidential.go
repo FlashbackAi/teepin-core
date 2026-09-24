@@ -58,6 +58,12 @@ const tinfoilClientTimeout = 30 * time.Second
 // identical to VLLMProvider's already-established, tested pattern instead of
 // re-deriving message translation against openai-go's typed union types.
 type TinfoilConfidentialProvider struct {
+	// client is kept (not just its HTTPClient()) so CheckHealth and
+	// Attestation can read the CURRENT verification state — it updates in
+	// place on certificate rotation (see reVerifyingTransport in
+	// tinfoil-go's own source), so holding onto it here rather than a
+	// point-in-time snapshot keeps both live.
+	client  *tinfoil.Client
 	http    *http.Client
 	baseURL string // "https://<enclave>/v1" — no trailing slash
 	enclave string
@@ -75,7 +81,11 @@ type TinfoilConfidentialProvider struct {
 	caps   Capabilities
 }
 
-var _ Provider = (*TinfoilConfidentialProvider)(nil)
+var (
+	_ Provider            = (*TinfoilConfidentialProvider)(nil)
+	_ HealthChecker       = (*TinfoilConfidentialProvider)(nil)
+	_ AttestationReporter = (*TinfoilConfidentialProvider)(nil)
+)
 
 // TinfoilConfidentialConfig configures a confidential-inference backend.
 type TinfoilConfidentialConfig struct {
@@ -135,6 +145,7 @@ func NewTinfoilConfidential(cfg TinfoilConfidentialConfig) (*TinfoilConfidential
 			return nil, fmt.Errorf("%w: enclave attestation failed for %q: %v", ErrProviderUnavailable, enclave, r.err)
 		}
 		return &TinfoilConfidentialProvider{
+			client:  r.client,
 			http:    r.client.HTTPClient(),
 			baseURL: fmt.Sprintf("https://%s/v1", enclave),
 			enclave: enclave,
@@ -165,6 +176,45 @@ func normalizeEnclave(s string) string {
 
 func (p *TinfoilConfidentialProvider) Name() string               { return "tinfoil_confidential" }
 func (p *TinfoilConfidentialProvider) Capabilities() Capabilities { return p.caps }
+
+// CheckHealth reports the enclave as unhealthy when its CURRENT verification
+// state says attestation is not actually satisfied — a stricter bar than
+// VLLMProvider's own CheckHealth (reachable + model listed), deliberately:
+// for a confidential-inference backend, a technically-reachable-but-
+// unverified enclave is not "degraded," it is the one failure mode this
+// whole provider exists to prevent from being silently served as if it
+// were secure. Costs no tokens — it reads the client's already-held
+// verification state rather than making a new request.
+func (p *TinfoilConfidentialProvider) CheckHealth(ctx context.Context) error {
+	if p.client == nil {
+		return fmt.Errorf("%w: no attestation client for %q", ErrProviderUnavailable, p.enclave)
+	}
+	doc := p.client.VerificationDocument()
+	if doc == nil {
+		return fmt.Errorf("%w: no verification document available for %q", ErrProviderUnavailable, p.enclave)
+	}
+	if !doc.SecurityVerified {
+		return fmt.Errorf("%w: enclave %q is not currently attestation-verified", ErrProviderUnavailable, p.enclave)
+	}
+	return nil
+}
+
+// Attestation returns the live tinfoil-go VerificationDocument — see
+// AttestationReporter's own doc comment for why the return type is `any`
+// here rather than the concrete tinfoil-go type. The document is already
+// JSON-tagged for exactly this purpose (tinfoil-go's own doc comment calls
+// it "Verification Center-compatible"), so a caller can marshal it directly
+// without this package or its caller needing to know its field shape.
+func (p *TinfoilConfidentialProvider) Attestation() (any, error) {
+	if p.client == nil {
+		return nil, fmt.Errorf("%w: no attestation client for %q", ErrProviderUnavailable, p.enclave)
+	}
+	doc := p.client.VerificationDocument()
+	if doc == nil {
+		return nil, fmt.Errorf("%w: no verification document available for %q", ErrProviderUnavailable, p.enclave)
+	}
+	return doc, nil
+}
 
 // Complete performs a non-streaming completion. Identical in shape to
 // VLLMProvider.Complete — same Extra-first encode, same raw-body passthrough

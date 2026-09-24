@@ -222,3 +222,35 @@ func TestTinfoilConfidential_Capabilities_ReportsFrontierCostClass(t *testing.T)
 		t.Errorf("CostClass = %q, want frontier (a partner bills Teepin per token, not Teepin's own capacity)", p.Capabilities().CostClass)
 	}
 }
+
+// A *tinfoil.Client can only be constructed via a real network attestation
+// handshake (no fake available — see newTestTinfoilConfidential's own
+// comment), so these exercise the nil-client guard rather than a real
+// VerificationDocument. What matters here is the fail-safe shape: a missing
+// client must error cleanly (ErrProviderUnavailable), never panic — a nil
+// *tinfoil.Client dereferences on VerificationDocument() (confirmed by
+// reading tinfoil-go's own source), so this guard is load-bearing, not
+// defensive theater.
+func TestTinfoilConfidential_CheckHealth_NilClientErrorsInsteadOfPanicking(t *testing.T) {
+	p := &TinfoilConfidentialProvider{enclave: "test.enclave.invalid"}
+	if err := p.CheckHealth(context.Background()); !errors.Is(err, ErrProviderUnavailable) {
+		t.Errorf("err = %v, want ErrProviderUnavailable", err)
+	}
+}
+
+func TestTinfoilConfidential_Attestation_NilClientErrorsInsteadOfPanicking(t *testing.T) {
+	p := &TinfoilConfidentialProvider{enclave: "test.enclave.invalid"}
+	if _, err := p.Attestation(); !errors.Is(err, ErrProviderUnavailable) {
+		t.Errorf("err = %v, want ErrProviderUnavailable", err)
+	}
+}
+
+func TestTinfoilConfidential_ImplementsOptionalCapabilityInterfaces(t *testing.T) {
+	var p any = &TinfoilConfidentialProvider{}
+	if _, ok := p.(HealthChecker); !ok {
+		t.Error("TinfoilConfidentialProvider should implement HealthChecker")
+	}
+	if _, ok := p.(AttestationReporter); !ok {
+		t.Error("TinfoilConfidentialProvider should implement AttestationReporter")
+	}
+}

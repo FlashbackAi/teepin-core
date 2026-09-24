@@ -49,6 +49,7 @@ const (
 type inferenceGateway interface {
 	Complete(ctx context.Context, accountID string, req inference.Request) (*inference.Response, error)
 	Stream(ctx context.Context, accountID string, req inference.Request, onChunk func(inference.Chunk) error) error
+	Attestation(ctx context.Context, m modelcatalog.Model) (any, error)
 }
 
 // catalogReader is the slice of modelcatalog.Service this handler uses.
@@ -416,6 +417,14 @@ type modelView struct {
 	Vision        bool    `json:"supports_vision"`
 	Audio         bool    `json:"supports_audio"`
 	Pricing       pricing `json:"pricing"`
+	// Confidential is true for a model served through a hardware-attested
+	// enclave (ProviderTinfoilConfidential) — safe to expose (unlike
+	// Provider/BaseURL, which would name the vendor/enclave outright): it
+	// only says a real attestation proof exists, fetchable from
+	// GET /v1/models/attestation. Never true for anything else, so a
+	// customer never has to wonder whether "confidential" quietly means
+	// something weaker for some other provider.
+	Confidential bool `json:"confidential"`
 }
 
 type pricing struct {
@@ -445,10 +454,60 @@ func (h *InferenceHandler) ListModels(c *gin.Context) {
 		out = append(out, modelView{
 			ID: m.ModelRoute, Object: "model", Created: m.CreatedAt.Unix(), OwnedBy: "teepin", DisplayName: m.DisplayName,
 			ContextWindow: m.ContextWindow, SupportsTools: m.SupportsTools, Vision: m.SupportsVision, Audio: m.SupportsAudio,
-			Pricing: pricing{InputPerMillion: m.InputPricePerMillion, OutputPerMillion: m.OutputPricePerMillion},
+			Pricing:      pricing{InputPerMillion: m.InputPricePerMillion, OutputPerMillion: m.OutputPricePerMillion},
+			Confidential: m.Provider == modelcatalog.ProviderTinfoilConfidential,
 		})
 	}
 	c.JSON(http.StatusOK, gin.H{"object": "list", "data": out})
+}
+
+// GetAttestation is GET /v1/models/attestation?model=<route>: the live
+// hardware-attestation proof for a confidential-inference model — a
+// customer-facing "verify it yourself" surface, not something Teepin
+// asserts on its own (see [[confidential-inference-hosting-model]]). model
+// is a query parameter, not a path segment, for the same reason every other
+// model-scoped endpoint in this codebase uses one: a route contains a
+// literal "/" ("teepin/confidential"), which breaks gin's single-segment
+// path params.
+func (h *InferenceHandler) GetAttestation(c *gin.Context) {
+	access, ok := resolveAccess(c)
+	if !ok {
+		return
+	}
+	route := c.Query("model")
+	if route == "" {
+		writeInferenceError(c, http.StatusBadRequest, "invalid_request_error", "invalid_request", `"model" query parameter is required`)
+		return
+	}
+
+	// Same combined check, and same uniform 404, as ChatCompletions: a
+	// caller must not learn what else exists from the shape of the error.
+	model, err := h.catalog.GetModel(c.Request.Context(), route)
+	if err != nil && !errors.Is(err, modelcatalog.ErrNotFound) {
+		log.Printf("inference: catalog lookup for %q: %v", route, err)
+		writeInferenceError(c, http.StatusInternalServerError, "api_error", "internal_error", "could not look up the model")
+		return
+	}
+	if err != nil || !model.Enabled || !model.OfferedToCustomers || !access.permits(route) {
+		writeInferenceError(c, http.StatusNotFound, "invalid_request_error", "model_not_found",
+			fmt.Sprintf("the model %q does not exist or you do not have access to it", route))
+		return
+	}
+
+	doc, err := h.gateway.Attestation(c.Request.Context(), *model)
+	if err != nil {
+		if errors.Is(err, inferencegateway.ErrAttestationNotSupported) {
+			// Not the "doesn't exist" 404 above — the model is real and
+			// accessible, it just isn't a confidential-inference model, which
+			// is not sensitive information once access is already confirmed.
+			writeInferenceError(c, http.StatusNotFound, "invalid_request_error", "attestation_not_supported",
+				fmt.Sprintf("%q does not provide an attestation proof", route))
+			return
+		}
+		h.writeGatewayError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, doc)
 }
 
 // InferenceUsageRecorder is the billing surface the inference handler meters

@@ -23,12 +23,15 @@ import (
 )
 
 type fakeGW struct {
-	completeResp *inference.Response
-	completeErr  error
-	streamChunks []inference.Chunk
-	streamErr    error
-	gotReq       inference.Request
-	gotAccount   string
+	completeResp        *inference.Response
+	completeErr         error
+	streamChunks        []inference.Chunk
+	streamErr           error
+	gotReq              inference.Request
+	gotAccount          string
+	attestationResp     any
+	attestationErr      error
+	gotAttestationModel modelcatalog.Model
 }
 
 func (f *fakeGW) Complete(_ context.Context, acct string, req inference.Request) (*inference.Response, error) {
@@ -44,6 +47,11 @@ func (f *fakeGW) Stream(_ context.Context, acct string, req inference.Request, o
 		}
 	}
 	return f.streamErr
+}
+
+func (f *fakeGW) Attestation(_ context.Context, m modelcatalog.Model) (any, error) {
+	f.gotAttestationModel = m
+	return f.attestationResp, f.attestationErr
 }
 
 type fakeCatalog struct{ models map[string]modelcatalog.Model }
@@ -114,6 +122,7 @@ func serve(t *testing.T, h *InferenceHandler, who caller, method, path, body str
 	})
 	r.POST("/v1/chat/completions", h.ChatCompletions)
 	r.GET("/v1/models", h.ListModels)
+	r.GET("/v1/models/attestation", h.GetAttestation)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -351,6 +360,106 @@ func TestListModels_FiltersToEnabledAndPermitted(t *testing.T) {
 
 	if rec := serve(t, h, caller{viaKey: true, scopes: []string{"instances:read"}}, "GET", "/v1/models", ""); rec.Code != 403 {
 		t.Errorf("key without the inference scope listed models: %d", rec.Code)
+	}
+}
+
+func confidentialCatalog() fakeCatalog {
+	return fakeCatalog{models: map[string]modelcatalog.Model{
+		"aptos/confidential": {
+			ModelRoute: "aptos/confidential", DisplayName: "Confidential", Engine: "tinfoil",
+			Enabled: true, OfferedToCustomers: true, Provider: modelcatalog.ProviderTinfoilConfidential,
+		},
+		"teepin/plain": {
+			ModelRoute: "teepin/plain", DisplayName: "Plain", Engine: "mlx",
+			Enabled: true, OfferedToCustomers: true,
+		},
+		"teepin/disabled-confidential": {
+			ModelRoute: "teepin/disabled-confidential", Enabled: false, Provider: modelcatalog.ProviderTinfoilConfidential,
+		},
+	}}
+}
+
+func TestListModels_ReportsConfidentialFlagOnlyForAttestedProvider(t *testing.T) {
+	h := NewInferenceHandler(&fakeGW{}, confidentialCatalog(), nil)
+	rec := serve(t, h, caller{}, "GET", "/v1/models", "")
+
+	var out struct {
+		Data []modelView `json:"data"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	byID := map[string]modelView{}
+	for _, m := range out.Data {
+		byID[m.ID] = m
+	}
+	if !byID["aptos/confidential"].Confidential {
+		t.Error("aptos/confidential should report confidential=true")
+	}
+	if byID["teepin/plain"].Confidential {
+		t.Error("teepin/plain should report confidential=false")
+	}
+}
+
+func TestGetAttestation_ReturnsTheGatewaysDocumentForAConfidentialModel(t *testing.T) {
+	gw := &fakeGW{attestationResp: map[string]any{"securityVerified": true, "enclaveHost": "router.inference.aptoslabs.com"}}
+	h := NewInferenceHandler(gw, confidentialCatalog(), nil)
+
+	rec := serve(t, h, caller{}, "GET", "/v1/models/attestation?model=aptos/confidential", "")
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "securityVerified") {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body)
+	}
+	if gw.gotAttestationModel.ModelRoute != "aptos/confidential" {
+		t.Errorf("gateway was asked about %q, want aptos/confidential", gw.gotAttestationModel.ModelRoute)
+	}
+}
+
+func TestGetAttestation_RequiresModelQueryParam(t *testing.T) {
+	h := NewInferenceHandler(&fakeGW{}, confidentialCatalog(), nil)
+	rec := serve(t, h, caller{}, "GET", "/v1/models/attestation", "")
+	if rec.Code != 400 || errCode(t, rec) != "invalid_request" {
+		t.Errorf("status=%d code=%q, want 400 invalid_request", rec.Code, errCode(t, rec))
+	}
+}
+
+// Mirrors TestChat_UnknownDisabledAndRestrictedModelsAreIndistinguishable's
+// own reasoning: a caller must not learn what else exists from the shape of
+// the error, whether a model is unknown, disabled, or off-limits to this key.
+func TestGetAttestation_UnknownDisabledAndRestrictedModelsAreIndistinguishable(t *testing.T) {
+	h := NewInferenceHandler(&fakeGW{}, confidentialCatalog(), nil)
+	key := caller{viaKey: true, scopes: []string{ScopeInferenceInvoke, scopeInferenceModel + "aptos/confidential"}}
+
+	cases := map[string]string{
+		"unknown":                   "teepin/nope",
+		"disabled":                  "teepin/disabled-confidential",
+		"not permitted to this key": "teepin/plain",
+	}
+	for name, model := range cases {
+		rec := serve(t, h, key, "GET", "/v1/models/attestation?model="+model, "")
+		if rec.Code != 404 || errCode(t, rec) != "model_not_found" {
+			t.Errorf("%s: status=%d code=%q, want 404 model_not_found", name, rec.Code, errCode(t, rec))
+		}
+	}
+}
+
+// A model that exists and is accessible, but simply isn't confidential, gets
+// a DIFFERENT error code from "doesn't exist" — that distinction is not
+// sensitive once access is already confirmed, unlike existence itself.
+func TestGetAttestation_NonConfidentialModelIsADistinctNotFoundCode(t *testing.T) {
+	gw := &fakeGW{attestationErr: inferencegateway.ErrAttestationNotSupported}
+	h := NewInferenceHandler(gw, confidentialCatalog(), nil)
+
+	rec := serve(t, h, caller{}, "GET", "/v1/models/attestation?model=teepin/plain", "")
+	if rec.Code != 404 || errCode(t, rec) != "attestation_not_supported" {
+		t.Errorf("status=%d code=%q, want 404 attestation_not_supported", rec.Code, errCode(t, rec))
+	}
+}
+
+func TestGetAttestation_GatewayErrorMapsThroughTheStandardErrorHandling(t *testing.T) {
+	gw := &fakeGW{attestationErr: inference.ErrProviderUnavailable}
+	h := NewInferenceHandler(gw, confidentialCatalog(), nil)
+
+	rec := serve(t, h, caller{}, "GET", "/v1/models/attestation?model=aptos/confidential", "")
+	if rec.Code != 503 || errCode(t, rec) != "model_unavailable" {
+		t.Errorf("status=%d code=%q, want 503 model_unavailable", rec.Code, errCode(t, rec))
 	}
 }
 

@@ -1487,6 +1487,7 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 			}
 			v1.POST("/chat/completions", append(inferenceAuth, publicInferenceHandler.ChatCompletions)...)
 			v1.GET("/models", append(inferenceAuth, publicInferenceHandler.ListModels)...)
+			v1.GET("/models/attestation", append(inferenceAuth, publicInferenceHandler.GetAttestation)...)
 		}
 
 		storageGroup := v1.Group("/storage")

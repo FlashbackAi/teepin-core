@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -35,6 +36,21 @@ func (f *fakeProvider) Stream(ctx context.Context, req inference.Request, onChun
 }
 
 var _ inference.Provider = (*fakeProvider)(nil)
+
+// fakeAttestingProvider is a fakeProvider that additionally implements
+// inference.AttestationReporter — a separate type, not a field on
+// fakeProvider itself, so a plain fakeProvider genuinely does NOT satisfy
+// the interface (exercising Attestation's type-assertion-fails path)
+// without needing an explicit "not implemented" sentinel.
+type fakeAttestingProvider struct {
+	*fakeProvider
+	doc any
+	err error
+}
+
+func (f *fakeAttestingProvider) Attestation() (any, error) { return f.doc, f.err }
+
+var _ inference.AttestationReporter = (*fakeAttestingProvider)(nil)
 
 func newTestServices(t *testing.T) (*modelcatalog.Service, *nodeservices.Service, sqlmock.Sqlmock, func()) {
 	t.Helper()
@@ -260,6 +276,60 @@ func TestStatus_ExternalBeforeAnyCheckIsUnknown(t *testing.T) {
 	g := New(nil, nil, nil)
 	if st := g.Status(context.Background(), haiku); st.State != StateUnknown {
 		t.Errorf("State = %q, want %q — an unchecked model must not look unhealthy", st.State, StateUnknown)
+	}
+}
+
+func TestAttestation_SelfHostedModelIsNotSupported(t *testing.T) {
+	g := New(nil, nil, nil)
+	_, err := g.Attestation(context.Background(), modelcatalog.Model{ModelRoute: "teepin/qwen3-30b-a3b", Provider: modelcatalog.ProviderNode})
+	if !errors.Is(err, ErrAttestationNotSupported) {
+		t.Errorf("err = %v, want ErrAttestationNotSupported", err)
+	}
+}
+
+func TestAttestation_ProviderWithoutAttestationReporterIsNotSupported(t *testing.T) {
+	g := New(nil, nil, nil)
+	g.newExternal = func(modelcatalog.Model, string) (inference.Provider, error) {
+		return &fakeProvider{name: "anthropic"}, nil // does not implement AttestationReporter
+	}
+	_, err := g.Attestation(context.Background(), haiku)
+	if !errors.Is(err, ErrAttestationNotSupported) {
+		t.Errorf("err = %v, want ErrAttestationNotSupported", err)
+	}
+}
+
+func TestAttestation_ReturnsTheReportersDocument(t *testing.T) {
+	g := New(nil, nil, nil)
+	wantDoc := map[string]any{"securityVerified": true}
+	g.newExternal = func(modelcatalog.Model, string) (inference.Provider, error) {
+		return &fakeAttestingProvider{fakeProvider: &fakeProvider{name: "tinfoil_confidential"}, doc: wantDoc}, nil
+	}
+	doc, err := g.Attestation(context.Background(), haiku)
+	if err != nil {
+		t.Fatalf("Attestation: %v", err)
+	}
+	if got, ok := doc.(map[string]any); !ok || got["securityVerified"] != true {
+		t.Errorf("doc = %+v, want %+v", doc, wantDoc)
+	}
+}
+
+// A resolution failure (attestation genuinely broken, key invalid, enclave
+// unreachable) must NOT be masked as "not supported" — those are very
+// different signals: one means "nothing to check here," the other means
+// "this model claims confidentiality and that claim currently can't be
+// substantiated," which callers need to be able to tell apart.
+func TestAttestation_ResolutionFailureIsNotMaskedAsNotSupported(t *testing.T) {
+	g := New(nil, nil, nil)
+	wantErr := fmt.Errorf("%w: enclave unreachable", inference.ErrProviderUnavailable)
+	g.newExternal = func(modelcatalog.Model, string) (inference.Provider, error) {
+		return nil, wantErr
+	}
+	_, err := g.Attestation(context.Background(), haiku)
+	if errors.Is(err, ErrAttestationNotSupported) {
+		t.Error("a resolution failure must not be reported as ErrAttestationNotSupported")
+	}
+	if !errors.Is(err, inference.ErrProviderUnavailable) {
+		t.Errorf("err = %v, want it to wrap ErrProviderUnavailable", err)
 	}
 }
 

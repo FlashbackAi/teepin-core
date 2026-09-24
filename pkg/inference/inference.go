@@ -178,6 +178,25 @@ type HealthChecker interface {
 	CheckHealth(ctx context.Context) error
 }
 
+// AttestationReporter is an optional capability a Provider may implement:
+// proof that a request is actually handled inside a hardware-attested
+// confidential-computing enclave, for a customer-facing "verify it
+// yourself" surface — not an internal health signal (see HealthChecker),
+// and not something Teepin asserts on its own. Only a provider genuinely
+// backed by remote attestation (TinfoilConfidentialProvider) implements
+// this; a caller finds out via a type assertion, same convention as
+// HealthChecker.
+type AttestationReporter interface {
+	// Attestation returns the CURRENT verification result — live, not a
+	// cached snapshot from provider construction, since the underlying
+	// transport can re-verify on certificate rotation. The return type is
+	// intentionally opaque here (an any-boxed, JSON-marshalable value):
+	// this package should not import a specific attestation vendor's SDK
+	// types into its own public interface, only the one provider that
+	// actually has one does.
+	Attestation() (any, error)
+}
+
 // EstimateTokens approximates the token count of a request for the
 // pre-dispatch fit check.
 //

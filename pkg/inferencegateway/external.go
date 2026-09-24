@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -192,6 +193,32 @@ func (g *Gateway) checkOne(ctx context.Context, m modelcatalog.Model) ModelStatu
 		return ModelStatus{State: StateUnhealthy, Detail: err.Error(), CheckedAt: &now}
 	}
 	return ModelStatus{State: StateServing, CheckedAt: &now}
+}
+
+// ErrAttestationNotSupported means m's provider does not implement
+// inference.AttestationReporter — not a failure to alert on, just "this
+// model has nothing to prove" (a plain vLLM or Anthropic-backed model).
+// Distinct from a resolution/attestation error, which means the model DOES
+// claim to be attested but that claim currently can't be substantiated.
+var ErrAttestationNotSupported = errors.New("this model does not provide an attestation proof")
+
+// Attestation returns the live attestation proof for an external model that
+// implements inference.AttestationReporter (currently only
+// ProviderTinfoilConfidential) — the customer-facing "verify it yourself"
+// surface. Mirrors Status/checkOne's own resolve-then-type-assert shape.
+func (g *Gateway) Attestation(ctx context.Context, m modelcatalog.Model) (any, error) {
+	if !m.Provider.IsExternal() {
+		return nil, ErrAttestationNotSupported
+	}
+	p, err := g.externalProviderFor(ctx, m)
+	if err != nil {
+		return nil, err
+	}
+	reporter, ok := p.(inference.AttestationReporter)
+	if !ok {
+		return nil, ErrAttestationNotSupported
+	}
+	return reporter.Attestation()
 }
 
 func (g *Gateway) setHealth(route string, st ModelStatus) {
