@@ -72,6 +72,9 @@ func TestRegisterModel_Validation(t *testing.T) {
 	if err := s.RegisterModel(context.Background(), Model{ModelRoute: "x", Engine: "vllm", CostClass: CostClassOwn, Provider: ProviderOpenAICompatible, ProviderModel: "m"}); err == nil {
 		t.Error("openai_compatible model without base_url accepted")
 	}
+	if err := s.RegisterModel(context.Background(), Model{ModelRoute: "x", Engine: "tinfoil", CostClass: CostClassFrontier, Provider: ProviderTinfoilConfidential, ProviderModel: "qwen3-omni"}); err == nil {
+		t.Error("tinfoil_confidential model without base_url accepted")
+	}
 	if err := s.RegisterModel(context.Background(), Model{ModelRoute: "x", Engine: "vllm", CostClass: CostClassOwn, Provider: "bogus"}); err == nil {
 		t.Error("invalid provider accepted")
 	}

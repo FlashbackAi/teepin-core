@@ -54,6 +54,10 @@ func (m *Model) validate() error {
 		if m.ProviderModel == "" || m.BaseURL == "" {
 			return fmt.Errorf("provider_model and base_url are required for an openai_compatible model")
 		}
+	case ProviderTinfoilConfidential:
+		if m.ProviderModel == "" || m.BaseURL == "" {
+			return fmt.Errorf("provider_model and base_url are required for a tinfoil_confidential model")
+		}
 	default:
 		return fmt.Errorf("invalid provider %q", m.Provider)
 	}
