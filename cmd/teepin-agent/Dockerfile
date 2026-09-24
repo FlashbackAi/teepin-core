@@ -4,8 +4,10 @@
 # The TEEPIN cluster agent: runs on the GPU node, dials out to the
 # control plane. Exposes no ports.
 
-# Must be >= the `go` directive in go.mod.
-FROM golang:1.25-alpine AS builder
+# Must be >= the `go` directive in go.mod (1.26.6, pushed up by the
+# tinfoil-go dependency — see cmd/api-server/Dockerfile's own pin, moved
+# for the same reason). This pin and go.mod have to move together.
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /app
 
