@@ -518,7 +518,12 @@ func (h *InferenceHandler) GetAttestation(c *gin.Context) {
 // neither, and grouping into buckets risks silently failing a customer's
 // deliberately-chosen confidential model over to a different, non-
 // confidential one (see migration 058's own doc comment for the incident
-// this replaced).
+// this replaced). SelfHosted is Provider.IsThirdParty()'s negation, not a
+// plain ProviderNode check: a partner-hosted confidential enclave
+// (ProviderTinfoilConfidential) is presented as Teepin's own infrastructure
+// to the customer, same as leased GPU/CPU compute — "third-party" is
+// reserved for a vendor's own API Teepin merely calls (Anthropic, an
+// arbitrary OpenAI-compatible endpoint).
 type kumbhaModelView struct {
 	Route         string  `json:"route"`
 	DisplayName   string  `json:"display_name"`
@@ -563,7 +568,7 @@ func (h *InferenceHandler) GetKumbhaModels(c *gin.Context) {
 		out = append(out, kumbhaModelView{
 			Route: m.ModelRoute, DisplayName: m.DisplayName,
 			Confidential: m.Provider == modelcatalog.ProviderTinfoilConfidential,
-			SelfHosted:   m.Provider == modelcatalog.ProviderNode,
+			SelfHosted:   !m.Provider.IsThirdParty(),
 			SupportsTools: m.SupportsTools, Vision: m.SupportsVision, Audio: m.SupportsAudio,
 			Pricing: pricing{InputPerMillion: m.InputPricePerMillion, OutputPerMillion: m.OutputPricePerMillion},
 		})

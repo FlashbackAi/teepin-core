@@ -45,9 +45,25 @@ const (
 	ProviderTinfoilConfidential Provider = "tinfoil_confidential"
 )
 
-// IsExternal reports whether the model is served by a third-party API
-// rather than Teepin's own nodes.
+// IsExternal reports whether serving this model means an actual network
+// call to somewhere other than Teepin's own nodes — the DISPATCH question
+// (which inferencegateway routing path applies), not a customer-facing
+// claim about whose infrastructure it is. ProviderTinfoilConfidential is
+// external by this measure (a real call to the enclave), even though
+// IsThirdParty says the opposite.
 func (p Provider) IsExternal() bool { return p != ProviderNode }
+
+// IsThirdParty reports whether a model is a vendor's own API that Teepin
+// merely calls (Anthropic, an arbitrary OpenAI-compatible endpoint) — the
+// customer-facing BRANDING question, distinct from IsExternal's dispatch
+// question. A partner-hosted confidential enclave (ProviderTinfoilConfidential)
+// is answered false here on purpose: Teepin presents it as its own
+// infrastructure to the customer, the same posture already taken for leased
+// GPU/CPU compute — the partnership is a hosting arrangement, not something
+// that should read as "third-party" in the product.
+func (p Provider) IsThirdParty() bool {
+	return p == ProviderAnthropic || p == ProviderOpenAICompatible
+}
 
 // Model is one entry in Teepin Inference's catalog: a routable model name,
 // what it can do, and what it costs on both sides of the ledger.

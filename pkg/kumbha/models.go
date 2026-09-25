@@ -48,8 +48,12 @@ type Model struct {
 	// hardware-attested enclave, not a claim Teepin or a plain third party
 	// makes about itself.
 	Confidential bool
-	// SelfHosted mirrors modelcatalog.ProviderNode — false means a
-	// third-party API Teepin calls directly (a "vendor-hosted" badge).
+	// SelfHosted is modelcatalog.Provider.IsThirdParty()'s negation, not a
+	// plain ProviderNode check — a partner-hosted confidential enclave
+	// (ProviderTinfoilConfidential) is presented as Teepin's own
+	// infrastructure to the customer, same posture as leased GPU/CPU
+	// compute. False means a genuine vendor API Teepin merely calls
+	// (Anthropic, an arbitrary OpenAI-compatible endpoint).
 	SelfHosted            bool
 	SupportsTools         bool
 	SupportsVision        bool
