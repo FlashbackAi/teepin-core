@@ -37,7 +37,7 @@ func TestStaticModels_ListsInOrderAndServesByRoute(t *testing.T) {
 		{Route: "b", Engine: "anthropic", Provider: &fakeProvider{name: "second"}},
 	}
 
-	listed, err := models.KumbhaModels(context.Background(), "teepin/fast")
+	listed, err := models.KumbhaModels(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,18 +51,5 @@ func TestStaticModels_ListsInOrderAndServesByRoute(t *testing.T) {
 	}
 	if _, err := models.Complete(context.Background(), "acct", inference.Request{Model: "missing"}); !errors.Is(err, inference.ErrUnknownModel) {
 		t.Errorf("Complete(missing) = %v, want ErrUnknownModel", err)
-	}
-}
-
-func TestIsModelAlias(t *testing.T) {
-	for name, want := range map[string]bool{
-		"teepin/fast":                true,
-		"teepin/deep":                true,
-		"anthropic/claude-haiku-4-5": false,
-		"":                           false,
-	} {
-		if got := isModelAlias(name); got != want {
-			t.Errorf("isModelAlias(%q) = %v, want %v", name, got, want)
-		}
 	}
 }

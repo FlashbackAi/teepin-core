@@ -101,14 +101,6 @@ type Model struct {
 	// models are tried in ascending KumbhaPriority order.
 	KumbhaEnabled  bool `json:"kumbha_enabled"`
 	KumbhaPriority int  `json:"kumbha_priority"`
-	// KumbhaAlias is which of Kumbha's own aliases ("teepin/fast",
-	// "teepin/deep", "teepin/confidential" — the only names Kumbha's agent
-	// or a customer ever addresses) this model may serve. A plain string,
-	// not a shared Go type with pkg/kumbha (which owns the actual alias
-	// set): mirrors how CostClass is redeclared here rather than imported,
-	// so this package stays free of a dependency on the runtime seam.
-	// Meaningless unless KumbhaEnabled is also true.
-	KumbhaAlias string `json:"kumbha_alias"`
 
 	UpdatedBy *string   `json:"updated_by,omitempty"`
 	CreatedAt time.Time `json:"created_at"`

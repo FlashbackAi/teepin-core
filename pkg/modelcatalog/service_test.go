@@ -117,7 +117,7 @@ func TestSetAvailability_PartialUpdateLeavesNilFieldsAlone(t *testing.T) {
 
 	on := true
 	mock.ExpectExec(`SET offered_to_customers = COALESCE\(\$1, offered_to_customers\)`).
-		WithArgs(nil, &on, nil, nil, "op", "anthropic/claude-haiku-4-5").
+		WithArgs(nil, &on, nil, "op", "anthropic/claude-haiku-4-5").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	if err := s.SetAvailability(context.Background(), "anthropic/claude-haiku-4-5", Availability{KumbhaEnabled: &on}, "op"); err != nil {
@@ -145,11 +145,10 @@ func TestListKumbhaModels_FiltersAndOrdersByPriority(t *testing.T) {
 	s, mock, done := newMock(t)
 	defer done()
 
-	mock.ExpectQuery(`WHERE enabled AND kumbha_enabled AND kumbha_alias = \$1 ORDER BY kumbha_priority, model_route`).
-		WithArgs("teepin/fast").
+	mock.ExpectQuery(`WHERE enabled AND kumbha_enabled ORDER BY kumbha_priority, model_route`).
 		WillReturnRows(sqlmock.NewRows(modelRowColumns()))
 
-	if _, err := s.ListKumbhaModels(context.Background(), "teepin/fast"); err != nil {
+	if _, err := s.ListKumbhaModels(context.Background()); err != nil {
 		t.Fatalf("ListKumbhaModels: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -228,7 +227,7 @@ func TestGetModel_ReturnsFullRow(t *testing.T) {
 			4.5, 18.0,
 			&vendorIn, &vendorOut,
 			true, "anthropic", "claude-sonnet-5", "", 8192,
-			"inference-model-key-abc", false, true, 1, "teepin/fast",
+			"inference-model-key-abc", false, true, 1,
 			"op", now, now,
 		))
 
@@ -297,7 +296,7 @@ func modelRowColumns() []string {
 		"input_price_per_million", "output_price_per_million",
 		"vendor_input_cost_per_million", "vendor_output_cost_per_million",
 		"enabled", "provider", "provider_model", "base_url", "max_output_tokens",
-		"api_key_ref", "offered_to_customers", "kumbha_enabled", "kumbha_priority", "kumbha_alias",
+		"api_key_ref", "offered_to_customers", "kumbha_enabled", "kumbha_priority",
 		"updated_by", "created_at", "updated_at",
 	}
 }

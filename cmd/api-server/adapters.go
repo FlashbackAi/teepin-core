@@ -333,14 +333,25 @@ func newKumbhaModelBackend(catalog *modelcatalog.Service, gateway *inferencegate
 	return &kumbhaModelBackend{catalog: catalog, gateway: gateway}
 }
 
-func (b *kumbhaModelBackend) KumbhaModels(ctx context.Context, alias string) ([]kumbha.Model, error) {
-	models, err := b.catalog.ListKumbhaModels(ctx, alias)
+func (b *kumbhaModelBackend) KumbhaModels(ctx context.Context) ([]kumbha.Model, error) {
+	models, err := b.catalog.ListKumbhaModels(ctx)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]kumbha.Model, 0, len(models))
 	for _, m := range models {
-		out = append(out, kumbha.Model{Route: m.ModelRoute, Engine: m.Engine})
+		out = append(out, kumbha.Model{
+			Route:                 m.ModelRoute,
+			DisplayName:           m.DisplayName,
+			Engine:                m.Engine,
+			Confidential:          m.Provider == modelcatalog.ProviderTinfoilConfidential,
+			SelfHosted:            m.Provider == modelcatalog.ProviderNode,
+			SupportsTools:         m.SupportsTools,
+			SupportsVision:        m.SupportsVision,
+			SupportsAudio:         m.SupportsAudio,
+			InputPricePerMillion:  m.InputPricePerMillion,
+			OutputPricePerMillion: m.OutputPricePerMillion,
+		})
 	}
 	return out, nil
 }

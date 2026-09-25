@@ -204,7 +204,8 @@ func TestCreateKumbhaSession_RequiresProjectScope(t *testing.T) {
 }
 
 func TestCreateKumbhaSession_PaymentRequiredMapsTo402(t *testing.T) {
-	server := newTestServerWithKumbha(t, denyGate{reason: "no card on file"}, nil)
+	models := kumbha.StaticModels{{Route: "teepin/qwen3-30b-a3b", Engine: "vllm", Provider: &stubProvider{}}}
+	server := newTestServerWithKumbha(t, denyGate{reason: "no card on file"}, models)
 	w := kumbhaRequest(server.CreateKumbhaSession, http.MethodPost, "/v1/kumbha/sessions", nil,
 		uuid.New(), createKumbhaSessionRequest{Budget: 5}, nil)
 	if w.Code != http.StatusPaymentRequired {
@@ -218,7 +219,8 @@ func TestCreateKumbhaSession_PaymentRequiredMapsTo402(t *testing.T) {
 }
 
 func TestCreateKumbhaSession_InvalidBudgetIs400(t *testing.T) {
-	server := newTestServerWithKumbha(t, allowGate{}, nil)
+	models := kumbha.StaticModels{{Route: "teepin/qwen3-30b-a3b", Engine: "vllm", Provider: &stubProvider{}}}
+	server := newTestServerWithKumbha(t, allowGate{}, models)
 	w := kumbhaRequest(server.CreateKumbhaSession, http.MethodPost, "/v1/kumbha/sessions", nil,
 		uuid.New(), createKumbhaSessionRequest{Budget: 0}, nil)
 	if w.Code != http.StatusBadRequest {
@@ -228,13 +230,14 @@ func TestCreateKumbhaSession_InvalidBudgetIs400(t *testing.T) {
 
 func TestCreateKumbhaSession_Success(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	models := kumbha.StaticModels{{Route: "teepin/qwen3-30b-a3b", Engine: "vllm", Provider: &stubProvider{}}}
+	gw := kumbha.NewGateway(kStore, models, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	projectID := uuid.New()
 	sessionID := uuid.New()
 	mock.ExpectQuery(`INSERT INTO billing\.inference_sessions`).
-		WithArgs(testAccountID, projectID, 5.0, "test build", kumbha.DefaultModelAlias).
+		WithArgs(testAccountID, projectID, 5.0, "test build", "teepin/qwen3-30b-a3b").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "spent", "status", "started_at"}).
 			AddRow(sessionID, 0.0, "open", nowStub()))
 
@@ -258,13 +261,14 @@ func TestCreateKumbhaSession_Success(t *testing.T) {
 // success for a build that never actually started.
 func TestCreateKumbhaSession_PromptWithoutAgentConfiguredIs503(t *testing.T) {
 	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
+	models := kumbha.StaticModels{{Route: "teepin/qwen3-30b-a3b", Engine: "vllm", Provider: &stubProvider{}}}
+	gw := kumbha.NewGateway(kStore, models, allowGate{}, &fakeKPricing{}, noopUsageRecorder{})
 	server := (&Server{store: cStore}).WithKumbha(gw)
 
 	projectID := uuid.New()
 	sessionID := uuid.New()
 	mock.ExpectQuery(`INSERT INTO billing\.inference_sessions`).
-		WithArgs(testAccountID, projectID, 5.0, nil, kumbha.DefaultModelAlias).
+		WithArgs(testAccountID, projectID, 5.0, nil, "teepin/qwen3-30b-a3b").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "spent", "status", "started_at"}).
 			AddRow(sessionID, 0.0, "open", nowStub()))
 

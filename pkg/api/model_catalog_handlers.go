@@ -93,10 +93,9 @@ type registerModelRequest struct {
 // availabilityRequest is where a model may be used; a nil field is left as
 // it is (see modelcatalog.Availability).
 type availabilityRequest struct {
-	OfferedToCustomers *bool   `json:"offered_to_customers"`
-	KumbhaEnabled      *bool   `json:"kumbha_enabled"`
-	KumbhaPriority     *int    `json:"kumbha_priority"`
-	KumbhaAlias        *string `json:"kumbha_alias"`
+	OfferedToCustomers *bool `json:"offered_to_customers"`
+	KumbhaEnabled      *bool `json:"kumbha_enabled"`
+	KumbhaPriority     *int  `json:"kumbha_priority"`
 }
 
 func (r availabilityRequest) toAvailability() modelcatalog.Availability {
@@ -104,12 +103,11 @@ func (r availabilityRequest) toAvailability() modelcatalog.Availability {
 		OfferedToCustomers: r.OfferedToCustomers,
 		KumbhaEnabled:      r.KumbhaEnabled,
 		KumbhaPriority:     r.KumbhaPriority,
-		KumbhaAlias:        r.KumbhaAlias,
 	}
 }
 
 func (r availabilityRequest) any() bool {
-	return r.OfferedToCustomers != nil || r.KumbhaEnabled != nil || r.KumbhaPriority != nil || r.KumbhaAlias != nil
+	return r.OfferedToCustomers != nil || r.KumbhaEnabled != nil || r.KumbhaPriority != nil
 }
 
 // RegisterModel is POST /v1/admin/inference/models — creates or updates a

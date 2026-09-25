@@ -63,10 +63,11 @@ type createKumbhaSessionRequest struct {
 	Budget float64 `json:"budget"`
 	Label  string  `json:"label,omitempty"`
 	Prompt string  `json:"prompt,omitempty"`
-	// Model is one of kumbha.ModelAliases ("teepin/fast", "teepin/deep",
-	// "teepin/confidential"). Empty means kumbha.DefaultModelAlias — an
-	// older console build, or a caller that never shows a tier picker,
-	// behaves exactly as it always has.
+	// Model is the exact catalog model_route a customer picked from the
+	// Kumbha model picker (see GetKumbhaModels). Empty defers to whichever
+	// kumbha-enabled model has the lowest kumbha_priority — an older
+	// console build, or a caller that never shows a picker, still gets a
+	// sensible default rather than an error.
 	Model string `json:"model,omitempty"`
 	// Attachments backs the initial prompt only — ignored entirely unless
 	// Prompt is also set (there is no session to launch an agent into
@@ -89,7 +90,7 @@ func kumbhaSessionResponse(sess *kumbha.Session) gin.H {
 		"spent":           sess.Spent,
 		"status":          sess.Status,
 		"label":           sess.Label,
-		"model_alias":     sess.ModelAlias,
+		"model_route":     sess.ModelRoute,
 		"deploy_approved": sess.DeployApproved,
 		// agent_running is derived rather than exposing agent_instance_id
 		// directly — the console needs to know whether a build is

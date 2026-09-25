@@ -11,20 +11,51 @@ import (
 )
 
 // Kumbha has no model registry of its own. Which models the build agent may
-// use, and in what order, is a property of each model in the platform's one
-// catalog (pkg/modelcatalog: kumbha_enabled / kumbha_priority), and every
-// completion is served through Teepin Inference's gateway — the same path a
-// customer's own API call takes. ModelBackend is that seam.
+// use is a property of each model in the platform's one catalog
+// (pkg/modelcatalog: kumbha_enabled), and every completion is served
+// through Teepin Inference's gateway — the same path a customer's own API
+// call takes. ModelBackend is that seam.
+//
+// A customer picks one of these models DIRECTLY, by its real route — there
+// is no alias/tier bucket sitting in front of them. An earlier design
+// (migration 055's kumbha_alias — "teepin/fast" / "teepin/deep" /
+// "teepin/confidential") modeled "which bucket" as one mutually-exclusive
+// category per model, which does not match reality: a model can be BOTH
+// tool-capable and confidential, or neither, and forcing it into exactly
+// one of three buckets either hid a real gap (a bucket with no
+// tool-capable model in it, silently unusable by the build agent) or
+// created a real security regression — a bucket with more than one
+// backing model could fail over from a customer's deliberately-chosen
+// confidential model to a DIFFERENT, non-confidential one, silently.
+// Direct selection with per-model badges (Confidential, Self-hosted vs
+// third-party — both computed from Provider, never stored separately)
+// avoids both problems: a customer sees exactly what they are choosing,
+// and a failure surfaces as an error on THAT model, never a silent switch
+// to one with different guarantees.
 
-// Model is one model the build agent may use.
+// Model is one model the build agent may use, listed to a customer so they
+// can choose it directly by name.
 type Model struct {
-	// Route is the model's catalog model_route — what the backend is asked
-	// for. Never shown to a customer.
-	Route string
+	// Route is the model's catalog model_route — what a customer's choice,
+	// and every completion request for that session, names directly.
+	Route       string
+	DisplayName string
 	// Engine identifies the serving backend in usage records' provider
 	// column, the one place backend identity is recorded (for the admin
-	// margin view).
+	// margin view) — never shown to a customer.
 	Engine string
+	// Confidential mirrors modelcatalog.ProviderTinfoilConfidential — a
+	// hardware-attested enclave, not a claim Teepin or a plain third party
+	// makes about itself.
+	Confidential bool
+	// SelfHosted mirrors modelcatalog.ProviderNode — false means a
+	// third-party API Teepin calls directly (a "vendor-hosted" badge).
+	SelfHosted            bool
+	SupportsTools         bool
+	SupportsVision        bool
+	SupportsAudio         bool
+	InputPricePerMillion  float64
+	OutputPricePerMillion float64
 }
 
 // ModelBackend lists Kumbha's models and serves completions against them.
@@ -32,42 +63,14 @@ type Model struct {
 // inferencegateway (cmd/api-server/adapters.go), which keeps this package
 // free of both.
 type ModelBackend interface {
-	// KumbhaModels returns the models backing ONE alias, in the order they
-	// should be tried. Before the alias parameter existed (migration 055),
-	// every alias silently resolved to the same list — see
-	// pkg/modelcatalog.Service.ListKumbhaModels's own doc comment.
-	KumbhaModels(ctx context.Context, alias string) ([]Model, error)
+	// KumbhaModels returns every model the build agent may currently be
+	// asked for — for a customer-facing picker. Order is catalog
+	// kumbha_priority (display/default order), never a failover sequence:
+	// a customer's choice is exact and is never silently substituted for a
+	// different model.
+	KumbhaModels(ctx context.Context) ([]Model, error)
 	// Complete serves req against the catalog model named by req.Model.
 	Complete(ctx context.Context, accountID string, req inference.Request) (*inference.Response, error)
-}
-
-// DefaultModelAlias is the model name the agent image addresses Kumbha by
-// absent an explicit customer choice.
-//
-// Kumbha's aliases are not models: whichever alias a request names, it is
-// served by that alias's own catalog models in priority order (an
-// operator-controlled list — pkg/modelcatalog's kumbha_alias column, not
-// something a customer's choice bypasses). "teepin/deep" is still accepted
-// so an agent image or harness configured with the old frontier-route name
-// keeps working. "teepin/confidential" is the one alias with a real,
-// customer-visible meaning today (hardware-attested inference, chosen
-// explicitly in the Kumbha composer) rather than an internal fast/deep
-// distinction the catalog alone decides.
-const DefaultModelAlias = "teepin/fast"
-
-// ModelAliases is every alias a session may be created with, and the only
-// values TEEPIN_ROUTE (the agent pod env var) is ever set to. Exported so
-// the API layer can validate a customer-supplied choice against the exact
-// same set this package resolves, rather than duplicating the list.
-var ModelAliases = []string{DefaultModelAlias, "teepin/deep", "teepin/confidential"}
-
-func isModelAlias(name string) bool {
-	for _, a := range ModelAliases {
-		if name == a {
-			return true
-		}
-	}
-	return false
 }
 
 // StaticModel is one entry of a StaticModels backend.
@@ -77,17 +80,12 @@ type StaticModel struct {
 	Provider inference.Provider
 }
 
-// StaticModels is a fixed, in-memory ModelBackend: its models are tried in
+// StaticModels is a fixed, in-memory ModelBackend: its models are listed in
 // slice order, each served by its own Provider. For tests and for running
 // Kumbha without a model catalog.
 type StaticModels []StaticModel
 
-// KumbhaModels ignores alias: StaticModels is a fixed test/no-catalog
-// fallback with no per-alias tagging of its own, so it serves every alias
-// identically — the pre-migration-055 behavior, acceptable here since this
-// backend exists for tests and running without a real catalog, not for
-// exercising alias-specific routing.
-func (s StaticModels) KumbhaModels(_ context.Context, _ string) ([]Model, error) {
+func (s StaticModels) KumbhaModels(context.Context) ([]Model, error) {
 	out := make([]Model, 0, len(s))
 	for _, m := range s {
 		out = append(out, Model{Route: m.Route, Engine: m.Engine})

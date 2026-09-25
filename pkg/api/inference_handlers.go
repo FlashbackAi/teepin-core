@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -21,7 +22,6 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/billing"
 	"github.com/FlashbackAi/teepin-core/pkg/inference"
 	"github.com/FlashbackAi/teepin-core/pkg/inferencegateway"
-	"github.com/FlashbackAi/teepin-core/pkg/kumbha"
 	"github.com/FlashbackAi/teepin-core/pkg/modelcatalog"
 )
 
@@ -511,62 +511,59 @@ func (h *InferenceHandler) GetAttestation(c *gin.Context) {
 	c.JSON(http.StatusOK, doc)
 }
 
-// tierView describes one Kumbha alias for the build composer's tier picker:
-// enough to show a price and capability subtext without exposing which
-// backend model or vendor actually serves it (Kumbha's own "never shown to
-// a customer" rule for model identity — see pkg/kumbha/models.go).
-type tierView struct {
-	Alias         string  `json:"alias"`
+// kumbhaModelView describes one Kumbha-enabled model for the build
+// composer's model picker: its real route and display name, plus badges
+// computed from its own Provider — never a fixed Fast/Deep/Confidential
+// bucket, since a model can be both tool-capable and confidential, or
+// neither, and grouping into buckets risks silently failing a customer's
+// deliberately-chosen confidential model over to a different, non-
+// confidential one (see migration 058's own doc comment for the incident
+// this replaced).
+type kumbhaModelView struct {
+	Route         string  `json:"route"`
 	DisplayName   string  `json:"display_name"`
-	Available     bool    `json:"available"`
+	Confidential  bool    `json:"confidential"`
+	SelfHosted    bool    `json:"self_hosted"`
 	SupportsTools bool    `json:"supports_tools"`
 	Vision        bool    `json:"supports_vision"`
 	Audio         bool    `json:"supports_audio"`
 	Pricing       pricing `json:"pricing"`
 }
 
-// GetKumbhaTiers is GET /v1/kumbha/tiers: what the Kumbha build composer's
-// tier picker shows for each alias — its highest-priority backing model's
-// display name, capabilities, and price, per
-// pkg/kumbha/gateway.go's own Complete() (that model is what a build gets
-// almost all the time; failover to a lower-priority model is the rare
-// exception, not something a customer's tier choice can name up front).
-// Available is false when an alias currently has no enabled, Kumbha-enabled
-// model at all — the composer should disable, not hide, that choice, so a
-// customer can see it exists without being able to pick something that
-// would fail immediately.
-func (h *InferenceHandler) GetKumbhaTiers(c *gin.Context) {
+// GetKumbhaModels is GET /v1/kumbha/models: every enabled, Kumbha-enabled
+// model the build composer's picker can offer directly, ordered by
+// KumbhaPriority (the picker's default/recommendation order — no longer a
+// failover sequence; see pkg/kumbha/gateway.go's resolveModel). Confidential
+// and SelfHosted are computed independently from Provider, not mutually
+// exclusive categories, so a customer sees exactly what a model actually
+// guarantees instead of a lossy bucket label.
+func (h *InferenceHandler) GetKumbhaModels(c *gin.Context) {
 	if _, ok := resolveAccess(c); !ok {
 		return
 	}
 	models, err := h.catalog.ListModels(c.Request.Context())
 	if err != nil {
-		log.Printf("inference: list models for kumbha tiers: %v", err)
-		writeInferenceError(c, http.StatusInternalServerError, "api_error", "internal_error", "could not list tiers")
+		log.Printf("inference: list models for kumbha picker: %v", err)
+		writeInferenceError(c, http.StatusInternalServerError, "api_error", "internal_error", "could not list models")
 		return
 	}
 
-	// The lowest KumbhaPriority per alias among enabled, Kumbha-enabled
-	// models — same selection Complete() itself tries first.
-	best := map[string]modelcatalog.Model{}
+	enabled := make([]modelcatalog.Model, 0, len(models))
 	for _, m := range models {
-		if !m.Enabled || !m.KumbhaEnabled {
-			continue
-		}
-		if cur, ok := best[m.KumbhaAlias]; !ok || m.KumbhaPriority < cur.KumbhaPriority {
-			best[m.KumbhaAlias] = m
+		if m.Enabled && m.KumbhaEnabled {
+			enabled = append(enabled, m)
 		}
 	}
+	sort.Slice(enabled, func(i, j int) bool {
+		return enabled[i].KumbhaPriority < enabled[j].KumbhaPriority
+	})
 
-	out := make([]tierView, 0, len(kumbha.ModelAliases))
-	for _, alias := range kumbha.ModelAliases {
-		m, ok := best[alias]
-		if !ok {
-			out = append(out, tierView{Alias: alias})
-			continue
-		}
-		out = append(out, tierView{
-			Alias: alias, DisplayName: m.DisplayName, Available: true,
+	out := make([]kumbhaModelView, 0, len(enabled))
+	for _, m := range enabled {
+		out = append(out, kumbhaModelView{
+			Route: m.ModelRoute, DisplayName: m.DisplayName,
+			Confidential: m.Provider == modelcatalog.ProviderTinfoilConfidential,
+			SelfHosted:   m.Provider == modelcatalog.ProviderNode,
 			SupportsTools: m.SupportsTools, Vision: m.SupportsVision, Audio: m.SupportsAudio,
 			Pricing: pricing{InputPerMillion: m.InputPricePerMillion, OutputPerMillion: m.OutputPricePerMillion},
 		})

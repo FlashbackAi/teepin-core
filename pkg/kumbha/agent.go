@@ -144,8 +144,8 @@ const internalScratchPathInstruction = "Keep any of your own internal working no
 	"\"" + InternalScratchDir + "/\" is ever shown to the customer, deployed, or included in their downloads " +
 	"— it exists purely for your own use across relaunches of this same session.\n\n"
 
-// checkModelsAvailable reports whether the catalog has at least one model
-// enabled for Kumbha — run once up front by LaunchAgent so a build fails
+// checkModelAvailable reports whether route is currently a real,
+// kumbha-enabled model — run once up front by LaunchAgent so a build fails
 // immediately with a clear error when there is nothing to serve it,
 // instead of launching a pod that is guaranteed to fail its very first
 // completion silently. Found live 2026-09-22: a build submitted while
@@ -153,18 +153,29 @@ const internalScratchPathInstruction = "Keep any of your own internal working no
 // then never produced any output at all, with nothing in the console
 // explaining why — the session just sat at "Idle" forever.
 //
-// Only an empty list refuses the launch. A failure to read the list fails
-// open: a database blip should not block every build launch, and the
-// agent's own first completion will surface a real outage anyway.
-func (g *Gateway) checkModelsAvailable(ctx context.Context, alias string) error {
-	_, err := g.kumbhaModels(ctx, alias)
+// route not being in the current kumbha-enabled list refuses the launch —
+// this matters specifically for the RELAUNCH path (a follow-up message
+// resuming a dead pod): the session's own model may have been disabled
+// since it was first created, and CreateSession's own resolveModel check
+// only ever ran once, at that original creation. A failure to read the
+// list at all fails open: a database blip should not block every build
+// launch, and the agent's own first completion will surface a real outage
+// anyway.
+func (g *Gateway) checkModelAvailable(ctx context.Context, route string) error {
+	models, err := g.kumbhaModels(ctx)
 	if errors.Is(err, errNoKumbhaModels) {
 		return err
 	}
 	if err != nil {
 		log.Printf("WARN: could not list Kumbha's models before launch, allowing it: %v", err)
+		return nil
 	}
-	return nil
+	for _, m := range models {
+		if m.Route == route {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: %q is no longer a Kumbha-enabled model", errNoKumbhaModels, route)
 }
 
 // CapacityCandidate is one node's identity plus free room — the minimum
@@ -259,7 +270,7 @@ func (g *Gateway) LaunchAgent(ctx context.Context, sess *Session, prompt string,
 		attachmentsJSON = string(encoded)
 	}
 
-	if err := g.checkModelsAvailable(ctx, sess.ModelAlias); err != nil {
+	if err := g.checkModelAvailable(ctx, sess.ModelRoute); err != nil {
 		// Logged for the operator; the HTTP layer answers
 		// ErrAgentRouteUnavailable with a generic message.
 		log.Printf("WARN: kumbha agent launch refused: %v", err)
@@ -310,14 +321,14 @@ func (g *Gateway) LaunchAgent(ctx context.Context, sess *Session, prompt string,
 			// Attachment's own doc comment for why images and files are
 			// handled completely differently downstream.
 			"TEEPIN_PROMPT_ATTACHMENTS": attachmentsJSON,
-			// Was never actually set before this — run.py's own
-			// "teepin/fast" default silently stood in for every session
-			// ever launched, since nothing here provided a value. sess.
-			// ModelAlias is always one of ModelAliases by the time a
-			// Session exists (Gateway.CreateSession validates it, and
-			// defaults empty to DefaultModelAlias), so this always carries
-			// the customer's actual choice.
-			"TEEPIN_ROUTE": sess.ModelAlias,
+			// Was never actually set before this — run.py's own hardcoded
+			// default silently stood in for every session ever launched,
+			// since nothing here provided a value. sess.ModelRoute is
+			// always a real, currently kumbha-enabled catalog route by the
+			// time a Session exists (Gateway.CreateSession resolves and
+			// validates it — see resolveModel), so this always carries the
+			// customer's actual choice.
+			"TEEPIN_ROUTE": sess.ModelRoute,
 			// run.py's own working directory defaults to "/workspace" — the
 			// pod's ephemeral, non-persistent root filesystem — while the
 			// PVC this spec mounts (below, via StorageGB) lands at /data.

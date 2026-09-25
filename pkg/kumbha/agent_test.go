@@ -157,7 +157,7 @@ func TestGateway_LaunchAgent_Success(t *testing.T) {
 		WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest", CPUUnits: 2, MemoryGB: 4})
 
 	sessID, accountID, projectID := uuid.New(), uuid.New(), uuid.New()
-	sess := &Session{ID: sessID, AccountID: accountID, ProjectID: projectID}
+	sess := &Session{ID: sessID, AccountID: accountID, ProjectID: projectID, ModelRoute: "teepin/qwen3-30b-a3b"}
 
 	mock.ExpectExec(`UPDATE billing\.inference_sessions SET agent_instance_id`).
 		WithArgs(sessID, "kumbha-agent-"+sessID.String()[:8]).
@@ -225,7 +225,7 @@ func TestGateway_LaunchAgent_PicksNodeWithEnoughCapacity(t *testing.T) {
 		WithNodeCapacity(lister)
 
 	sessID := uuid.New()
-	sess := &Session{ID: sessID, AccountID: uuid.New(), ProjectID: uuid.New()}
+	sess := &Session{ID: sessID, AccountID: uuid.New(), ProjectID: uuid.New(), ModelRoute: "teepin/qwen3-30b-a3b"}
 	mock.ExpectExec(`UPDATE billing\.inference_sessions SET agent_instance_id`).
 		WithArgs(sessID, "kumbha-agent-"+sessID.String()[:8]).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -253,7 +253,7 @@ func TestGateway_LaunchAgent_PrefersNodeWithMostFreeCPU(t *testing.T) {
 		WithNodeCapacity(lister)
 
 	sessID := uuid.New()
-	sess := &Session{ID: sessID, AccountID: uuid.New(), ProjectID: uuid.New()}
+	sess := &Session{ID: sessID, AccountID: uuid.New(), ProjectID: uuid.New(), ModelRoute: "teepin/qwen3-30b-a3b"}
 	mock.ExpectExec(`UPDATE billing\.inference_sessions SET agent_instance_id`).
 		WithArgs(sessID, "kumbha-agent-"+sessID.String()[:8]).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -281,7 +281,7 @@ func TestGateway_LaunchAgent_NoCapacityAnywhereRefusesUpFront(t *testing.T) {
 		WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest", CPUUnits: 2, MemoryGB: 4}).
 		WithNodeCapacity(lister)
 
-	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), ProjectID: uuid.New()}
+	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), ProjectID: uuid.New(), ModelRoute: "teepin/qwen3-30b-a3b"}
 	err := gw.LaunchAgent(context.Background(), sess, "build me a booking app", nil)
 	if !errors.Is(err, ErrNoCapacity) {
 		t.Fatalf("got %v, want ErrNoCapacity", err)
@@ -304,7 +304,7 @@ func TestGateway_LaunchAgent_CapacityLookupErrorFailsOpen(t *testing.T) {
 		WithNodeCapacity(lister)
 
 	sessID := uuid.New()
-	sess := &Session{ID: sessID, AccountID: uuid.New(), ProjectID: uuid.New()}
+	sess := &Session{ID: sessID, AccountID: uuid.New(), ProjectID: uuid.New(), ModelRoute: "teepin/qwen3-30b-a3b"}
 	mock.ExpectExec(`UPDATE billing\.inference_sessions SET agent_instance_id`).
 		WithArgs(sessID, "kumbha-agent-"+sessID.String()[:8]).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -327,7 +327,7 @@ func TestGateway_LaunchAgent_NoCapacityListerConfiguredLeavesProviderIDEmpty(t *
 		WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest", CPUUnits: 2, MemoryGB: 4})
 
 	sessID := uuid.New()
-	sess := &Session{ID: sessID, AccountID: uuid.New(), ProjectID: uuid.New()}
+	sess := &Session{ID: sessID, AccountID: uuid.New(), ProjectID: uuid.New(), ModelRoute: "teepin/qwen3-30b-a3b"}
 	mock.ExpectExec(`UPDATE billing\.inference_sessions SET agent_instance_id`).
 		WithArgs(sessID, "kumbha-agent-"+sessID.String()[:8]).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -355,7 +355,7 @@ func TestGateway_LaunchAgent_PropagatesVisionCapableFlag(t *testing.T) {
 			WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest", VisionCapable: visionCapable})
 
 		sessID := uuid.New()
-		sess := &Session{ID: sessID, AccountID: uuid.New(), ProjectID: uuid.New()}
+		sess := &Session{ID: sessID, AccountID: uuid.New(), ProjectID: uuid.New(), ModelRoute: "teepin/qwen3-30b-a3b"}
 
 		mock.ExpectExec(`UPDATE billing\.inference_sessions SET agent_instance_id`).
 			WithArgs(sessID, "kumbha-agent-"+sessID.String()[:8]).
@@ -379,7 +379,7 @@ func TestGateway_LaunchAgent_RecordingFailureCleansUpThePod(t *testing.T) {
 		WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest"})
 
 	sessID := uuid.New()
-	sess := &Session{ID: sessID, AccountID: uuid.New(), ProjectID: uuid.New()}
+	sess := &Session{ID: sessID, AccountID: uuid.New(), ProjectID: uuid.New(), ModelRoute: "teepin/qwen3-30b-a3b"}
 
 	mock.ExpectExec(`UPDATE billing\.inference_sessions SET agent_instance_id`).
 		WillReturnError(errors.New("db write failed"))
@@ -654,7 +654,7 @@ func TestGateway_DeliverMessage_RelaunchesWhenAgentNotRunning(t *testing.T) {
 		WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest"})
 
 	sessID := uuid.New()
-	sess := &Session{ID: sessID, AccountID: uuid.New(), ProjectID: uuid.New(), AgentInstanceID: "kumbha-agent-abc"}
+	sess := &Session{ID: sessID, AccountID: uuid.New(), ProjectID: uuid.New(), AgentInstanceID: "kumbha-agent-abc", ModelRoute: "teepin/qwen3-30b-a3b"}
 
 	mock.ExpectExec(`UPDATE billing\.inference_sessions SET agent_instance_id`).
 		WithArgs(sessID, "kumbha-agent-"+sessID.String()[:8]).
@@ -701,7 +701,7 @@ func TestGateway_DeleteSessions_StopsAnOpenSessionThenDeletesIt(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "account_id", "project_id", "budget", "spent", "status", "label",
 			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
-			"last_deploy_failed", "last_deploy_error", "last_deploy_at", "model_alias",
+			"last_deploy_failed", "last_deploy_error", "last_deploy_at", "model_route",
 		}).AddRow(sessID, accountID, projectID, 5.0, 0.0, "open", nil, agentPodID, nil, false, startedAt, nil, false, nil, nil, "teepin/fast"))
 
 	// CloseSession: Close + tear down the agent pod (no settlement any
@@ -747,7 +747,7 @@ func TestGateway_DeleteSessions_AlreadyClosedSessionSkipsCloseCall(t *testing.T)
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "account_id", "project_id", "budget", "spent", "status", "label",
 			"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
-			"last_deploy_failed", "last_deploy_error", "last_deploy_at", "model_alias",
+			"last_deploy_failed", "last_deploy_error", "last_deploy_at", "model_route",
 		}).AddRow(sessID, accountID, projectID, 5.0, 0.0, "closed", nil, nil, nil, false, startedAt, startedAt, false, nil, nil, "teepin/fast"))
 
 	// No Close-related queries expected — already closed, nothing to stop.

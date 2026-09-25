@@ -145,15 +145,17 @@ func (g *Gateway) WithNodeCapacity(lister NodeCapacityLister) *Gateway {
 // payment check compute provisioning already enforces: an account that
 // cannot create an instance cannot start a Kumbha session either.
 //
-// modelAlias must be one of ModelAliases; "" means DefaultModelAlias (a
-// customer who never sees a tier picker, or an older console build,
-// behaves exactly as before this parameter existed).
-func (g *Gateway) CreateSession(ctx context.Context, accountID, projectID uuid.UUID, budget float64, label, modelAlias string) (*Session, error) {
-	if modelAlias == "" {
-		modelAlias = DefaultModelAlias
-	}
-	if !isModelAlias(modelAlias) {
-		return nil, fmt.Errorf("%w: %q", inference.ErrUnknownModel, modelAlias)
+// modelRoute is the exact catalog model_route a customer picked from the
+// Kumbha model picker; "" defers to whichever kumbha-enabled model has the
+// lowest kumbha_priority (an operator-set "recommended default," not a
+// failover order — see resolveModel's own doc comment). The resolved
+// route is bound to the session for its whole lifetime; every completion
+// within it uses exactly this model, never a different one Kumbha
+// silently substitutes.
+func (g *Gateway) CreateSession(ctx context.Context, accountID, projectID uuid.UUID, budget float64, label, modelRoute string) (*Session, error) {
+	resolved, err := g.resolveModel(ctx, modelRoute)
+	if err != nil {
+		return nil, err
 	}
 	if g.gate != nil {
 		allowed, reason, err := g.gate.AccountCanProvision(ctx, accountID)
@@ -164,7 +166,28 @@ func (g *Gateway) CreateSession(ctx context.Context, accountID, projectID uuid.U
 			return nil, fmt.Errorf("%w: %s", ErrPaymentRequired, reason)
 		}
 	}
-	return g.store.Create(ctx, accountID, projectID, budget, label, modelAlias)
+	return g.store.Create(ctx, accountID, projectID, budget, label, resolved.Route)
+}
+
+// resolveModel validates a customer's chosen model route against the
+// currently kumbha-enabled set, or — if none was given — picks the
+// lowest-kumbha_priority one as the default. Never returns a DIFFERENT
+// model than what was actually requested: a caller naming an unknown or
+// no-longer-enabled route gets a clear error, not a silent substitution.
+func (g *Gateway) resolveModel(ctx context.Context, requestedRoute string) (Model, error) {
+	models, err := g.kumbhaModels(ctx)
+	if err != nil {
+		return Model{}, err
+	}
+	if requestedRoute == "" {
+		return models[0], nil // lowest kumbha_priority, by ListKumbhaModels' own ORDER BY
+	}
+	for _, m := range models {
+		if m.Route == requestedRoute {
+			return m, nil
+		}
+	}
+	return Model{}, fmt.Errorf("%w: %q", inference.ErrUnknownModel, requestedRoute)
 }
 
 // GetSession loads a session scoped to its owning account.
@@ -380,11 +403,11 @@ type CompletionResult struct {
 
 // kumbhaModels returns the catalog models backing alias, in order, or
 // errNoKumbhaModels when there are none.
-func (g *Gateway) kumbhaModels(ctx context.Context, alias string) ([]Model, error) {
+func (g *Gateway) kumbhaModels(ctx context.Context) ([]Model, error) {
 	if g.models == nil {
 		return nil, errNoKumbhaModels
 	}
-	models, err := g.models.KumbhaModels(ctx, alias)
+	models, err := g.models.KumbhaModels(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("%w: listing Kumbha's models: %v", inference.ErrProviderUnavailable, err)
 	}
@@ -394,16 +417,16 @@ func (g *Gateway) kumbhaModels(ctx context.Context, alias string) ([]Model, erro
 	return models, nil
 }
 
-// Complete runs stages 3-9 of the request lifecycle: check budget, pick a
-// model, dispatch, capture tokens, compute cost, accrue.
+// Complete runs stages 3-9 of the request lifecycle: check budget,
+// dispatch, capture tokens, compute cost, accrue.
 //
-// req.Model must be one of Kumbha's aliases; the catalog's Kumbha models
-// are tried in priority order, falling through to the next only when one
-// is unavailable (unreachable, not mounted, throttled, or disabled since
-// it was listed) — never on an application-level error like a rejected
-// request. Falling through is safe because Complete is atomic: either a
-// full response comes back or nothing does, so there is no partial output
-// to double-send.
+// req.Model must be the EXACT route sess was created with (sess.ModelRoute)
+// — there is no failover to a different model here. That is deliberate:
+// the earlier alias-bucket design could fail over from a customer's
+// deliberately-chosen model (e.g. a confidential one) to a DIFFERENT model
+// with different guarantees, silently. A failure here is surfaced to the
+// caller as a real error on the model they actually picked, not routed
+// around.
 //
 // A pre-flight budget check happens here (sess.Spent >= sess.Budget) so an
 // already-exhausted session is refused before spending a round trip on a
@@ -417,45 +440,45 @@ func (g *Gateway) Complete(ctx context.Context, sess *Session, req inference.Req
 	if sess.Spent >= sess.Budget {
 		return nil, ErrBudgetExhausted
 	}
-	if !isModelAlias(req.Model) {
-		return nil, fmt.Errorf("%w: %q", inference.ErrUnknownModel, req.Model)
+	if req.Model != sess.ModelRoute {
+		return nil, fmt.Errorf("%w: session is bound to %q, not %q", inference.ErrUnknownModel, sess.ModelRoute, req.Model)
+	}
+	// A Gateway built with models=nil (see NewGateway's own doc comment: "a
+	// deployment that only manages sessions") can never actually reach here
+	// in production — CreateSession's resolveModel already refuses to bind
+	// a session to any model without a real backend to list from — but
+	// guard it explicitly anyway rather than let g.models.Complete below
+	// panic on a nil interface.
+	if g.models == nil {
+		return nil, errNoKumbhaModels
 	}
 
-	models, err := g.kumbhaModels(ctx, req.Model)
-	if err != nil {
-		return nil, err
+	// Engine is looked up only for the audit/margin column, from the SAME
+	// kumbha-enabled list the picker uses — a model an operator disabled
+	// for Kumbha mid-session (rare) falls back to an empty engine string
+	// rather than blocking an otherwise-servable completion; the
+	// underlying gateway call below doesn't consult kumbha_enabled at all.
+	engine := ""
+	if models, err := g.kumbhaModels(ctx); err == nil {
+		for _, m := range models {
+			if m.Route == sess.ModelRoute {
+				engine = m.Engine
+				break
+			}
+		}
 	}
 
 	start := time.Now()
-	var resp *inference.Response
-	var served Model
-	for i, m := range models {
-		attempt := req
-		attempt.Model = m.Route
-		resp, err = g.models.Complete(ctx, sess.AccountID.String(), attempt)
-		if err == nil {
-			served = m
-			break
-		}
-		if !errors.Is(err, inference.ErrProviderUnavailable) && !errors.Is(err, inference.ErrUnknownModel) {
-			return nil, err
-		}
-		log.Printf("Kumbha: model %q unavailable (%d/%d): %v", m.Route, i+1, len(models), err)
-		if i == len(models)-1 {
-			// The alias, not the last model's route: which models back
-			// Kumbha is operator-only, and this reaches the caller.
-			return nil, fmt.Errorf("%w: no model for %q is available right now", inference.ErrProviderUnavailable, req.Model)
-		}
+	resp, err := g.models.Complete(ctx, sess.AccountID.String(), req)
+	if err != nil {
+		return nil, err
 	}
 	end := time.Now()
 
-	// Priced at the model that actually served it. Recorded under the
-	// alias, which is what the customer sees on their session and invoice;
-	// the serving engine goes only to the operator-only provider column.
-	cost := g.cost(ctx, served.Route, resp.Usage)
+	cost := g.cost(ctx, sess.ModelRoute, resp.Usage)
 
 	newSpent, err := g.store.Accrue(ctx, sess.ID, sess.AccountID, cost,
-		req.Model, served.Engine, resp.Usage.InputTokens, resp.Usage.OutputTokens)
+		req.Model, engine, resp.Usage.InputTokens, resp.Usage.OutputTokens)
 	if err != nil {
 		// The completion already happened and tokens were genuinely spent
 		// upstream — this is a recording failure, not a request failure,
@@ -478,14 +501,14 @@ func (g *Gateway) Complete(ctx context.Context, sess *Session, req inference.Req
 	// settlement failure surfaces to the CALLER (so the customer sees it,
 	// same as an accrual failure) but the tokens were already genuinely
 	// spent upstream either way.
-	inRate, outRate := g.rates(ctx, served.Route)
+	inRate, outRate := g.rates(ctx, sess.ModelRoute)
 	var settleErrs []error
 	if resp.Usage.InputTokens > 0 {
-		settleErrs = append(settleErrs, g.settleLine(ctx, sess, req.Model+":input", served.Engine,
+		settleErrs = append(settleErrs, g.settleLine(ctx, sess, req.Model+":input", engine,
 			float64(resp.Usage.InputTokens), float64(resp.Usage.InputTokens)/1e6*inRate, start, end))
 	}
 	if resp.Usage.OutputTokens > 0 {
-		settleErrs = append(settleErrs, g.settleLine(ctx, sess, req.Model+":output", served.Engine,
+		settleErrs = append(settleErrs, g.settleLine(ctx, sess, req.Model+":output", engine,
 			float64(resp.Usage.OutputTokens), float64(resp.Usage.OutputTokens)/1e6*outRate, start, end))
 	}
 	if err := errors.Join(settleErrs...); err != nil {

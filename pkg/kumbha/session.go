@@ -87,11 +87,13 @@ type Session struct {
 	LastDeployAt     *time.Time
 	StartedAt        time.Time
 	EndedAt          *time.Time
-	// ModelAlias is which Kumbha alias this session was started with
-	// (see ModelAliases) — persisted so a relaunch (a follow-up message,
-	// or resuming after an idle timeout) sets the SAME TEEPIN_ROUTE the
-	// customer originally chose, not a value re-derived at relaunch time.
-	ModelAlias string
+	// ModelRoute is the exact catalog model_route this session was bound
+	// to at creation — persisted so a relaunch (a follow-up message, or
+	// resuming after an idle timeout) sets the SAME TEEPIN_ROUTE the
+	// customer originally chose, and so Complete can refuse a request for
+	// any other model (see Gateway.Complete's own doc comment on why
+	// there is no failover to a different model).
+	ModelRoute string
 }
 
 // RouteUsage is one session's accumulated tokens for one route — the raw
@@ -114,11 +116,10 @@ func NewStore(db *sql.DB) *Store {
 }
 
 // Create pre-authorises a new session. budget must be positive and within
-// maxSessionBudget — see its comment. modelAlias must already be a valid
-// alias (validated by Gateway.CreateSession, not re-checked here — this
-// Store has no knowledge of what a valid alias even is beyond the
-// database's own CHECK constraint).
-func (s *Store) Create(ctx context.Context, accountID, projectID uuid.UUID, budget float64, label, modelAlias string) (*Session, error) {
+// maxSessionBudget — see its comment. modelRoute must already be a valid,
+// kumbha-enabled model route (validated by Gateway.CreateSession's own
+// resolveModel, not re-checked here).
+func (s *Store) Create(ctx context.Context, accountID, projectID uuid.UUID, budget float64, label, modelRoute string) (*Session, error) {
 	if budget <= 0 {
 		return nil, fmt.Errorf("budget must be positive")
 	}
@@ -126,12 +127,12 @@ func (s *Store) Create(ctx context.Context, accountID, projectID uuid.UUID, budg
 		return nil, fmt.Errorf("budget %.2f exceeds the per-session cap of %.2f", budget, maxSessionBudget)
 	}
 
-	sess := &Session{AccountID: accountID, ProjectID: projectID, Budget: budget, Label: label, ModelAlias: modelAlias}
+	sess := &Session{AccountID: accountID, ProjectID: projectID, Budget: budget, Label: label, ModelRoute: modelRoute}
 	err := s.db.QueryRowContext(ctx, `
-		INSERT INTO billing.inference_sessions (account_id, project_id, budget, label, model_alias)
+		INSERT INTO billing.inference_sessions (account_id, project_id, budget, label, model_route)
 		VALUES ($1, $2, $3, $4, $5)
 		RETURNING id, spent, status, started_at
-	`, accountID, projectID, budget, nullIfEmpty(label), modelAlias).Scan(&sess.ID, &sess.Spent, &sess.Status, &sess.StartedAt)
+	`, accountID, projectID, budget, nullIfEmpty(label), modelRoute).Scan(&sess.ID, &sess.Spent, &sess.Status, &sess.StartedAt)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create session: %w", err)
 	}
@@ -219,12 +220,12 @@ func (s *Store) Get(ctx context.Context, id, accountID uuid.UUID) (*Session, err
 	err := s.db.QueryRowContext(ctx, `
 		SELECT id, account_id, project_id, budget, spent, status, label,
 		       agent_instance_id, app_instance_id, deploy_approved, started_at, ended_at,
-		       last_deploy_failed, last_deploy_error, last_deploy_at, model_alias
+		       last_deploy_failed, last_deploy_error, last_deploy_at, model_route
 		FROM billing.inference_sessions
 		WHERE id = $1 AND account_id = $2
 	`, id, accountID).Scan(&sess.ID, &sess.AccountID, &sess.ProjectID, &sess.Budget,
 		&sess.Spent, &sess.Status, &label, &agentInstanceID, &appInstanceID, &sess.DeployApproved,
-		&sess.StartedAt, &endedAt, &sess.LastDeployFailed, &lastDeployError, &lastDeployAt, &sess.ModelAlias)
+		&sess.StartedAt, &endedAt, &sess.LastDeployFailed, &lastDeployError, &lastDeployAt, &sess.ModelRoute)
 	if err == sql.ErrNoRows {
 		return nil, ErrSessionNotFound
 	}
@@ -572,7 +573,7 @@ func (s *Store) ListByProject(ctx context.Context, accountID, projectID uuid.UUI
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, account_id, project_id, budget, spent, status, label,
 		       agent_instance_id, app_instance_id, deploy_approved, started_at, ended_at,
-		       last_deploy_failed, last_deploy_error, last_deploy_at, model_alias
+		       last_deploy_failed, last_deploy_error, last_deploy_at, model_route
 		FROM billing.inference_sessions
 		WHERE account_id = $1 AND project_id = $2
 		ORDER BY started_at DESC
@@ -589,7 +590,7 @@ func (s *Store) ListByProject(ctx context.Context, accountID, projectID uuid.UUI
 		var endedAt, lastDeployAt sql.NullTime
 		if err := rows.Scan(&sess.ID, &sess.AccountID, &sess.ProjectID, &sess.Budget,
 			&sess.Spent, &sess.Status, &label, &agentInstanceID, &appInstanceID, &sess.DeployApproved,
-			&sess.StartedAt, &endedAt, &sess.LastDeployFailed, &lastDeployError, &lastDeployAt, &sess.ModelAlias); err != nil {
+			&sess.StartedAt, &endedAt, &sess.LastDeployFailed, &lastDeployError, &lastDeployAt, &sess.ModelRoute); err != nil {
 			return nil, fmt.Errorf("failed to scan session: %w", err)
 		}
 		sess.Label = label.String

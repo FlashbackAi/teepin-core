@@ -49,7 +49,7 @@ func modelRows() []string {
 		"input_price_per_million", "output_price_per_million",
 		"vendor_input_cost_per_million", "vendor_output_cost_per_million",
 		"enabled", "provider", "provider_model", "base_url", "max_output_tokens",
-		"api_key_ref", "offered_to_customers", "kumbha_enabled", "kumbha_priority", "kumbha_alias",
+		"api_key_ref", "offered_to_customers", "kumbha_enabled", "kumbha_priority",
 		"updated_by", "created_at", "updated_at",
 	}
 }
@@ -63,7 +63,7 @@ func expectModelRow(mock sqlmock.Sqlmock, route, provider, apiKeyRef string) {
 			route, "Model", "frontier", "anthropic", 200000,
 			true, false, false, 0.0, 0.0, nil, nil,
 			true, provider, "claude-haiku-4-5-20251001", "", 4096,
-			apiKeyRef, false, true, 0, "teepin/fast",
+			apiKeyRef, false, true, 0,
 			"admin-api", time.Now(), time.Now(),
 		))
 }
@@ -133,7 +133,7 @@ func TestRegisterModel_ExternalModelStoresKeyAndAvailability(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	off, on := false, true
 	mock.ExpectExec(`SET offered_to_customers = COALESCE`).
-		WithArgs(&off, &on, nil, nil, "admin-api", "anthropic/claude-haiku-4-5").
+		WithArgs(&off, &on, nil, "admin-api", "anthropic/claude-haiku-4-5").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	expectModelRow(mock, "anthropic/claude-haiku-4-5", "anthropic", "") // storeAPIKey's lookup: no key yet
 	mock.ExpectExec(`SET api_key_ref = NULLIF`).
@@ -278,7 +278,7 @@ func TestSetAvailability_UpdatesOnlyWhatWasSent(t *testing.T) {
 
 	priority := 2
 	mock.ExpectExec(`SET offered_to_customers = COALESCE`).
-		WithArgs(nil, nil, &priority, nil, "admin-api", "teepin/a").
+		WithArgs(nil, nil, &priority, "admin-api", "teepin/a").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := jsonRequest(h.SetAvailability, "PUT", "/v1/admin/inference/models/availability?model_route=teepin/a", []byte(`{"kumbha_priority":2}`), nil)
@@ -342,7 +342,7 @@ func TestListModels_IncludesLiveStatus(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows(modelRows()).AddRow(
 			"teepin/qwen3-30b-a3b", "Qwen", "own", "mlx", 8000,
 			false, false, false, 0.0, 0.0, nil, nil,
-			true, "node", "", "", 4096, "", true, false, 0, "teepin/fast",
+			true, "node", "", "", 4096, "", true, false, 0,
 			"op", time.Now(), time.Now(),
 		))
 
