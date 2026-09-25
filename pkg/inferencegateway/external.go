@@ -160,9 +160,15 @@ func (g *Gateway) Status(ctx context.Context, m modelcatalog.Model) ModelStatus 
 const healthCheckTimeout = 10 * time.Second
 
 // CheckExternalHealth runs one round of health checks over every enabled
-// external model, sequentially — the count is small. Checks are metadata
-// calls (inference.HealthChecker), never completions, so they cost no
-// tokens.
+// external model EXCEPT confidential-inference ones, sequentially — the
+// count is small. Checks are metadata calls (inference.HealthChecker),
+// never completions, so they cost no tokens. Confidential models
+// (ProviderTinfoilConfidential) are deliberately excluded here and checked
+// instead by CheckConfidentialAttestation on its own, independent, faster
+// cadence (see StartConfidentialAttestationChecks) — this general interval
+// is meant to be tunable for noise/cost reasons on ordinary vendor APIs
+// without that also slowing down how quickly a broken attestation guarantee
+// gets caught.
 func (g *Gateway) CheckExternalHealth(ctx context.Context) {
 	models, err := g.catalog.ListModels(ctx)
 	if err != nil {
@@ -170,7 +176,30 @@ func (g *Gateway) CheckExternalHealth(ctx context.Context) {
 		return
 	}
 	for _, m := range models {
-		if !m.Enabled || !m.Provider.IsExternal() {
+		if !m.Enabled || !m.Provider.IsExternal() || m.Provider == modelcatalog.ProviderTinfoilConfidential {
+			continue
+		}
+		g.setHealth(m.ModelRoute, g.checkOne(ctx, m))
+	}
+}
+
+// CheckConfidentialAttestation runs one round of attestation checks over
+// every enabled confidential-inference model. Split from CheckExternalHealth
+// so its cadence (see StartConfidentialAttestationChecks) is never coupled
+// to whatever interval an operator sets for ordinary external-model health
+// checks — this one reads an already-held, locally-cached verification
+// state (see TinfoilConfidentialProvider.CheckHealth's own doc comment), so
+// it costs nothing to run often, and a confidentiality guarantee silently
+// breaking deserves to be caught fast regardless of how noisy or expensive
+// checking some other vendor's API is judged to be.
+func (g *Gateway) CheckConfidentialAttestation(ctx context.Context) {
+	models, err := g.catalog.ListModels(ctx)
+	if err != nil {
+		log.Printf("WARN: confidential attestation check could not list the catalog: %v", err)
+		return
+	}
+	for _, m := range models {
+		if !m.Enabled || m.Provider != modelcatalog.ProviderTinfoilConfidential {
 			continue
 		}
 		g.setHealth(m.ModelRoute, g.checkOne(ctx, m))
@@ -181,6 +210,7 @@ func (g *Gateway) checkOne(ctx context.Context, m modelcatalog.Model) ModelStatu
 	now := time.Now()
 	p, err := g.externalProviderFor(ctx, m)
 	if err != nil {
+		g.logAttestationFailureIfConfidential(m, err)
 		return ModelStatus{State: StateUnhealthy, Detail: err.Error(), CheckedAt: &now}
 	}
 	checker, ok := p.(inference.HealthChecker)
@@ -190,9 +220,33 @@ func (g *Gateway) checkOne(ctx context.Context, m modelcatalog.Model) ModelStatu
 	checkCtx, cancel := context.WithTimeout(ctx, healthCheckTimeout)
 	defer cancel()
 	if err := checker.CheckHealth(checkCtx); err != nil {
+		g.logAttestationFailureIfConfidential(m, err)
 		return ModelStatus{State: StateUnhealthy, Detail: err.Error(), CheckedAt: &now}
 	}
 	return ModelStatus{State: StateServing, CheckedAt: &now}
+}
+
+// logAttestationFailureIfConfidential emits a distinct, loudly-grep-able
+// ERROR line when the model that just failed its periodic health check is
+// confidential-inference (ProviderTinfoilConfidential — currently the only
+// Provider that promises hardware attestation at all) — as opposed to every
+// other external-model health failure, which stays unlogged here exactly as
+// before (a plain vLLM/Anthropic hiccup is ordinary and already visible via
+// the admin catalog's cached status). A confidentiality guarantee silently
+// failing is not ordinary: this is the signal an operator's log-based
+// alerting (Loki/CloudWatch) should watch for, since a customer relying on
+// this model's attestation would otherwise have no way to know it just
+// stopped holding. Filters on the catalog's own Provider field, not a type
+// assertion on the constructed provider, so this fires even when
+// construction itself failed (externalProviderFor's error case above) — an
+// unreachable enclave is at least as serious as one whose CheckHealth
+// merely reports unverified.
+func (g *Gateway) logAttestationFailureIfConfidential(m modelcatalog.Model, checkErr error) {
+	if m.Provider != modelcatalog.ProviderTinfoilConfidential {
+		return
+	}
+	log.Printf("ERROR: confidential inference attestation check failed for %q (provider=%s): %v — this model may no longer be serving verified confidential inference",
+		m.ModelRoute, m.Provider, checkErr)
 }
 
 // ErrAttestationNotSupported means m's provider does not implement
@@ -227,7 +281,8 @@ func (g *Gateway) setHealth(route string, st ModelStatus) {
 	g.health[route] = st
 }
 
-// StartHealthChecks checks external models immediately, then every
+// StartHealthChecks checks external models (excluding confidential-
+// inference ones — see CheckExternalHealth) immediately, then every
 // interval until ctx is cancelled. Run it with `go`.
 func (g *Gateway) StartHealthChecks(ctx context.Context, interval time.Duration) {
 	g.CheckExternalHealth(ctx)
@@ -237,6 +292,26 @@ func (g *Gateway) StartHealthChecks(ctx context.Context, interval time.Duration)
 		select {
 		case <-ticker.C:
 			g.CheckExternalHealth(ctx)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// StartConfidentialAttestationChecks checks confidential-inference models'
+// attestation immediately, then every interval until ctx is cancelled — a
+// separate loop from StartHealthChecks, deliberately, so this interval
+// stays fast regardless of whatever an operator sets the general external-
+// model health-check interval to (see CheckConfidentialAttestation's own
+// doc comment for why a fast interval here costs nothing). Run it with `go`.
+func (g *Gateway) StartConfidentialAttestationChecks(ctx context.Context, interval time.Duration) {
+	g.CheckConfidentialAttestation(ctx)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			g.CheckConfidentialAttestation(ctx)
 		case <-ctx.Done():
 			return
 		}

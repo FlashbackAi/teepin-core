@@ -484,6 +484,16 @@ func main() {
 		}
 		go inferenceGateway.StartHealthChecks(context.Background(),
 			time.Duration(getEnvInt("TEEPIN_MODEL_HEALTH_INTERVAL_SECONDS", 60))*time.Second)
+		// Deliberately a separate, independently-tunable loop from the
+		// general external-model health check above — see
+		// StartConfidentialAttestationChecks' own doc comment. Defaults
+		// faster than the general interval: this check is a local,
+		// already-held verification-state read (no network call), so
+		// checking often costs nothing, and a broken confidentiality
+		// guarantee deserves to be caught quickly regardless of how the
+		// general interval is tuned for cost/noise on ordinary vendor APIs.
+		go inferenceGateway.StartConfidentialAttestationChecks(context.Background(),
+			time.Duration(getEnvInt("TEEPIN_ATTESTATION_CHECK_INTERVAL_SECONDS", 30))*time.Second)
 		playgroundHandler = api.NewInferencePlaygroundHandler(inferenceGateway)
 		// The public, API-key-authenticated API. billingService may be nil
 		// (no database), in which case nothing is metered.
