@@ -655,28 +655,43 @@ func (s *Service) resolveBillToByAccount(ctx context.Context, accountID uuid.UUI
 // removed. The previous scheme used 8 random hex characters, which was
 // neither sequential nor collision-proof by construction.
 func (s *Service) nextInvoiceNumber(ctx context.Context, tx *sql.Tx) (string, error) {
-	return allocateInvoiceNumber(ctx, tx, time.Now().UTC().Year())
+	return allocateDocumentNumber(ctx, tx, seriesInvoice, time.Now().UTC().Year())
 }
 
-// allocateInvoiceNumber takes the next number for a calendar year from a
-// counter row. The upsert locks that row until the surrounding transaction
-// ends, so concurrent issuers queue rather than skip numbers, and a rollback
-// hands the number back: the sequence is gapless by construction, which most
-// tax authorities require. The year is part of the number ("INV-2026-000001")
-// so numbering restarts each year and a customer can date an invoice at a
-// glance. Separate from the time source so it can be tested for any year.
-func allocateInvoiceNumber(ctx context.Context, tx *sql.Tx, year int) (string, error) {
+// nextReceiptNumber allocates the next number in the receipt series
+// ("RCT-2026-000001") — a series of its own, so neither series has holes
+// where the other's documents would have been.
+func (s *Service) nextReceiptNumber(ctx context.Context, tx *sql.Tx) (string, error) {
+	return allocateDocumentNumber(ctx, tx, seriesReceipt, time.Now().UTC().Year())
+}
+
+// Document number series. Each has its own counter (billing.invoice_counters
+// is keyed by series and year), so each is gapless on its own.
+const (
+	seriesInvoice = "INV"
+	seriesReceipt = "RCT"
+)
+
+// allocateDocumentNumber takes the next number for a series and calendar
+// year from a counter row. The upsert locks that row until the surrounding
+// transaction ends, so concurrent issuers queue rather than skip numbers,
+// and a rollback hands the number back: the sequence is gapless by
+// construction, which most tax authorities require. The year is part of the
+// number ("INV-2026-000001") so numbering restarts each year and a customer
+// can date a document at a glance. Separate from the time source so it can
+// be tested for any year.
+func allocateDocumentNumber(ctx context.Context, tx *sql.Tx, series string, year int) (string, error) {
 	var n int64
 	if err := tx.QueryRowContext(ctx, `
-		INSERT INTO billing.invoice_counters (year, last_number)
-		VALUES ($1, 1)
-		ON CONFLICT (year) DO UPDATE
+		INSERT INTO billing.invoice_counters (series, year, last_number)
+		VALUES ($1, $2, 1)
+		ON CONFLICT (series, year) DO UPDATE
 		    SET last_number = billing.invoice_counters.last_number + 1
 		RETURNING last_number
-	`, year).Scan(&n); err != nil {
-		return "", fmt.Errorf("failed to allocate invoice number: %w", err)
+	`, series, year).Scan(&n); err != nil {
+		return "", fmt.Errorf("failed to allocate %s document number: %w", series, err)
 	}
-	return fmt.Sprintf("INV-%d-%06d", year, n), nil
+	return fmt.Sprintf("%s-%d-%06d", series, year, n), nil
 }
 
 // ErrNoLineItems is returned for an invoice with nothing on it.

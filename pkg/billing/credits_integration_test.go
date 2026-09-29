@@ -15,6 +15,7 @@ package billing
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"math"
 	"os"
 	"sync"
@@ -266,5 +267,80 @@ func TestCreditLotsIntegration_ConcurrentSpendingNeverOverdraws(t *testing.T) {
 	}
 	if got := itBalance(t, s, account); !itNear(got, 0) {
 		t.Errorf("balance = %v, want 0", got)
+	}
+}
+
+// Each document series is gapless on its own: they do not share a counter,
+// a rolled-back allocation hands its number back, and concurrent issuers
+// each get a distinct number with none skipped.
+func TestDocumentNumbersIntegration(t *testing.T) {
+	db := integrationDB(t)
+	ctx := context.Background()
+
+	alloc := func(series string, year int, commit bool) string {
+		t.Helper()
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		n, err := allocateDocumentNumber(ctx, tx, series, year)
+		if err != nil {
+			tx.Rollback()
+			t.Fatalf("allocate: %v", err)
+		}
+		if commit {
+			if err := tx.Commit(); err != nil {
+				t.Fatalf("commit: %v", err)
+			}
+		} else {
+			tx.Rollback()
+		}
+		return n
+	}
+
+	// Independent series in the same year.
+	if got := alloc(seriesInvoice, 2099, true); got != "INV-2099-000001" {
+		t.Errorf("first invoice = %s", got)
+	}
+	if got := alloc(seriesInvoice, 2099, true); got != "INV-2099-000002" {
+		t.Errorf("second invoice = %s", got)
+	}
+	if got := alloc(seriesReceipt, 2099, true); got != "RCT-2099-000001" {
+		t.Errorf("first receipt = %s, want its own series (RCT-2099-000001)", got)
+	}
+
+	// A rollback returns the number.
+	if got := alloc(seriesReceipt, 2099, false); got != "RCT-2099-000002" {
+		t.Errorf("rolled-back receipt = %s", got)
+	}
+	if got := alloc(seriesReceipt, 2099, true); got != "RCT-2099-000002" {
+		t.Errorf("receipt after a rollback = %s, want RCT-2099-000002 (number handed back)", got)
+	}
+
+	// Concurrent issuers: distinct, contiguous.
+	db.SetMaxOpenConns(30)
+	const workers = 20
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	seen := map[string]bool{}
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			n := alloc(seriesReceipt, 2098, true)
+			mu.Lock()
+			seen[n] = true
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	if len(seen) != workers {
+		t.Errorf("%d distinct numbers from %d concurrent issuers", len(seen), workers)
+	}
+	for i := 1; i <= workers; i++ {
+		want := fmt.Sprintf("RCT-2098-%06d", i)
+		if !seen[want] {
+			t.Errorf("missing %s: the series has a gap", want)
+		}
 	}
 }

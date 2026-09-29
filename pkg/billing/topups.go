@@ -294,7 +294,7 @@ func (s *Service) SettleTopUpByPaymentIntent(ctx context.Context, piID string, r
 // together or not at all. Tax is zero: purchases are made from the US
 // entity, which charges no sales tax today (the same default as NoTax).
 func (s *Service) insertCreditPurchaseReceipt(ctx context.Context, tx *sql.Tx, bill *billTo, amount float64, currency, methodSummary string) (uuid.UUID, string, error) {
-	invoiceNumber, err := s.nextInvoiceNumber(ctx, tx)
+	invoiceNumber, err := s.nextReceiptNumber(ctx, tx)
 	if err != nil {
 		return uuid.Nil, "", err
 	}

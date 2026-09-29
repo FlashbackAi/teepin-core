@@ -281,8 +281,14 @@ func TestRender_CreditPurchaseIsAReceipt(t *testing.T) {
 		"PAID ON SEPTEMBER 29, 2026",
 		"Paid in full by Visa ending 4242",
 		"Teepin prepaid credit", "$50.00",
-		"Total for this receipt",
+		"Total paid",
 		"No tax has been charged on this receipt",
 	)
 	mustNotContain(t, doc, "Billing period", "Due date", "TOTAL AMOUNT DUE", "Total for this invoice")
+	// One table, not an invoice's Summary + Detail groupings that would
+	// print the same amount three times.
+	mustNotContain(t, doc, "Summary", "Charges")
+	if got := strings.Count(doc, "Teepin prepaid credit"); got != 1 {
+		t.Errorf("the line description appears %d times, want 1", got)
+	}
 }

@@ -198,6 +198,7 @@ func TestSettleTopUp_CreditsAndIssuesReceipt(t *testing.T) {
 		WithArgs("pi_1").
 		WillReturnRows(lockedTopUpRow(topUpID, 50, "processing"))
 	mock.ExpectQuery(`INSERT INTO billing\.invoice_counters`).
+		WithArgs("RCT", year).
 		WillReturnRows(sqlmock.NewRows([]string{"last_number"}).AddRow(int64(7)))
 	mock.ExpectQuery(`INSERT INTO billing\.invoices.*'paid','credit_purchase'`).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(receiptID))
@@ -205,7 +206,7 @@ func TestSettleTopUp_CreditsAndIssuesReceipt(t *testing.T) {
 		WithArgs(receiptID, creditPurchaseDescription, 50.0).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`INSERT INTO billing\.credit_transactions.*'purchase'`).
-		WithArgs(account, 50.0, fmt.Sprintf("Credit purchase (INV-%d-000007)", year), topUpID).
+		WithArgs(account, 50.0, fmt.Sprintf("Credit purchase (RCT-%d-000007)", year), topUpID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`UPDATE billing\.credit_topups\s+SET status = 'succeeded'`).
 		WithArgs(topUpID, "Visa ending 4242", receiptID).

@@ -135,8 +135,15 @@ func Render(inv *billing.Invoice) ([]byte, error) {
 	d.letterhead()
 	d.parties()
 	d.dueBanner()
-	d.summary()
-	d.detail()
+	if inv.Source == "credit_purchase" {
+		// A receipt is one line bought and paid; the banner above already
+		// states the amount, so the Summary/Detail sections an invoice
+		// needs would only repeat it.
+		d.receiptBody()
+	} else {
+		d.summary()
+		d.detail()
+	}
 	d.taxes()
 	d.paymentAndNotes()
 
@@ -476,6 +483,35 @@ func (d *doc) summary() {
 	}
 	d.summaryRow(d.taxLabel(), d.money(d.inv.Tax), false, false)
 	d.summaryRow("Total for this "+d.docNoun(), d.money(d.inv.Total), false, true)
+	d.pdf.Ln(6)
+}
+
+// receiptBody is the body of a credit-purchase receipt: what was bought as
+// a single table, then the totals. Deliberately not summary()+detail(),
+// which group by service and would show the one amount three times.
+func (d *doc) receiptBody() {
+	d.header("Details")
+
+	// Column heads.
+	d.color(muteColor)
+	d.pdf.SetFont("Helvetica", "B", 7.5)
+	d.pdf.SetX(marginX)
+	d.pdf.CellFormat(contentW-40, 6, "  DESCRIPTION", "", 0, "L", false, 0, "")
+	d.pdf.CellFormat(40, 6, "AMOUNT  ", "", 1, "R", false, 0, "")
+
+	d.color(inkColor)
+	d.pdf.SetFont("Helvetica", "", 9.5)
+	for _, li := range d.inv.LineItems {
+		d.pdf.SetX(marginX)
+		d.pdf.CellFormat(contentW-40, 7, "  "+d.tr(li.Description), "", 0, "L", false, 0, "")
+		d.pdf.CellFormat(40, 7, d.tr(d.money(li.Amount))+"  ", "", 1, "R", false, 0, "")
+		d.rule(marginX, contentW)
+	}
+	d.pdf.Ln(2)
+
+	d.summaryRow("Subtotal", d.money(d.inv.Subtotal), false, false)
+	d.summaryRow(d.taxLabel(), d.money(d.inv.Tax), false, false)
+	d.summaryRow("Total paid", d.money(d.inv.Total), false, true)
 	d.pdf.Ln(6)
 }
 

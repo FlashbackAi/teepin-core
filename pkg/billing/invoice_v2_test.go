@@ -12,9 +12,10 @@ import (
 	"github.com/google/uuid"
 )
 
-// Numbers are per calendar year, gapless within it, and formatted with the year
-// so a customer can date an invoice at a glance.
-func TestAllocateInvoiceNumber_PerYearSequence(t *testing.T) {
+// Numbers are per series and calendar year, gapless within each, and
+// formatted with the series and year so a customer can tell an invoice from
+// a receipt and date either at a glance.
+func TestAllocateDocumentNumber_PerSeriesAndYear(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	if err != nil {
 		t.Fatal(err)
@@ -22,25 +23,34 @@ func TestAllocateInvoiceNumber_PerYearSequence(t *testing.T) {
 	defer db.Close()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`INSERT INTO billing\.invoice_counters .* ON CONFLICT \(year\) DO UPDATE`).
-		WithArgs(2026).
+	mock.ExpectQuery(`INSERT INTO billing\.invoice_counters .* ON CONFLICT \(series, year\) DO UPDATE`).
+		WithArgs("INV", 2026).
 		WillReturnRows(sqlmock.NewRows([]string{"last_number"}).AddRow(int64(42)))
 	mock.ExpectQuery(`INSERT INTO billing\.invoice_counters`).
-		WithArgs(2027).
+		WithArgs("INV", 2027).
 		WillReturnRows(sqlmock.NewRows([]string{"last_number"}).AddRow(int64(1))) // a new year restarts at 1
+	mock.ExpectQuery(`INSERT INTO billing\.invoice_counters`).
+		WithArgs("RCT", 2026).
+		WillReturnRows(sqlmock.NewRows([]string{"last_number"}).AddRow(int64(7))) // receipts count on their own
 	mock.ExpectRollback()
 
 	tx, err := db.Begin()
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := allocateInvoiceNumber(context.Background(), tx, 2026)
-	if err != nil || got != "INV-2026-000042" {
-		t.Fatalf("2026 = %q, %v, want INV-2026-000042", got, err)
-	}
-	got, err = allocateInvoiceNumber(context.Background(), tx, 2027)
-	if err != nil || got != "INV-2027-000001" {
-		t.Fatalf("2027 = %q, %v, want INV-2027-000001", got, err)
+	for _, tc := range []struct {
+		series string
+		year   int
+		want   string
+	}{
+		{seriesInvoice, 2026, "INV-2026-000042"},
+		{seriesInvoice, 2027, "INV-2027-000001"},
+		{seriesReceipt, 2026, "RCT-2026-000007"},
+	} {
+		got, err := allocateDocumentNumber(context.Background(), tx, tc.series, tc.year)
+		if err != nil || got != tc.want {
+			t.Fatalf("%s %d = %q, %v, want %s", tc.series, tc.year, got, err, tc.want)
+		}
 	}
 	_ = tx.Rollback()
 	if err := mock.ExpectationsWereMet(); err != nil {

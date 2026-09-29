@@ -247,3 +247,65 @@ func TestCreditLotsDrill(t *testing.T) {
 	}
 	check("after re-up")
 }
+
+// Migration 061 (separate INV / RCT number series): the primary key becomes
+// (series, year), existing counters stay INV, receipt counters are resumed
+// from RCT numbers already issued, and it reverts and re-applies cleanly.
+func TestDocumentSeriesDrill(t *testing.T) {
+	dsn := os.Getenv("TEEPIN_DRILL_DSN")
+	if dsn == "" {
+		t.Skip("set TEEPIN_DRILL_DSN to run the migration drill")
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := migrator(t, db).Migrate(60); err != nil && err != migrate.ErrNoChange {
+		t.Fatalf("migrate to 060: %v", err)
+	}
+	// State before 061: one counter keyed by year, and receipts already
+	// issued under a later-abandoned RCT- prefix.
+	mustExec(t, db, `DELETE FROM billing.invoice_counters`)
+	mustExec(t, db, `INSERT INTO billing.invoice_counters (year, last_number) VALUES (2026, 4)`)
+	acct := seedAccount(t, db, "000000000099", "drill-series")
+	for _, n := range []string{"RCT-2026-000001", "RCT-2026-000005", "RCT-2025-000002"} {
+		mustExec(t, db, `
+			INSERT INTO billing.invoices (account_id, invoice_number, period_start, period_end, subtotal, total, status, source)
+			VALUES ($1, $2, CURRENT_DATE, CURRENT_DATE, 10, 10, 'paid', 'credit_purchase')`, acct, n)
+	}
+
+	if err := migrator(t, db).Migrate(61); err != nil {
+		t.Fatalf("migrate to 061: %v", err)
+	}
+	last := func(series string, year int) float64 {
+		return queryFloat(t, db, `SELECT last_number FROM billing.invoice_counters WHERE series = $1 AND year = $2`, series, year)
+	}
+	if got := last("INV", 2026); !near(got, 4) {
+		t.Errorf("INV 2026 counter = %v, want 4 (existing counters stay in the invoice series)", got)
+	}
+	if got := last("RCT", 2026); !near(got, 5) {
+		t.Errorf("RCT 2026 counter = %v, want 5 (resume after the highest issued)", got)
+	}
+	if got := last("RCT", 2025); !near(got, 2) {
+		t.Errorf("RCT 2025 counter = %v, want 2", got)
+	}
+	// The two series must be able to share a year.
+	if _, err := db.Exec(`INSERT INTO billing.invoice_counters (series, year, last_number) VALUES ('INV', 2026, 1)`); err == nil {
+		t.Error("a duplicate (series, year) counter was accepted")
+	}
+
+	if err := migrator(t, db).Migrate(60); err != nil {
+		t.Fatalf("migrate down to 060: %v", err)
+	}
+	if got := queryFloat(t, db, `SELECT last_number FROM billing.invoice_counters WHERE year = 2026`); !near(got, 4) {
+		t.Errorf("after down: 2026 counter = %v, want 4", got)
+	}
+	if err := migrator(t, db).Migrate(61); err != nil {
+		t.Fatalf("re-up to 061: %v", err)
+	}
+	if got := last("RCT", 2026); !near(got, 5) {
+		t.Errorf("after re-up: RCT 2026 counter = %v, want 5 (re-derived, no number reused)", got)
+	}
+}
