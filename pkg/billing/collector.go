@@ -26,14 +26,38 @@ type UsageCollector struct {
 	stopChan           chan struct{}
 }
 
+// DefaultCollectionInterval is how often compute usage is metered. Short
+// enough that the credit balance a customer sees tracks what they are
+// spending; the credit enforcer projects the time in between, so zero
+// balance never depends on this being tight.
+const DefaultCollectionInterval = 10 * time.Minute
+
 // NewUsageCollector creates a new usage collector
 func NewUsageCollector(db *sql.DB, billingService *Service) *UsageCollector {
 	return &UsageCollector{
 		db:                 db,
 		billingService:     billingService,
-		collectionInterval: 1 * time.Hour, // Collect every hour
+		collectionInterval: DefaultCollectionInterval,
 		stopChan:           make(chan struct{}),
 	}
+}
+
+// WithInterval overrides how often usage is collected. A non-positive value
+// keeps the default.
+func (c *UsageCollector) WithInterval(d time.Duration) *UsageCollector {
+	if d > 0 {
+		c.collectionInterval = d
+	}
+	return c
+}
+
+// CollectAccount meters one account's compute right now — used when the
+// credit enforcer ends an account's instances, so the final stretch is
+// billed immediately instead of waiting for the next scheduled tick.
+func (c *UsageCollector) CollectAccount(ctx context.Context, accountID uuid.UUID) error {
+	err := c.collect(ctx, &accountID)
+	c.collectStoppedStorage(ctx, &accountID)
+	return err
 }
 
 // Start begins periodic usage collection
@@ -44,14 +68,14 @@ func (c *UsageCollector) Start(ctx context.Context) {
 	defer ticker.Stop()
 
 	// Run immediately on start
-	if err := c.collectUsage(ctx); err != nil {
+	if err := c.tick(ctx); err != nil {
 		log.Printf("WARN: usage collection error: %v", err)
 	}
 
 	for {
 		select {
 		case <-ticker.C:
-			if err := c.collectUsage(ctx); err != nil {
+			if err := c.tick(ctx); err != nil {
 				log.Printf("WARN: usage collection error: %v", err)
 			}
 		case <-c.stopChan:
@@ -62,6 +86,14 @@ func (c *UsageCollector) Start(ctx context.Context) {
 			return
 		}
 	}
+}
+
+// tick is one scheduled pass: compute usage, then the storage of stopped
+// instances' disks.
+func (c *UsageCollector) tick(ctx context.Context) error {
+	err := c.collectUsage(ctx)
+	c.collectStoppedStorage(ctx, nil)
+	return err
 }
 
 // Stop stops the usage collector
@@ -75,9 +107,14 @@ func (c *UsageCollector) Stop() {
 // tick and termination — including the entire life of instances shorter
 // than one interval — would silently ride free.
 func (c *UsageCollector) collectUsage(ctx context.Context) error {
+	return c.collect(ctx, nil)
+}
+
+// collect meters every billable instance, or only accountID's when set.
+func (c *UsageCollector) collect(ctx context.Context, accountID *uuid.UUID) error {
 	log.Println("Collecting usage metrics...")
 
-	instances, err := c.getBillableInstances(ctx)
+	instances, err := c.getBillableInstances(ctx, accountID)
 	if err != nil {
 		return fmt.Errorf("failed to get billable instances: %w", err)
 	}
@@ -93,12 +130,7 @@ func (c *UsageCollector) collectUsage(ctx context.Context) error {
 	// Rates are read once per collection run so every record in the run is
 	// metered consistently, but never cached across runs — admin price
 	// changes apply from the next tick.
-	vramRate := 0.0
-	cpuRate := 0.0
-	memRate := 0.0
-	storageRate := 0.0
-	pCoreRate := 0.0
-	eCoreRate := 0.0
+	var rates computeRates
 	rateFetched := false
 
 	for _, inst := range instances {
@@ -131,46 +163,15 @@ func (c *UsageCollector) collectUsage(ctx context.Context) error {
 		}
 
 		if !rateFetched {
-			vramRate = c.billingService.VRAMPricePerGBHour(ctx)
-			cpuRate = c.billingService.CPUCoreRate(ctx)
-			memRate = c.billingService.MemoryGBRate(ctx)
-			storageRate = c.billingService.StorageGBMonthRate(ctx)
-			pCoreRate = c.billingService.PCoreRate(ctx)
-			eCoreRate = c.billingService.ECoreRate(ctx)
+			rates = c.billingService.loadComputeRates(ctx)
 			rateFetched = true
 		}
 
-		// Cost by class. A GPU instance is linear on allocated VRAM. A
-		// CPU-only instance (home compute) is linear on cores + memory; its
-		// rates default to 0, so it costs nothing until an operator sets a
-		// price. A CPU instance placed with a DETECTED P/E split
-		// (PCoresUsed/ECoresUsed both non-nil — see billableInstance's own
-		// doc comment) prices via the separate P-core/E-core rates instead
-		// of the single undifferentiated CPUUnits rate; an instance with no
-		// detected split is billed exactly as before this feature.
-		// unitPrice is the per-hour rate for the interval, recorded for
+		// The price of the interval — see computeRates.cost, shared with the
+		// credit enforcer so what is charged and what is projected cannot
+		// diverge. unitPrice is the per-hour rate, recorded for
 		// transparency on the usage record.
-		var unitPrice float64
-		switch {
-		case inst.GPUVRAMGB > 0:
-			unitPrice = float64(inst.GPUVRAMGB) * vramRate
-		case inst.PCoresUsed != nil && inst.ECoresUsed != nil:
-			unitPrice = float64(*inst.PCoresUsed)*pCoreRate + float64(*inst.ECoresUsed)*eCoreRate + float64(inst.MemoryGB)*memRate
-		default:
-			unitPrice = float64(inst.CPUUnits)*cpuRate + float64(inst.MemoryGB)*memRate
-		}
-		cost := unitPrice * hours
-
-		// Storage is priced per GB-MONTH, not per hour like everything
-		// above — converted here rather than folded into unitPrice, which
-		// would misrepresent the per-hour rate recorded on the usage
-		// record. hoursPerMonth (730 = 365*24/12, the standard average
-		// used for this conversion) is a deliberate constant rather than a
-		// calendar-specific calculation, which would drift the same
-		// instance's hourly rate depending on which actual month elapsed.
-		if inst.StorageGB > 0 && storageRate > 0 {
-			cost += float64(inst.StorageGB) * storageRate / hoursPerMonth * hours
-		}
+		unitPrice, cost := rates.cost(inst, hours)
 
 		// Record usage
 		record := &UsageRecord{
@@ -236,25 +237,28 @@ type billableInstance struct {
 // The old `gpu_vram_gb > 0` filter is gone: CPU-only instances are now
 // metered too (home compute). Whether a CPU instance actually costs anything
 // depends on the CPU/memory rates, which default to 0.
-func (c *UsageCollector) getBillableInstances(ctx context.Context) ([]billableInstance, error) {
+func (c *UsageCollector) getBillableInstances(ctx context.Context, accountID *uuid.UUID) ([]billableInstance, error) {
 	query := `
 		SELECT i.id, i.account_id, i.project_id, COALESCE(i.instance_type_id, ''),
 		       COALESCE(i.gpu_vram_gb, 0), COALESCE(i.cpu_units, 0),
 		       COALESCE(i.memory_gb, 0), COALESCE(i.storage_gb, 0),
 		       i.p_cores_used, i.e_cores_used,
-		       i.created_at, i.terminated_at
+		       i.created_at,
+		       COALESCE(i.terminated_at, CASE WHEN i.status = 'stopped' THEN i.stopped_at END)
 		FROM compute.instances i
 		LEFT JOIN LATERAL (
 			SELECT MAX(end_time) AS last_end
 			FROM billing.usage_records ur
 			WHERE ur.instance_id = i.id
 		) b ON true
-		WHERE (i.status = 'running' AND i.terminated_at IS NULL)
-			OR (i.terminated_at IS NOT NULL
-			    AND i.terminated_at > COALESCE(b.last_end, i.created_at) + interval '1 minute')
+		WHERE ((i.status = 'running' AND i.terminated_at IS NULL)
+			OR (COALESCE(i.terminated_at, CASE WHEN i.status = 'stopped' THEN i.stopped_at END) IS NOT NULL
+			    AND COALESCE(i.terminated_at, CASE WHEN i.status = 'stopped' THEN i.stopped_at END)
+			        > GREATEST(COALESCE(b.last_end, i.created_at), COALESCE(i.resumed_at, i.created_at)) + interval '1 minute'))
+			AND ($1::uuid IS NULL OR i.account_id = $1)
 	`
 
-	rows, err := c.db.QueryContext(ctx, query)
+	rows, err := c.db.QueryContext(ctx, query, accountID)
 	if err != nil {
 		return nil, fmt.Errorf("query failed: %w", err)
 	}
@@ -277,10 +281,13 @@ func (c *UsageCollector) getBillableInstances(ctx context.Context) ([]billableIn
 
 // getLastCollectionTime gets the last time usage was collected for an instance
 func (c *UsageCollector) getLastCollectionTime(ctx context.Context, instanceID string) (time.Time, error) {
+	// GREATEST ignores NULLs: the later of the last billed interval and the
+	// moment a stopped instance was started again, so the stopped gap is
+	// never billed as running time.
 	query := `
-		SELECT MAX(end_time)
-		FROM billing.usage_records
-		WHERE instance_id = $1
+		SELECT GREATEST(
+			(SELECT MAX(end_time) FROM billing.usage_records WHERE instance_id = $1),
+			(SELECT resumed_at FROM compute.instances WHERE id = $1))
 	`
 
 	var lastTime sql.NullTime

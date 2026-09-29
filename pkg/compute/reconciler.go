@@ -122,6 +122,12 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 
 	for i := range instances {
 		inst := &instances[i]
+		// A stopped instance has no pod on purpose (its disk is held for a
+		// customer who ran out of credit). Its absence from the cluster is
+		// the expected state, not a vanished workload to mark terminated.
+		if inst.Status == StatusStopped {
+			continue
+		}
 		observed, exists := live[inst.ID]
 
 		if !exists {

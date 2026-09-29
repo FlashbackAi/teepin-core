@@ -573,3 +573,96 @@ func TestPresentBody_KeepsOnlyStandardFieldsAndTokenCounts(t *testing.T) {
 		t.Error("choices (including reasoning) must pass through untouched")
 	}
 }
+
+// fakeCredit is a creditChecker with a fixed balance.
+type fakeCredit struct {
+	balance   float64
+	err       error
+	gotAmount float64
+	calls     int
+}
+
+func (f *fakeCredit) CanAfford(_ context.Context, _ uuid.UUID, worstCase float64) (bool, float64, error) {
+	f.calls++
+	f.gotAmount = worstCase
+	if f.err != nil {
+		return false, 0, f.err
+	}
+	return f.balance > 0 && f.balance >= worstCase, f.balance, nil
+}
+
+func TestChat_RefusesWhenCreditIsGone(t *testing.T) {
+	gw := &fakeGW{completeResp: okResponse()}
+	h := NewInferenceHandler(gw, testCatalog(), &fakeUsage{}).WithCreditGuard(&fakeCredit{balance: 0})
+
+	rec := serve(t, h, caller{}, "POST", "/v1/chat/completions", okBody)
+	if rec.Code != 402 || errCode(t, rec) != "insufficient_credit" {
+		t.Fatalf("status=%d code=%q body=%s", rec.Code, errCode(t, rec), rec.Body)
+	}
+	if gw.gotAccount != "" {
+		t.Error("the model was called for an account with no credit")
+	}
+}
+
+func TestChat_RefusesStreamingWhenCreditIsGone(t *testing.T) {
+	gw := &fakeGW{streamChunks: []inference.Chunk{{Data: []byte(`{}`)}}}
+	h := NewInferenceHandler(gw, testCatalog(), &fakeUsage{}).WithCreditGuard(&fakeCredit{balance: 0})
+
+	rec := serve(t, h, caller{}, "POST", "/v1/chat/completions", streamBody)
+	if rec.Code != 402 || strings.Contains(rec.Header().Get("Content-Type"), "event-stream") {
+		t.Fatalf("a refused stream must be a plain 402, got %d %q", rec.Code, rec.Header().Get("Content-Type"))
+	}
+}
+
+func TestChat_ServesWhenCreditCoversIt(t *testing.T) {
+	credit := &fakeCredit{balance: 5}
+	h := NewInferenceHandler(&fakeGW{completeResp: okResponse()}, testCatalog(), &fakeUsage{}).WithCreditGuard(credit)
+
+	if rec := serve(t, h, caller{}, "POST", "/v1/chat/completions", okBody); rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	if credit.calls != 1 {
+		t.Errorf("credit checked %d times, want once", credit.calls)
+	}
+}
+
+func TestChat_FailsClosedWhenCreditCannotBeChecked(t *testing.T) {
+	gw := &fakeGW{completeResp: okResponse()}
+	h := NewInferenceHandler(gw, testCatalog(), &fakeUsage{}).WithCreditGuard(&fakeCredit{err: errors.New("db down")})
+
+	rec := serve(t, h, caller{}, "POST", "/v1/chat/completions", okBody)
+	if rec.Code != 503 || errCode(t, rec) != "billing_unavailable" {
+		t.Fatalf("status=%d code=%q", rec.Code, errCode(t, rec))
+	}
+	if gw.gotAccount != "" {
+		t.Error("the model was called though credit could not be verified")
+	}
+}
+
+func TestInferencePreflightCost(t *testing.T) {
+	m := &modelcatalog.Model{InputPricePerMillion: 2, OutputPricePerMillion: 10, MaxOutputTokens: 32000}
+	req := inference.Request{Messages: []json.RawMessage{json.RawMessage(strings.Repeat("x", 4000))}}
+	in := float64(inference.EstimateTokens(req)) / 1e6 * 2
+
+	// Unbounded request: output is priced at the reserve, not the model's
+	// 32k limit, so a small balance is not refused for an answer that will
+	// almost never be that long.
+	got := inferencePreflightCost(m, req)
+	want := in + float64(inferenceOutputReserveTokens)/1e6*10
+	if got != want {
+		t.Errorf("unbounded request cost = %v, want %v", got, want)
+	}
+
+	// A request that bounds its own output is priced at that bound.
+	req.MaxTokens = 100
+	if got, want := inferencePreflightCost(m, req), in+100.0/1e6*10; got != want {
+		t.Errorf("bounded request cost = %v, want %v", got, want)
+	}
+
+	// A request asking for more than the model can emit is capped at the model limit first.
+	m.MaxOutputTokens = 500
+	req.MaxTokens = 100000
+	if got, want := inferencePreflightCost(m, req), in+500.0/1e6*10; got != want {
+		t.Errorf("over-limit request cost = %v, want %v", got, want)
+	}
+}

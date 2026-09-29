@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -31,6 +32,116 @@ func newTestClient(t *testing.T, mux *http.ServeMux) *teepinClient {
 	}
 }
 
+// testVerification is a check description long and specific enough to pass
+// checkVerification, for the tests that are about something else.
+const testVerification = "Started python http.server on 8000, opened http://localhost:8000 and saw the booking form render."
+
+func planPricingMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/billing/pricing", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"cpu_price_per_core_hour":1,"memory_price_per_gb_hour":1,"storage_price_per_gb_month":1}`))
+	})
+	return mux
+}
+
+func presentText(t *testing.T, c *teepinClient, args presentDeploymentPlanArgs) string {
+	t.Helper()
+	result, _, err := c.presentDeploymentPlan(context.Background(), &mcp.CallToolRequest{}, args)
+	if err != nil {
+		t.Fatalf("presentDeploymentPlan: %v", err)
+	}
+	return result.Content[0].(*mcp.TextContent).Text
+}
+
+func isPricedPlan(text string) bool {
+	var plan struct {
+		Resources []json.RawMessage `json:"resources"`
+	}
+	return json.Unmarshal([]byte(text), &plan) == nil && len(plan.Resources) > 0
+}
+
+// A plan cannot be presented without saying what was checked.
+func TestPresentDeploymentPlan_RefusesWithoutVerification(t *testing.T) {
+	c := newTestClient(t, planPricingMux())
+	text := presentText(t, c, presentDeploymentPlanArgs{Resources: []resourceRequest{{Name: "web", CPUUnits: 1, MemoryGB: 1}}})
+	if isPricedPlan(text) {
+		t.Fatalf("a plan was produced with no verification: %s", text)
+	}
+	if !strings.Contains(text, "verification") || !strings.Contains(text, "verify-before-presenting") {
+		t.Errorf("refusal should tell the agent what to do, got: %s", text)
+	}
+}
+
+// "verified" is not a description of a check.
+func TestPresentDeploymentPlan_RefusesAOneWordVerification(t *testing.T) {
+	c := newTestClient(t, planPricingMux())
+	text := presentText(t, c, presentDeploymentPlanArgs{
+		Resources: []resourceRequest{{Name: "web", CPUUnits: 1, MemoryGB: 1}}, Verification: "verified, works",
+	})
+	if isPricedPlan(text) || !strings.Contains(text, "too short") {
+		t.Errorf("got %s", text)
+	}
+}
+
+// With a marker path configured, the written statement alone is not enough:
+// run.py must have seen a local run since the last edit. This is what stops a
+// fabricated "verification".
+func TestPresentDeploymentPlan_NeedsTheEvidenceMarkerWhenConfigured(t *testing.T) {
+	marker := t.TempDir() + "/verified"
+	t.Setenv(verifyMarkerEnv, marker)
+	c := newTestClient(t, planPricingMux())
+	args := presentDeploymentPlanArgs{
+		Resources: []resourceRequest{{Name: "web", CPUUnits: 1, MemoryGB: 1}}, Verification: testVerification,
+	}
+
+	text := presentText(t, c, args)
+	if isPricedPlan(text) || !strings.Contains(text, "no local run has been seen") {
+		t.Fatalf("plan produced without evidence of a local run: %s", text)
+	}
+
+	if err := os.WriteFile(marker, []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if text := presentText(t, c, args); !isPricedPlan(text) {
+		t.Fatalf("plan refused although the evidence marker exists: %s", text)
+	}
+}
+
+// An app that cannot run inside the pod may say so, with a real reason, and
+// the reason travels with the plan so it is never a silent skip.
+func TestPresentDeploymentPlan_SkipReasonBypassesTheMarkerAndIsEchoed(t *testing.T) {
+	t.Setenv(verifyMarkerEnv, t.TempDir()+"/never-written")
+	c := newTestClient(t, planPricingMux())
+	reason := "Needs a managed Postgres that does not exist in this pod; I checked the SQL migrations parse instead."
+	text := presentText(t, c, presentDeploymentPlanArgs{
+		Resources: []resourceRequest{{Name: "api", CPUUnits: 1, MemoryGB: 1}}, VerificationSkippedReason: reason,
+	})
+	if !isPricedPlan(text) {
+		t.Fatalf("plan refused despite a skip reason: %s", text)
+	}
+	if !strings.Contains(text, "verification_skipped_reason") || !strings.Contains(text, "managed Postgres") {
+		t.Errorf("the skip reason must be echoed in the plan: %s", text)
+	}
+
+	short := presentText(t, c, presentDeploymentPlanArgs{
+		Resources: []resourceRequest{{Name: "api", CPUUnits: 1, MemoryGB: 1}}, VerificationSkippedReason: "cannot run",
+	})
+	if isPricedPlan(short) {
+		t.Errorf("a token skip reason must not be accepted: %s", short)
+	}
+}
+
+// The verification text is echoed in the plan the console renders.
+func TestPresentDeploymentPlan_EchoesVerification(t *testing.T) {
+	c := newTestClient(t, planPricingMux())
+	text := presentText(t, c, presentDeploymentPlanArgs{
+		Resources: []resourceRequest{{Name: "web", CPUUnits: 1, MemoryGB: 1}}, Verification: testVerification,
+	})
+	if !strings.Contains(text, "booking form render") {
+		t.Errorf("verification missing from the plan: %s", text)
+	}
+}
+
 func TestPresentDeploymentPlan_ComputesCostFromLiveRates(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/billing/pricing", func(w http.ResponseWriter, r *http.Request) {
@@ -46,6 +157,7 @@ func TestPresentDeploymentPlan_ComputesCostFromLiveRates(t *testing.T) {
 		Resources: []resourceRequest{
 			{Name: "web", CPUUnits: 2, MemoryGB: 4, StorageGB: 0},
 		},
+		Verification: testVerification,
 	})
 	if err != nil {
 		t.Fatalf("presentDeploymentPlan: %v", err)
@@ -81,7 +193,8 @@ func TestPresentDeploymentPlan_IncludesStorageConvertedFromGBMonth(t *testing.T)
 	c := newTestClient(t, mux)
 
 	result, _, err := c.presentDeploymentPlan(context.Background(), &mcp.CallToolRequest{}, presentDeploymentPlanArgs{
-		Resources: []resourceRequest{{Name: "db", StorageGB: 100}},
+		Resources:    []resourceRequest{{Name: "db", StorageGB: 100}},
+		Verification: testVerification,
 	})
 	if err != nil {
 		t.Fatalf("presentDeploymentPlan: %v", err)
@@ -128,7 +241,8 @@ func TestPresentDeploymentPlan_RejectsAllZeroResource(t *testing.T) {
 	c := newTestClient(t, mux)
 
 	result, _, err := c.presentDeploymentPlan(context.Background(), &mcp.CallToolRequest{}, presentDeploymentPlanArgs{
-		Resources: []resourceRequest{{Name: "pomodoro-instance"}},
+		Resources:    []resourceRequest{{Name: "pomodoro-instance"}},
+		Verification: testVerification,
 	})
 	if err != nil {
 		t.Fatalf("presentDeploymentPlan: %v", err)
@@ -150,7 +264,8 @@ func TestPresentDeploymentPlan_AllowsStorageOnlyResource(t *testing.T) {
 	c := newTestClient(t, mux)
 
 	result, _, err := c.presentDeploymentPlan(context.Background(), &mcp.CallToolRequest{}, presentDeploymentPlanArgs{
-		Resources: []resourceRequest{{Name: "db", StorageGB: 10}},
+		Resources:    []resourceRequest{{Name: "db", StorageGB: 10}},
+		Verification: testVerification,
 	})
 	if err != nil {
 		t.Fatalf("presentDeploymentPlan: %v", err)

@@ -54,10 +54,15 @@ type Model struct {
 	// infrastructure to the customer, same posture as leased GPU/CPU
 	// compute. False means a genuine vendor API Teepin merely calls
 	// (Anthropic, an arbitrary OpenAI-compatible endpoint).
-	SelfHosted            bool
-	SupportsTools         bool
-	SupportsVision        bool
-	SupportsAudio         bool
+	SelfHosted     bool
+	SupportsTools  bool
+	SupportsVision bool
+	SupportsAudio  bool
+	// ContextWindow is the model's input window in tokens, 0 when the
+	// catalog does not know it. The agent pod uses it to decide when to
+	// condense its conversation history (see LaunchAgent's
+	// TEEPIN_CONTEXT_WINDOW).
+	ContextWindow         int
 	InputPricePerMillion  float64
 	OutputPricePerMillion float64
 }
@@ -79,9 +84,10 @@ type ModelBackend interface {
 
 // StaticModel is one entry of a StaticModels backend.
 type StaticModel struct {
-	Route    string
-	Engine   string
-	Provider inference.Provider
+	Route         string
+	Engine        string
+	ContextWindow int
+	Provider      inference.Provider
 }
 
 // StaticModels is a fixed, in-memory ModelBackend: its models are listed in
@@ -92,7 +98,7 @@ type StaticModels []StaticModel
 func (s StaticModels) KumbhaModels(context.Context) ([]Model, error) {
 	out := make([]Model, 0, len(s))
 	for _, m := range s {
-		out = append(out, Model{Route: m.Route, Engine: m.Engine})
+		out = append(out, Model{Route: m.Route, Engine: m.Engine, ContextWindow: m.ContextWindow})
 	}
 	return out, nil
 }

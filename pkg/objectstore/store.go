@@ -458,6 +458,48 @@ func (s *Store) ListAllBucketsForMetering(ctx context.Context) ([]BucketRecord, 
 	return out, rows.Err()
 }
 
+// ListAccountsWithBuckets returns every account that owns at least one live
+// bucket - the accounts whose stored data the storage hold has to consider.
+func (s *Store) ListAccountsWithBuckets(ctx context.Context) ([]uuid.UUID, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT account_id FROM storage.buckets WHERE deleted_at IS NULL`)
+	if err != nil {
+		return nil, fmt.Errorf("objectstore: list accounts with buckets: %w", err)
+	}
+	defer rows.Close()
+	var out []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// ListBucketsForAccount returns every live bucket an account owns across all
+// its projects. For platform-internal use (purging held data) only: customer
+// requests always go through the project-scoped ListBuckets.
+func (s *Store) ListBucketsForAccount(ctx context.Context, accountID uuid.UUID) ([]BucketRecord, error) {
+	rows, err := s.db.QueryContext(ctx, bucketSelectColumns+`
+		WHERE account_id = $1 AND deleted_at IS NULL
+	`, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("objectstore: list account buckets: %w", err)
+	}
+	defer rows.Close()
+	var out []BucketRecord
+	for rows.Next() {
+		var b BucketRecord
+		if err := rows.Scan(&b.ID, &b.AccountID, &b.ProjectID, &b.Name, &b.Backend,
+			&b.ObjectCount, &b.TotalBytes, &b.CreatedAt, &b.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("objectstore: scan bucket: %w", err)
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
 // LastBillingEndTime returns the most recent end_time already billed for
 // a subject (e.g. a bucket, by ID) in billing.usage_records, or the zero
 // time if nothing has been billed for it yet. Queries billing's own

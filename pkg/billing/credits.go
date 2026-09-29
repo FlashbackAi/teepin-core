@@ -77,6 +77,7 @@ func (s *Service) GrantCredit(ctx context.Context, req GrantRequest) error {
 	if err != nil {
 		return fmt.Errorf("failed to record credit grant: %w", err)
 	}
+	s.balances.forget(req.AccountID)
 	return nil
 }
 
@@ -193,6 +194,9 @@ func (s *Service) ConsumeCredit(ctx context.Context, accountID, usageRecordID uu
 
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("failed to commit consumption: %w", err)
+	}
+	if applied > 0 {
+		s.balances.adjust(accountID, -applied)
 	}
 	return applied, nil
 }

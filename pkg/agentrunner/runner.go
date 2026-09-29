@@ -348,6 +348,9 @@ func (r *Runner) handleCommand(ctx context.Context, s stream, msg *agentpb.Contr
 	case *agentpb.ControlMessage_DeleteInstance:
 		r.handleDelete(ctx, s, msg.RequestId, payload.DeleteInstance)
 
+	case *agentpb.ControlMessage_StopInstance:
+		r.handleStop(ctx, s, msg.RequestId, payload.StopInstance)
+
 	case *agentpb.ControlMessage_FetchLogs:
 		r.handleLogs(ctx, s, msg.RequestId, payload.FetchLogs)
 
@@ -511,6 +514,34 @@ func (r *Runner) handleDelete(ctx context.Context, s stream, requestID string, c
 	}
 
 	log.Printf("Deleted instance %s", cmd.InstanceId)
+
+	r.statusMu.Lock()
+	delete(r.lastReported, cmd.InstanceId)
+	r.statusMu.Unlock()
+
+	_ = r.send(s, &agentpb.AgentMessage{
+		RequestId: requestID,
+		Payload:   &agentpb.AgentMessage_Result{Result: &agentpb.CommandResult{Success: true}},
+	})
+}
+
+// handleStop ends an instance's pod but keeps its volume. Needs a cluster that
+// can (cluster.InstanceStopper); one that cannot answers with an error and
+// leaves the instance untouched.
+func (r *Runner) handleStop(ctx context.Context, s stream, requestID string, cmd *agentpb.StopInstanceCommand) {
+	stopper, ok := r.cfg.Cluster.(cluster.InstanceStopper)
+	if !ok {
+		r.replyError(s, requestID, agentpb.ErrorCode_ERROR_CODE_INVALID_ARGUMENT,
+			"this agent cannot stop an instance while keeping its disk")
+		return
+	}
+	if err := stopper.StopInstance(ctx, cluster.AllTenants(), cmd.InstanceId); err != nil {
+		log.Printf("Stop %s failed: %v", cmd.InstanceId, err)
+		r.replyError(s, requestID, errorCodeFor(err), err.Error())
+		return
+	}
+
+	log.Printf("Stopped instance %s (volume kept)", cmd.InstanceId)
 
 	r.statusMu.Lock()
 	delete(r.lastReported, cmd.InstanceId)

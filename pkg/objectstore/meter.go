@@ -90,6 +90,17 @@ func (m *Meter) collect(ctx context.Context) error {
 	now := time.Now()
 	var billed int
 	for _, b := range buckets {
+		// Data held for lack of credit is not billed, and the held period
+		// is never back-charged once the hold ends.
+		held, floor, err := m.billingService.StorageBillingFloor(ctx, b.AccountID)
+		if err != nil {
+			log.Printf("WARN: objectstore meter: failed to read hold state for account %s: %v", b.AccountID, err)
+			continue
+		}
+		if held {
+			continue
+		}
+
 		lastEnd, err := m.store.LastBillingEndTime(ctx, SubjectTypeBucket, b.ID.String())
 		if err != nil {
 			log.Printf("WARN: objectstore meter: failed to read last billing time for bucket %s: %v", b.ID, err)
@@ -97,6 +108,9 @@ func (m *Meter) collect(ctx context.Context) error {
 		}
 		if lastEnd.IsZero() {
 			lastEnd = b.CreatedAt
+		}
+		if floor.After(lastEnd) {
+			lastEnd = floor
 		}
 
 		duration := now.Sub(lastEnd)

@@ -4,9 +4,11 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -15,6 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
+	"github.com/FlashbackAi/teepin-core/pkg/billing"
 	"github.com/FlashbackAi/teepin-core/pkg/models"
 	"github.com/FlashbackAi/teepin-core/pkg/objectstore"
 )
@@ -54,6 +57,102 @@ func objectModel(o *objectstore.ObjectRecord) models.StorageObject {
 	}
 }
 
+// creditFloor is the smallest amount an account must be able to pay for an
+// action that has no up-front price (a bucket, a write): any positive
+// balance qualifies, zero does not.
+const creditFloor = 0.000001
+
+// requireCredit writes the refusal and returns false when the account has
+// no credit to start something that will bill. Fails closed when the
+// balance cannot be read. A nil guard (standalone mode) allows everything.
+func (s *Server) requireCredit(c *gin.Context, accountID uuid.UUID) bool {
+	if s.credit == nil {
+		return true
+	}
+	ok, _, err := s.credit.CanAfford(c.Request.Context(), accountID, creditFloor)
+	if err != nil {
+		log.Printf("api: credit check for %s failed: %v", accountID, err)
+		c.Header("Retry-After", "5")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not verify your credit right now; retry shortly", "code": "billing_unavailable"})
+		return false
+	}
+	if !ok {
+		c.JSON(http.StatusPaymentRequired, gin.H{
+			"error": "your account has no credit; add credit in the console to continue",
+			"code":  "insufficient_credit",
+		})
+		return false
+	}
+	return true
+}
+
+// storageHoldReader reads an account's active storage hold. Implemented by
+// billing.Service.
+type storageHoldReader interface {
+	ActiveStorageHold(ctx context.Context, accountID uuid.UUID) (*billing.StorageHold, error)
+}
+
+// requireStorageAccess allows reading stored data only while the account has
+// credit. An account at zero has its data held: completely inaccessible - no
+// listing, metadata, downloads or signed links - until credit is added, when
+// access returns at once (the check is the balance itself, not a flag the
+// sweeper has to clear). Fails closed when the balance cannot be read.
+func (s *Server) requireStorageAccess(c *gin.Context, accountID uuid.UUID) bool {
+	if s.credit == nil {
+		return true
+	}
+	ok, _, err := s.credit.CanAfford(c.Request.Context(), accountID, creditFloor)
+	if err != nil {
+		log.Printf("api: storage access check for %s failed: %v", accountID, err)
+		c.Header("Retry-After", "5")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not verify your credit right now; retry shortly", "code": "billing_unavailable"})
+		return false
+	}
+	if ok {
+		return true
+	}
+	body := gin.H{
+		"error": "your stored data is on hold because your account has no credit; add credit to get it back",
+		"code":  "storage_on_hold",
+	}
+	if s.holds != nil {
+		if hold, err := s.holds.ActiveStorageHold(c.Request.Context(), accountID); err == nil && hold != nil {
+			body["delete_after"] = hold.DeleteAfter.UTC().Format(time.RFC3339)
+			body["error"] = fmt.Sprintf("your stored data is on hold because your account has no credit; add credit before %s or it will be deleted",
+				hold.DeleteAfter.UTC().Format("2 Jan 2006 15:04 UTC"))
+		}
+	}
+	c.JSON(http.StatusPaymentRequired, body)
+	return false
+}
+
+// GetStorageHold handles GET /v1/storage/hold: whether the account's stored
+// data is currently on hold and when it will be deleted.
+func (s *Server) GetStorageHold(c *gin.Context) {
+	_, accountID, ok := s.requireScope(c)
+	if !ok {
+		return
+	}
+	resp := gin.H{"held": false}
+	if s.credit != nil {
+		can, _, err := s.credit.CanAfford(c.Request.Context(), accountID, creditFloor)
+		if err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not verify your credit right now; retry shortly"})
+			return
+		}
+		if !can {
+			resp["held"] = true
+			if s.holds != nil {
+				if hold, err := s.holds.ActiveStorageHold(c.Request.Context(), accountID); err == nil && hold != nil {
+					resp["held_since"] = hold.HeldSince.UTC().Format(time.RFC3339)
+					resp["delete_after"] = hold.DeleteAfter.UTC().Format(time.RFC3339)
+				}
+			}
+		}
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
 // CreateBucket handles POST /v1/storage/buckets.
 func (s *Server) CreateBucket(c *gin.Context) {
 	if s.objectStore == nil {
@@ -70,6 +169,9 @@ func (s *Server) CreateBucket(c *gin.Context) {
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		return
+	}
+	if !s.requireCredit(c, accountID) {
 		return
 	}
 
@@ -165,6 +267,9 @@ func (s *Server) ListObjects(c *gin.Context) {
 	if !ok {
 		return
 	}
+	if !s.requireStorageAccess(c, accountID) {
+		return
+	}
 
 	limit, _ := strconv.Atoi(c.Query("limit"))
 	objects, err := s.objectStore.ListObjects(c.Request.Context(), accountID, projectID,
@@ -207,6 +312,9 @@ func (s *Server) PutObject(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Content-Length is required"})
 		return
 	}
+	if !s.requireCredit(c, accountID) {
+		return
+	}
 
 	contentType := c.GetHeader("Content-Type")
 	metadata := map[string]string{}
@@ -243,6 +351,9 @@ func (s *Server) GetObjectMeta(c *gin.Context) {
 	if !ok {
 		return
 	}
+	if !s.requireStorageAccess(c, accountID) {
+		return
+	}
 
 	key := c.Query("key")
 	if key == "" {
@@ -274,6 +385,9 @@ func (s *Server) GetObjectContent(c *gin.Context) {
 	}
 	projectID, accountID, ok := s.requireScope(c)
 	if !ok {
+		return
+	}
+	if !s.requireStorageAccess(c, accountID) {
 		return
 	}
 
@@ -392,6 +506,9 @@ func (s *Server) MintObjectDownloadURL(c *gin.Context) {
 	if !ok {
 		return
 	}
+	if !s.requireStorageAccess(c, accountID) {
+		return
+	}
 
 	key := c.Query("key")
 	if key == "" {
@@ -458,6 +575,10 @@ func (s *Server) RedeemObjectDownloadURL(c *gin.Context) {
 	d, err := s.objectStoreSigner.Verify(c.Param("token"))
 	if err != nil {
 		c.JSON(http.StatusForbidden, gin.H{"error": "invalid or expired link"})
+		return
+	}
+	// A link minted before the hold must not keep working during it.
+	if !s.requireStorageAccess(c, d.AccountID) {
 		return
 	}
 

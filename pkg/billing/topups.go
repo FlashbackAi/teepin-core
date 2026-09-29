@@ -274,6 +274,9 @@ func (s *Service) SettleTopUpByPaymentIntent(ctx context.Context, piID string, r
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit top-up settlement: %w", err)
 	}
+	// The purchase is spendable now; do not let a pre-flight keep judging on
+	// the balance from before it.
+	s.balances.forget(accountID)
 
 	// The credit and the receipt record are committed; the PDF is a derived
 	// document and must not undo them if rendering or storage fails.

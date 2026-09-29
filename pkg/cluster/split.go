@@ -63,6 +63,27 @@ func (s *SplitClient) DeleteInstance(ctx context.Context, scope Scope, id string
 	return s.containers.DeleteInstance(ctx, scope, id)
 }
 
+// RouteInstance forwards to the container client, the only one that can hold
+// a stopped instance's disk.
+func (s *SplitClient) RouteInstance(instanceID, providerID string) {
+	if r, ok := s.containers.(InstanceRouter); ok {
+		r.RouteInstance(instanceID, providerID)
+	}
+}
+
+// StopInstance is supported for container workloads only; a native-runtime
+// instance has no persistent volume to keep.
+func (s *SplitClient) StopInstance(ctx context.Context, scope Scope, id string) error {
+	if s.holdsNative(ctx, scope, id) {
+		return errors.New("native-runtime instances cannot be stopped with their disk kept")
+	}
+	stopper, ok := s.containers.(InstanceStopper)
+	if !ok {
+		return errors.New("this cluster client cannot stop an instance while keeping its disk")
+	}
+	return stopper.StopInstance(ctx, scope, id)
+}
+
 func (s *SplitClient) GetInstanceStatus(ctx context.Context, scope Scope, id string) (*InstanceStatus, error) {
 	if st, err := s.native.GetInstanceStatus(ctx, scope, id); err == nil {
 		return st, nil

@@ -47,7 +47,9 @@ func main() {
 		Description: "Show the customer an itemised infrastructure cost estimate " +
 			"(Resource / Sized / Cost per hour and per month) and wait for their " +
 			"approval before calling create_instance, deploy, or attach_domain. " +
-			"Always call this BEFORE attempting to provision anything real.",
+			"Always call this BEFORE attempting to provision anything real. " +
+			"You must have run your app inside this pod and checked it first, and " +
+			"describe that check in \"verification\" — the call is refused without it.",
 	}, client.presentDeploymentPlan)
 
 	mcp.AddTool(server, &mcp.Tool{
@@ -221,6 +223,60 @@ type resourceRequest struct {
 
 type presentDeploymentPlanArgs struct {
 	Resources []resourceRequest `json:"resources" jsonschema:"every compute resource this build will need"`
+	// Verification is the agent's own account of running its app in this pod
+	// and checking it. Required unless VerificationSkippedReason is given.
+	Verification string `json:"verification,omitempty" jsonschema:"REQUIRED unless verification_skipped_reason is set: in plain words, what you started inside this pod, the localhost address you opened or requested, and what you saw. Run and check the app BEFORE presenting a plan."`
+	// VerificationSkippedReason is the escape hatch for an app that cannot
+	// run inside the pod at all (an external database, a paid service). It is
+	// echoed in the plan so it is never a silent skip.
+	VerificationSkippedReason string `json:"verification_skipped_reason,omitempty" jsonschema:"ONLY if the app genuinely cannot run inside this pod: why, and what you checked instead"`
+}
+
+// verifyMarkerEnv names the file run.py writes when it has watched the agent
+// run the app locally and look at it (a localhost page opened in the browser
+// tool, or a localhost request with curl) with no edit since. Unset means the
+// deployment has no such evidence source and only the written statement is
+// required — how this server behaves outside the Kumbha agent pod.
+const verifyMarkerEnv = "TEEPIN_VERIFY_MARKER"
+
+// minVerificationChars keeps a one-word "verified" from satisfying the check.
+const minVerificationChars = 40
+
+const verificationRequiredMessage = "Before presenting a plan, run the app inside this pod and check it yourself, " +
+	"then call present_deployment_plan again with \"verification\" describing what you started, " +
+	"the localhost address you opened (browser tool) or requested (curl), and what you saw. " +
+	"See the verify-before-presenting skill. If the app cannot run inside this pod at all, set " +
+	"\"verification_skipped_reason\" instead and explain why."
+
+const verificationEvidenceMessage = "You described a check, but no local run has been seen since your last edit: " +
+	"open http://localhost:<port> with the browser tool (or curl it) while your app is running, " +
+	"and if you have edited any file since, check again. Then call present_deployment_plan again."
+
+// checkVerification returns "" when the agent may present a plan, or the
+// message to hand back to it. A skipped-reason overrides the marker check
+// (the app cannot run here, so there is nothing to observe) but never
+// removes the need for a real explanation.
+func checkVerification(args presentDeploymentPlanArgs) string {
+	skipped := strings.TrimSpace(args.VerificationSkippedReason)
+	verified := strings.TrimSpace(args.Verification)
+	if skipped != "" {
+		if len(skipped) < minVerificationChars {
+			return "verification_skipped_reason is too short to be an explanation: say why the app cannot run inside this pod and what you checked instead."
+		}
+		return ""
+	}
+	if verified == "" {
+		return verificationRequiredMessage
+	}
+	if len(verified) < minVerificationChars {
+		return "verification is too short to describe a check: say what you started, the address you opened and what you saw."
+	}
+	if marker := os.Getenv(verifyMarkerEnv); marker != "" {
+		if _, err := os.Stat(marker); err != nil {
+			return verificationEvidenceMessage
+		}
+	}
+	return ""
 }
 
 // hoursPerMonth mirrors pkg/billing/collector.go's own constant — the
@@ -232,6 +288,9 @@ const hoursPerMonth = 730.0
 func (c *teepinClient) presentDeploymentPlan(ctx context.Context, req *mcp.CallToolRequest, args presentDeploymentPlanArgs) (*mcp.CallToolResult, any, error) {
 	if len(args.Resources) == 0 {
 		return textResult("at least one resource is required")
+	}
+	if msg := checkVerification(args); msg != "" {
+		return textResult("%s", msg)
 	}
 	// Go's json.Unmarshal never rejects a missing or wrong-named field — it
 	// just leaves the zero value in place. Left unchecked, a call using the
@@ -284,7 +343,14 @@ func (c *teepinClient) presentDeploymentPlan(ctx context.Context, req *mcp.CallT
 		Resources         []lineOut `json:"resources"`
 		TotalCostPerHour  float64   `json:"total_cost_per_hour"`
 		TotalCostPerMonth float64   `json:"total_cost_per_month"`
-	}{}
+		// Echoed so the check the agent claims is part of what the customer
+		// (and an operator reading the event log) sees with the plan.
+		Verification              string `json:"verification,omitempty"`
+		VerificationSkippedReason string `json:"verification_skipped_reason,omitempty"`
+	}{
+		Verification:              strings.TrimSpace(args.Verification),
+		VerificationSkippedReason: strings.TrimSpace(args.VerificationSkippedReason),
+	}
 
 	for _, r := range args.Resources {
 		hourly := float64(r.CPUUnits)*pricing.CPUPricePerCoreHour + float64(r.MemoryGB)*pricing.MemoryPricePerGBHour

@@ -24,6 +24,10 @@ const (
 	StatusRunning    = "running"
 	StatusFailed     = "failed"
 	StatusTerminated = "terminated"
+	// StatusStopped means the pod was stopped for lack of credit with the
+	// disk kept. terminated_at stays NULL: the instance still exists and can
+	// be started again until its hold expires.
+	StatusStopped = "stopped"
 )
 
 // InstanceRecord is a row of compute.instances.

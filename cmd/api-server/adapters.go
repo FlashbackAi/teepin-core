@@ -360,6 +360,7 @@ func (b *kumbhaModelBackend) KumbhaModels(ctx context.Context) ([]kumbha.Model, 
 			SupportsTools:         m.SupportsTools,
 			SupportsVision:        m.SupportsVision,
 			SupportsAudio:         m.SupportsAudio,
+			ContextWindow:         m.ContextWindow,
 			InputPricePerMillion:  m.InputPricePerMillion,
 			OutputPricePerMillion: m.OutputPricePerMillion,
 		})
@@ -503,4 +504,137 @@ func (r *resourceSuspender) SuspendAccountResources(ctx context.Context, account
 		stopped++
 	}
 	return stopped, nil
+}
+
+// computeStopper implements billing.ComputeStopper for the credit enforcer:
+// it ends the named instances at the cluster and marks each terminated.
+// Only instances that are still active for the given account are touched,
+// so an id from another tenant (or one already gone) is ignored.
+type computeStopper struct {
+	cluster cluster.Client
+	store   *compute.Store
+}
+
+func newComputeStopper(c cluster.Client, store *compute.Store) *computeStopper {
+	return &computeStopper{cluster: c, store: store}
+}
+
+func (s *computeStopper) StopInstances(ctx context.Context, accountID uuid.UUID, instanceIDs []string) ([]string, error) {
+	want := make(map[string]bool, len(instanceIDs))
+	for _, id := range instanceIDs {
+		want[id] = true
+	}
+	active, err := s.store.ListActiveByAccount(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	var stopped []string
+	var errs []error
+	for _, inst := range active {
+		if !want[inst.ID] {
+			continue
+		}
+		scope := cluster.ProjectScope(inst.ProjectID.String())
+		if err := s.cluster.DeleteInstance(ctx, scope, inst.ID); err != nil {
+			errs = append(errs, fmt.Errorf("delete %s: %w", inst.ID, err))
+			continue
+		}
+		if err := s.store.MarkTerminated(ctx, inst.ID); err != nil {
+			errs = append(errs, fmt.Errorf("mark %s terminated: %w", inst.ID, err))
+			continue
+		}
+		stopped = append(stopped, inst.ID)
+	}
+	return stopped, errors.Join(errs...)
+}
+
+// HoldInstances stops instances that have a persistent disk WITHOUT deleting
+// the disk (billing.ComputeStopper). An instance is held only if it can be
+// started again later - its launch spec must be stored - and the cluster can
+// keep the disk; otherwise it is reported and left running, never deleted:
+// its disk is the customer's data.
+func (s *computeStopper) HoldInstances(ctx context.Context, accountID uuid.UUID, instanceIDs []string) ([]string, error) {
+	want := make(map[string]bool, len(instanceIDs))
+	for _, id := range instanceIDs {
+		want[id] = true
+	}
+	active, err := s.store.ListActiveByAccount(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	stopper, canStop := s.cluster.(cluster.InstanceStopper)
+	var held []string
+	var errs []error
+	for _, inst := range active {
+		if !want[inst.ID] {
+			continue
+		}
+		if !canStop {
+			errs = append(errs, fmt.Errorf("%s: this cluster client cannot stop an instance with its disk kept", inst.ID))
+			continue
+		}
+		if _, err := s.store.LoadLaunchSpec(ctx, inst.ID); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", inst.ID, err))
+			continue
+		}
+		if r, ok := s.cluster.(cluster.InstanceRouter); ok {
+			r.RouteInstance(inst.ID, inst.ProviderID)
+		}
+		scope := cluster.ProjectScope(inst.ProjectID.String())
+		if err := stopper.StopInstance(ctx, scope, inst.ID); err != nil {
+			errs = append(errs, fmt.Errorf("%s: stop: %w", inst.ID, err))
+			continue
+		}
+		if _, err := s.store.MarkStopped(ctx, inst.ID); err != nil {
+			// The pod is gone but the record still says running; the
+			// reconciler would mark it terminated and lose the disk's
+			// record. Say so loudly - this needs a human.
+			errs = append(errs, fmt.Errorf("%s: stopped but not recorded: %w", inst.ID, err))
+			continue
+		}
+		held = append(held, inst.ID)
+	}
+	return held, errors.Join(errs...)
+}
+
+// heldDisks is the storage-hold view of stopped instances' disks
+// (billing.HeldStorage): the disks are covered by the same 7-day hold as
+// object storage, and deleted when it expires.
+type heldDisks struct {
+	cluster cluster.Client
+	store   *compute.Store
+}
+
+func newHeldDisks(c cluster.Client, store *compute.Store) *heldDisks {
+	return &heldDisks{cluster: c, store: store}
+}
+
+func (h *heldDisks) Name() string { return "instance disks" }
+
+func (h *heldDisks) AccountsWithStorage(ctx context.Context) ([]uuid.UUID, error) {
+	return h.store.AccountsWithStoppedInstances(ctx)
+}
+
+// PurgeAccount deletes every stopped instance of the account together with
+// its disk. Each is routed to the node that holds its disk first: a stopped
+// instance has no live status the client could route by.
+func (h *heldDisks) PurgeAccount(ctx context.Context, accountID uuid.UUID) error {
+	stopped, err := h.store.ListStoppedByAccount(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, inst := range stopped {
+		if r, ok := h.cluster.(cluster.InstanceRouter); ok {
+			r.RouteInstance(inst.ID, inst.ProviderID)
+		}
+		if err := h.cluster.DeleteInstance(ctx, cluster.AllTenants(), inst.ID); err != nil {
+			errs = append(errs, fmt.Errorf("delete %s: %w", inst.ID, err))
+			continue
+		}
+		if err := h.store.MarkTerminated(ctx, inst.ID); err != nil {
+			errs = append(errs, fmt.Errorf("mark %s terminated: %w", inst.ID, err))
+		}
+	}
+	return errors.Join(errs...)
 }

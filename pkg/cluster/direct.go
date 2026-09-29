@@ -464,6 +464,19 @@ func appendScope(selector string, scope Scope) string {
 // not an error: commands may be redelivered after an agent reconnects,
 // and a delete that finds nothing has achieved its purpose.
 func (c *DirectClient) DeleteInstance(ctx context.Context, scope Scope, instanceID string) error {
+	return c.remove(ctx, scope, instanceID, false)
+}
+
+// StopInstance ends the pod, endpoint and network policy but keeps the
+// persistent volume (the customer's disk). Used when an account runs out of
+// credit: the disk is held, then either started again after a top-up or
+// deleted when the hold expires (by a normal DeleteInstance).
+func (c *DirectClient) StopInstance(ctx context.Context, scope Scope, instanceID string) error {
+	return c.remove(ctx, scope, instanceID, true)
+}
+
+// remove is the shared teardown. keepVolume leaves the PVC in place.
+func (c *DirectClient) remove(ctx context.Context, scope Scope, instanceID string, keepVolume bool) error {
 	pods, err := c.k8s.CoreV1().Pods(workloadNamespace).List(ctx, metav1.ListOptions{
 		LabelSelector: instanceSelector(scope, instanceID),
 	})
@@ -513,7 +526,7 @@ func (c *DirectClient) DeleteInstance(ctx context.Context, scope Scope, instance
 	// delete by name, same idempotent IsNotFound-is-success idiom as the
 	// pod delete above. A PVC delete when StorageGB was never set simply
 	// finds nothing, which is not an error.
-	if !isKumbhaAgent {
+	if !isKumbhaAgent && !keepVolume {
 		if err := c.k8s.CoreV1().PersistentVolumeClaims(workloadNamespace).Delete(
 			ctx, pvcName(instanceID), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("delete pvc: %w", err)

@@ -20,6 +20,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/FlashbackAi/teepin-core/pkg/auth"
+	"github.com/FlashbackAi/teepin-core/pkg/billing"
 	"github.com/FlashbackAi/teepin-core/pkg/build"
 	"github.com/FlashbackAi/teepin-core/pkg/cluster"
 	"github.com/FlashbackAi/teepin-core/pkg/compute"
@@ -160,6 +161,18 @@ type Server struct {
 	// egress simply isn't billed — downloads still work identically,
 	// same "feature off when unconfigured" posture as everything else.
 	objectStoreEgress *objectstore.EgressTracker
+
+	// credit refuses actions that start costing money when the account has
+	// no credit. nil in standalone mode (no billing).
+	credit creditChecker
+
+	// holds reports an account's storage hold, for the message shown when
+	// stored data is inaccessible for lack of credit. nil is fine.
+	holds storageHoldReader
+
+	// specVault seals launch specs so a disk-backed instance can be stopped
+	// and later started again. nil disables holding such instances.
+	specVault *compute.SpecVault
 	// publicBaseURL is Teepin's own internet-reachable API host (e.g.
 	// "https://dev-api.teepin.com") — deliberately NOT the same value as
 	// TEEPIN_KUMBHA_AGENT_API_BASE_URL, which is cluster-internal and
@@ -194,6 +207,21 @@ func (s *Server) WithObjectStore(os *objectstore.Service) *Server {
 // download links. Returns the same *Server for chaining.
 func (s *Server) WithObjectStoreSigner(signer *objectstore.Signer) *Server {
 	s.objectStoreSigner = signer
+	return s
+}
+
+// WithCreditGuard makes actions that start costing money (creating storage
+// buckets, writing objects) refuse an account with no credit. Returns the
+// same *Server for chaining.
+func (s *Server) WithCreditGuard(g creditChecker) *Server {
+	s.credit = g
+	return s
+}
+
+// WithStorageHolds lets the storage endpoints tell a customer when their
+// held data will be deleted. Returns the same *Server for chaining.
+func (s *Server) WithStorageHolds(r storageHoldReader) *Server {
+	s.holds = r
 	return s
 }
 
@@ -604,18 +632,35 @@ func (s *Server) CreateInstance(c *gin.Context) {
 	// not just something an agent is trusted to avoid.
 	if s.kumbha != nil && kumbhaSessionID != uuid.Nil {
 		sess, err := s.kumbha.GetSession(c.Request.Context(), kumbhaSessionID, accountID)
-		if err == nil && sess.AppInstanceID != "" {
+		// Real spend needs the customer's approval, enforced here and not
+		// only in the MCP tool: the token that reaches this endpoint is
+		// readable by the agent's own terminal, so a client-side check in
+		// teepin-mcp-server can be skipped by calling the API directly. Same
+		// gate BuildKumbhaSession/DeployKumbhaSession use.
+		//
+		// Fails CLOSED. This used to degrade to "allow" on a lookup error,
+		// which was harmless while the check only prevented a duplicate
+		// instance; now that it is the approval gate, an unreadable session
+		// must deny rather than hand out real spend on a database blip.
+		if err != nil {
+			log.Printf("api: could not read Kumbha session %s to check approval: %v", kumbhaSessionID, err)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "unable to verify the deployment approval, please retry"})
+			return
+		}
+		if !sess.DeployApproved {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error": "the customer has not approved the deployment plan yet",
+				"code":  "not_approved",
+			})
+			return
+		}
+		if sess.AppInstanceID != "" {
 			c.JSON(http.StatusConflict, gin.H{
 				"error": "this session already has a deployed instance (" + sess.AppInstanceID + "); use the deploy tool to redeploy it in place instead of creating a new one",
 				"code":  "instance_already_exists",
 			})
 			return
 		}
-		// A lookup failure here (session not found, DB blip) is not a
-		// reason to block a create outright — it degrades to the
-		// pre-existing behavior rather than failing closed on an
-		// unrelated error, matching every other best-effort Kumbha check
-		// in this file.
 	}
 
 	// Payment gate: no validated payment method (or a non-active account),
@@ -730,6 +775,32 @@ func (s *Server) CreateInstance(c *gin.Context) {
 		vramGB, err = gpu.ParseVRAM(req.GPUVRAM)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid gpu_vram: %v", err)})
+			return
+		}
+	}
+
+	// A GPU instance must be affordable for a minimum stretch, not merely
+	// for the moment: the credit enforcer stops an account's compute as its
+	// credit runs out, so launching something that could be paid for only
+	// briefly would just start it to kill it minutes later. Priced on the
+	// requested size (the allocated size can only be larger, and the
+	// enforcer covers that difference). Checked before allocation so a
+	// refusal reserves nothing.
+	if s.credit != nil && vramGB > 0 {
+		hourly := gpu.PriceForVRAM(vramGB, s.vramRate(c.Request.Context()))
+		need := hourly * billing.MinLaunchRunway.Hours()
+		ok, balance, cerr := s.credit.CanAfford(c.Request.Context(), accountID, need)
+		if cerr != nil {
+			log.Printf("api: launch credit check for %s failed: %v", accountID, cerr)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "unable to verify billing status, please retry"})
+			return
+		}
+		if !ok {
+			c.JSON(http.StatusPaymentRequired, gin.H{
+				"error": fmt.Sprintf("this instance costs $%.2f/hour and needs at least $%.2f of credit to launch (you have $%.2f); add credit in the console",
+					hourly, need, balance),
+				"code": "insufficient_credit",
+			})
 			return
 		}
 	}
@@ -864,6 +935,10 @@ func (s *Server) CreateInstance(c *gin.Context) {
 			return
 		}
 
+		// Keep the launch details (sealed) for an instance with a disk, so it
+		// can be stopped-and-held rather than deleted if credit runs out.
+		s.persistLaunchSpec(c.Request.Context(), instanceID, spec)
+
 		// A Kumbha session that just provisioned REAL infrastructure needs
 		// its current workspace draft checkpointed — the same thing
 		// DeployKumbhaSession already does after its own create call, but
@@ -962,8 +1037,17 @@ func (s *Server) ListInstances(c *gin.Context) {
 
 	rate := s.vramRate(c.Request.Context())
 	instances := make([]models.Instance, 0, len(statuses))
+	seen := make(map[string]bool, len(statuses))
 	for _, st := range statuses {
+		seen[st.InstanceID] = true
 		instances = append(instances, statusToInstance(st, records[st.InstanceID], rate, s.endpointDomain))
+	}
+	// Stopped instances have no pod, so the cluster does not list them; they
+	// still exist (their disk is kept) and the customer must see them.
+	for id, rec := range records {
+		if !seen[id] && rec.Status == compute.StatusStopped && rec.TerminatedAt == nil {
+			instances = append(instances, s.stoppedView(c.Request.Context(), rec))
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -1010,6 +1094,12 @@ func (s *Server) GetInstance(c *gin.Context) {
 		return
 	}
 
+	// A stopped instance has no pod to ask the cluster about.
+	if rec := s.stoppedRecord(c.Request.Context(), projectID, instanceID); rec != nil {
+		c.JSON(http.StatusOK, s.stoppedView(c.Request.Context(), rec))
+		return
+	}
+
 	st, err := s.cluster.GetInstanceStatus(c.Request.Context(), scopeFor(projectID), instanceID)
 	if err != nil {
 		// Another tenant's instance and a nonexistent one are the same
@@ -1047,6 +1137,13 @@ func (s *Server) DeleteInstance(c *gin.Context) {
 		return
 	}
 	scope := scopeFor(projectID)
+
+	// A stopped instance is deleted with its disk, by a route that does not
+	// depend on a live cluster status (there is none).
+	if rec := s.stoppedRecord(c.Request.Context(), projectID, instanceID); rec != nil {
+		s.deleteStoppedInstance(c, rec)
+		return
+	}
 
 	// Existence check before deleting, so that deleting something that
 	// was never there is a 404 rather than a misleading success. The

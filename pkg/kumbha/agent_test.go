@@ -213,6 +213,46 @@ func TestGateway_LaunchAgent_Success(t *testing.T) {
 // landing on a node with zero free memory purely by the luck of Go's
 // randomized map iteration in cluster.Registry.Any().
 
+// The agent sizes its history condenser from the model's input window, so
+// LaunchAgent must hand it the catalog's number for the session's own route
+// ("0" when the catalog has none, which makes run.py fall back to an
+// event-count trigger).
+func TestGateway_LaunchAgent_PassesTheRoutesContextWindow(t *testing.T) {
+	cases := []struct {
+		name   string
+		window int
+		want   string
+	}{
+		{"known window", 32768, "32768"},
+		{"unknown window", 0, "0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store, mock := newMockStore(t)
+			fc := &fakeCluster{}
+			models := StaticModels{
+				{Route: "teepin/other", Engine: "vllm", ContextWindow: 999999, Provider: &fakeProvider{name: "vllm"}},
+				{Route: "teepin/chosen", Engine: "vllm", ContextWindow: tc.window, Provider: &fakeProvider{name: "vllm"}},
+			}
+			gw := NewGateway(store, models, nil, &fakePricing{}, &fakeUsageRecorder{}).
+				WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest", CPUUnits: 2, MemoryGB: 4})
+
+			sessID := uuid.New()
+			sess := &Session{ID: sessID, AccountID: uuid.New(), ProjectID: uuid.New(), ModelRoute: "teepin/chosen"}
+			mock.ExpectExec(`UPDATE billing\.inference_sessions SET agent_instance_id`).
+				WithArgs(sessID, sqlmock.AnyArg()).
+				WillReturnResult(sqlmock.NewResult(0, 1))
+
+			if err := gw.LaunchAgent(context.Background(), sess, "build", nil); err != nil {
+				t.Fatalf("LaunchAgent: %v", err)
+			}
+			if got := fc.created[0].Env["TEEPIN_CONTEXT_WINDOW"]; got != tc.want {
+				t.Errorf("TEEPIN_CONTEXT_WINDOW = %q, want %q (must come from the session's own route, not another model's)", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestGateway_LaunchAgent_PicksNodeWithEnoughCapacity(t *testing.T) {
 	store, mock := newMockStore(t)
 	fc := &fakeCluster{}

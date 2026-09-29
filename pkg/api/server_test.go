@@ -1279,6 +1279,11 @@ func TestCreateInstance_CheckspointsKumbhaWorkspaceWhenSessionLinked(t *testing.
 
 	sessionID := uuid.New()
 
+	// A session credential may only create an instance once the customer
+	// approved the deployment plan (enforced server-side in CreateInstance).
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
+		WithArgs(sessionID, testAccountID).
+		WillReturnRows(approvedSessionRow(sessionID))
 	mock.ExpectQuery(`INSERT INTO compute\.instances`).
 		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),

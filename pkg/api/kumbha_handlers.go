@@ -20,6 +20,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/FlashbackAi/teepin-core/pkg/auth"
+	"github.com/FlashbackAi/teepin-core/pkg/billing"
 	"github.com/FlashbackAi/teepin-core/pkg/build"
 	"github.com/FlashbackAi/teepin-core/pkg/cluster"
 	"github.com/FlashbackAi/teepin-core/pkg/compute"
@@ -1326,6 +1327,10 @@ func (s *Server) redeployKumbhaInstance(ctx context.Context, c *gin.Context, ses
 		return
 	}
 
+	// A redeploy changes what the instance runs; the stored launch details
+	// (used to start it again after a stop) must follow.
+	s.persistLaunchSpec(ctx, existing.ID, spec)
+
 	containerPort := 0
 	if len(ports) > 0 {
 		containerPort = ports[0].Container
@@ -1911,6 +1916,13 @@ func (s *Server) KumbhaChatCompletions(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "X-Teepin-Session is not a valid session id"})
 		return
 	}
+	// A session-scoped credential may only spend its own session's budget.
+	// Without this an agent could name any other session in the same
+	// account in the header and bill its completions there.
+	if tokenSession, isSessionToken := auth.GetSessionID(c); isSessionToken && tokenSession != sessionID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "this credential belongs to a different session"})
+		return
+	}
 
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
@@ -1963,6 +1975,16 @@ func (s *Server) KumbhaChatCompletions(c *gin.Context) {
 				"error": "session budget exhausted", "code": "budget_exhausted",
 				"spent": sess.Spent, "budget": sess.Budget,
 			})
+		case errors.Is(err, billing.ErrInsufficientCredit):
+			// Distinct from budget_exhausted: raising the session budget
+			// does not help, the account itself has to add credit.
+			c.JSON(http.StatusPaymentRequired, gin.H{
+				"error": "your account does not have enough credit to continue; add credit in the console",
+				"code":  "insufficient_credit",
+			})
+		case errors.Is(err, kumbha.ErrGateUnavailable):
+			c.Header("Retry-After", "5")
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not verify your credit right now; retry shortly", "code": "billing_unavailable"})
 		case errors.Is(err, inference.ErrUnknownModel):
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error(), "code": "unknown_model"})
 		case errors.Is(err, inference.ErrContextTooLarge):

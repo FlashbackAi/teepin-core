@@ -87,7 +87,7 @@ func TestCollectUsage_BillsCustomSizeLinearly(t *testing.T) {
 			AddRow("inst-25gb0001", accountID, projectID, "gpu.h100.custom-25gb", 25, 8, 32, 0, nil, nil, createdAt, nil))
 
 	// No previous collection.
-	mock.ExpectQuery(`SELECT MAX\(end_time\)`).
+	mock.ExpectQuery(`SELECT GREATEST\(`).
 		WithArgs("inst-25gb0001").
 		WillReturnRows(sqlmock.NewRows([]string{"max"}).AddRow(nil))
 
@@ -123,7 +123,7 @@ func TestCollectUsage_UsesAdminConfiguredRate(t *testing.T) {
 		WillReturnRows(billableInstanceRows().
 			AddRow("inst-20gb0001", accountID, projectID, "gpu.a100.2g.20gb", 20, 8, 32, 0, nil, nil, createdAt, nil))
 
-	mock.ExpectQuery(`SELECT MAX\(end_time\)`).
+	mock.ExpectQuery(`SELECT GREATEST\(`).
 		WithArgs("inst-20gb0001").
 		WillReturnRows(sqlmock.NewRows([]string{"max"}).AddRow(nil))
 
@@ -160,7 +160,7 @@ func TestCollectUsage_BillsTerminatedTail(t *testing.T) {
 		WillReturnRows(billableInstanceRows().
 			AddRow("inst-short001", accountID, projectID, "gpu.a100.2g.20gb", 20, 8, 32, 0, nil, nil, createdAt, terminatedAt))
 
-	mock.ExpectQuery(`SELECT MAX\(end_time\)`).
+	mock.ExpectQuery(`SELECT GREATEST\(`).
 		WithArgs("inst-short001").
 		WillReturnRows(sqlmock.NewRows([]string{"max"}).AddRow(nil))
 
@@ -199,7 +199,7 @@ func TestCollectUsage_MetersCPUInstance(t *testing.T) {
 		WillReturnRows(billableInstanceRows().
 			AddRow("inst-cpu00001", accountID, projectID, "cpu.home", 0, 4, 8, 0, nil, nil, createdAt, nil))
 
-	mock.ExpectQuery(`SELECT MAX\(end_time\)`).
+	mock.ExpectQuery(`SELECT GREATEST\(`).
 		WithArgs("inst-cpu00001").
 		WillReturnRows(sqlmock.NewRows([]string{"max"}).AddRow(nil))
 
@@ -242,7 +242,7 @@ func TestCollectUsage_BillsPECoreSplitSeparately(t *testing.T) {
 			"created_at", "terminated_at",
 		}).AddRow("inst-pe000001", accountID, projectID, "cpu.home", 0, 6, 8, 0, 4, 2, createdAt, nil))
 
-	mock.ExpectQuery(`SELECT MAX\(end_time\)`).
+	mock.ExpectQuery(`SELECT GREATEST\(`).
 		WithArgs("inst-pe000001").
 		WillReturnRows(sqlmock.NewRows([]string{"max"}).AddRow(nil))
 
@@ -279,7 +279,7 @@ func TestCollectUsage_CPUAtZeroRateRecordsZero(t *testing.T) {
 	mock.ExpectQuery(`SELECT .+ FROM compute\.instances`).
 		WillReturnRows(billableInstanceRows().
 			AddRow("inst-cpu00002", accountID, projectID, "cpu.home", 0, 4, 8, 0, nil, nil, createdAt, nil))
-	mock.ExpectQuery(`SELECT MAX\(end_time\)`).
+	mock.ExpectQuery(`SELECT GREATEST\(`).
 		WithArgs("inst-cpu00002").
 		WillReturnRows(sqlmock.NewRows([]string{"max"}).AddRow(nil))
 	// All rates 0 (migration default).
@@ -318,7 +318,7 @@ func TestCollectUsage_MetersStorage(t *testing.T) {
 	mock.ExpectQuery(`SELECT .+ FROM compute\.instances`).
 		WillReturnRows(billableInstanceRows().
 			AddRow("inst-vol00001", accountID, projectID, "cpu.home", 0, 0, 0, 100, nil, nil, createdAt, nil))
-	mock.ExpectQuery(`SELECT MAX\(end_time\)`).
+	mock.ExpectQuery(`SELECT GREATEST\(`).
 		WithArgs("inst-vol00001").
 		WillReturnRows(sqlmock.NewRows([]string{"max"}).AddRow(nil))
 	// $0.10/GB-month storage rate; CPU/memory both 0.
@@ -365,7 +365,7 @@ func TestCollectUsage_SkipsRecentlyCollected(t *testing.T) {
 
 	// Last collection was 30 seconds ago → below the 1-minute floor,
 	// no new record (and no pricing read either).
-	mock.ExpectQuery(`SELECT MAX\(end_time\)`).
+	mock.ExpectQuery(`SELECT GREATEST\(`).
 		WithArgs("inst-20gb0001").
 		WillReturnRows(sqlmock.NewRows([]string{"max"}).
 			AddRow(time.Now().Add(-30 * time.Second)))

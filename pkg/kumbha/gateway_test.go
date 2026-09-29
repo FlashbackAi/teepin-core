@@ -37,9 +37,20 @@ type fakeUsageRecorder struct {
 	consumed   []float64
 	recordErr  error
 	consumeErr error
+	// recordFailFirst/consumeFailFirst make the first N calls fail, then
+	// succeed - a transient fault, as opposed to recordErr/consumeErr which
+	// never recover.
+	recordFailFirst  int
+	consumeFailFirst int
+	recordCalls      int
+	consumeCalls     int
 }
 
 func (f *fakeUsageRecorder) RecordUsage(_ context.Context, r *billing.UsageRecord) error {
+	f.recordCalls++
+	if f.recordCalls <= f.recordFailFirst {
+		return errors.New("transient record failure")
+	}
 	if f.recordErr != nil {
 		return f.recordErr
 	}
@@ -49,6 +60,10 @@ func (f *fakeUsageRecorder) RecordUsage(_ context.Context, r *billing.UsageRecor
 }
 
 func (f *fakeUsageRecorder) ConsumeCredit(_ context.Context, _, _ uuid.UUID, cost float64) (float64, error) {
+	f.consumeCalls++
+	if f.consumeCalls <= f.consumeFailFirst {
+		return 0, errors.New("transient consume failure")
+	}
 	if f.consumeErr != nil {
 		return 0, f.consumeErr
 	}
@@ -562,5 +577,169 @@ func TestGateway_Complete_FallsBackToFlatRateWithNoCatalogEntry(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Error(err)
+	}
+}
+
+type fakeCreditChecker struct {
+	balance float64
+	err     error
+	got     float64
+}
+
+func (f *fakeCreditChecker) CanAfford(_ context.Context, _ uuid.UUID, worst float64) (bool, float64, error) {
+	f.got = worst
+	if f.err != nil {
+		return false, 0, f.err
+	}
+	return f.balance > 0 && f.balance >= worst, f.balance, nil
+}
+
+// An account with no credit is refused before any tokens are spent, and
+// before any database write: nothing about the request is recorded.
+func TestGateway_Complete_RefusesWhenAccountHasNoCredit(t *testing.T) {
+	store, mock := newMockStore(t)
+	provider := &fakeProvider{name: "vllm", usage: inference.Usage{InputTokens: 10, OutputTokens: 10}}
+	models := StaticModels{{Route: "teepin/fast", Engine: "vllm", Provider: provider}}
+	gw := NewGateway(store, models, nil, &fakePricing{in: 2, out: 8}, &fakeUsageRecorder{}).
+		WithCreditGuard(&fakeCreditChecker{balance: 0})
+
+	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), Status: "open", Budget: 5.0, ModelRoute: "teepin/fast"}
+	_, err := gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/fast"})
+	if !errors.Is(err, billing.ErrInsufficientCredit) {
+		t.Fatalf("got %v, want billing.ErrInsufficientCredit", err)
+	}
+	if provider.calls != 0 {
+		t.Error("the model was called for an account with no credit")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unexpected DB interaction: %v", err)
+	}
+}
+
+func TestGateway_Complete_FailsClosedWhenCreditUnreadable(t *testing.T) {
+	store, _ := newMockStore(t)
+	provider := &fakeProvider{name: "vllm"}
+	models := StaticModels{{Route: "teepin/fast", Engine: "vllm", Provider: provider}}
+	gw := NewGateway(store, models, nil, &fakePricing{in: 2, out: 8}, &fakeUsageRecorder{}).
+		WithCreditGuard(&fakeCreditChecker{err: errors.New("db down")})
+
+	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), Status: "open", Budget: 5.0, ModelRoute: "teepin/fast"}
+	_, err := gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/fast"})
+	if !errors.Is(err, ErrGateUnavailable) {
+		t.Fatalf("got %v, want ErrGateUnavailable", err)
+	}
+	if provider.calls != 0 {
+		t.Error("the model was called though credit could not be verified")
+	}
+}
+
+// The pre-flight prices the output at the request's own bound when it has
+// one, and at the reserve otherwise.
+func TestGateway_Complete_PreflightPricesOutputBound(t *testing.T) {
+	store, _ := newMockStore(t)
+	models := StaticModels{{Route: "teepin/fast", Engine: "vllm", Provider: &fakeProvider{name: "vllm"}}}
+	credit := &fakeCreditChecker{balance: 0}
+	gw := NewGateway(store, models, nil, &fakePricing{in: 0, out: 10}, &fakeUsageRecorder{}).WithCreditGuard(credit)
+	sess := &Session{ID: uuid.New(), AccountID: uuid.New(), Status: "open", Budget: 5.0, ModelRoute: "teepin/fast"}
+
+	_, _ = gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/fast", MaxTokens: 100})
+	if want := 100.0 / 1e6 * 10; credit.got != want {
+		t.Errorf("bounded pre-flight = %v, want %v", credit.got, want)
+	}
+	_, _ = gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/fast"})
+	if want := float64(completionOutputReserveTokens) / 1e6 * 10; credit.got != want {
+		t.Errorf("unbounded pre-flight = %v, want %v", credit.got, want)
+	}
+}
+
+func init() { settleRetryDelay = 0 }
+
+// expectAccrueOK queues a successful Accrue for a session with room to spare.
+func expectAccrueOK(mock sqlmock.Sqlmock, sessID, accountID uuid.UUID) {
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT status, budget, spent FROM billing\.inference_sessions`).
+		WithArgs(sessID, accountID).
+		WillReturnRows(sqlmock.NewRows([]string{"status", "budget", "spent"}).AddRow("open", 5.0, 0.0))
+	mock.ExpectExec(`UPDATE billing\.inference_sessions SET spent`).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`INSERT INTO billing\.inference_session_usage`).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+}
+
+func completeWith(t *testing.T, mock sqlmock.Sqlmock, store *Store, usage *fakeUsageRecorder, accrue func()) (*CompletionResult, error) {
+	t.Helper()
+	sessID, accountID := uuid.New(), uuid.New()
+	if accrue != nil {
+		accrue()
+	} else {
+		expectAccrueOK(mock, sessID, accountID)
+	}
+	provider := &fakeProvider{name: "vllm", usage: inference.Usage{InputTokens: 1000, OutputTokens: 500}}
+	models := StaticModels{{Route: "teepin/fast", Engine: "vllm", Provider: provider}}
+	gw := NewGateway(store, models, nil, &fakePricing{in: 2.0, out: 8.0}, usage)
+	sess := &Session{ID: sessID, AccountID: accountID, Status: "open", Budget: 5.0, ModelRoute: "teepin/fast"}
+	return gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/fast"})
+}
+
+// A transient failure recording usage is retried inside the request and the
+// customer still gets the answer - never a 500 that makes the harness rerun
+// (and re-bill) the model. Each line lands exactly once.
+func TestGateway_Complete_TransientRecordFailureIsRetriedNotSurfaced(t *testing.T) {
+	store, mock := newMockStore(t)
+	usage := &fakeUsageRecorder{recordFailFirst: 2}
+	result, err := completeWith(t, mock, store, usage, nil)
+	if err != nil || result == nil {
+		t.Fatalf("a served completion was failed over bookkeeping: %v", err)
+	}
+	if len(usage.records) != 2 {
+		t.Errorf("usage lines = %d, want exactly input+output once each", len(usage.records))
+	}
+	if len(usage.consumed) != 2 {
+		t.Errorf("credit draws = %v, want one per line", usage.consumed)
+	}
+}
+
+// Credit drawing retries against the SAME usage record (idempotent), so a
+// transient failure cannot produce a second usage row.
+func TestGateway_Complete_TransientConsumeFailureDoesNotDuplicateUsage(t *testing.T) {
+	store, mock := newMockStore(t)
+	usage := &fakeUsageRecorder{consumeFailFirst: 1}
+	if _, err := completeWith(t, mock, store, usage, nil); err != nil {
+		t.Fatalf("a served completion was failed over bookkeeping: %v", err)
+	}
+	if len(usage.records) != 2 {
+		t.Errorf("usage rows = %d, want 2 (a retry must not insert another)", len(usage.records))
+	}
+	if len(usage.consumed) != 2 {
+		t.Errorf("credit draws = %v, want 2", usage.consumed)
+	}
+}
+
+// Even when recording never recovers, the answer is returned; the failure is
+// logged for reconciliation instead of provoking a retry storm.
+func TestGateway_Complete_PermanentBookkeepingFailureStillReturnsAnswer(t *testing.T) {
+	store, mock := newMockStore(t)
+	usage := &fakeUsageRecorder{recordErr: errors.New("db down")}
+	result, err := completeWith(t, mock, store, usage, nil)
+	if err != nil || result == nil {
+		t.Fatalf("got %v, want the served answer", err)
+	}
+	if usage.recordCalls != 2*settleAttempts {
+		t.Errorf("record attempts = %d, want %d (bounded retry per line)", usage.recordCalls, 2*settleAttempts)
+	}
+}
+
+// A failure writing the session's own spend counter must not lose the
+// account charge or the answer.
+func TestGateway_Complete_SessionAccrualFaultStillBillsAccount(t *testing.T) {
+	store, mock := newMockStore(t)
+	usage := &fakeUsageRecorder{}
+	result, err := completeWith(t, mock, store, usage, func() {
+		mock.ExpectBegin().WillReturnError(errors.New("db down"))
+	})
+	if err != nil || result == nil {
+		t.Fatalf("a served completion was failed over a session-counter fault: %v", err)
+	}
+	if len(usage.records) != 2 || len(usage.consumed) != 2 {
+		t.Errorf("account not billed: records=%d consumed=%v", len(usage.records), usage.consumed)
 	}
 }

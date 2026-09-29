@@ -58,6 +58,7 @@ message ControlMessage {
     ExecStart             exec_start      = 9;  // interactive exec: open one session
     ExecInput             exec_input      = 10; // interactive exec: stdin/resize/cancel, same request_id
     DeleteCachedModelCommand delete_cached_model = 11; // remove one downloaded model from the node's model cache
+    StopInstanceCommand   stop_instance   = 12; // end the pod, KEEP the persistent volume (out-of-credit hold)
   }
 }
 
@@ -196,6 +197,20 @@ message DeleteInstanceCommand {
   string instance_id = 1;
   // Deleting an already-absent instance is success, not an error: the
   // control plane may retry after a reconnect.
+}
+
+// StopInstanceCommand ends an instance's pod and endpoint but KEEPS its
+// persistent volume, so the same instance can be started again later.
+//
+// Deliberately its own command rather than a flag on DeleteInstanceCommand:
+// an agent built before this existed ignores unknown fields on a message it
+// does understand, so a "keep_storage" flag sent to an old agent would be
+// silently dropped and the volume - the customer's data - deleted. An old
+// agent instead answers an unknown command with INVALID_ARGUMENT and touches
+// nothing.
+message StopInstanceCommand {
+  string instance_id = 1;
+  // Stopping an already-stopped or absent instance is success, not an error.
 }
 
 message FetchLogsCommand {

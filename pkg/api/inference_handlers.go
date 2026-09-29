@@ -72,6 +72,67 @@ type InferenceHandler struct {
 	gateway inferenceGateway
 	catalog catalogReader
 	usage   usageRecorder
+	credit  creditChecker
+}
+
+// creditChecker answers whether an account can pay for a request before it
+// is served. Implemented by billing.Service.
+type creditChecker interface {
+	CanAfford(ctx context.Context, accountID uuid.UUID, worstCase float64) (bool, float64, error)
+}
+
+// WithCreditGuard makes the handler refuse requests an account cannot pay
+// for (402 insufficient_credit). Without it nothing is checked, which only
+// makes sense in tests.
+func (h *InferenceHandler) WithCreditGuard(g creditChecker) *InferenceHandler {
+	h.credit = g
+	return h
+}
+
+// inferenceOutputReserveTokens is how much output a pre-flight assumes when
+// a request does not bound it tightly. Pricing the model's full output
+// limit would refuse requests that will in practice cost a fraction of that;
+// the difference on an unusually long answer is absorbed by the balance
+// floor (ConsumeCredit never draws more than the balance), so credit still
+// never goes negative.
+const inferenceOutputReserveTokens = 2048
+
+// inferencePreflightCost estimates what a request will cost at most, for
+// the "can this account pay?" check made before it is served.
+func inferencePreflightCost(model *modelcatalog.Model, req inference.Request) float64 {
+	out := req.MaxTokens
+	if out <= 0 || (model.MaxOutputTokens > 0 && out > model.MaxOutputTokens) {
+		out = model.MaxOutputTokens
+	}
+	if out <= 0 || out > inferenceOutputReserveTokens {
+		out = inferenceOutputReserveTokens
+	}
+	in := float64(inference.EstimateTokens(req))
+	return in/1e6*model.InputPricePerMillion + float64(out)/1e6*model.OutputPricePerMillion
+}
+
+// requireCredit writes the refusal and returns false when the account
+// cannot pay for the request. A balance that cannot be read refuses too:
+// unlike a running workload, a request not yet started costs nothing to
+// turn away.
+func (h *InferenceHandler) requireCredit(c *gin.Context, accountID uuid.UUID, model *modelcatalog.Model, req inference.Request) bool {
+	if h.credit == nil {
+		return true
+	}
+	ok, _, err := h.credit.CanAfford(c.Request.Context(), accountID, inferencePreflightCost(model, req))
+	if err != nil {
+		log.Printf("inference: credit check for %s failed: %v", accountID, err)
+		c.Header("Retry-After", "5")
+		writeInferenceError(c, http.StatusServiceUnavailable, "api_error", "billing_unavailable",
+			"could not verify your credit right now; retry shortly")
+		return false
+	}
+	if !ok {
+		writeInferenceError(c, http.StatusPaymentRequired, "insufficient_credit", "insufficient_credit",
+			"your account does not have enough credit for this request; add credit in the console to continue")
+		return false
+	}
+	return true
 }
 
 // NewInferenceHandler wires the handler. usage may be nil (nothing is
@@ -256,6 +317,10 @@ func (h *InferenceHandler) ChatCompletions(c *gin.Context) {
 		Extra:     req.extra,
 	}
 	acct := accountID.String()
+
+	if !h.requireCredit(c, accountID, model, ireq) {
+		return
+	}
 
 	if req.stream {
 		h.serveStream(c, acct, projectID, model, ireq)

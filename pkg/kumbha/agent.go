@@ -178,6 +178,24 @@ func (g *Gateway) checkModelAvailable(ctx context.Context, route string) error {
 	return fmt.Errorf("%w: %q is no longer a Kumbha-enabled model", errNoKumbhaModels, route)
 }
 
+// routeContextWindow returns the catalog's input window (tokens) for route,
+// or 0 when it is unknown — no such model, no window recorded, or the model
+// list could not be read. Best-effort by design: the agent uses it only to
+// decide when to condense its history, and 0 makes it fall back to an
+// event-count trigger, so a lookup failure never blocks a launch.
+func (g *Gateway) routeContextWindow(ctx context.Context, route string) int {
+	models, err := g.kumbhaModels(ctx)
+	if err != nil {
+		return 0
+	}
+	for _, m := range models {
+		if m.Route == route {
+			return m.ContextWindow
+		}
+	}
+	return 0
+}
+
 // CapacityCandidate is one node's identity plus free room — the minimum
 // pickNodeWithCapacity needs, deliberately NOT pkg/nodes.NodeCapacity
 // directly (that package's own HiddenWorkloadCounter doc comment already
@@ -329,6 +347,10 @@ func (g *Gateway) LaunchAgent(ctx context.Context, sess *Session, prompt string,
 			// validates it — see resolveModel), so this always carries the
 			// customer's actual choice.
 			"TEEPIN_ROUTE": sess.ModelRoute,
+			// The route's input window in tokens ("0" when unknown). run.py
+			// sizes its history condenser from it, so a small-window model
+			// condenses early instead of failing on an oversized request.
+			"TEEPIN_CONTEXT_WINDOW": strconv.Itoa(g.routeContextWindow(ctx, sess.ModelRoute)),
 			// run.py's own working directory defaults to "/workspace" — the
 			// pod's ephemeral, non-persistent root filesystem — while the
 			// PVC this spec mounts (below, via StorageGB) lands at /data.
@@ -641,13 +663,15 @@ func (g *Gateway) IsAgentRunning(ctx context.Context, sess *Session) (bool, erro
 // itself), or relaunch the agent with the message as a fresh prompt if the
 // previous pod already exited.
 //
-// The relaunch path is an honest, bounded degradation, not real
-// conversation persistence: a relaunched agent has NO memory of what it
-// discussed before (no persistence_dir/conversation_id wiring exists
-// yet — a real follow-up item, not silently glossed over here) — but the
-// WORKSPACE it built is still there (versioned, on disk via the PVC), and
-// the relaunch prompt says so explicitly, so the agent inspects what
-// exists rather than starting over or contradicting itself.
+// A relaunched pod resumes the conversation, not just the files: run.py
+// keeps the SDK's event log under the PVC (STATE_DIRNAME) keyed by session
+// id and reopens it on start, so the agent remembers what it discussed and
+// did. That state can be missing (a session from before persistence
+// existed) or unreadable (an SDK upgrade between launches); run.py then
+// starts a fresh conversation, and the WORKSPACE it built is still there
+// (versioned, on disk via the PVC). The relaunch prompt says so
+// explicitly either way, so the agent inspects what exists rather than
+// starting over or contradicting itself.
 //
 // Returns relaunched=true when a new agent pod was started rather than an
 // existing one resuming — the caller (SendMessage's HTTP handler) surfaces

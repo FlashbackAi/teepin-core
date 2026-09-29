@@ -242,6 +242,9 @@ func (m *Middleware) RequireAuth() gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
 			return
 		}
+		if !enforceSessionRoutes(c, p) {
+			return
+		}
 		store(c, p)
 		c.Next()
 	}
@@ -252,6 +255,9 @@ func (m *Middleware) RequireAuth() gin.HandlerFunc {
 func (m *Middleware) OptionalAuth() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if p := m.authenticate(c); p != nil {
+			if !enforceSessionRoutes(c, p) {
+				return
+			}
 			store(c, p)
 		}
 		c.Next()

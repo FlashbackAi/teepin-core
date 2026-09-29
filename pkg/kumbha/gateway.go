@@ -48,6 +48,29 @@ type ModelPricingProvider interface {
 	ModelPricing(ctx context.Context, modelRoute string) (input, output float64, ok bool)
 }
 
+// CreditChecker answers whether an account can pay for a request before it
+// is served. Implemented by billing.Service. Optional on the Gateway.
+type CreditChecker interface {
+	CanAfford(ctx context.Context, accountID uuid.UUID, worstCase float64) (bool, float64, error)
+}
+
+// completionOutputReserveTokens is how much output a completion's pre-flight
+// assumes when the request does not bound it tighter. The difference on an
+// unusually long answer is absorbed by the balance floor (ConsumeCredit
+// never draws more than the balance).
+const completionOutputReserveTokens = 2048
+
+const (
+	// completionSettleTimeout bounds recording a served completion's usage.
+	completionSettleTimeout = 15 * time.Second
+	// settleAttempts is how many times each recording step is tried.
+	settleAttempts = 3
+)
+
+// settleRetryDelay is the pause between recording attempts. A variable so
+// tests need not wait.
+var settleRetryDelay = 200 * time.Millisecond
+
 // UsageRecorder is the subset of billing.Service the Gateway needs at
 // session close: write the ledger rows and draw down credit against them.
 // An interface so kumbha's tests do not require a full *billing.Service.
@@ -109,6 +132,11 @@ type Gateway struct {
 	// modelcatalog.Service exists.
 	modelPricing ModelPricingProvider
 
+	// credit is OPTIONAL — nil means completions are not checked against the
+	// account's credit balance (tests, standalone mode). Set via
+	// WithCreditGuard.
+	credit CreditChecker
+
 	// nodeCapacity is OPTIONAL — nil means LaunchAgent/CaptureScreenshot
 	// fall back to cluster.Client's own placement (registry.Any() for the
 	// tunnel-based home path, a random pick among every connected node
@@ -128,6 +156,15 @@ func NewGateway(store *Store, models ModelBackend, gate ProvisionGate, pricing P
 // the same *Gateway for chaining, matching WithAgent's own shape.
 func (g *Gateway) WithModelPricing(p ModelPricingProvider) *Gateway {
 	g.modelPricing = p
+	return g
+}
+
+// WithCreditGuard makes Complete refuse (billing.ErrInsufficientCredit) a
+// completion the account's credit cannot pay for. A session budget only caps
+// what one build may spend; it says nothing about whether the account has
+// the money, so without this a build could keep spending at a zero balance.
+func (g *Gateway) WithCreditGuard(c CreditChecker) *Gateway {
+	g.credit = c
 	return g
 }
 
@@ -453,6 +490,25 @@ func (g *Gateway) Complete(ctx context.Context, sess *Session, req inference.Req
 		return nil, errNoKumbhaModels
 	}
 
+	// Refuse before spending tokens on an account that cannot pay for them.
+	// Fails closed: an unreadable balance refuses the completion (the agent
+	// harness retries), it does not open an unmetered hole.
+	if g.credit != nil {
+		inRate, outRate := g.rates(ctx, sess.ModelRoute)
+		out := req.MaxTokens
+		if out <= 0 || out > completionOutputReserveTokens {
+			out = completionOutputReserveTokens
+		}
+		worst := float64(inference.EstimateTokens(req))/1e6*inRate + float64(out)/1e6*outRate
+		ok, _, err := g.credit.CanAfford(ctx, sess.AccountID, worst)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrGateUnavailable, err)
+		}
+		if !ok {
+			return nil, billing.ErrInsufficientCredit
+		}
+	}
+
 	// Engine is looked up only for the audit/margin column, from the SAME
 	// kumbha-enabled list the picker uses — a model an operator disabled
 	// for Kumbha mid-session (rare) falls back to an empty engine string
@@ -477,42 +533,49 @@ func (g *Gateway) Complete(ctx context.Context, sess *Session, req inference.Req
 
 	cost := g.cost(ctx, sess.ModelRoute, resp.Usage)
 
-	newSpent, err := g.store.Accrue(ctx, sess.ID, sess.AccountID, cost,
+	// From here the model has answered and its tokens are spent, so nothing
+	// below may turn the response into an error. The harness retries a failed
+	// completion (up to 5 times), and each retry runs the model and bills
+	// again - a bookkeeping hiccup used to charge the same work repeatedly
+	// while the customer received nothing. Bookkeeping therefore retries
+	// itself and, if it still cannot finish, is logged for reconciliation
+	// and the answer is returned anyway.
+	//
+	// Runs on a detached context so a client hanging up cannot cancel the
+	// writes that bill for tokens already generated.
+	bctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), completionSettleTimeout)
+	defer cancel()
+
+	newSpent, err := g.store.Accrue(bctx, sess.ID, sess.AccountID, cost,
 		req.Model, engine, resp.Usage.InputTokens, resp.Usage.OutputTokens)
 	if err != nil {
-		// The completion already happened and tokens were genuinely spent
-		// upstream — this is a recording failure, not a request failure,
-		// and it is surfaced distinctly so a caller does not mistake it for
-		// "no completion occurred" (which would invite a retry that spends
-		// tokens twice).
-		return nil, fmt.Errorf("completion served but accrual failed: %w", err)
+		if errors.Is(err, ErrBudgetExhausted) || errors.Is(err, ErrSessionClosed) || errors.Is(err, ErrSessionNotFound) {
+			// A deliberate refusal by the session, not a recording fault.
+			return nil, fmt.Errorf("completion served but not accrued: %w", err)
+		}
+		log.Printf("ERROR: kumbha session %s: completion served but its spend was not recorded on the session (cost %.6f): %v", sess.ID, cost, err)
+		newSpent = sess.Spent + cost
 	}
 
-	// Settled immediately, per completion — not batched until the session
-	// closes. Billing is metered per-token already; there is no reason a
-	// customer's ability to keep chatting (and thus keep building) should
-	// depend on an explicit "close this session" action, and batching to
-	// Close meant a session that was simply abandoned (never explicitly
-	// closed) left its spend sitting unrecorded in usage_records
-	// indefinitely. See CloseSession's own doc comment for what it does
-	// instead now (pull down its own agent pod only — settlement no
-	// longer happens there at all, so a session's `spent` counter and its
-	// invoice-visible cost never diverge). Best-effort in the sense that a
-	// settlement failure surfaces to the CALLER (so the customer sees it,
-	// same as an accrual failure) but the tokens were already genuinely
-	// spent upstream either way.
-	inRate, outRate := g.rates(ctx, sess.ModelRoute)
-	var settleErrs []error
+	// Settled immediately, per completion - not batched until the session
+	// closes. Billing is metered per-token already; a customer's ability to
+	// keep chatting (and thus keep building) must not depend on an explicit
+	// "close this session" action, and batching to Close left an abandoned
+	// session's spend unrecorded indefinitely. See CloseSession's own doc
+	// comment: settlement no longer happens there at all, so a session's
+	// `spent` counter and its invoice-visible cost never diverge.
+	inRate, outRate := g.rates(bctx, sess.ModelRoute)
 	if resp.Usage.InputTokens > 0 {
-		settleErrs = append(settleErrs, g.settleLine(ctx, sess, req.Model+":input", engine,
-			float64(resp.Usage.InputTokens), float64(resp.Usage.InputTokens)/1e6*inRate, start, end))
+		if err := g.settleLine(bctx, sess, req.Model+":input", engine,
+			float64(resp.Usage.InputTokens), float64(resp.Usage.InputTokens)/1e6*inRate, start, end); err != nil {
+			log.Printf("ERROR: kumbha session %s: completion served but its input usage was not billed: %v", sess.ID, err)
+		}
 	}
 	if resp.Usage.OutputTokens > 0 {
-		settleErrs = append(settleErrs, g.settleLine(ctx, sess, req.Model+":output", engine,
-			float64(resp.Usage.OutputTokens), float64(resp.Usage.OutputTokens)/1e6*outRate, start, end))
-	}
-	if err := errors.Join(settleErrs...); err != nil {
-		return nil, fmt.Errorf("completion served but settlement failed: %w", err)
+		if err := g.settleLine(bctx, sess, req.Model+":output", engine,
+			float64(resp.Usage.OutputTokens), float64(resp.Usage.OutputTokens)/1e6*outRate, start, end); err != nil {
+			log.Printf("ERROR: kumbha session %s: completion served but its output usage was not billed: %v", sess.ID, err)
+		}
 	}
 
 	return &CompletionResult{Response: resp, Cost: cost, Spent: newSpent, Budget: sess.Budget}, nil
@@ -635,12 +698,33 @@ func (g *Gateway) settleLine(ctx context.Context, sess *Session, resourceType, p
 	if quantity > 0 {
 		record.UnitPrice = totalCost / quantity * 1e6 // back into a per-million rate for display
 	}
-	if err := g.usage.RecordUsage(ctx, record); err != nil {
+	// Each step retries on its own. RecordUsage creates the row only on
+	// success (a failed attempt inserted nothing), so it is repeated until it
+	// lands once; ConsumeCredit is idempotent per usage record, so repeating
+	// it can never draw twice. Neither retry can double-charge.
+	var err error
+	for attempt := 0; attempt < settleAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(settleRetryDelay)
+		}
+		if err = g.usage.RecordUsage(ctx, record); err == nil {
+			break
+		}
+	}
+	if err != nil {
 		return fmt.Errorf("failed to record %s: %w", resourceType, err)
 	}
 	if totalCost > 0 {
-		if _, err := g.usage.ConsumeCredit(ctx, sess.AccountID, record.ID, totalCost); err != nil {
-			return fmt.Errorf("failed to consume credit for %s: %w", resourceType, err)
+		for attempt := 0; attempt < settleAttempts; attempt++ {
+			if attempt > 0 {
+				time.Sleep(settleRetryDelay)
+			}
+			if _, err = g.usage.ConsumeCredit(ctx, sess.AccountID, record.ID, totalCost); err == nil {
+				break
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("failed to consume credit for %s (usage record %s): %w", resourceType, record.ID, err)
 		}
 	}
 	return nil

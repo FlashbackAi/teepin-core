@@ -17,10 +17,12 @@ type fakeProvider struct {
 	name  string
 	err   error
 	usage inference.Usage
+	calls int
 }
 
 func (f *fakeProvider) Name() string { return f.name }
 func (f *fakeProvider) Complete(context.Context, inference.Request) (*inference.Response, error) {
+	f.calls++
 	if f.err != nil {
 		return nil, f.err
 	}

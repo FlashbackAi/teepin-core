@@ -1030,3 +1030,79 @@ func TestAgentClient_CreateInstance_OrdinaryInstanceStillListed(t *testing.T) {
 	}
 	t.Fatal("inst-real0001 did not appear in ListInstanceStatuses")
 }
+
+func TestAgentClient_StopInstanceSendsStopNotDelete(t *testing.T) {
+	fake := newFakeAgent(&agentpb.CommandResult{Success: true})
+	c := NewAgentClient(registryWith(fake.session))
+	c.RecordStatus(InstanceStatus{InstanceID: "inst-stop0001", ProjectID: "proj", Status: "running", ProviderID: "provider-1"})
+	c.RouteInstance("inst-stop0001", "provider-1")
+
+	if err := c.StopInstance(context.Background(), ProjectScope("proj"), "inst-stop0001"); err != nil {
+		t.Fatalf("StopInstance: %v", err)
+	}
+
+	sent := fake.lastSent()
+	if sent == nil || sent.GetStopInstance() == nil || sent.GetStopInstance().InstanceId != "inst-stop0001" {
+		t.Fatalf("sent = %+v, want a StopInstanceCommand", sent)
+	}
+	if sent.GetDeleteInstance() != nil {
+		t.Error("a delete was sent; that would destroy the disk")
+	}
+	// The status is gone, but routing to the owning provider is kept so a
+	// later delete of the stopped instance reaches the node with the disk.
+	c.mu.RLock()
+	_, hasStatus := c.statuses["inst-stop0001"]
+	provider := c.providers["inst-stop0001"]
+	c.mu.RUnlock()
+	if hasStatus {
+		t.Error("status should be forgotten after a stop")
+	}
+	if provider != "provider-1" {
+		t.Errorf("provider routing = %q, want it kept as provider-1", provider)
+	}
+}
+
+// An agent built before the stop command answers INVALID_ARGUMENT; the
+// control plane must see an error and treat the instance as still running.
+func TestAgentClient_StopInstanceOldAgentIsAnError(t *testing.T) {
+	fake := newFakeAgent(&agentpb.CommandResult{Success: false, ErrorCode: agentpb.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, ErrorMessage: "unsupported command"})
+	c := NewAgentClient(registryWith(fake.session))
+	c.RecordStatus(InstanceStatus{InstanceID: "inst-stop0002", ProjectID: "proj", Status: "running"})
+
+	if err := c.StopInstance(context.Background(), ProjectScope("proj"), "inst-stop0002"); err == nil {
+		t.Fatal("an old agent's refusal was reported as success")
+	}
+	c.mu.RLock()
+	_, hasStatus := c.statuses["inst-stop0002"]
+	c.mu.RUnlock()
+	if !hasStatus {
+		t.Error("status was forgotten though the stop failed")
+	}
+}
+
+func TestAgentClient_StopInstanceOtherTenantSendsNothing(t *testing.T) {
+	fake := newFakeAgent(&agentpb.CommandResult{Success: true})
+	c := NewAgentClient(registryWith(fake.session))
+	c.RecordStatus(InstanceStatus{InstanceID: "inst-stop0003", ProjectID: "bob", Status: "running"})
+
+	if err := c.StopInstance(context.Background(), ProjectScope("alice"), "inst-stop0003"); err != nil {
+		t.Fatal(err)
+	}
+	if fake.lastSent() != nil {
+		t.Error("a stop reached the agent for another tenant's instance")
+	}
+}
+
+// After a control-plane restart the routing map is empty; RouteInstance
+// re-seeds it from the database so a delete reaches the right node.
+func TestAgentClient_RouteInstanceSeedsRouting(t *testing.T) {
+	c := NewAgentClient(NewRegistry())
+	c.RouteInstance("inst-x", "provider-9")
+	c.RouteInstance("", "provider-9")
+	c.RouteInstance("inst-y", "")
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.providers["inst-x"] != "provider-9" || len(c.providers) != 1 {
+		t.Errorf("providers = %v", c.providers)
+	}
+}

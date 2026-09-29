@@ -153,7 +153,10 @@ func main() {
 		}
 
 		billingHandler = api.NewBillingHandler(billingService, authService)
-		usageCollector = billing.NewUsageCollector(dbClient.DB(), billingService)
+		// TEEPIN_USAGE_COLLECT_INTERVAL_SECONDS tunes how often compute is
+		// metered (default 10 minutes). Enforcement does not depend on it.
+		usageCollector = billing.NewUsageCollector(dbClient.DB(), billingService).
+			WithInterval(time.Duration(getEnvInt("TEEPIN_USAGE_COLLECT_INTERVAL_SECONDS", 0)) * time.Second)
 		log.Println("✅ Billing system initialized")
 
 		// Start usage collector in background
@@ -492,6 +495,11 @@ func main() {
 			usage = billingService
 		}
 		publicInferenceHandler = api.NewInferenceHandler(inferenceGateway, modelCatalogService, usage)
+		if billingService != nil {
+			// Refuse requests the account has no credit to pay for. Guarded
+			// so a nil billingService never becomes a typed-nil interface.
+			publicInferenceHandler.WithCreditGuard(billingService)
+		}
 		if agentRegistry != nil && nodeService != nil {
 			nodeModelCacheHandler = api.NewNodeModelCacheHandler(agentRegistry, nodeService, nodeServicesService)
 		}
@@ -563,6 +571,28 @@ func main() {
 		log.Println("Instance retention sweeper started")
 	}
 
+	// Kinds of stored data covered by the zero-credit storage hold; filled in
+	// as each is configured and started after all are known (see below).
+	var heldStores []billing.HeldStorage
+
+	// Credit enforcer: prepaid means compute stops when credit runs out. It
+	// projects each account's remaining credit (balance minus time not yet
+	// metered) every minute and ends paid compute that would outlast it.
+	// TEEPIN_CREDIT_ENFORCEMENT: enforce (default), dry-run (log only), off.
+	if billingService != nil && instanceStore != nil && usageCollector != nil {
+		mode, err := billing.ParseEnforcementMode(os.Getenv("TEEPIN_CREDIT_ENFORCEMENT"))
+		if err != nil {
+			log.Fatalf("TEEPIN_CREDIT_ENFORCEMENT: %v", err)
+		}
+		enforcer := billing.NewCreditEnforcer(dbClient.DB(), billingService,
+			newComputeStopper(clusterClient, instanceStore), usageCollector, mode)
+		go enforcer.Start(context.Background())
+
+		// Disks of instances stopped at zero credit join the same storage
+		// hold as object storage (registered below, once both are known).
+		heldStores = append(heldStores, newHeldDisks(clusterClient, instanceStore))
+	}
+
 	// Initialize API server with networking integration. billingService
 	// doubles as the live pricing provider: rates come from the
 	// billing.pricing table and are re-read before every allocation.
@@ -605,6 +635,23 @@ func main() {
 	// node_class:"home" request is refused cleanly (the placer is nil).
 	if nodeService != nil {
 		apiServer = apiServer.WithNodePlacer(newNodePlacerAdapter(nodeService))
+	}
+	// Launch specs are stored sealed under the platform encryption key; without
+	// it, instances with a disk cannot be stopped-and-held at zero credit (the
+	// enforcer reports them instead of stopping them).
+	if key := os.Getenv("ENCRYPTION_KEY"); key != "" {
+		vault, vaultErr := compute.NewSpecVault(key)
+		if vaultErr != nil {
+			log.Fatalf("launch spec vault: %v", vaultErr)
+		}
+		apiServer = apiServer.WithSpecVault(vault)
+	} else {
+		log.Println("ENCRYPTION_KEY not set: instances with a persistent disk cannot be held when credit runs out (launch specs are not stored)")
+	}
+	// Refuse launches and storage writes from an account with no credit.
+	// Guarded: a nil billingService must not become a typed-nil interface.
+	if billingService != nil {
+		apiServer = apiServer.WithCreditGuard(billingService)
 	}
 	// Hidden-workload capacity accounting: without this, an active Kumbha
 	// agent/screenshot/build pod's CPU/memory is invisible to
@@ -728,10 +775,28 @@ func main() {
 				go egressTracker.Start(context.Background())
 				apiServer = apiServer.WithObjectStoreEgress(egressTracker)
 				log.Println("✅ Teepin S3 billing/metering enabled (GB-stored + GB-transferred)")
+
+				heldStores = append(heldStores, objectStoreService)
 			} else {
 				log.Println("Teepin S3 billing/metering disabled (no billing service) — storage and transfer are not billed")
 			}
 		}
+	}
+
+	// Out-of-credit accounts: stored data (object storage, and the disks of
+	// stopped instances) is held - inaccessible and unbilled - for
+	// TEEPIN_STORAGE_HOLD_DAYS (default 7), then deleted unless credit is
+	// added. TEEPIN_STORAGE_HOLD: enforce (default), dry-run (log only),
+	// off. Deletion is irreversible, so dry-run is worth a look first.
+	if billingService != nil && len(heldStores) > 0 {
+		holdMode, holdErr := billing.ParseEnforcementMode(os.Getenv("TEEPIN_STORAGE_HOLD"))
+		if holdErr != nil {
+			log.Fatalf("TEEPIN_STORAGE_HOLD: %v", holdErr)
+		}
+		holdPeriod := time.Duration(getEnvInt("TEEPIN_STORAGE_HOLD_DAYS", 7)) * 24 * time.Hour
+		go billing.NewStorageHoldSweeper(billingService, holdMode, holdPeriod, heldStores...).
+			Start(context.Background())
+		apiServer = apiServer.WithStorageHolds(billingService)
 	}
 
 	// kumbhaEventTickets is set inside the Kumbha Gateway block below, but
@@ -758,7 +823,8 @@ func main() {
 		kumbhaStore := kumbha.NewStore(dbClient.DB())
 		kumbhaGateway := kumbha.NewGateway(kumbhaStore, newKumbhaModelBackend(modelCatalogService, inferenceGateway),
 			billingService, billingService, billingService).
-			WithModelPricing(modelCatalogService)
+			WithModelPricing(modelCatalogService).
+			WithCreditGuard(billingService)
 
 		// Capacity-aware placement for Kumbha's own agent/screenshot
 		// pods (LaunchAgent/CaptureScreenshot) — see
@@ -1505,6 +1571,7 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 		}
 		{
 			storageGroup.POST("/buckets", apiServer.CreateBucket)
+			storageGroup.GET("/hold", apiServer.GetStorageHold)
 			storageGroup.GET("/buckets", apiServer.ListBuckets)
 			storageGroup.GET("/buckets/:bucket", apiServer.GetBucket)
 			storageGroup.DELETE("/buckets/:bucket", apiServer.DeleteBucket)
@@ -1533,6 +1600,7 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 			compute.GET("/image-ports", apiServer.ImagePorts)
 			compute.POST("/instances", apiServer.CreateInstance)
 			compute.GET("/instances", apiServer.ListInstances)
+			compute.POST("/instances/:id/start", apiServer.StartInstance)
 			compute.GET("/instances/:id", apiServer.GetInstance)
 			compute.DELETE("/instances/:id", apiServer.DeleteInstance)
 			compute.GET("/instances/:id/logs", apiServer.GetInstanceLogs)

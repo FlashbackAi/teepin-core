@@ -28,6 +28,13 @@ func newMockMeter(t *testing.T) (*Meter, sqlmock.Sqlmock) {
 	return NewMeter(NewStore(db), billing.NewService(db), time.Hour), mock
 }
 
+// expectNoHold queues the meter's per-account hold read for an account that
+// has never had one.
+func expectNoHold(mock sqlmock.Sqlmock, accountID uuid.UUID) {
+	mock.ExpectQuery(`FROM billing\.storage_holds WHERE account_id`).WithArgs(accountID).
+		WillReturnRows(sqlmock.NewRows([]string{"held", "released"}).AddRow(false, nil))
+}
+
 func bucketMeterRows() *sqlmock.Rows {
 	return sqlmock.NewRows([]string{
 		"id", "account_id", "project_id", "name", "backend",
@@ -72,6 +79,7 @@ func TestMeter_BillsBucketSinceCreation(t *testing.T) {
 	// No prior billing record for this bucket — MAX(end_time) over zero
 	// matching rows still returns one row with a NULL value (standard SQL
 	// aggregate behaviour), not zero rows.
+	expectNoHold(mock, accountID)
 	mock.ExpectQuery(`SELECT MAX\(end_time\) FROM billing\.usage_records`).
 		WithArgs(SubjectTypeBucket, bucketID.String()).
 		WillReturnRows(sqlmock.NewRows([]string{"max"}).AddRow(nil))
@@ -100,6 +108,7 @@ func TestMeter_SkipsRecentlyBilledBucket(t *testing.T) {
 	mock.ExpectQuery(`SELECT .* FROM storage\.buckets\s+WHERE deleted_at IS NULL`).
 		WillReturnRows(bucketMeterRows().
 			AddRow(bucketID, accountID, projectID, "photos", "shelby", 3, int64(10<<30), time.Now().Add(-5*time.Hour), time.Now()))
+	expectNoHold(mock, accountID)
 	mock.ExpectQuery(`SELECT MAX\(end_time\) FROM billing\.usage_records`).
 		WithArgs(SubjectTypeBucket, bucketID.String()).
 		WillReturnRows(sqlmock.NewRows([]string{"max"}).AddRow(time.Now().Add(-30 * time.Second)))
@@ -109,5 +118,54 @@ func TestMeter_SkipsRecentlyBilledBucket(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Error(err)
+	}
+}
+
+// A bucket whose account is on storage hold is not billed at all.
+func TestMeter_DoesNotBillHeldStorage(t *testing.T) {
+	meter, mock := newMockMeter(t)
+	bucketID, accountID, projectID := uuid.New(), uuid.New(), uuid.New()
+
+	mock.ExpectQuery(`SELECT object_storage_price_per_gb_month FROM billing\.pricing`).
+		WillReturnRows(sqlmock.NewRows([]string{"object_storage_price_per_gb_month"}).AddRow(0.02))
+	mock.ExpectQuery(`SELECT .* FROM storage\.buckets\s+WHERE deleted_at IS NULL`).
+		WillReturnRows(bucketMeterRows().
+			AddRow(bucketID, accountID, projectID, "photos", "shelby", 3, int64(10<<30), time.Now().Add(-5*time.Hour), time.Now()))
+	mock.ExpectQuery(`FROM billing\.storage_holds WHERE account_id`).WithArgs(accountID).
+		WillReturnRows(sqlmock.NewRows([]string{"held", "released"}).AddRow(true, nil))
+
+	if err := meter.collect(context.Background()); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err) // no usage query or insert may follow the hold read
+	}
+}
+
+// When a hold has just ended, billing resumes from the release moment, not
+// from the last pre-hold record: the held days are never back-charged.
+func TestMeter_DoesNotBackBillTheHeldPeriod(t *testing.T) {
+	meter, mock := newMockMeter(t)
+	bucketID, accountID, projectID := uuid.New(), uuid.New(), uuid.New()
+	released := time.Now().Add(-30 * time.Second) // hold ended 30s ago
+
+	mock.ExpectQuery(`SELECT object_storage_price_per_gb_month FROM billing\.pricing`).
+		WillReturnRows(sqlmock.NewRows([]string{"object_storage_price_per_gb_month"}).AddRow(0.02))
+	mock.ExpectQuery(`SELECT .* FROM storage\.buckets\s+WHERE deleted_at IS NULL`).
+		WillReturnRows(bucketMeterRows().
+			AddRow(bucketID, accountID, projectID, "photos", "shelby", 3, int64(10<<30), time.Now().Add(-240*time.Hour), time.Now()))
+	mock.ExpectQuery(`FROM billing\.storage_holds WHERE account_id`).WithArgs(accountID).
+		WillReturnRows(sqlmock.NewRows([]string{"held", "released"}).AddRow(false, released))
+	// Last billed 8 days ago (before the hold), but only 30s since release,
+	// which is under the one-minute floor, so nothing is recorded.
+	mock.ExpectQuery(`SELECT MAX\(end_time\) FROM billing\.usage_records`).
+		WithArgs(SubjectTypeBucket, bucketID.String()).
+		WillReturnRows(sqlmock.NewRows([]string{"max"}).AddRow(time.Now().Add(-8 * 24 * time.Hour)))
+
+	if err := meter.collect(context.Background()); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err) // an INSERT here would mean the held days were billed
 	}
 }

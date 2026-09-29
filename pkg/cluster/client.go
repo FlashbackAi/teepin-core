@@ -396,6 +396,27 @@ func (s Scope) IsRestricted() bool {
 //
 // Implementations must be safe for concurrent use: the API server calls
 // this from many request goroutines simultaneously.
+// InstanceStopper is implemented by clients that can end an instance's pod
+// and endpoint while KEEPING its persistent volume, so the same instance can
+// be started again later. A separate, optional interface (rather than a
+// Client method) because only some clients can do it: a client that cannot
+// simply does not implement it, and callers treat that as "cannot hold".
+type InstanceStopper interface {
+	// StopInstance is idempotent: stopping an absent or already-stopped
+	// instance succeeds. Out-of-scope instances are treated as absent.
+	StopInstance(ctx context.Context, scope Scope, instanceID string) error
+}
+
+// InstanceRouter lets a caller tell a client which provider holds an
+// instance the client has no live record of. A stopped instance is exactly
+// that: no pod, no status reports, only a disk on one particular node, so a
+// later delete (or start) must be routed to that node's agent - the
+// database knows it, the client's in-memory cache does not (and forgets it
+// on a control-plane restart). Optional, like InstanceStopper.
+type InstanceRouter interface {
+	RouteInstance(instanceID, providerID string)
+}
+
 type Client interface {
 	// CreateInstance realises a placement decision. Returns
 	// ErrResourceExhausted if the chosen GPU resource is gone, so the

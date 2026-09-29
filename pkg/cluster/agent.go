@@ -381,6 +381,50 @@ func (c *AgentClient) DeleteInstance(ctx context.Context, scope Scope, instanceI
 	return nil
 }
 
+// StopInstance asks the instance's agent to end its pod but keep its volume.
+// An agent built before StopInstanceCommand existed answers
+// INVALID_ARGUMENT ("unsupported command") and touches nothing, which
+// surfaces here as an error - the instance keeps running, never loses data.
+func (c *AgentClient) StopInstance(ctx context.Context, scope Scope, instanceID string) error {
+	if !c.visible(scope, instanceID) {
+		return nil
+	}
+	session, ok := c.sessionForInstance(instanceID)
+	if !ok {
+		return ErrClusterUnavailable
+	}
+	result, err := session.dispatch(ctx, &agentpb.ControlMessage{
+		RequestId: "stop-" + instanceID,
+		Payload: &agentpb.ControlMessage_StopInstance{
+			StopInstance: &agentpb.StopInstanceCommand{InstanceId: instanceID},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if !result.Success && result.ErrorCode != agentpb.ErrorCode_ERROR_CODE_NOT_FOUND {
+		return errorFromResult(result)
+	}
+	// The pod is gone but the disk is not: forget the cached status, KEEP
+	// the routing to the owning provider so a later delete reaches the node
+	// that holds the disk.
+	c.mu.Lock()
+	delete(c.statuses, instanceID)
+	c.mu.Unlock()
+	return nil
+}
+
+// RouteInstance records which provider holds an instance, for commands that
+// must reach it when it has no live status (a stopped instance).
+func (c *AgentClient) RouteInstance(instanceID, providerID string) {
+	if instanceID == "" || providerID == "" {
+		return
+	}
+	c.mu.Lock()
+	c.providers[instanceID] = providerID
+	c.mu.Unlock()
+}
+
 func (c *AgentClient) GetInstanceStatus(_ context.Context, scope Scope, instanceID string) (*InstanceStatus, error) {
 	c.mu.RLock()
 	status, ok := c.statuses[instanceID]

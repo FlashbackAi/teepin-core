@@ -1322,3 +1322,80 @@ func TestUpdateInstance_ScopedToProjectLikeAnyOtherMutation(t *testing.T) {
 		t.Errorf("cross-tenant UpdateInstance: err = %v, want ErrNotFound", err)
 	}
 }
+
+// StopInstance ends the pod but keeps the customer's disk, and the instance
+// can then be created again under the same id, re-attaching that disk.
+func TestStopInstance_KeepsPVCAndAllowsRestart(t *testing.T) {
+	c := newTestClient()
+	ctx := context.Background()
+	spec := InstanceSpec{InstanceID: "inst-held0001", Image: "nginx:latest", CPUUnits: 2, MemoryGB: 4, StorageGB: 10}
+
+	if _, err := c.CreateInstance(ctx, spec); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	if err := c.StopInstance(ctx, AllTenants(), "inst-held0001"); err != nil {
+		t.Fatalf("StopInstance: %v", err)
+	}
+
+	pods, _ := c.k8s.CoreV1().Pods(workloadNamespace).List(ctx, metav1.ListOptions{})
+	if len(pods.Items) != 0 {
+		t.Errorf("pod still present after stop: %d", len(pods.Items))
+	}
+	if _, err := c.k8s.CoreV1().PersistentVolumeClaims(workloadNamespace).
+		Get(ctx, pvcName("inst-held0001"), metav1.GetOptions{}); err != nil {
+		t.Fatalf("PVC must survive a stop (it is the customer's data): %v", err)
+	}
+
+	// Stopping again is fine (commands are redelivered after reconnects).
+	if err := c.StopInstance(ctx, AllTenants(), "inst-held0001"); err != nil {
+		t.Errorf("second StopInstance: %v", err)
+	}
+
+	// Start again: same id, same disk, no "already exists" failure.
+	if _, err := c.CreateInstance(ctx, spec); err != nil {
+		t.Fatalf("restart CreateInstance: %v", err)
+	}
+	// A later delete of the stopped-then-restarted instance still wipes the disk.
+	if err := c.DeleteInstance(ctx, AllTenants(), "inst-held0001"); err != nil {
+		t.Fatalf("DeleteInstance: %v", err)
+	}
+	if _, err := c.k8s.CoreV1().PersistentVolumeClaims(workloadNamespace).
+		Get(ctx, pvcName("inst-held0001"), metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Errorf("delete after restart should remove the PVC, got err=%v", err)
+	}
+}
+
+// Deleting a STOPPED instance (no pod left) must still remove its disk: this
+// is how an expired hold or a customer's delete actually frees it.
+func TestDeleteInstance_RemovesDiskOfStoppedInstance(t *testing.T) {
+	c := newTestClient()
+	ctx := context.Background()
+	if _, err := c.CreateInstance(ctx, InstanceSpec{InstanceID: "inst-held0002", Image: "nginx:latest", CPUUnits: 1, MemoryGB: 1, StorageGB: 5}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.StopInstance(ctx, AllTenants(), "inst-held0002"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.DeleteInstance(ctx, AllTenants(), "inst-held0002"); err != nil {
+		t.Fatalf("DeleteInstance on a stopped instance: %v", err)
+	}
+	if _, err := c.k8s.CoreV1().PersistentVolumeClaims(workloadNamespace).
+		Get(ctx, pvcName("inst-held0002"), metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Errorf("the stopped instance's disk was not removed, err=%v", err)
+	}
+}
+
+func TestStopInstance_OtherTenantIsUntouched(t *testing.T) {
+	c := newTestClient()
+	ctx := context.Background()
+	if _, err := c.CreateInstance(ctx, InstanceSpec{InstanceID: "inst-held0003", ProjectID: "proj-a", Image: "nginx:latest", CPUUnits: 1, MemoryGB: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.StopInstance(ctx, ProjectScope("proj-b"), "inst-held0003"); err != nil {
+		t.Fatalf("out-of-scope stop should be treated as absent, got %v", err)
+	}
+	pods, _ := c.k8s.CoreV1().Pods(workloadNamespace).List(ctx, metav1.ListOptions{})
+	if len(pods.Items) != 1 {
+		t.Errorf("another tenant's stop request removed the pod")
+	}
+}

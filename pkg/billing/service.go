@@ -53,6 +53,10 @@ type Service struct {
 
 	// tax decides which taxes an invoice carries. Nil means none.
 	tax TaxPolicy
+
+	// balances caches recent balances for pre-flight checks; see
+	// credit_guard.go. Zero value is ready to use.
+	balances balanceCache
 }
 
 // NewService creates a new billing service

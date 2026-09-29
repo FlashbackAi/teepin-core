@@ -298,3 +298,45 @@ func (s *Service) DeleteObject(ctx context.Context, accountID, projectID uuid.UU
 	}
 	return nil
 }
+
+// Name identifies object storage to the storage-hold sweeper.
+func (s *Service) Name() string { return "object storage" }
+
+// AccountsWithStorage lists accounts that own any bucket.
+func (s *Service) AccountsWithStorage(ctx context.Context) ([]uuid.UUID, error) {
+	return s.store.ListAccountsWithBuckets(ctx)
+}
+
+// PurgeAccount permanently deletes every object and bucket an account owns.
+// Used only when a storage hold expires. Idempotent and resumable: a failure
+// partway leaves the rest for the next attempt. A backend that refuses to
+// delete a blob does not stop the purge (the catalog is what defines what
+// exists, and DeleteObject already leaves such blobs for reconciliation).
+func (s *Service) PurgeAccount(ctx context.Context, accountID uuid.UUID) error {
+	buckets, err := s.store.ListBucketsForAccount(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	for _, b := range buckets {
+		cursor := ""
+		for {
+			page, err := s.store.ListObjects(ctx, accountID, b.ProjectID, b.ID, "", cursor, 500)
+			if err != nil {
+				return err
+			}
+			if len(page) == 0 {
+				break
+			}
+			for _, o := range page {
+				if err := s.DeleteObject(ctx, accountID, b.ProjectID, b.Name, o.Key); err != nil && !errors.Is(err, ErrObjectNotFound) {
+					return fmt.Errorf("delete %s/%s: %w", b.Name, o.Key, err)
+				}
+				cursor = o.Key
+			}
+		}
+		if err := s.store.DeleteBucket(ctx, accountID, b.ProjectID, b.ID); err != nil && !errors.Is(err, ErrBucketNotFound) {
+			return fmt.Errorf("delete bucket %s: %w", b.Name, err)
+		}
+	}
+	return nil
+}

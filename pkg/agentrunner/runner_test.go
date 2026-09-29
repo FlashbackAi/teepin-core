@@ -632,3 +632,74 @@ func TestRun_ReturnsOnStreamEOF(t *testing.T) {
 		t.Fatal("Run did not return on EOF")
 	}
 }
+
+// stoppingCluster is a cluster that can stop an instance with its disk kept.
+type stoppingCluster struct {
+	nullCluster
+	stopped []string
+	err     error
+}
+
+func (c *stoppingCluster) StopInstance(_ context.Context, _ cluster.Scope, id string) error {
+	c.stopped = append(c.stopped, id)
+	return c.err
+}
+
+func lastResult(t *testing.T, s *stubStream) *agentpb.CommandResult {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.sent) == 0 {
+		t.Fatal("no reply was sent")
+	}
+	res := s.sent[len(s.sent)-1].GetResult()
+	if res == nil {
+		t.Fatal("reply was not a CommandResult")
+	}
+	return res
+}
+
+func TestHandleStop_StopsWithDiskKeptAndSucceeds(t *testing.T) {
+	fc := &stoppingCluster{}
+	r := New(Config{ProviderID: "p", Cluster: fc})
+	s := newStubStream()
+
+	r.handleStop(context.Background(), s, "req-1", &agentpb.StopInstanceCommand{InstanceId: "inst-hold0001"})
+
+	if len(fc.stopped) != 1 || fc.stopped[0] != "inst-hold0001" {
+		t.Fatalf("stopped = %v", fc.stopped)
+	}
+	if res := lastResult(t, s); !res.Success {
+		t.Errorf("reply = %+v, want success", res)
+	}
+}
+
+// A cluster that cannot keep the disk must refuse rather than fall back to a
+// delete: the disk is the customer's data.
+func TestHandleStop_ClusterWithoutStopSupportRefusesAndTouchesNothing(t *testing.T) {
+	fc := &capturingCluster{}
+	r := New(Config{ProviderID: "p", Cluster: fc})
+	s := newStubStream()
+
+	r.handleStop(context.Background(), s, "req-1", &agentpb.StopInstanceCommand{InstanceId: "inst-hold0002"})
+
+	res := lastResult(t, s)
+	if res.Success || res.ErrorCode != agentpb.ErrorCode_ERROR_CODE_INVALID_ARGUMENT {
+		t.Errorf("reply = %+v, want INVALID_ARGUMENT failure", res)
+	}
+	if fc.calledCreate || fc.calledUpdate {
+		t.Error("the cluster was modified")
+	}
+}
+
+func TestHandleStop_FailurePropagates(t *testing.T) {
+	fc := &stoppingCluster{err: errors.New("k8s unreachable")}
+	r := New(Config{ProviderID: "p", Cluster: fc})
+	s := newStubStream()
+
+	r.handleStop(context.Background(), s, "req-1", &agentpb.StopInstanceCommand{InstanceId: "inst-hold0003"})
+
+	if res := lastResult(t, s); res.Success {
+		t.Errorf("a failed stop was reported as success: %+v", res)
+	}
+}
