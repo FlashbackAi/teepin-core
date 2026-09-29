@@ -5,6 +5,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -28,6 +29,13 @@ type WebhookEvent struct {
 	PaymentIntentID string
 	InvoiceID       string
 	FailureReason   string
+	// IsTopUp marks a prepaid credit top-up's PaymentIntent (from the
+	// metadata we set when creating it), routing the event to top-up
+	// settlement instead of invoice settlement.
+	IsTopUp bool
+	// AmountReceivedCents / Currency are what Stripe actually collected.
+	AmountReceivedCents int64
+	Currency            string
 }
 
 // CardDetails mirrors payments.CardDetails for the same decoupling reason.
@@ -45,6 +53,9 @@ type StripeWebhookVerifier interface {
 	// GetCard fetches display details for a payment method — needed after
 	// a setup_intent succeeds, which carries only the pm id.
 	GetCard(paymentMethodID string) (*CardDetails, error)
+	// PaymentMethodSummary describes any payment method type for a receipt
+	// ("Visa ending 4242", "Chase account ending 6789").
+	PaymentMethodSummary(paymentMethodID string) (string, error)
 }
 
 // WebhookHandler processes Stripe webhooks.
@@ -126,8 +137,8 @@ func (h *WebhookHandler) dispatch(ctx context.Context, event *WebhookEvent) erro
 		return h.billing.MarkSetupFailed(ctx, event.SetupIntentID)
 
 	case "payment_method.detached":
-		// Card removed at Stripe's end. If it was the account's last
-		// verified card, this starts the 24h grace clock.
+		// Card removed at Stripe's end. Prepaid: this only updates the card
+		// list; it never affects the account's ability to run.
 		return h.billing.MarkPaymentMethodDetachedByStripeID(ctx, event.PaymentMethodID)
 
 	case "payment_method.automatically_updated":
@@ -138,14 +149,26 @@ func (h *WebhookHandler) dispatch(ctx context.Context, event *WebhookEvent) erro
 		return nil
 
 	case "payment_intent.succeeded":
-		// A card charge settled. Mark the invoice tied to this PaymentIntent
-		// paid — matched by the pi id we minted, never a client-supplied id.
-		// Safe to replay: an already-paid invoice is a no-op.
+		if event.IsTopUp {
+			return h.settleTopUp(ctx, event)
+		}
+		// An invoice charge settled. Mark the invoice tied to this
+		// PaymentIntent paid — matched by the pi id we minted, never a
+		// client-supplied id. Safe to replay: an already-paid invoice is a
+		// no-op.
 		return h.billing.SettleInvoiceByPaymentIntent(ctx, event.PaymentIntentID)
 
+	case "payment_intent.processing":
+		// Only top-ups track this (an ACH debit settles days later).
+		if event.IsTopUp {
+			return h.billing.MarkTopUpProcessing(ctx, event.PaymentIntentID)
+		}
+		return nil
+
 	case "payment_intent.payment_failed":
-		// A card charge failed. Record it against the invoice; once attempts
-		// are exhausted this arms the 24h suspension grace clock.
+		if event.IsTopUp {
+			return h.billing.FailTopUpByPaymentIntent(ctx, event.PaymentIntentID, event.FailureReason)
+		}
 		return h.billing.RecordChargeFailureByPaymentIntent(ctx,
 			event.PaymentIntentID, event.FailureReason)
 
@@ -154,4 +177,29 @@ func (h *WebhookHandler) dispatch(ctx context.Context, event *WebhookEvent) erro
 		// silently 200 the ones we do not handle.
 		return nil
 	}
+}
+
+// settleTopUp credits a paid top-up. The payment method description is
+// only for the receipt, so failing to fetch it must not hold back the
+// customer's credit: it is best-effort, and the receipt then just says
+// "Paid in full". A top-up the platform has no record of is logged and
+// acknowledged — retrying cannot make it appear, so Stripe must not
+// retry it forever.
+func (h *WebhookHandler) settleTopUp(ctx context.Context, event *WebhookEvent) error {
+	summary := ""
+	if event.PaymentMethodID != "" {
+		s, err := h.verifier.PaymentMethodSummary(event.PaymentMethodID)
+		if err != nil {
+			log.Printf("WARN: top-up %s: could not describe payment method for the receipt: %v", event.PaymentIntentID, err)
+		} else {
+			summary = s
+		}
+	}
+	err := h.billing.SettleTopUpByPaymentIntent(ctx, event.PaymentIntentID,
+		event.AmountReceivedCents, event.Currency, summary)
+	if errors.Is(err, billing.ErrTopUpNotFound) {
+		log.Printf("ERROR: payment intent %s is marked as a top-up but no top-up records it; no credit added", event.PaymentIntentID)
+		return nil
+	}
+	return err
 }

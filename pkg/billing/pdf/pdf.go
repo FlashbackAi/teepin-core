@@ -29,6 +29,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-pdf/fpdf"
 
@@ -197,13 +198,10 @@ func (d *doc) letterhead() {
 	logoH := logoDrawW * logoAspect
 	d.pdf.ImageOptions("logo", marginX, 14, logoDrawW, logoH, false, opt, 0, "")
 
-	// Title, right-aligned on the logo's line.
-	d.color(inkColor)
-	d.pdf.SetFont("Helvetica", "B", 24)
-	d.pdf.SetXY(pageWidth-marginX-80, 13)
-	d.pdf.CellFormat(80, 11, "Invoice", "", 0, "R", false, 0, "")
-
-	// Summary box: label/value pairs under the title.
+	// Title, right-aligned on the logo's line. A prepaid credit purchase is
+	// paid at the moment it is issued, so it is titled a receipt and has no
+	// billing period or due date.
+	title := "Invoice"
 	rows := [][2]string{
 		{"Invoice number", d.inv.InvoiceNumber},
 		{"Invoice date", d.inv.CreatedAt.Format(dateLayout)},
@@ -211,6 +209,18 @@ func (d *doc) letterhead() {
 		{"Due date", d.dueText()},
 		{"Status", humanStatus(d.inv.Status)},
 	}
+	if d.inv.Source == "credit_purchase" {
+		title = "Receipt"
+		rows = [][2]string{
+			{"Receipt number", d.inv.InvoiceNumber},
+			{"Date paid", d.paidDate().Format(dateLayout)},
+			{"Status", humanStatus(d.inv.Status)},
+		}
+	}
+	d.color(inkColor)
+	d.pdf.SetFont("Helvetica", "B", 24)
+	d.pdf.SetXY(pageWidth-marginX-80, 13)
+	d.pdf.CellFormat(80, 11, title, "", 0, "R", false, 0, "")
 	y := 27.0
 	for _, r := range rows {
 		d.pdf.SetXY(pageWidth-marginX-80, y)
@@ -223,6 +233,22 @@ func (d *doc) letterhead() {
 		y += 5
 	}
 	d.pdf.SetY(logoH + 18)
+}
+
+// docNoun is what the document calls itself in running text.
+func (d *doc) docNoun() string {
+	if d.inv.Source == "credit_purchase" {
+		return "receipt"
+	}
+	return "invoice"
+}
+
+// paidDate is when the document was paid, falling back to its issue date.
+func (d *doc) paidDate() time.Time {
+	if d.inv.PaidAt != nil {
+		return *d.inv.PaidAt
+	}
+	return d.inv.CreatedAt
 }
 
 // dueText: an explicit due date if one was set, "On receipt" for terms that
@@ -449,7 +475,7 @@ func (d *doc) summary() {
 		d.summaryRow("Credits", d.money(credits.total), false, false)
 	}
 	d.summaryRow(d.taxLabel(), d.money(d.inv.Tax), false, false)
-	d.summaryRow("Total for this invoice", d.money(d.inv.Total), false, true)
+	d.summaryRow("Total for this "+d.docNoun(), d.money(d.inv.Total), false, true)
 	d.pdf.Ln(6)
 }
 
@@ -653,9 +679,9 @@ func (d *doc) paymentAndNotes() {
 func (d *doc) finePrint() string {
 	parts := []string{fmt.Sprintf("All amounts are in %s.", currencyName(d.inv.Currency))}
 	if len(d.inv.TaxDetails) == 0 {
-		parts = append(parts, "No tax has been charged on this invoice.")
+		parts = append(parts, "No tax has been charged on this "+d.docNoun()+".")
 	}
-	parts = append(parts, "Questions? "+d.contactEmail()+" (quote the invoice number).")
+	parts = append(parts, "Questions? "+d.contactEmail()+" (quote the "+d.docNoun()+" number).")
 	return strings.Join(parts, " ")
 }
 

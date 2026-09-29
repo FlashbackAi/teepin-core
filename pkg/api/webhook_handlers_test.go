@@ -20,10 +20,12 @@ import (
 // fakeVerifier stands in for the Stripe adapter: it returns a canned
 // event, or an error to simulate a bad signature.
 type fakeVerifier struct {
-	event   *WebhookEvent
-	err     error
-	card    *CardDetails
-	cardErr error
+	event      *WebhookEvent
+	err        error
+	card       *CardDetails
+	cardErr    error
+	summary    string
+	summaryErr error
 }
 
 func (f *fakeVerifier) VerifyWebhook([]byte, string) (*WebhookEvent, error) {
@@ -31,6 +33,9 @@ func (f *fakeVerifier) VerifyWebhook([]byte, string) (*WebhookEvent, error) {
 }
 func (f *fakeVerifier) GetCard(string) (*CardDetails, error) {
 	return f.card, f.cardErr
+}
+func (f *fakeVerifier) PaymentMethodSummary(string) (string, error) {
+	return f.summary, f.summaryErr
 }
 
 func postWebhook(h *WebhookHandler) *httptest.ResponseRecorder {
@@ -201,5 +206,90 @@ func TestWebhook_UnknownEventAcknowledged(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unexpected queries for unknown event: %v", err)
+	}
+}
+
+// A top-up's failed payment is recorded on the top-up, never routed to the
+// invoice-charging path.
+func TestWebhook_TopUpFailedRoutesToTopUp(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	v := &fakeVerifier{event: &WebhookEvent{
+		Type: "payment_intent.payment_failed", PaymentIntentID: "pi_t", FailureReason: "card declined", IsTopUp: true,
+	}}
+	h := NewWebhookHandler(v, billing.NewService(db))
+
+	mock.ExpectExec(`UPDATE billing\.credit_topups\s+SET status = 'failed'`).
+		WithArgs("pi_t", "card declined").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if w := postWebhook(h); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// processing is tracked for top-ups (an ACH debit settles days later) and
+// ignored for anything else.
+func TestWebhook_ProcessingOnlyTracksTopUps(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	topUp := NewWebhookHandler(&fakeVerifier{event: &WebhookEvent{
+		Type: "payment_intent.processing", PaymentIntentID: "pi_t", IsTopUp: true,
+	}}, billing.NewService(db))
+	mock.ExpectExec(`UPDATE billing\.credit_topups\s+SET status = 'processing'`).
+		WithArgs("pi_t").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	if w := postWebhook(topUp); w.Code != http.StatusOK {
+		t.Fatalf("top-up processing status = %d, want 200", w.Code)
+	}
+
+	other := NewWebhookHandler(&fakeVerifier{event: &WebhookEvent{
+		Type: "payment_intent.processing", PaymentIntentID: "pi_i",
+	}}, billing.NewService(db))
+	if w := postWebhook(other); w.Code != http.StatusOK {
+		t.Fatalf("invoice processing status = %d, want 200", w.Code)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
+	}
+}
+
+// A payment marked as a top-up that no top-up records cannot be fixed by a
+// retry, so it is acknowledged (200) instead of making Stripe retry forever.
+func TestWebhook_UnknownTopUpAcknowledged(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	v := &fakeVerifier{
+		event: &WebhookEvent{
+			Type: "payment_intent.succeeded", PaymentIntentID: "pi_x", IsTopUp: true,
+			PaymentMethodID: "pm_1", AmountReceivedCents: 5000, Currency: "usd",
+		},
+		summaryErr: errors.New("stripe unreachable"),
+	}
+	h := NewWebhookHandler(v, billing.NewService(db))
+	mock.ExpectQuery(`SELECT account_id FROM billing\.credit_topups`).
+		WithArgs("pi_x").
+		WillReturnRows(sqlmock.NewRows([]string{"account_id"}))
+
+	if w := postWebhook(h); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet expectations: %v", err)
 	}
 }

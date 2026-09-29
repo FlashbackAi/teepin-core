@@ -250,3 +250,39 @@ func TestRender_WriteUsageSample(t *testing.T) {
 	}
 	t.Logf("wrote %d bytes to %s", len(b), out)
 }
+
+// A prepaid credit purchase renders as a receipt: paid on issue, with the
+// payment method, and none of an invoice's billing-period or due-date fields.
+func TestRender_CreditPurchaseIsAReceipt(t *testing.T) {
+	paid := time.Date(2026, 9, 29, 14, 0, 0, 0, time.UTC)
+	doc := render(t, &billing.Invoice{
+		ID:            uuid.New(),
+		AccountID:     uuid.New(),
+		InvoiceNumber: "INV-2026-000042",
+		PeriodStart:   paid,
+		PeriodEnd:     paid,
+		CreatedAt:     paid,
+		PaidAt:        &paid,
+		Subtotal:      50,
+		Total:         50,
+		Status:        "paid",
+		Source:        "credit_purchase",
+		Currency:      "USD",
+		BillToName:    "Acme Inc",
+		PaymentTerms:  "Paid in full by Visa ending 4242",
+		LineItems: []billing.InvoiceLineItem{
+			{Description: "Teepin prepaid credit", Service: "Prepaid credit", Quantity: 1, UnitPrice: 50, Amount: 50},
+		},
+	})
+
+	mustContain(t, doc,
+		"Receipt", "Receipt number", "INV-2026-000042",
+		"Date paid", "September 29, 2026",
+		"PAID ON SEPTEMBER 29, 2026",
+		"Paid in full by Visa ending 4242",
+		"Teepin prepaid credit", "$50.00",
+		"Total for this receipt",
+		"No tax has been charged on this receipt",
+	)
+	mustNotContain(t, doc, "Billing period", "Due date", "TOTAL AMOUNT DUE", "Total for this invoice")
+}

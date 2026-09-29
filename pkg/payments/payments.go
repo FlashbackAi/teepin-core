@@ -9,15 +9,16 @@
 // vendor's types. That keeps Stripe swappable and, more immediately,
 // keeps the billing package's tests free of Stripe.
 //
-// This package both VALIDATES cards (SetupIntent, off-session) and CHARGES
-// them (PaymentIntent, off-session). Validation moves no funds; the charge
-// path (CreatePaymentIntent) is the only place money actually moves, and it
-// is driven by the billing ChargeCollector against already-issued invoices.
+// This package VALIDATES cards (SetupIntent, off-session) and collects
+// money two ways: prepaid credit top-ups the customer confirms in the
+// browser (CreateTopUpPaymentIntent), and off-session invoice charges
+// (CreatePaymentIntent).
 package payments
 
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/stripe/stripe-go/v79"
 	"github.com/stripe/stripe-go/v79/client"
@@ -181,6 +182,112 @@ func (c *Client) CreatePaymentIntent(customerID, pmID, currency string, amountCe
 	return pi.ID, string(pi.Status), nil
 }
 
+// TopUpPurpose is the PaymentIntent metadata value marking a prepaid
+// credit top-up, so the webhook can route the event to top-up settlement
+// rather than invoice settlement. Routing only: the top-up itself is
+// always matched by the PaymentIntent id we minted.
+const TopUpPurpose = "credit_topup"
+
+// CreateTopUpPaymentIntent opens a PaymentIntent for a prepaid credit
+// purchase that the customer completes in the browser (the Payment
+// Element), unlike CreatePaymentIntent's off-session charge.
+//
+//   - Automatic payment methods let Stripe offer every method enabled on
+//     the account (cards, Link, wallets, ACH Direct Debit) without code
+//     changes here; which ones appear is Dashboard configuration.
+//   - idempotencyKey (derived from our top-up id) makes a retried create
+//     return the same PaymentIntent instead of opening a second one.
+//
+// Returns the PaymentIntent id (stored so the webhook can find the
+// top-up) and its client secret (handed to the browser to confirm).
+func (c *Client) CreateTopUpPaymentIntent(customerID string, amountCents int64, currency, topUpID, accountNumber, idempotencyKey string) (piID, clientSecret string, err error) {
+	params := &stripe.PaymentIntentParams{
+		Amount:   stripe.Int64(amountCents),
+		Currency: stripe.String(currency),
+		Customer: stripe.String(customerID),
+		AutomaticPaymentMethods: &stripe.PaymentIntentAutomaticPaymentMethodsParams{
+			Enabled: stripe.Bool(true),
+		},
+		Description: stripe.String("Teepin prepaid credit"),
+	}
+	params.AddMetadata("teepin_purpose", TopUpPurpose)
+	params.AddMetadata("teepin_topup_id", topUpID)
+	params.AddMetadata("teepin_account_number", accountNumber)
+	params.SetIdempotencyKey(idempotencyKey)
+
+	pi, err := c.sc.PaymentIntents.New(params)
+	if err != nil {
+		return "", "", fmt.Errorf("stripe: create top-up payment intent: %w", err)
+	}
+	return pi.ID, pi.ClientSecret, nil
+}
+
+// PaymentMethodSummary describes a payment method in a form fit for a
+// receipt ("Visa ending 4242", "Chase account ending 6789", "Link"), for
+// any method type Stripe may have used — not only cards. Unknown types
+// fall back to a readable form of Stripe's type name.
+func (c *Client) PaymentMethodSummary(pmID string) (string, error) {
+	pm, err := c.sc.PaymentMethods.Get(pmID, nil)
+	if err != nil {
+		return "", fmt.Errorf("stripe: get payment method: %w", err)
+	}
+	return summarizePaymentMethod(pm), nil
+}
+
+// summarizePaymentMethod is the pure formatting half of
+// PaymentMethodSummary, separated so it is testable without Stripe.
+func summarizePaymentMethod(pm *stripe.PaymentMethod) string {
+	switch {
+	case pm.Card != nil:
+		return fmt.Sprintf("%s ending %s", cardBrandLabel(string(pm.Card.Brand)), pm.Card.Last4)
+	case pm.USBankAccount != nil:
+		bank := pm.USBankAccount.BankName
+		if bank == "" {
+			bank = "Bank"
+		}
+		return fmt.Sprintf("%s account ending %s", bank, pm.USBankAccount.Last4)
+	case pm.Link != nil:
+		return "Link"
+	case pm.CashApp != nil:
+		return "Cash App Pay"
+	case pm.AmazonPay != nil:
+		return "Amazon Pay"
+	case pm.Paypal != nil:
+		return "PayPal"
+	case pm.SEPADebit != nil:
+		return fmt.Sprintf("SEPA Direct Debit ending %s", pm.SEPADebit.Last4)
+	}
+	if pm.Type == "" {
+		return "Stripe"
+	}
+	return strings.ReplaceAll(string(pm.Type), "_", " ")
+}
+
+// cardBrandLabel turns Stripe's lowercase brand code into the name printed
+// on a receipt.
+func cardBrandLabel(brand string) string {
+	switch brand {
+	case "visa":
+		return "Visa"
+	case "mastercard":
+		return "Mastercard"
+	case "amex":
+		return "American Express"
+	case "discover":
+		return "Discover"
+	case "diners":
+		return "Diners Club"
+	case "jcb":
+		return "JCB"
+	case "unionpay":
+		return "UnionPay"
+	case "":
+		return "Card"
+	}
+	name := strings.ReplaceAll(brand, "_", " ")
+	return strings.ToUpper(name[:1]) + name[1:]
+}
+
 // WebhookEvent is a vendor-neutral view of the Stripe events this
 // platform acts on, decoded from a verified webhook. Returning this
 // rather than a stripe.Event keeps the api/billing packages free of
@@ -203,6 +310,13 @@ type WebhookEvent struct {
 	InvoiceID       string
 	// FailureReason is the customer-safe decline message on a failed charge.
 	FailureReason string
+	// Purpose is the "teepin_purpose" metadata we set on the intent;
+	// TopUpPurpose marks a prepaid credit top-up. Used for routing only.
+	Purpose string
+	// AmountReceivedCents / Currency are what Stripe actually collected, so
+	// settlement can check them against what the top-up recorded.
+	AmountReceivedCents int64
+	Currency            string
 }
 
 // VerifyWebhook authenticates a webhook request and decodes it to a
@@ -266,10 +380,15 @@ func (c *Client) VerifyWebhook(payload []byte, sigHeader string) (*WebhookEvent,
 			}
 		}
 
-	case "payment_intent.succeeded", "payment_intent.payment_failed":
+	case "payment_intent.succeeded", "payment_intent.payment_failed", "payment_intent.processing":
 		var pi struct {
-			ID            string            `json:"id"`
-			Metadata      map[string]string `json:"metadata"`
+			ID             string            `json:"id"`
+			Metadata       map[string]string `json:"metadata"`
+			AmountReceived int64             `json:"amount_received"`
+			Currency       string            `json:"currency"`
+			// payment_method is an id string unless expanded; we never
+			// expand it on webhooks.
+			PaymentMethod  string `json:"payment_method"`
 			LastPaymentErr *struct {
 				Message string `json:"message"`
 			} `json:"last_payment_error"`
@@ -278,8 +397,12 @@ func (c *Client) VerifyWebhook(payload []byte, sigHeader string) (*WebhookEvent,
 			return nil, fmt.Errorf("stripe: decode payment_intent: %w", err)
 		}
 		out.PaymentIntentID = pi.ID
+		out.PaymentMethodID = pi.PaymentMethod
+		out.AmountReceivedCents = pi.AmountReceived
+		out.Currency = pi.Currency
 		if pi.Metadata != nil {
 			out.InvoiceID = pi.Metadata["teepin_invoice_id"]
+			out.Purpose = pi.Metadata["teepin_purpose"]
 		}
 		if pi.LastPaymentErr != nil {
 			out.FailureReason = pi.LastPaymentErr.Message

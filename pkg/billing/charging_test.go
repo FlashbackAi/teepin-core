@@ -17,10 +17,12 @@ import (
 // idempotency can be asserted, and lets a test choose the returned status or
 // force an error to exercise the decline path.
 type fakeGateway struct {
-	chargeCalls int
-	lastAmount  int64
-	retStatus   string // status returned on success (default "succeeded")
-	retErr      error  // if set, CreatePaymentIntent returns this error
+	chargeCalls        int
+	topUpCalls         int
+	lastAmount         int64
+	lastIdempotencyKey string
+	retStatus          string // status returned on success (default "succeeded")
+	retErr             error  // if set, CreatePaymentIntent/CreateTopUpPaymentIntent return this error
 }
 
 func (f *fakeGateway) EnsureCustomer(existingID, email, name, accountNumber string) (string, error) {
@@ -44,6 +46,16 @@ func (f *fakeGateway) CreatePaymentIntent(customerID, pmID, currency string, amo
 		status = "succeeded"
 	}
 	return "pi_test", status, nil
+}
+
+func (f *fakeGateway) CreateTopUpPaymentIntent(customerID string, amountCents int64, currency, topUpID, accountNumber, idempotencyKey string) (string, string, error) {
+	f.topUpCalls++
+	f.lastAmount = amountCents
+	f.lastIdempotencyKey = idempotencyKey
+	if f.retErr != nil {
+		return "", "", f.retErr
+	}
+	return "pi_topup", "pi_topup_secret", nil
 }
 
 // invoiceLoadRows builds the row the ChargeInvoice loader expects.

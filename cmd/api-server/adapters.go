@@ -71,6 +71,10 @@ func (a *stripeGatewayAdapter) CreatePaymentIntent(customerID, pmID, currency st
 	return a.c.CreatePaymentIntent(customerID, pmID, currency, amountCents, invoiceID, idempotencyKey)
 }
 
+func (a *stripeGatewayAdapter) CreateTopUpPaymentIntent(customerID string, amountCents int64, currency, topUpID, accountNumber, idempotencyKey string) (string, string, error) {
+	return a.c.CreateTopUpPaymentIntent(customerID, amountCents, currency, topUpID, accountNumber, idempotencyKey)
+}
+
 // stripeWebhookAdapter makes *payments.Client satisfy
 // api.StripeWebhookVerifier, translating the verified event and card
 // details into the api package's own types.
@@ -88,12 +92,15 @@ func (a *stripeWebhookAdapter) VerifyWebhook(payload []byte, sigHeader string) (
 		return nil, err
 	}
 	out := &api.WebhookEvent{
-		Type:            e.Type,
-		SetupIntentID:   e.SetupIntentID,
-		PaymentMethodID: e.PaymentMethodID,
-		PaymentIntentID: e.PaymentIntentID,
-		InvoiceID:       e.InvoiceID,
-		FailureReason:   e.FailureReason,
+		Type:                e.Type,
+		SetupIntentID:       e.SetupIntentID,
+		PaymentMethodID:     e.PaymentMethodID,
+		PaymentIntentID:     e.PaymentIntentID,
+		InvoiceID:           e.InvoiceID,
+		FailureReason:       e.FailureReason,
+		IsTopUp:             e.Purpose == payments.TopUpPurpose,
+		AmountReceivedCents: e.AmountReceivedCents,
+		Currency:            e.Currency,
 	}
 	if e.Card != nil {
 		out.Card = &api.CardDetails{
@@ -105,6 +112,10 @@ func (a *stripeWebhookAdapter) VerifyWebhook(payload []byte, sigHeader string) (
 		}
 	}
 	return out, nil
+}
+
+func (a *stripeWebhookAdapter) PaymentMethodSummary(paymentMethodID string) (string, error) {
+	return a.c.PaymentMethodSummary(paymentMethodID)
 }
 
 func (a *stripeWebhookAdapter) GetCard(paymentMethodID string) (*api.CardDetails, error) {

@@ -567,8 +567,8 @@ func (h *InferenceHandler) GetKumbhaModels(c *gin.Context) {
 	for _, m := range enabled {
 		out = append(out, kumbhaModelView{
 			Route: m.ModelRoute, DisplayName: m.DisplayName,
-			Confidential: m.Provider == modelcatalog.ProviderTinfoilConfidential,
-			SelfHosted:   !m.Provider.IsThirdParty(),
+			Confidential:  m.Provider == modelcatalog.ProviderTinfoilConfidential,
+			SelfHosted:    !m.Provider.IsThirdParty(),
 			SupportsTools: m.SupportsTools, Vision: m.SupportsVision, Audio: m.SupportsAudio,
 			Pricing: pricing{InputPerMillion: m.InputPricePerMillion, OutputPerMillion: m.OutputPricePerMillion},
 		})

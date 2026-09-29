@@ -87,8 +87,11 @@ func (s *Service) GrantCredit(ctx context.Context, req GrantRequest) error {
 // ConsumeCredit draws up to cost from an account's balance for one
 // metered usage record, returning the amount actually applied (which may
 // be zero, or a partial draw when the balance is smaller than the cost).
-// The remainder — cost minus applied — is what still gets billed to the
-// card later.
+// The balance therefore never goes negative. Teepin is prepaid, so the
+// remainder — cost minus applied — is never collected; enforcement stops
+// usage before the balance runs out so that remainder stays near zero, and
+// it is derivable for audit as the usage record's total_cost minus its
+// consumption row.
 //
 // Atomic and idempotent:
 //   - the account row is locked FOR UPDATE so two concurrent collectors

@@ -36,45 +36,53 @@ type StripeGateway interface {
 	// amount of an issued invoice. idempotencyKey (the invoice id) makes a
 	// retried create a no-op at Stripe rather than a double charge.
 	CreatePaymentIntent(customerID, pmID, currency string, amountCents int64, invoiceID, idempotencyKey string) (piID, status string, err error)
+	// CreateTopUpPaymentIntent opens a PaymentIntent for a prepaid credit
+	// purchase the customer confirms in the browser; returns its id and
+	// client secret. idempotencyKey (derived from the top-up id) makes a
+	// retried create return the same intent.
+	CreateTopUpPaymentIntent(customerID string, amountCents int64, currency, topUpID, accountNumber, idempotencyKey string) (piID, clientSecret string, err error)
 }
 
-// ErrLastVerifiedCard is returned when removing a card would leave the
-// account with no means of payment. Callers map it to 409 Conflict: the
-// request is well-formed, the current state forbids it.
-var ErrLastVerifiedCard = errors.New("cannot remove the only verified payment method; add a replacement first")
+// ErrPaymentsNotConfigured means no payment provider is wired (local dev,
+// or Stripe keys unset). Callers map it to 503.
+var ErrPaymentsNotConfigured = errors.New("payments are not configured")
 
 // WithStripe enables payment-method management. Left unset (local dev,
-// no Stripe), the payment endpoints and the provisioning gate's
-// card check degrade safely — see each method. Returns the same
-// *Service for chaining, so existing NewService(db) call sites and their
-// tests compile unchanged.
+// no Stripe), the payment endpoints degrade safely — see each method.
+// Returns the same *Service for chaining, so existing NewService(db) call
+// sites and their tests compile unchanged.
 func (s *Service) WithStripe(gw StripeGateway) *Service {
 	s.stripe = gw
 	return s
 }
 
-// AccountCanProvision is the single source of truth for the "no
-// validated card, no resources" gate. It answers one question — may this
+// AccountCanProvision is the single source of truth for the prepaid
+// "no credit, no resources" gate. It answers one question — may this
 // account create resources right now — so every caller (the create
-// handler, the console pre-check) agrees.
+// handler, Kumbha, the console pre-check) agrees. A card on file is not
+// required: Teepin is prepaid only, so what matters is spendable credit,
+// however it was funded.
 //
 // Returns (false, reason, nil) with a customer-facing reason when the
-// account is not active or has no verified payment method. The reason is
-// safe to show a customer; it never leaks another tenant's state because
-// the caller has already established this is the caller's own account.
+// account is not active or has no spendable credit. The balance uses the
+// same predicate as CreditBalance (expired operator grants excluded). The
+// reason is safe to show a customer; it never leaks another tenant's state
+// because the caller has already established this is the caller's own
+// account.
 //
 // One query, so the gate costs a single round-trip on the hot path of
 // instance creation.
 func (s *Service) AccountCanProvision(ctx context.Context, accountID uuid.UUID) (bool, string, error) {
 	var status string
-	var verifiedCards int
+	var balance float64
 	err := s.db.QueryRowContext(ctx, `
 		SELECT a.status,
-		       (SELECT COUNT(*) FROM billing.payment_methods pm
-		          WHERE pm.account_id = a.id AND pm.status = 'verified')
+		       (SELECT COALESCE(SUM(ct.amount), 0) FROM billing.credit_transactions ct
+		          WHERE ct.account_id = a.id
+		            AND (ct.kind != 'grant' OR ct.expires_at IS NULL OR ct.expires_at > NOW()))
 		FROM auth.accounts a
 		WHERE a.id = $1
-	`, accountID).Scan(&status, &verifiedCards)
+	`, accountID).Scan(&status, &balance)
 	if err == sql.ErrNoRows {
 		return false, "account not found", nil
 	}
@@ -89,8 +97,8 @@ func (s *Service) AccountCanProvision(ctx context.Context, accountID uuid.UUID) 
 		return false, "this account is closed", nil
 	}
 
-	if verifiedCards == 0 {
-		return false, "add a validated payment method before launching resources", nil
+	if balance <= 0 {
+		return false, "add credit to your account before launching resources", nil
 	}
 	return true, "", nil
 }
@@ -114,45 +122,14 @@ func (s *Service) AccountCanProvision(ctx context.Context, accountID uuid.UUID) 
 // entering anything and clicking Cancel.
 func (s *Service) CreateSetupIntent(ctx context.Context, accountID uuid.UUID) (clientSecret string, paymentMethodID uuid.UUID, err error) {
 	if s.stripe == nil {
-		return "", uuid.Nil, fmt.Errorf("payments not configured")
+		return "", uuid.Nil, ErrPaymentsNotConfigured
 	}
 
-	// Resolve the account's billing identity and existing Stripe customer.
-	var (
-		customerID sql.NullString
-		email      sql.NullString
-		accountNo  string
-		display    string
-		legal      sql.NullString
-	)
-	err = s.db.QueryRowContext(ctx, `
-		SELECT stripe_customer_id, billing_email, account_number, display_name, legal_name
-		FROM auth.accounts WHERE id = $1
-	`, accountID).Scan(&customerID, &email, &accountNo, &display, &legal)
-	if err == sql.ErrNoRows {
-		return "", uuid.Nil, fmt.Errorf("account not found")
-	}
-	if err != nil {
-		return "", uuid.Nil, fmt.Errorf("failed to load account: %w", err)
-	}
-
-	name := legal.String
-	if name == "" {
-		name = display
-	}
-
-	newCustomerID, err := s.stripe.EnsureCustomer(customerID.String, email.String, name, accountNo)
+	cust, err := s.ensureStripeCustomer(ctx, accountID)
 	if err != nil {
 		return "", uuid.Nil, err
 	}
-	// Persist a freshly created customer id so we never create a second.
-	if !customerID.Valid || customerID.String == "" {
-		if _, err := s.db.ExecContext(ctx,
-			`UPDATE auth.accounts SET stripe_customer_id = $1, updated_at = NOW() WHERE id = $2`,
-			newCustomerID, accountID); err != nil {
-			return "", uuid.Nil, fmt.Errorf("failed to store stripe customer: %w", err)
-		}
-	}
+	newCustomerID := cust.CustomerID
 
 	secret, intentID, err := s.stripe.CreateSetupIntent(newCustomerID, "usd")
 	if err != nil {
@@ -173,6 +150,56 @@ func (s *Service) CreateSetupIntent(ctx context.Context, accountID uuid.UUID) (c
 	}
 
 	return secret, paymentMethodID, nil
+}
+
+// stripeCustomer is an account's Stripe identity plus the account facts
+// callers opening a payment need alongside it.
+type stripeCustomer struct {
+	CustomerID    string
+	AccountNumber string
+	Status        string
+}
+
+// ensureStripeCustomer returns the account's Stripe customer, creating and
+// persisting one on first use so an account never gets a second customer.
+// Requires s.stripe to be set.
+func (s *Service) ensureStripeCustomer(ctx context.Context, accountID uuid.UUID) (*stripeCustomer, error) {
+	var (
+		customerID sql.NullString
+		email      sql.NullString
+		accountNo  string
+		display    string
+		legal      sql.NullString
+		status     string
+	)
+	err := s.db.QueryRowContext(ctx, `
+		SELECT stripe_customer_id, billing_email, account_number, display_name, legal_name, status
+		FROM auth.accounts WHERE id = $1
+	`, accountID).Scan(&customerID, &email, &accountNo, &display, &legal, &status)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("account not found")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to load account: %w", err)
+	}
+
+	name := legal.String
+	if name == "" {
+		name = display
+	}
+
+	id, err := s.stripe.EnsureCustomer(customerID.String, email.String, name, accountNo)
+	if err != nil {
+		return nil, err
+	}
+	if !customerID.Valid || customerID.String == "" {
+		if _, err := s.db.ExecContext(ctx,
+			`UPDATE auth.accounts SET stripe_customer_id = $1, updated_at = NOW() WHERE id = $2`,
+			id, accountID); err != nil {
+			return nil, fmt.Errorf("failed to store stripe customer: %w", err)
+		}
+	}
+	return &stripeCustomer{CustomerID: id, AccountNumber: accountNo, Status: status}, nil
 }
 
 // MarkPaymentMethodVerified is called from the Stripe webhook when a
@@ -246,62 +273,21 @@ func (s *Service) MarkSetupFailed(ctx context.Context, setupIntentID string) err
 }
 
 // MarkPaymentMethodDetachedByStripeID handles a card removed at Stripe's
-// end (bank-initiated, fraud block, or a detach we did not originate). It
-// flips the row to removed and, if that was the account's LAST verified
-// card, starts the 24h grace clock — this is exactly the "card went bad
-// out from under us" case the clock exists for. A detach we performed
-// ourselves already removed the row (RemovePaymentMethod), so the status
-// update is a no-op and the last-card check sees the truthful count.
+// end (bank-initiated, fraud block, or a detach we did not originate) by
+// flipping the row to removed. It deliberately does not suspend or start
+// any grace clock: Teepin is prepaid, so losing a card never affects an
+// account's ability to run — only its credit balance does.
 //
 // Idempotent: a missing/already-removed row is not an error.
 func (s *Service) MarkPaymentMethodDetachedByStripeID(ctx context.Context, stripePMID string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback()
-
-	var accountID uuid.UUID
-	err = tx.QueryRowContext(ctx, `
-		SELECT account_id FROM billing.payment_methods
-		WHERE stripe_payment_method_id = $1 AND status != 'removed'
-	`, stripePMID).Scan(&accountID)
-	if err == sql.ErrNoRows {
-		return nil // already removed or never ours — idempotent
-	}
-	if err != nil {
-		return fmt.Errorf("failed to find payment method: %w", err)
-	}
-
-	if _, err := tx.ExecContext(ctx, `
+	if _, err := s.db.ExecContext(ctx, `
 		UPDATE billing.payment_methods
 		SET status = 'removed', is_default = FALSE, updated_at = NOW()
-		WHERE stripe_payment_method_id = $1
+		WHERE stripe_payment_method_id = $1 AND status != 'removed'
 	`, stripePMID); err != nil {
 		return fmt.Errorf("failed to mark detached: %w", err)
 	}
-
-	// If the account now has no verified card, start the grace clock —
-	// but only if it is not already running (do not push the deadline
-	// forward on a second card loss).
-	var remaining int
-	if err := tx.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM billing.payment_methods
-		WHERE account_id = $1 AND status = 'verified'
-	`, accountID).Scan(&remaining); err != nil {
-		return fmt.Errorf("failed to count remaining cards: %w", err)
-	}
-	if remaining == 0 {
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE auth.accounts
-			SET payment_failed_at = COALESCE(payment_failed_at, NOW()), updated_at = NOW()
-			WHERE id = $1
-		`, accountID); err != nil {
-			return fmt.Errorf("failed to start grace clock: %w", err)
-		}
-	}
-
-	return tx.Commit()
+	return nil
 }
 
 // RefreshCardByStripeID updates a stored card's display details when
@@ -351,10 +337,9 @@ func (s *Service) ListPaymentMethods(ctx context.Context, accountID uuid.UUID) (
 	return methods, rows.Err()
 }
 
-// RemovePaymentMethod removes a card, enforcing the invariant that an
-// account is never left card-less: if the target is the only VERIFIED
-// card, it refuses with ErrLastVerifiedCard (→ 409). The replacement
-// flow is therefore always add-new-then-remove-old.
+// RemovePaymentMethod removes a card. Any card may be removed, including
+// the last one: Teepin is prepaid, so an account runs on its credit
+// balance, not on a card on file.
 func (s *Service) RemovePaymentMethod(ctx context.Context, accountID, paymentMethodID uuid.UUID) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -362,36 +347,18 @@ func (s *Service) RemovePaymentMethod(ctx context.Context, accountID, paymentMet
 	}
 	defer tx.Rollback()
 
-	// Lock the account's verified cards for the duration so a concurrent
-	// remove cannot race us to "both were the last one".
-	var targetStatus string
 	var stripePMID string
 	err = tx.QueryRowContext(ctx, `
-		SELECT status, stripe_payment_method_id
+		SELECT stripe_payment_method_id
 		FROM billing.payment_methods
 		WHERE id = $1 AND account_id = $2
 		FOR UPDATE
-	`, paymentMethodID, accountID).Scan(&targetStatus, &stripePMID)
+	`, paymentMethodID, accountID).Scan(&stripePMID)
 	if err == sql.ErrNoRows {
 		return fmt.Errorf("payment method not found")
 	}
 	if err != nil {
 		return fmt.Errorf("failed to load payment method: %w", err)
-	}
-
-	// Only a verified card counts toward the "must keep one" invariant —
-	// removing a pending/failed card is always allowed.
-	if targetStatus == "verified" {
-		var verifiedCount int
-		if err := tx.QueryRowContext(ctx, `
-			SELECT COUNT(*) FROM billing.payment_methods
-			WHERE account_id = $1 AND status = 'verified'
-		`, accountID).Scan(&verifiedCount); err != nil {
-			return fmt.Errorf("failed to count verified cards: %w", err)
-		}
-		if verifiedCount <= 1 {
-			return ErrLastVerifiedCard
-		}
 	}
 
 	if _, err := tx.ExecContext(ctx, `

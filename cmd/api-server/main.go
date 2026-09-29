@@ -159,23 +159,9 @@ func main() {
 		// Start usage collector in background
 		go usageCollector.Start(context.Background())
 
-		// Monthly billing cycle: on the 1st, auto-generate + issue a usage
-		// invoice per account for the previous calendar month. Idempotent
-		// and skips accounts with no usage.
-		go billing.NewBillingCycle(dbClient.DB(), billingService).Start(context.Background())
-		log.Println("Monthly billing cycle started")
-
-		// Charge collector: charges issued usage invoices off-session against
-		// the account's verified card, for the net amount after credits.
-		// Only started when Stripe is configured — without a gateway there
-		// is nothing to charge with, and starting it would only record
-		// pointless "not configured" attempts.
-		if stripeClient != nil {
-			go billing.NewChargeCollector(dbClient.DB(), billingService).Start(context.Background())
-			log.Println("Charge collector started")
-		} else {
-			log.Println("Charge collector not started (Stripe not configured); issued invoices will not be charged")
-		}
+		// Teepin is prepaid only: usage draws from the account's credit
+		// balance, so the postpaid monthly invoice cycle and the card
+		// ChargeCollector are deliberately not started.
 	}
 
 	// Home-compute pilot: consumer-grade nodes as CPU capacity. Behind a
@@ -571,18 +557,6 @@ func main() {
 		retentionSweeper := compute.NewRetentionSweeper(instanceStore)
 		go retentionSweeper.Start(context.Background())
 		log.Println("Instance retention sweeper started")
-	}
-
-	// Suspension sweeper: suspends accounts whose 24h payment grace period
-	// has elapsed and tears down their resources. Inert until something
-	// sets accounts.payment_failed_at (a card removed at Stripe today; a
-	// failed charge later). Needs the DB, and — to actually stop
-	// workloads — the cluster and instance store.
-	if billingService != nil && instanceStore != nil {
-		suspender := newResourceSuspender(clusterClient, instanceStore)
-		sweeper := billing.NewSuspensionSweeper(dbClient.DB(), suspender)
-		go sweeper.Start(context.Background())
-		log.Println("Suspension sweeper started")
 	}
 
 	// Initialize API server with networking integration. billingService
@@ -1430,6 +1404,9 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 				billing.GET("/invoices/:id/pdf", billingHandler.DownloadInvoicePDF)
 				billing.POST("/invoices", billingHandler.CreateInvoice)
 				billing.GET("/credits", billingHandler.GetCreditBalance)
+				billing.POST("/credits/topups", billingHandler.CreateCreditTopUp)
+				billing.GET("/credits/topups", billingHandler.ListCreditTopUps)
+				billing.GET("/credits/topups/:id", billingHandler.GetCreditTopUp)
 				billing.GET("/pricing", billingHandler.GetPricing)
 			}
 		}

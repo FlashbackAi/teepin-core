@@ -5,6 +5,7 @@ package api
 
 import (
 	"errors"
+	"log"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -60,8 +61,8 @@ func (h *BillingHandler) ListPaymentMethods(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"payment_methods": methods, "count": len(methods)})
 }
 
-// RemovePaymentMethod removes a card. Refusing to remove the last
-// verified card is a 409 — the account must never be left card-less.
+// RemovePaymentMethod removes a card, including the last one (prepaid:
+// no card is required to keep running).
 // DELETE /v1/accounts/current/payment-methods/:id
 func (h *BillingHandler) RemovePaymentMethod(c *gin.Context) {
 	accountID, ok := auth.GetAccountID(c)
@@ -76,10 +77,6 @@ func (h *BillingHandler) RemovePaymentMethod(c *gin.Context) {
 	}
 
 	err = h.billingService.RemovePaymentMethod(c.Request.Context(), accountID, pmID)
-	if errors.Is(err, billing.ErrLastVerifiedCard) {
-		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
-		return
-	}
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -107,8 +104,109 @@ func (h *BillingHandler) SetDefaultPaymentMethod(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"updated": true})
 }
 
+// requireSignedInUser rejects API-key and agent-session credentials:
+// buying credit spends a customer's money, so only a person signed in to
+// the console may start it. Writes the response and returns false when
+// the caller is not allowed.
+func requireSignedInUser(c *gin.Context) (uuid.UUID, bool) {
+	accountID, ok := auth.GetAccountID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "account authentication required"})
+		return uuid.Nil, false
+	}
+	if _, viaAPIKey := auth.GetAPIKeyScopes(c); viaAPIKey {
+		c.JSON(http.StatusForbidden, gin.H{"error": "credit can only be purchased by a signed-in user"})
+		return uuid.Nil, false
+	}
+	if _, isSession := auth.GetSessionID(c); isSession {
+		c.JSON(http.StatusForbidden, gin.H{"error": "credit can only be purchased by a signed-in user"})
+		return uuid.Nil, false
+	}
+	return accountID, true
+}
+
+type createTopUpRequest struct {
+	// Amount in USD. Whole cents, between billing.MinTopUp and
+	// billing.MaxTopUp.
+	Amount float64 `json:"amount" binding:"required"`
+}
+
+// CreateCreditTopUp starts a prepaid credit purchase and returns the
+// client secret the browser uses to pay. Credit is added only when Stripe
+// confirms the payment (webhook), never by this call.
+// POST /v1/billing/credits/topups
+func (h *BillingHandler) CreateCreditTopUp(c *gin.Context) {
+	accountID, ok := requireSignedInUser(c)
+	if !ok {
+		return
+	}
+	var req createTopUpRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": billing.ErrTopUpAmount.Error()})
+		return
+	}
+
+	intent, err := h.billingService.CreateTopUp(c.Request.Context(), accountID, req.Amount)
+	switch {
+	case errors.Is(err, billing.ErrTopUpAmount):
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	case errors.Is(err, billing.ErrAccountClosed):
+		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+	case errors.Is(err, billing.ErrPaymentsNotConfigured):
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+	case err != nil:
+		log.Printf("WARN: create top-up for account %s: %v", accountID, err)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "could not start the payment, please try again"})
+	default:
+		c.JSON(http.StatusCreated, intent)
+	}
+}
+
+// ListCreditTopUps returns the account's credit purchase history.
+// GET /v1/billing/credits/topups
+func (h *BillingHandler) ListCreditTopUps(c *gin.Context) {
+	accountID, ok := auth.GetAccountID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "account authentication required"})
+		return
+	}
+	topUps, err := h.billingService.ListTopUps(c.Request.Context(), accountID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"topups": topUps, "count": len(topUps)})
+}
+
+// GetCreditTopUp returns one top-up, so the console can follow a payment
+// it just submitted until the webhook settles it. Another account's
+// top-up is a 404.
+// GET /v1/billing/credits/topups/:id
+func (h *BillingHandler) GetCreditTopUp(c *gin.Context) {
+	accountID, ok := auth.GetAccountID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "account authentication required"})
+		return
+	}
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid top-up id"})
+		return
+	}
+	topUp, err := h.billingService.GetTopUp(c.Request.Context(), accountID, id)
+	if errors.Is(err, billing.ErrTopUpNotFound) {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, topUp)
+}
+
 // GetCreditBalance returns the account's current credit balance, for the
-// billing overview. Read-only; grants are operator-only (admin API).
+// billing overview and the console's provisioning pre-check.
 // GET /v1/billing/credits
 func (h *BillingHandler) GetCreditBalance(c *gin.Context) {
 	accountID, ok := auth.GetAccountID(c)

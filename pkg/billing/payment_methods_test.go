@@ -12,20 +12,21 @@ import (
 )
 
 // AccountCanProvision is the gate's single source of truth, so its truth
-// table is worth pinning exactly: active + a verified card opens the
-// gate; everything else keeps it shut.
+// table is worth pinning exactly: an active account with spendable credit
+// opens the gate; everything else keeps it shut. A card on file plays no
+// part — Teepin is prepaid.
 func TestAccountCanProvision(t *testing.T) {
 	cases := []struct {
-		name          string
-		status        string
-		verifiedCards int
-		wantOK        bool
+		name    string
+		status  string
+		balance float64
+		wantOK  bool
 	}{
-		{"active with verified card", "active", 1, true},
-		{"active no card", "active", 0, false},
-		{"active card not yet verified", "active", 0, false},
-		{"suspended with card", "suspended", 1, false},
-		{"closed with card", "closed", 1, false},
+		{"active with credit", "active", 20, true},
+		{"active with a sliver of credit", "active", 0.0001, true},
+		{"active with zero balance", "active", 0, false},
+		{"suspended with credit", "suspended", 50, false},
+		{"closed with credit", "closed", 50, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -37,10 +38,10 @@ func TestAccountCanProvision(t *testing.T) {
 			s := NewService(db)
 			account := uuid.New()
 
-			mock.ExpectQuery(`SELECT a\.status,.*FROM auth\.accounts`).
+			mock.ExpectQuery(`SELECT a\.status,.*billing\.credit_transactions.*FROM auth\.accounts`).
 				WithArgs(account).
-				WillReturnRows(sqlmock.NewRows([]string{"status", "count"}).
-					AddRow(tc.status, tc.verifiedCards))
+				WillReturnRows(sqlmock.NewRows([]string{"status", "balance"}).
+					AddRow(tc.status, tc.balance))
 
 			ok, reason, err := s.AccountCanProvision(context.Background(), account)
 			if err != nil {
@@ -81,41 +82,9 @@ func TestAccountCanProvision_ErrorFailsClosed(t *testing.T) {
 	}
 }
 
-// Removing the only verified card must be refused with
-// ErrLastVerifiedCard — an account with resources must never be left
-// without a means of payment.
-func TestRemovePaymentMethod_LastVerifiedIs409(t *testing.T) {
-	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
-	if err != nil {
-		t.Fatalf("sqlmock.New: %v", err)
-	}
-	defer db.Close()
-	s := NewService(db)
-	account := uuid.New()
-	pmID := uuid.New()
-
-	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT status, stripe_payment_method_id.*FOR UPDATE`).
-		WithArgs(pmID, account).
-		WillReturnRows(sqlmock.NewRows([]string{"status", "stripe_payment_method_id"}).
-			AddRow("verified", "pm_123"))
-	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM billing\.payment_methods`).
-		WithArgs(account).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
-	// No UPDATE expected — it must bail before removing.
-	mock.ExpectRollback()
-
-	err = s.RemovePaymentMethod(context.Background(), account, pmID)
-	if err != ErrLastVerifiedCard {
-		t.Errorf("got %v, want ErrLastVerifiedCard", err)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unexpected queries: %v", err)
-	}
-}
-
-// Removing one of several verified cards succeeds.
-func TestRemovePaymentMethod_OneOfManySucceeds(t *testing.T) {
+// Removing the account's only card succeeds: under prepaid billing a card
+// is optional, so there is no "must keep one" invariant any more.
+func TestRemovePaymentMethod_LastCardSucceeds(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)
@@ -127,13 +96,10 @@ func TestRemovePaymentMethod_OneOfManySucceeds(t *testing.T) {
 	pmID := uuid.New()
 
 	mock.ExpectBegin()
-	mock.ExpectQuery(`SELECT status, stripe_payment_method_id.*FOR UPDATE`).
+	mock.ExpectQuery(`SELECT stripe_payment_method_id.*FOR UPDATE`).
 		WithArgs(pmID, account).
-		WillReturnRows(sqlmock.NewRows([]string{"status", "stripe_payment_method_id"}).
-			AddRow("verified", "pm_123"))
-	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM billing\.payment_methods`).
-		WithArgs(account).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(2))
+		WillReturnRows(sqlmock.NewRows([]string{"stripe_payment_method_id"}).
+			AddRow("pm_123"))
 	mock.ExpectExec(`UPDATE billing\.payment_methods\s+SET status = 'removed'`).
 		WithArgs(pmID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -159,9 +125,7 @@ func TestRemovePaymentMethod_OneOfManySucceeds(t *testing.T) {
 // if the customer never finished. Returning the row's own id is what
 // makes that possible: the console now removes it on Cancel or on a
 // failure to load Stripe, via the existing RemovePaymentMethod endpoint
-// (which already treats removing a pending/non-verified card as always
-// allowed — see TestRemovePaymentMethod_OneOfManySucceeds's sibling
-// coverage of that invariant).
+// (which allows removing any card — see TestRemovePaymentMethod_LastCardSucceeds).
 func TestCreateSetupIntent_ReturnsPendingRowID(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	if err != nil {
@@ -173,11 +137,11 @@ func TestCreateSetupIntent_ReturnsPendingRowID(t *testing.T) {
 	account := uuid.New()
 	wantID := uuid.New()
 
-	mock.ExpectQuery(`SELECT stripe_customer_id, billing_email, account_number, display_name, legal_name`).
+	mock.ExpectQuery(`SELECT stripe_customer_id, billing_email, account_number, display_name, legal_name, status`).
 		WithArgs(account).
 		WillReturnRows(sqlmock.NewRows(
-			[]string{"stripe_customer_id", "billing_email", "account_number", "display_name", "legal_name"},
-		).AddRow(nil, "a@example.com", "ACC-001", "Acme", nil))
+			[]string{"stripe_customer_id", "billing_email", "account_number", "display_name", "legal_name", "status"},
+		).AddRow(nil, "a@example.com", "ACC-001", "Acme", nil, "active"))
 
 	// No existing Stripe customer id -> EnsureCustomer mints one (fakeGateway
 	// returns "cus_test"), which must be persisted back onto the account.
