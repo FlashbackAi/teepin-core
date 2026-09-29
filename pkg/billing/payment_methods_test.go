@@ -38,7 +38,7 @@ func TestAccountCanProvision(t *testing.T) {
 			s := NewService(db)
 			account := uuid.New()
 
-			mock.ExpectQuery(`SELECT a\.status,.*billing\.credit_transactions.*FROM auth\.accounts`).
+			mock.ExpectQuery(`SELECT a\.status,.*billing\.credit_balance\(a\.id\).*FROM auth\.accounts`).
 				WithArgs(account).
 				WillReturnRows(sqlmock.NewRows([]string{"status", "balance"}).
 					AddRow(tc.status, tc.balance))

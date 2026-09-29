@@ -162,6 +162,10 @@ func main() {
 		// Teepin is prepaid only: usage draws from the account's credit
 		// balance, so the postpaid monthly invoice cycle and the card
 		// ChargeCollector are deliberately not started.
+
+		// Forfeits the unspent part of expired credit grants so the ledger
+		// shows them (balance reads are exact without it).
+		go billing.NewCreditExpirer(billingService).Start(context.Background())
 	}
 
 	// Home-compute pilot: consumer-grade nodes as CPU capacity. Behind a

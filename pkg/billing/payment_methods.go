@@ -64,8 +64,8 @@ func (s *Service) WithStripe(gw StripeGateway) *Service {
 // however it was funded.
 //
 // Returns (false, reason, nil) with a customer-facing reason when the
-// account is not active or has no spendable credit. The balance uses the
-// same predicate as CreditBalance (expired operator grants excluded). The
+// account is not active or has no spendable credit. The balance is the same
+// billing.credit_balance function CreditBalance reads. The
 // reason is safe to show a customer; it never leaks another tenant's state
 // because the caller has already established this is the caller's own
 // account.
@@ -77,9 +77,7 @@ func (s *Service) AccountCanProvision(ctx context.Context, accountID uuid.UUID) 
 	var balance float64
 	err := s.db.QueryRowContext(ctx, `
 		SELECT a.status,
-		       (SELECT COALESCE(SUM(ct.amount), 0) FROM billing.credit_transactions ct
-		          WHERE ct.account_id = a.id
-		            AND (ct.kind != 'grant' OR ct.expires_at IS NULL OR ct.expires_at > NOW()))
+		       billing.credit_balance(a.id)
 		FROM auth.accounts a
 		WHERE a.id = $1
 	`, accountID).Scan(&status, &balance)
