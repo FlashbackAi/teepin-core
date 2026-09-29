@@ -51,9 +51,9 @@ func TestCreditEnforcerIntegration(t *testing.T) {
 	diskful := itAccount(t, db) // out of credit but has a persistent disk
 	itLot(t, db, broke, "purchase", 1.02, 0, nil)
 	itLot(t, db, funded, "purchase", 100, 0, nil)
-	itInstance(t, ctx, s, broke, "it-broke", 20, 0)
-	itInstance(t, ctx, s, funded, "it-funded", 20, 0)
-	itInstance(t, ctx, s, diskful, "it-disk", 20, 50)
+	itInstance(t, ctx, s, broke, uniq("it-broke"), 20, 0)
+	itInstance(t, ctx, s, funded, uniq("it-funded"), 20, 0)
+	itInstance(t, ctx, s, diskful, uniq("it-disk"), 20, 50)
 
 	stopper := &fakeStopper{}
 	e := NewCreditEnforcer(db, s, stopper, nil, EnforceOn)
@@ -65,13 +65,22 @@ func TestCreditEnforcerIntegration(t *testing.T) {
 			stopped[id] = true
 		}
 	}
-	if !stopped["it-broke"] {
+	if !stopped[uniq("it-broke")] {
 		t.Error("the account whose credit is nearly gone was not stopped")
 	}
-	if stopped["it-funded"] {
+	if stopped[uniq("it-funded")] {
 		t.Error("an account with $100 credit was stopped")
 	}
-	if stopped["it-disk"] {
-		t.Error("an instance with a persistent disk was stopped (data loss)")
+	if stopped[uniq("it-disk")] {
+		t.Error("an instance with a persistent disk was deleted (data loss)")
+	}
+	held := map[string]bool{}
+	for _, call := range stopper.holds {
+		for _, id := range call {
+			held[id] = true
+		}
+	}
+	if !held[uniq("it-disk")] {
+		t.Error("the disk-backed instance was not held (stopped with its disk kept)")
 	}
 }
