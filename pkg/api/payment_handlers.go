@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -203,6 +204,37 @@ func (h *BillingHandler) GetCreditTopUp(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, topUp)
+}
+
+// GetCreditStatus handles GET /v1/billing/credits/status: the account's credit
+// position - balance, current spend, how long it lasts, and how worried to
+// be - for the console banner. Computed by the same code that decides which
+// warning emails to send, so the banner and the emails cannot disagree.
+func (h *BillingHandler) GetCreditStatus(c *gin.Context) {
+	accountID, ok := auth.GetAccountID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "account authentication required"})
+		return
+	}
+	report, err := h.billingService.Runway(c.Request.Context(), accountID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	resp := gin.H{
+		"balance":       report.Balance,
+		"burn_per_hour": report.BurnPerHour,
+		"level":         report.Level.String(),
+		"impacted":      report.Impacted,
+		"runway_hours":  nil,
+	}
+	if hours, ok := report.RunwayHours(); ok {
+		resp["runway_hours"] = hours
+	}
+	if hold, err := h.billingService.ActiveStorageHold(c.Request.Context(), accountID); err == nil && hold != nil {
+		resp["storage_delete_after"] = hold.DeleteAfter.UTC().Format(time.RFC3339)
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // GetCreditBalance returns the account's current credit balance, for the

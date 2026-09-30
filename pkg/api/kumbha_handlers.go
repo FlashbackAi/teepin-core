@@ -1164,6 +1164,17 @@ func (s *Server) redeployKumbhaInstance(ctx context.Context, c *gin.Context, ses
 		return
 	}
 
+	// A redeploy builds a fresh spec, so the customer's saved secrets are
+	// injected again here — including any saved since the first deploy.
+	env, secretsErr := s.withKumbhaSecrets(ctx, sessionID, accountID, env)
+	if secretsErr != nil {
+		log.Printf("api: could not load saved secrets for Kumbha session %s: %v", sessionID, secretsErr)
+		msg := "could not load the app's saved secrets, please retry"
+		s.recordDeployOutcome(ctx, sessionID, msg)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": msg})
+		return
+	}
+
 	req := models.CreateInstanceRequest{
 		Name:      existing.Name,
 		Image:     imageRef,
@@ -1962,7 +1973,14 @@ func (s *Server) KumbhaChatCompletions(c *gin.Context) {
 		return
 	}
 
+	// Each completion is one blocking round trip to the model (the gateway
+	// does not stream yet), so its duration is the number to look at when a
+	// build seems stuck: a slow model looks exactly like a hung agent from
+	// the console. Logged for every call, success or not.
+	completeStart := time.Now()
 	result, err := s.kumbha.Complete(c.Request.Context(), sess, req)
+	log.Printf("kumbha: completion session=%s route=%s messages=%d took=%s ok=%t",
+		sess.ID, req.Model, len(req.Messages), time.Since(completeStart).Round(time.Millisecond), err == nil)
 	if err != nil {
 		switch {
 		case errors.Is(err, kumbha.ErrSessionClosed):

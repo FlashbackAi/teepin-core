@@ -281,6 +281,7 @@ func TestSettleTopUp_UnknownPaymentIntent(t *testing.T) {
 // provider reason still leaves the customer an explanation.
 func TestFailTopUp(t *testing.T) {
 	s, mock, _ := newTopUpMock(t)
+	expectTopUpStatus(mock, "pi_1", "pending")
 	mock.ExpectExec(`UPDATE billing\.credit_topups\s+SET status = 'failed'.*status != 'succeeded'`).
 		WithArgs("pi_1", "the payment did not go through").
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -317,5 +318,118 @@ func TestGetTopUp_OtherAccountNotFound(t *testing.T) {
 
 	if _, err := s.GetTopUp(context.Background(), account, id); !errors.Is(err, ErrTopUpNotFound) {
 		t.Errorf("got %v, want ErrTopUpNotFound", err)
+	}
+}
+
+func expectTopUpStatus(mock sqlmock.Sqlmock, piID, status string) {
+	mock.ExpectQuery(`SELECT account_id, amount, currency, status FROM billing\.credit_topups`).
+		WithArgs(piID).
+		WillReturnRows(sqlmock.NewRows([]string{"account_id", "amount", "currency", "status"}).
+			AddRow(uuid.New(), 50.0, "usd", status))
+}
+
+type notices struct {
+	settled []TopUpReceiptNotice
+	failed  []TopUpFailureNotice
+}
+
+func (n *notices) wire(s *Service) {
+	s.WithTopUpNotifiers(
+		func(_ context.Context, r TopUpReceiptNotice) { n.settled = append(n.settled, r) },
+		func(_ context.Context, f TopUpFailureNotice) { n.failed = append(n.failed, f) })
+}
+
+// A bank debit that was accepted and later returned is the failure the
+// customer cannot see happen, so it is emailed. A card declined on the spot
+// is not: the console already showed the error.
+func TestFailTopUp_EmailsOnlyAfterAsyncPaymentFails(t *testing.T) {
+	for _, c := range []struct {
+		prev string
+		want int
+	}{{"processing", 1}, {"pending", 0}} {
+		s, mock, _ := newTopUpMock(t)
+		var n notices
+		n.wire(s)
+		expectTopUpStatus(mock, "pi_1", c.prev)
+		mock.ExpectExec(`UPDATE billing\.credit_topups\s+SET status = 'failed'`).
+			WithArgs("pi_1", "insufficient funds").WillReturnResult(sqlmock.NewResult(0, 1))
+
+		if err := s.FailTopUpByPaymentIntent(context.Background(), "pi_1", "insufficient funds"); err != nil {
+			t.Fatal(err)
+		}
+		if len(n.failed) != c.want {
+			t.Errorf("previous status %q: %d failure notices, want %d", c.prev, len(n.failed), c.want)
+		}
+		if c.want == 1 && (n.failed[0].Amount != 50 || n.failed[0].Reason != "insufficient funds") {
+			t.Errorf("notice = %+v", n.failed[0])
+		}
+	}
+}
+
+// A failure webhook replayed after success changes nothing, so it says nothing.
+func TestFailTopUp_NoEmailWhenNothingChanged(t *testing.T) {
+	s, mock, _ := newTopUpMock(t)
+	var n notices
+	n.wire(s)
+	expectTopUpStatus(mock, "pi_1", "processing")
+	mock.ExpectExec(`UPDATE billing\.credit_topups\s+SET status = 'failed'`).
+		WillReturnResult(sqlmock.NewResult(0, 0)) // already succeeded
+
+	_ = s.FailTopUpByPaymentIntent(context.Background(), "pi_1", "late")
+	if len(n.failed) != 0 {
+		t.Errorf("notified about a failure that changed nothing: %+v", n.failed)
+	}
+}
+
+func TestSettleTopUp_SendsTheReceiptNoticeOnce(t *testing.T) {
+	s, mock, _ := newTopUpMock(t)
+	var n notices
+	n.wire(s)
+	account, topUpID, receiptID := uuid.New(), uuid.New(), uuid.New()
+	year := time.Now().UTC().Year()
+
+	expectSettlePreamble(mock, "pi_1", account)
+	mock.ExpectQuery(`FOR UPDATE`).WithArgs("pi_1").WillReturnRows(lockedTopUpRow(topUpID, 50, "processing"))
+	mock.ExpectQuery(`INSERT INTO billing\.invoice_counters`).WithArgs("RCT", year).
+		WillReturnRows(sqlmock.NewRows([]string{"last_number"}).AddRow(int64(7)))
+	mock.ExpectQuery(`INSERT INTO billing\.invoices`).WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(receiptID))
+	mock.ExpectExec(`INSERT INTO billing\.invoice_line_items`).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`INSERT INTO billing\.credit_transactions`).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`UPDATE billing\.credit_topups\s+SET status = 'succeeded'`).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	if err := s.SettleTopUpByPaymentIntent(context.Background(), "pi_1", 5000, "usd", "Visa ending 4242"); err != nil {
+		t.Fatal(err)
+	}
+	if len(n.settled) != 1 {
+		t.Fatalf("receipt notices = %d, want 1", len(n.settled))
+	}
+	got := n.settled[0]
+	if got.AccountID != account || got.ReceiptID != receiptID || got.Amount != 50 ||
+		got.ReceiptNumber != fmt.Sprintf("RCT-%d-000007", year) || got.PaymentMethod != "Visa ending 4242" {
+		t.Errorf("notice = %+v", got)
+	}
+}
+
+// Stripe retries webhooks; a replay or a rejected amount must not email a receipt.
+func TestSettleTopUp_ReplayAndMismatchSendNoReceipt(t *testing.T) {
+	s, mock, _ := newTopUpMock(t)
+	var n notices
+	n.wire(s)
+	account := uuid.New()
+
+	expectSettlePreamble(mock, "pi_1", account)
+	mock.ExpectQuery(`FOR UPDATE`).WithArgs("pi_1").WillReturnRows(lockedTopUpRow(uuid.New(), 50, "succeeded"))
+	mock.ExpectRollback()
+	_ = s.SettleTopUpByPaymentIntent(context.Background(), "pi_1", 5000, "usd", "")
+
+	expectSettlePreamble(mock, "pi_2", account)
+	mock.ExpectQuery(`FOR UPDATE`).WithArgs("pi_2").WillReturnRows(lockedTopUpRow(uuid.New(), 50, "pending"))
+	mock.ExpectExec(`SET status = 'failed'`).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	_ = s.SettleTopUpByPaymentIntent(context.Background(), "pi_2", 4999, "usd", "")
+
+	if len(n.settled) != 0 {
+		t.Errorf("a receipt was emailed for %+v", n.settled)
 	}
 }

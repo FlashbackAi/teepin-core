@@ -165,6 +165,57 @@ func (s *Service) MarkTopUpProcessing(ctx context.Context, piID string) error {
 	return nil
 }
 
+// TopUpReceiptNotice describes a top-up that has just been credited, for the
+// receipt email.
+type TopUpReceiptNotice struct {
+	AccountID     uuid.UUID
+	ReceiptID     uuid.UUID
+	ReceiptNumber string
+	Amount        float64
+	Currency      string
+	PaymentMethod string
+}
+
+// TopUpFailureNotice describes a top-up whose payment failed after it had
+// been accepted for processing (a bank debit that was later returned).
+type TopUpFailureNotice struct {
+	AccountID uuid.UUID
+	Amount    float64
+	Currency  string
+	Reason    string
+}
+
+// notifyTimeout bounds one notification. Notifications run inside the Stripe
+// webhook request, so a slow email provider must not hold it open.
+const notifyTimeout = 5 * time.Second
+
+// WithTopUpNotifiers registers what to do after a top-up is credited or
+// fails asynchronously. Either may be nil. A notifier failing is logged by
+// the notifier itself and never undoes or fails the payment.
+func (s *Service) WithTopUpNotifiers(settled func(context.Context, TopUpReceiptNotice), failed func(context.Context, TopUpFailureNotice)) *Service {
+	s.onTopUpSettled = settled
+	s.onTopUpFailed = failed
+	return s
+}
+
+func (s *Service) notifySettled(n TopUpReceiptNotice) {
+	if s.onTopUpSettled == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
+	defer cancel()
+	s.onTopUpSettled(ctx, n)
+}
+
+func (s *Service) notifyFailed(n TopUpFailureNotice) {
+	if s.onTopUpFailed == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
+	defer cancel()
+	s.onTopUpFailed(ctx, n)
+}
+
 // FailTopUpByPaymentIntent records a failed payment attempt. A top-up that
 // already succeeded is never downgraded. A failed PaymentIntent can still
 // be retried by the customer with another method, which then settles the
@@ -173,12 +224,30 @@ func (s *Service) FailTopUpByPaymentIntent(ctx context.Context, piID, reason str
 	if strings.TrimSpace(reason) == "" {
 		reason = "the payment did not go through"
 	}
-	if _, err := s.db.ExecContext(ctx, `
+	// What it was before matters: a payment that was already 'processing' (a
+	// bank debit) fails later and out of sight, so the customer must be told;
+	// one that fails on the spot (a declined card) is shown the error in the
+	// console straight away and does not also need an email.
+	var (
+		accountID uuid.UUID
+		amount    float64
+		currency  string
+		prev      string
+	)
+	prevErr := s.db.QueryRowContext(ctx, `
+		SELECT account_id, amount, currency, status FROM billing.credit_topups
+		WHERE stripe_payment_intent_id = $1`, piID).Scan(&accountID, &amount, &currency, &prev)
+
+	res, err := s.db.ExecContext(ctx, `
 		UPDATE billing.credit_topups
 		SET status = 'failed', failure_reason = $2, updated_at = NOW()
 		WHERE stripe_payment_intent_id = $1 AND status != 'succeeded'
-	`, piID, reason); err != nil {
+	`, piID, reason)
+	if err != nil {
 		return fmt.Errorf("failed to record top-up failure: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n > 0 && prevErr == nil && prev == "processing" {
+		s.notifyFailed(TopUpFailureNotice{AccountID: accountID, Amount: amount, Currency: currency, Reason: reason})
 	}
 	return nil
 }
@@ -277,6 +346,12 @@ func (s *Service) SettleTopUpByPaymentIntent(ctx context.Context, piID string, r
 	// The purchase is spendable now; do not let a pre-flight keep judging on
 	// the balance from before it.
 	s.balances.forget(accountID)
+	// Tell the customer once the credit is real and the receipt (with its PDF,
+	// below) exists. Deferred so every return path after the commit runs it.
+	defer s.notifySettled(TopUpReceiptNotice{
+		AccountID: accountID, ReceiptID: receiptID, ReceiptNumber: invoiceNumber,
+		Amount: amount, Currency: topUpCurrency, PaymentMethod: methodSummary,
+	})
 
 	// The credit and the receipt record are committed; the PDF is a derived
 	// document and must not undo them if rendering or storage fails.

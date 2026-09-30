@@ -142,7 +142,7 @@ func (s *EventTicketStore) Reap(ctx context.Context) {
 // (teepin-console/src/lib/api/types.ts) is extended to read it — the two
 // must be kept in lockstep, since a silently-dropped field fails exactly
 // this way: the browser never sees an error, it just renders nothing.
-var eventFieldAllowlist = []string{"type", "tool", "summary", "ts", "role", "diff", "reasoning", "tasks", "is_error"}
+var eventFieldAllowlist = []string{"type", "tool", "summary", "ts", "role", "diff", "reasoning", "tasks", "is_error", "seconds"}
 
 // sanitizeEventLine parses one JSON line from the agent pod's stdout and
 // re-encodes only the allowlisted fields. Returns ok=false for a blank or

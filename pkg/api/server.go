@@ -661,6 +661,18 @@ func (s *Server) CreateInstance(c *gin.Context) {
 			})
 			return
 		}
+
+		// The secrets the customer entered for this build go into the app's
+		// environment here, on the control plane: the agent never held their
+		// values. Done before any allocation so a failure to load them
+		// cannot leave anything reserved.
+		mergedEnv, err := s.withKumbhaSecrets(c.Request.Context(), kumbhaSessionID, accountID, req.Env)
+		if err != nil {
+			log.Printf("api: could not load saved secrets for Kumbha session %s: %v", kumbhaSessionID, err)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not load the app's saved secrets, please retry"})
+			return
+		}
+		req.Env = mergedEnv
 	}
 
 	// Payment gate: no validated payment method (or a non-active account),

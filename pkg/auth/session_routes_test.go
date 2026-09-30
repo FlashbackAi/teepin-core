@@ -51,6 +51,10 @@ func TestSessionMayCall_DeniesEverythingElse(t *testing.T) {
 		{"POST", "/v1/kumbha/sessions/:id/workspace"},
 		{"POST", "/v1/kumbha/sessions/:id/workspace/rollback"},
 		{"POST", "/v1/kumbha/attachments"},
+		// Secrets must never pass through the agent.
+		{"PUT", "/v1/kumbha/sessions/:id/secrets/:name"},
+		{"GET", "/v1/kumbha/sessions/:id/secrets"},
+		{"DELETE", "/v1/kumbha/sessions/:id/secrets/:name"},
 		{"DELETE", "/v1/compute/instances/:id"},
 		{"POST", "/v1/compute/instances/:id/exec"},
 		{"GET", "/v1/compute/instances"},

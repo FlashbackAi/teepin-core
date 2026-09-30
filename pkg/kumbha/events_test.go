@@ -83,6 +83,23 @@ func TestSanitizeEventLine_PassesThroughRoleDiffReasoningTasksAndIsError(t *test
 	}
 }
 
+// The "still working" heartbeat carries its elapsed seconds in a field of its
+// own; if the allowlist dropped it the console would show a heartbeat with no
+// time on it, the same silent failure the test above pins for role.
+func TestSanitizeEventLine_PassesThroughThinkingSeconds(t *testing.T) {
+	sanitized, ok := sanitizeEventLine([]byte(`{"type":"thinking","seconds":130,"summary":"Working on the next step","ts":1}`))
+	if !ok {
+		t.Fatal("expected sanitisation to succeed")
+	}
+	var got map[string]any
+	if err := json.Unmarshal(sanitized, &got); err != nil {
+		t.Fatalf("sanitized output is not valid JSON: %v", err)
+	}
+	if got["seconds"] != float64(130) {
+		t.Errorf("seconds = %v, want 130", got["seconds"])
+	}
+}
+
 func TestSanitizeEventLine_RejectsBlankLines(t *testing.T) {
 	if _, ok := sanitizeEventLine([]byte("   ")); ok {
 		t.Error("a blank line should not sanitize successfully")

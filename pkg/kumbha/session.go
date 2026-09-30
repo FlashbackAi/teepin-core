@@ -109,6 +109,10 @@ type RouteUsage struct {
 // Store persists Kumbha sessions and their per-route usage.
 type Store struct {
 	db *sql.DB
+	// vault seals customer secrets at rest (see secrets.go). Nil disables
+	// the secrets capability cleanly: every secrets method returns
+	// ErrSecretsNotConfigured.
+	vault *SecretVault
 }
 
 func NewStore(db *sql.DB) *Store {

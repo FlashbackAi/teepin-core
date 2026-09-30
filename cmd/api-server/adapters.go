@@ -8,8 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/sesv2"
 	"github.com/google/uuid"
 
 	"github.com/FlashbackAi/teepin-core/pkg/api"
@@ -17,6 +20,7 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/build"
 	"github.com/FlashbackAi/teepin-core/pkg/cluster"
 	"github.com/FlashbackAi/teepin-core/pkg/compute"
+	"github.com/FlashbackAi/teepin-core/pkg/email"
 	"github.com/FlashbackAi/teepin-core/pkg/inference"
 	"github.com/FlashbackAi/teepin-core/pkg/inferencegateway"
 	"github.com/FlashbackAi/teepin-core/pkg/kumbha"
@@ -637,4 +641,27 @@ func (h *heldDisks) PurgeAccount(ctx context.Context, accountID uuid.UUID) error
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// newEmailSender picks how email leaves the platform: Amazon SES when
+// TEEPIN_EMAIL_FROM names a verified sender, otherwise a log-only sender so
+// the rest of the system runs unchanged in development.
+func newEmailSender() email.Sender {
+	from := os.Getenv("TEEPIN_EMAIL_FROM")
+	if from == "" {
+		log.Println("Email not configured (TEEPIN_EMAIL_FROM unset): notices are logged, not sent")
+		return email.LogSender{}
+	}
+	cfg, err := awsconfig.LoadDefaultConfig(context.Background())
+	if err != nil {
+		log.Printf("WARN: email disabled: could not load AWS configuration: %v", err)
+		return email.LogSender{}
+	}
+	sender, err := email.NewSESSender(sesv2.NewFromConfig(cfg), from)
+	if err != nil {
+		log.Printf("WARN: email disabled: %v", err)
+		return email.LogSender{}
+	}
+	log.Println("Email enabled via Amazon SES")
+	return sender
 }

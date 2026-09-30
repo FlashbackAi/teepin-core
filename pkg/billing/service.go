@@ -54,6 +54,11 @@ type Service struct {
 	// tax decides which taxes an invoice carries. Nil means none.
 	tax TaxPolicy
 
+	// onTopUpSettled / onTopUpFailed are told about top-up outcomes the
+	// customer should hear about; see WithTopUpNotifiers.
+	onTopUpSettled func(context.Context, TopUpReceiptNotice)
+	onTopUpFailed  func(context.Context, TopUpFailureNotice)
+
 	// balances caches recent balances for pre-flight checks; see
 	// credit_guard.go. Zero value is ready to use.
 	balances balanceCache

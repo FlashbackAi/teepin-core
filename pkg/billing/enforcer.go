@@ -85,6 +85,19 @@ type tailSettler interface {
 	CollectAccount(ctx context.Context, accountID uuid.UUID) error
 }
 
+// OutOfCreditNotifier is told when the enforcer has ended an account's
+// compute for lack of credit, so the customer hears about it. Optional.
+type OutOfCreditNotifier interface {
+	RaiseOutOfCredit(ctx context.Context, accountID uuid.UUID)
+}
+
+// WithNotifier makes the enforcer report each account it stops. Returns the
+// same *CreditEnforcer for chaining.
+func (e *CreditEnforcer) WithNotifier(n OutOfCreditNotifier) *CreditEnforcer {
+	e.notifier = n
+	return e
+}
+
 // CreditEnforcer keeps prepaid accounts from running paid compute on credit
 // they do not have. Each tick it projects, per account, how much credit
 // remains once the not-yet-metered time is charged, and stops the account's
@@ -97,6 +110,7 @@ type CreditEnforcer struct {
 	billing  *Service
 	stopper  ComputeStopper
 	settler  tailSettler
+	notifier OutOfCreditNotifier
 	mode     EnforcementMode
 	interval time.Duration
 	stopChan chan struct{}
@@ -282,6 +296,9 @@ func (e *CreditEnforcer) exhausted(ctx context.Context, accountID uuid.UUID, a a
 			if err := e.settler.CollectAccount(ctx, accountID); err != nil {
 				log.Printf("WARN: credit enforcer could not settle final usage for account %s: %v", accountID, err)
 			}
+		}
+		if e.notifier != nil {
+			e.notifier.RaiseOutOfCredit(ctx, accountID)
 		}
 	}
 }

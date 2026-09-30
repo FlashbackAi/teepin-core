@@ -105,6 +105,7 @@ func main() {
 	var billingService *billing.Service
 	var billingHandler *api.BillingHandler
 	var usageCollector *billing.UsageCollector
+	var creditAlerter *billing.CreditAlerter
 	var stripeClient *payments.Client
 
 	if dbClient != nil && authService != nil {
@@ -169,6 +170,20 @@ func main() {
 		// Forfeits the unspent part of expired credit grants so the ledger
 		// shows them (balance reads are exact without it).
 		go billing.NewCreditExpirer(billingService).Start(context.Background())
+
+		// Low-credit warnings to each account's owners and admins. Email goes
+		// through Amazon SES when TEEPIN_EMAIL_FROM is set (a verified SES
+		// identity); otherwise the warnings are computed and shown in the
+		// console but only logged, never sent.
+		emailSender := newEmailSender()
+		consoleURL := getEnv("TEEPIN_CONSOLE_URL", "https://console.teepin.com")
+		creditAlerter = billing.NewCreditAlerter(dbClient.DB(), billingService, emailSender, consoleURL)
+		go creditAlerter.Start(context.Background())
+
+		// Payment outcomes: the receipt for each credit purchase, and a notice
+		// when a bank debit that was accepted is later returned.
+		billingMailer := billing.NewBillingMailer(dbClient.DB(), billingService, emailSender, consoleURL)
+		billingService.WithTopUpNotifiers(billingMailer.TopUpSettled, billingMailer.TopUpFailed)
 	}
 
 	// Home-compute pilot: consumer-grade nodes as CPU capacity. Behind a
@@ -586,6 +601,9 @@ func main() {
 		}
 		enforcer := billing.NewCreditEnforcer(dbClient.DB(), billingService,
 			newComputeStopper(clusterClient, instanceStore), usageCollector, mode)
+		if creditAlerter != nil {
+			enforcer.WithNotifier(creditAlerter)
+		}
 		go enforcer.Start(context.Background())
 
 		// Disks of instances stopped at zero credit join the same storage
@@ -821,6 +839,19 @@ func main() {
 		log.Println("WARN: TEEPIN_KUMBHA_ENABLED is set, but Kumbha needs the database and Teepin Inference — Kumbha Gateway disabled")
 	} else {
 		kumbhaStore := kumbha.NewStore(dbClient.DB())
+		// Secrets a customer enters for their app are stored sealed under
+		// the platform encryption key. Without it the console cannot offer
+		// a secure field at all (saving answers 404) and the agent's
+		// request_secret has nothing to point at.
+		if key := os.Getenv("ENCRYPTION_KEY"); key != "" {
+			secretVault, secretErr := kumbha.NewSecretVault(key)
+			if secretErr != nil {
+				log.Fatalf("Kumbha secret vault: %v", secretErr)
+			}
+			kumbhaStore.WithSecretVault(secretVault)
+		} else {
+			log.Println("ENCRYPTION_KEY not set: Kumbha builds cannot store customer secrets")
+		}
 		kumbhaGateway := kumbha.NewGateway(kumbhaStore, newKumbhaModelBackend(modelCatalogService, inferenceGateway),
 			billingService, billingService, billingService).
 			WithModelPricing(modelCatalogService).
@@ -1474,6 +1505,7 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 				billing.GET("/invoices/:id/pdf", billingHandler.DownloadInvoicePDF)
 				billing.POST("/invoices", billingHandler.CreateInvoice)
 				billing.GET("/credits", billingHandler.GetCreditBalance)
+				billing.GET("/credits/status", billingHandler.GetCreditStatus)
 				billing.POST("/credits/topups", billingHandler.CreateCreditTopUp)
 				billing.GET("/credits/topups", billingHandler.ListCreditTopUps)
 				billing.GET("/credits/topups/:id", billingHandler.GetCreditTopUp)
@@ -1505,6 +1537,12 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 			kumbhaGroup.POST("/sessions/:id/stop", apiServer.StopKumbhaAgent)
 			kumbhaGroup.POST("/sessions/:id/approve-deploy", apiServer.ApproveKumbhaDeploy)
 			kumbhaGroup.PATCH("/sessions/:id/budget", apiServer.UpdateKumbhaBudget)
+			// Secrets the customer enters for their app. Deliberately NOT on
+			// the agent's route allowlist: the value must never pass through
+			// the agent.
+			kumbhaGroup.GET("/sessions/:id/secrets", apiServer.ListKumbhaSecrets)
+			kumbhaGroup.PUT("/sessions/:id/secrets/:name", apiServer.PutKumbhaSecret)
+			kumbhaGroup.DELETE("/sessions/:id/secrets/:name", apiServer.DeleteKumbhaSecret)
 			kumbhaGroup.POST("/sessions/:id/events", apiServer.CreateKumbhaEventTicket)
 			kumbhaGroup.POST("/sessions/:id/build", apiServer.BuildKumbhaSession)
 			// Deploy: build + create (or replace) a real, customer-facing

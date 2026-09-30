@@ -52,6 +52,8 @@ func main() {
 			"describe that check in \"verification\" — the call is refused without it.",
 	}, client.presentDeploymentPlan)
 
+	registerPromptTools(server, client)
+
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "create_instance",
 		Description: "Create a running Teepin compute instance from a container image. " +
@@ -428,7 +430,7 @@ type createInstanceArgs struct {
 	// which returned a 400 for exactly that shape. An array of
 	// well-defined objects is fully strict-mode-compatible, the same
 	// pattern Ports (above) already used successfully.
-	Env     []envVar `json:"env,omitempty" jsonschema:"environment variables to set in the container"`
+	Env     []envVar `json:"env,omitempty" jsonschema:"NON-SECRET environment variables to set in the container. Never put a credential here: ask for it with request_secret, and the platform sets it for you"`
 	Command []string `json:"command,omitempty"`
 	Args    []string `json:"args,omitempty"`
 }
@@ -500,7 +502,7 @@ type deployArgs struct {
 	Ports          []portArg `json:"ports,omitempty"`
 	// See createInstanceArgs.Env's own doc comment — same array-of-objects
 	// shape, same strict-tool-calling reason.
-	Env []envVar `json:"env,omitempty" jsonschema:"environment variables to set in the container"`
+	Env []envVar `json:"env,omitempty" jsonschema:"NON-SECRET environment variables to set in the container. Never put a credential here: ask for it with request_secret, and the platform sets it for you"`
 }
 
 // deploy builds the session's current workspace version and runs it as a

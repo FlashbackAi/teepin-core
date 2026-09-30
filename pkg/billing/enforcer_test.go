@@ -306,3 +306,44 @@ func TestReportHeld_RateLimited(t *testing.T) {
 		t.Error("held error never re-logged after the window")
 	}
 }
+
+type fakeNotifier struct{ accounts []uuid.UUID }
+
+func (f *fakeNotifier) RaiseOutOfCredit(_ context.Context, id uuid.UUID) {
+	f.accounts = append(f.accounts, id)
+}
+
+// The customer is told whenever the enforcer ends something for lack of
+// credit - and not when it did nothing.
+func TestTick_TellsTheCustomerWhenItStopsCompute(t *testing.T) {
+	e, mock, _, _ := newTestEnforcer(t, EnforceOn)
+	n := &fakeNotifier{}
+	e.WithNotifier(n)
+	acct := uuid.New()
+	now := time.Now()
+	rows := runningRows().AddRow("i-1", acct, uuid.New(), "", 20, 0, 0, 0, nil, nil, now.Add(-time.Hour), nil, now.Add(-30*time.Minute))
+	expectTick(mock, acct, rows, 0)
+
+	e.Tick(context.Background())
+
+	if len(n.accounts) != 1 || n.accounts[0] != acct {
+		t.Fatalf("notified = %v, want the stopped account once", n.accounts)
+	}
+}
+
+func TestTick_DoesNotNotifyWhenNothingWasStopped(t *testing.T) {
+	e, mock, stopper, _ := newTestEnforcer(t, EnforceOn)
+	stopper.failing = true
+	n := &fakeNotifier{}
+	e.WithNotifier(n)
+	acct := uuid.New()
+	now := time.Now()
+	rows := runningRows().AddRow("i-1", acct, uuid.New(), "", 20, 0, 0, 0, nil, nil, now.Add(-time.Hour), nil, now.Add(-30*time.Minute))
+	expectTick(mock, acct, rows, 0)
+
+	e.Tick(context.Background())
+
+	if len(n.accounts) != 0 {
+		t.Errorf("told the customer their compute stopped when the stop failed: %v", n.accounts)
+	}
+}
