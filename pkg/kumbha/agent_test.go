@@ -665,7 +665,7 @@ func TestGateway_DeliverMessage_QueuesWhenAgentRunning(t *testing.T) {
 	sess := &Session{ID: sessID, AccountID: uuid.New(), ProjectID: uuid.New(), AgentInstanceID: "kumbha-agent-abc"}
 
 	mock.ExpectQuery(`INSERT INTO billing\.kumbha_messages`).
-		WithArgs(sessID, "add a footer", []byte(nil)).
+		WithArgs(sessID, "add a footer", nil).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(1), time.Now()))
 
 	relaunched, err := gw.DeliverMessage(context.Background(), sess, "add a footer", nil)

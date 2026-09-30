@@ -54,7 +54,7 @@ func TestSendMessage_Success(t *testing.T) {
 	createdAt := time.Now()
 
 	mock.ExpectQuery(`INSERT INTO billing\.kumbha_messages`).
-		WithArgs(sessionID, "add a footer", []byte(nil)).
+		WithArgs(sessionID, "add a footer", nil).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(1), createdAt))
 
 	msg, err := store.SendMessage(context.Background(), sessionID, "add a footer", nil)
@@ -73,7 +73,7 @@ func TestSendMessage_EncodesAttachmentsAsJSON(t *testing.T) {
 	attachments := []Attachment{{URL: "https://example/a.png", Type: AttachmentImage, Filename: "a.png"}}
 
 	mock.ExpectQuery(`INSERT INTO billing\.kumbha_messages`).
-		WithArgs(sessionID, "look at this", []byte(`[{"url":"https://example/a.png","type":"image","filename":"a.png"}]`)).
+		WithArgs(sessionID, "look at this", `[{"url":"https://example/a.png","type":"image","filename":"a.png"}]`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(1), createdAt))
 
 	msg, err := store.SendMessage(context.Background(), sessionID, "look at this", attachments)
@@ -93,7 +93,7 @@ func TestSendMessage_ClosedOrMissingSessionIsErrSessionClosed(t *testing.T) {
 	// nonexistent session returns zero rows, not an error — sql.ErrNoRows
 	// from Scan is how that surfaces.
 	mock.ExpectQuery(`INSERT INTO billing\.kumbha_messages`).
-		WithArgs(sessionID, "hello", []byte(nil)).
+		WithArgs(sessionID, "hello", nil).
 		WillReturnError(sql.ErrNoRows)
 
 	_, err := store.SendMessage(context.Background(), sessionID, "hello", nil)

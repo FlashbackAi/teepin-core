@@ -1874,7 +1874,7 @@ func TestSendKumbhaMessage_QueuesWhenAgentRunning(t *testing.T) {
 			"last_deploy_failed", "last_deploy_error", "last_deploy_at", "model_alias",
 		}).AddRow(sessionID, testAccountID, projectID, 5.0, 0.0, "open", nil, "kumbha-agent-abc", nil, false, nowStub(), nil, false, nil, nil, "teepin/fast"))
 	mock.ExpectQuery(`INSERT INTO billing\.kumbha_messages`).
-		WithArgs(sessionID, "add a footer", []byte(nil)).
+		WithArgs(sessionID, "add a footer", nil).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(1), nowStub()))
 
 	w := kumbhaRequest(server.SendKumbhaMessage, http.MethodPost, "/v1/kumbha/sessions/"+sessionID.String()+"/messages",

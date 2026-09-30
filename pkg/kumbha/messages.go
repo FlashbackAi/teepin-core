@@ -104,22 +104,32 @@ func (s *Store) SendMessage(ctx context.Context, sessionID uuid.UUID, content st
 		return nil, err
 	}
 
-	var attachmentsJSON []byte
+	// nil means SQL NULL: "no attachments" is a real, distinct state in this
+	// column (migration 057), and it must not be sent as an empty value. This
+	// used to pass a nil []byte, which the driver sends as an EMPTY STRING,
+	// not NULL; Postgres refuses that for a JSONB column ("invalid input
+	// syntax for type json"), so every follow-up typed while the agent was
+	// alive and had no attachment failed to queue. The mocked tests could not
+	// see it (messages_integration_test.go now runs it against real Postgres).
+	var attachmentsArg any
 	if len(attachments) > 0 {
-		var err error
-		attachmentsJSON, err = json.Marshal(attachments)
+		encoded, err := json.Marshal(attachments)
 		if err != nil {
 			return nil, fmt.Errorf("failed to encode attachments: %w", err)
 		}
+		attachmentsArg = string(encoded)
 	}
 
 	msg := &Message{SessionID: sessionID, Content: content, Attachments: attachments}
+	// $3 is cast explicitly: in "INSERT ... SELECT $1, $2, $3" Postgres does
+	// not infer a parameter's type from the target column, so without the
+	// cast it would be guessed from the value.
 	err := s.db.QueryRowContext(ctx, `
 		INSERT INTO billing.kumbha_messages (session_id, content, attachments)
-		SELECT $1, $2, $3
+		SELECT $1, $2, $3::jsonb
 		WHERE EXISTS (SELECT 1 FROM billing.inference_sessions WHERE id = $1 AND status = 'open')
 		RETURNING id, created_at
-	`, sessionID, content, attachmentsJSON).Scan(&msg.ID, &msg.CreatedAt)
+	`, sessionID, content, attachmentsArg).Scan(&msg.ID, &msg.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, ErrSessionClosed
 	}
