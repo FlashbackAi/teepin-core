@@ -31,6 +31,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -58,7 +59,8 @@ func main() {
 	registerPromptTools(server, client)
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "create_instance",
+		Name:        "create_instance",
+		InputSchema: mustInputSchema[createInstanceArgs](),
 		Description: "Create a running Teepin compute instance from a container image. " +
 			"Requires the customer to have approved the deployment plan first — call " +
 			"present_deployment_plan and wait if you have not done that yet. IMPORTANT: " +
@@ -68,7 +70,8 @@ func main() {
 	}, client.createInstance)
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "deploy",
+		Name:        "deploy",
+		InputSchema: mustInputSchema[deployArgs](),
 		Description: "Build the current workspace into a container image and run it as " +
 			"a Teepin instance. The first deployment requires the customer to have " +
 			"approved the deployment plan. If the app is already deployed, this updates it " +
@@ -88,6 +91,14 @@ func main() {
 	if err := server.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
 		log.Fatalf("teepin-mcp-server: %v", err)
 	}
+}
+
+func mustInputSchema[T any]() *jsonschema.Schema {
+	s, err := inputSchemaFor[T]()
+	if err != nil {
+		log.Fatalf("teepin-mcp-server: build input schema: %v", err)
+	}
+	return s
 }
 
 // teepinClient calls the control plane's REAL customer-facing APIs — the
