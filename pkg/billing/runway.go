@@ -68,6 +68,10 @@ type RunwayReport struct {
 	// stored data on hold - things a top-up would bring back.
 	Impacted bool
 	Level    AlertLevel
+	// AutoRecharge is true when the customer's automatic recharge is on and
+	// healthy, so running low is handled and Level below out-of-credit is
+	// reported as none.
+	AutoRecharge bool
 }
 
 // RunwayHours is how long the balance lasts at the current spend, and false
@@ -141,11 +145,24 @@ func (s *Service) Runway(ctx context.Context, accountID uuid.UUID) (RunwayReport
 	}
 	impacted := stoppedCount > 0 || hold != nil
 
+	level := levelFor(balance, burn, impacted)
+	// With a healthy automatic recharge the account is about to be topped up,
+	// so "running low" warnings would only alarm the customer. Out-of-credit
+	// still shows: it means the recharge did not save the account.
+	covered, err := s.autoRechargeCovers(ctx, accountID)
+	if err != nil {
+		return RunwayReport{}, err
+	}
+	if covered && level < LevelOutOfCredit {
+		level = LevelNone
+	}
+
 	return RunwayReport{
-		Balance:     balance,
-		BurnPerHour: burn,
-		Impacted:    impacted,
-		Level:       levelFor(balance, burn, impacted),
+		Balance:      balance,
+		BurnPerHour:  burn,
+		Impacted:     impacted,
+		Level:        level,
+		AutoRecharge: covered,
 	}, nil
 }
 

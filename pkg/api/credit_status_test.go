@@ -41,6 +41,8 @@ func TestGetCreditStatus_ReportsRunwayAndLevel(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"s"}).AddRow(nil))
 	mock.ExpectQuery(`SELECT -SUM\(amount\) FROM billing\.credit_transactions`).
 		WillReturnRows(sqlmock.NewRows([]string{"s"}).AddRow(24.0)) // $24 over 24h
+	mock.ExpectQuery(`FROM billing\.auto_recharge WHERE account_id`).
+		WillReturnRows(sqlmock.NewRows([]string{"enabled", "amount", "monthly_cap", "consecutive_failures"}))
 	deleteAfter := time.Date(2026, 10, 6, 9, 30, 0, 0, time.UTC)
 	mock.ExpectQuery(`FROM billing\.storage_holds`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "account_id", "held_since", "delete_after"}).

@@ -174,6 +174,9 @@ type TopUpReceiptNotice struct {
 	Amount        float64
 	Currency      string
 	PaymentMethod string
+	// Automatic is true when the charge was made by the customer's automatic
+	// recharge rule rather than bought in the console.
+	Automatic bool
 }
 
 // TopUpFailureNotice describes a top-up whose payment failed after it had

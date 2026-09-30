@@ -73,6 +73,12 @@ func (m *BillingMailer) TopUpSettled(ctx context.Context, n TopUpReceiptNotice) 
 		log.Printf("WARN: receipt email for %s: %v", n.ReceiptNumber, err)
 		return
 	}
+	// Say so when the customer's automatic recharge made this charge.
+	var source string
+	if err := m.db.QueryRowContext(ctx,
+		`SELECT source FROM billing.credit_topups WHERE receipt_invoice_id = $1`, n.ReceiptID).Scan(&source); err == nil {
+		n.Automatic = source == "auto"
+	}
 	// If anything was stopped for lack of credit, say what to do about it.
 	_, stopped, err := m.billing.stoppedDiskTotals(ctx, n.AccountID)
 	if err != nil {
@@ -115,8 +121,12 @@ func money(currency string, amount float64) string {
 // (numbered, with the issuer's legal details) lives there.
 func TopUpReceiptMessage(n TopUpReceiptNotice, balance float64, hasStopped bool, receiptURL string) email.Message {
 	amount := money(n.Currency, n.Amount)
+	intro := "Thanks - we received your payment and added " + amount + " of credit to your Teepin account."
+	if n.Automatic {
+		intro = "Your automatic recharge added " + amount + " of credit to your Teepin account."
+	}
 	lines := []string{
-		"Thanks - we received your payment and added " + amount + " of credit to your Teepin account.",
+		intro,
 		"",
 		"Receipt:        " + n.ReceiptNumber,
 		"Amount:         " + amount,
@@ -134,7 +144,11 @@ func TopUpReceiptMessage(n TopUpReceiptNotice, balance float64, hasStopped bool,
 		"", "You are receiving this because you are an owner or admin of this Teepin account.")
 
 	var b strings.Builder
-	b.WriteString("<p>Thanks - we received your payment and added <strong>" + html.EscapeString(amount) + "</strong> of credit to your Teepin account.</p>")
+	if n.Automatic {
+		b.WriteString("<p>Your automatic recharge added <strong>" + html.EscapeString(amount) + "</strong> of credit to your Teepin account.</p>")
+	} else {
+		b.WriteString("<p>Thanks - we received your payment and added <strong>" + html.EscapeString(amount) + "</strong> of credit to your Teepin account.</p>")
+	}
 	b.WriteString("<table cellpadding=\"4\" style=\"border-collapse:collapse\">")
 	row := func(k, v string) {
 		b.WriteString("<tr><td style=\"color:#666\">" + html.EscapeString(k) + "</td><td>" + html.EscapeString(v) + "</td></tr>")
@@ -152,8 +166,12 @@ func TopUpReceiptMessage(n TopUpReceiptNotice, balance float64, hasStopped bool,
 	b.WriteString("<p><a href=\"" + html.EscapeString(receiptURL) + "\">View or download the receipt</a></p>")
 	b.WriteString("<p style=\"color:#666;font-size:12px\">You are receiving this because you are an owner or admin of this Teepin account.</p>")
 
+	subject := "Receipt " + n.ReceiptNumber + " - " + amount + " credit added"
+	if n.Automatic {
+		subject = "Receipt " + n.ReceiptNumber + " - " + amount + " automatic recharge"
+	}
 	return email.Message{
-		Subject: "Receipt " + n.ReceiptNumber + " - " + amount + " credit added",
+		Subject: subject,
 		Text:    strings.Join(lines, "\n") + "\n",
 		HTML:    b.String(),
 	}

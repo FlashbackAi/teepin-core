@@ -184,6 +184,11 @@ func main() {
 		// when a bank debit that was accepted is later returned.
 		billingMailer := billing.NewBillingMailer(dbClient.DB(), billingService, emailSender, consoleURL)
 		billingService.WithTopUpNotifiers(billingMailer.TopUpSettled, billingMailer.TopUpFailed)
+
+		// Automatic recharge: charge the saved default card when credit falls
+		// below the customer's threshold. Off for every account until the
+		// customer turns it on.
+		go billing.NewAutoRecharger(dbClient.DB(), billingService, billingMailer).Start(context.Background())
 	}
 
 	// Home-compute pilot: consumer-grade nodes as CPU capacity. Behind a
@@ -1506,6 +1511,8 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 				billing.POST("/invoices", billingHandler.CreateInvoice)
 				billing.GET("/credits", billingHandler.GetCreditBalance)
 				billing.GET("/credits/status", billingHandler.GetCreditStatus)
+				billing.GET("/credits/auto-recharge", billingHandler.GetAutoRecharge)
+				billing.PUT("/credits/auto-recharge", billingHandler.PutAutoRecharge)
 				billing.POST("/credits/topups", billingHandler.CreateCreditTopUp)
 				billing.GET("/credits/topups", billingHandler.ListCreditTopUps)
 				billing.GET("/credits/topups/:id", billingHandler.GetCreditTopUp)

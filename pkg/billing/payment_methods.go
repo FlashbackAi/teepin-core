@@ -41,6 +41,10 @@ type StripeGateway interface {
 	// client secret. idempotencyKey (derived from the top-up id) makes a
 	// retried create return the same intent.
 	CreateTopUpPaymentIntent(customerID string, amountCents int64, currency, topUpID, accountNumber, idempotencyKey string) (piID, clientSecret string, err error)
+	// CreateAutoTopUpPaymentIntent charges a saved card off-session for an
+	// automatic recharge and returns the PaymentIntent id and its status.
+	// A decline is returned as an error (with the id when Stripe made one).
+	CreateAutoTopUpPaymentIntent(customerID, pmID string, amountCents int64, currency, topUpID, accountNumber, idempotencyKey string) (piID, status string, err error)
 }
 
 // ErrPaymentsNotConfigured means no payment provider is wired (local dev,
@@ -370,6 +374,9 @@ func (s *Service) RemovePaymentMethod(ctx context.Context, accountID, paymentMet
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit removal: %w", err)
 	}
+
+	// Automatic recharge charges the default card; without one it cannot run.
+	s.DisableAutoRechargeIfNoCard(ctx, accountID)
 
 	// Detach at Stripe AFTER our own state is durable. A detach failure
 	// here is not fatal — the card is already removed on our side and the

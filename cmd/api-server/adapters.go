@@ -75,6 +75,10 @@ func (a *stripeGatewayAdapter) CreatePaymentIntent(customerID, pmID, currency st
 	return a.c.CreatePaymentIntent(customerID, pmID, currency, amountCents, invoiceID, idempotencyKey)
 }
 
+func (a *stripeGatewayAdapter) CreateAutoTopUpPaymentIntent(customerID, pmID string, amountCents int64, currency, topUpID, accountNumber, idempotencyKey string) (string, string, error) {
+	return a.c.CreateAutoTopUpPaymentIntent(customerID, pmID, amountCents, currency, topUpID, accountNumber, idempotencyKey)
+}
+
 func (a *stripeGatewayAdapter) CreateTopUpPaymentIntent(customerID string, amountCents int64, currency, topUpID, accountNumber, idempotencyKey string) (string, string, error) {
 	return a.c.CreateTopUpPaymentIntent(customerID, amountCents, currency, topUpID, accountNumber, idempotencyKey)
 }

@@ -226,6 +226,7 @@ func (h *BillingHandler) GetCreditStatus(c *gin.Context) {
 		"burn_per_hour": report.BurnPerHour,
 		"level":         report.Level.String(),
 		"impacted":      report.Impacted,
+		"auto_recharge": report.AutoRecharge,
 		"runway_hours":  nil,
 	}
 	if hours, ok := report.RunwayHours(); ok {
@@ -252,4 +253,87 @@ func (h *BillingHandler) GetCreditBalance(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"balance": balance})
+}
+
+// autoRechargeView is the wire form of an account's automatic recharge rule.
+func autoRechargeView(ar *billing.AutoRecharge) gin.H {
+	return gin.H{
+		"enabled":              ar.Enabled,
+		"configured":           ar.Configured,
+		"threshold":            ar.Threshold,
+		"amount":               ar.Amount,
+		"monthly_cap":          ar.MonthlyCap,
+		"spent_this_month":     ar.SpentThisMonth,
+		"consecutive_failures": ar.ConsecutiveFailures,
+		"disabled_reason":      ar.DisabledReason,
+		"has_card":             ar.HasCard,
+		"limits": gin.H{
+			"min_threshold":   billing.MinAutoThreshold,
+			"min_amount":      billing.MinTopUp,
+			"max_amount":      billing.MaxTopUp,
+			"max_monthly_cap": billing.MaxAutoMonthlyCap,
+			"max_failures":    billing.MaxAutoFailures,
+		},
+	}
+}
+
+// GetAutoRecharge handles GET /v1/billing/credits/auto-recharge.
+func (h *BillingHandler) GetAutoRecharge(c *gin.Context) {
+	accountID, ok := auth.GetAccountID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "account authentication required"})
+		return
+	}
+	ar, err := h.billingService.GetAutoRecharge(c.Request.Context(), accountID)
+	if err != nil {
+		log.Printf("api: automatic recharge read for %s: %v", accountID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not read automatic recharge"})
+		return
+	}
+	c.JSON(http.StatusOK, autoRechargeView(ar))
+}
+
+type putAutoRechargeRequest struct {
+	Enabled    bool    `json:"enabled"`
+	Threshold  float64 `json:"threshold"`
+	Amount     float64 `json:"amount"`
+	MonthlyCap float64 `json:"monthly_cap"`
+}
+
+// PutAutoRecharge handles PUT /v1/billing/credits/auto-recharge: save the
+// rule, or switch it off. Only a signed-in user may set it - it authorises
+// charging the saved card without the customer present, so an API key or an
+// agent session must never be able to.
+func (h *BillingHandler) PutAutoRecharge(c *gin.Context) {
+	accountID, ok := requireSignedInUser(c)
+	if !ok {
+		return
+	}
+	var req putAutoRechargeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "threshold, amount and monthly_cap are required"})
+		return
+	}
+	userID, _ := auth.GetUserID(c)
+	err := h.billingService.SetAutoRecharge(c.Request.Context(), accountID, userID, billing.AutoRechargeSettings{
+		Enabled: req.Enabled, Threshold: req.Threshold, Amount: req.Amount, MonthlyCap: req.MonthlyCap,
+	})
+	switch {
+	case errors.Is(err, billing.ErrAutoRechargeInvalid):
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error(), "code": "invalid_auto_recharge"})
+		return
+	case errors.Is(err, billing.ErrNoDefaultCard):
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "code": "no_default_card"})
+		return
+	case err != nil:
+		log.Printf("api: automatic recharge save for %s: %v", accountID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not save automatic recharge"})
+		return
+	}
+	ar, err := h.billingService.GetAutoRecharge(c.Request.Context(), accountID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "saved, but could not read it back"})
+		return
+	}
+	c.JSON(http.StatusOK, autoRechargeView(ar))
 }

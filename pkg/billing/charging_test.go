@@ -23,6 +23,28 @@ type fakeGateway struct {
 	lastIdempotencyKey string
 	retStatus          string // status returned on success (default "succeeded")
 	retErr             error  // if set, CreatePaymentIntent/CreateTopUpPaymentIntent return this error
+
+	// Automatic recharge calls.
+	autoCalls     int
+	autoStatus    string // status returned on success (default "succeeded")
+	autoErr       error
+	lastAutoPM    string
+	lastAutoCents int64
+	lastAutoKey   string
+}
+
+func (f *fakeGateway) CreateAutoTopUpPaymentIntent(customerID, pmID string, amountCents int64, currency, topUpID, accountNumber, idempotencyKey string) (string, string, error) {
+	f.autoCalls++
+	f.lastAutoPM, f.lastAutoCents, f.lastAutoKey = pmID, amountCents, idempotencyKey
+	if f.autoErr != nil {
+		return "pi_auto_declined", "", f.autoErr
+	}
+	status := f.autoStatus
+	if status == "" {
+		status = "succeeded"
+	}
+	// Unique per call, like Stripe: the payment intent id is a unique column.
+	return "pi_auto_" + topUpID, status, nil
 }
 
 func (f *fakeGateway) EnsureCustomer(existingID, email, name, accountNumber string) (string, error) {

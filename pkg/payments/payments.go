@@ -222,6 +222,44 @@ func (c *Client) CreateTopUpPaymentIntent(customerID string, amountCents int64, 
 	return pi.ID, pi.ClientSecret, nil
 }
 
+// CreateAutoTopUpPaymentIntent charges a saved card for a prepaid credit
+// top-up without the customer present (automatic recharge). Confirmed
+// immediately and off-session; tagged exactly like a customer-initiated top-up
+// so the same webhook credits it, issues the receipt and sends the email.
+//
+// A decline, or a card that needs the customer to authenticate, comes back as
+// an error carrying a customer-safe message; the PaymentIntent id is returned
+// when Stripe created one. idempotencyKey (derived from our top-up id) makes a
+// retried create a no-op at Stripe instead of a second charge.
+func (c *Client) CreateAutoTopUpPaymentIntent(customerID, pmID string, amountCents int64, currency, topUpID, accountNumber, idempotencyKey string) (piID, status string, err error) {
+	params := &stripe.PaymentIntentParams{
+		Amount:        stripe.Int64(amountCents),
+		Currency:      stripe.String(currency),
+		Customer:      stripe.String(customerID),
+		PaymentMethod: stripe.String(pmID),
+		Confirm:       stripe.Bool(true),
+		OffSession:    stripe.Bool(true),
+		Description:   stripe.String("Teepin prepaid credit (automatic recharge)"),
+	}
+	params.AddMetadata("teepin_purpose", TopUpPurpose)
+	params.AddMetadata("teepin_topup_id", topUpID)
+	params.AddMetadata("teepin_account_number", accountNumber)
+	params.SetIdempotencyKey(idempotencyKey)
+
+	pi, err := c.sc.PaymentIntents.New(params)
+	if err != nil {
+		if serr, ok := err.(*stripe.Error); ok {
+			id := ""
+			if serr.PaymentIntent != nil {
+				id = serr.PaymentIntent.ID
+			}
+			return id, "", fmt.Errorf("stripe: charge declined: %s", serr.Msg)
+		}
+		return "", "", fmt.Errorf("stripe: create automatic top-up payment intent: %w", err)
+	}
+	return pi.ID, string(pi.Status), nil
+}
+
 // PaymentMethodSummary describes a payment method in a form fit for a
 // receipt ("Visa ending 4242", "Chase account ending 6789", "Link"), for
 // any method type Stripe may have used — not only cards. Unknown types

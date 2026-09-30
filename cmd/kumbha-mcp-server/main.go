@@ -47,7 +47,10 @@ func main() {
 		Description: "Show the customer an itemised infrastructure cost estimate " +
 			"(Resource / Sized / Cost per hour and per month) and wait for their " +
 			"approval before calling create_instance, deploy, or attach_domain. " +
-			"Always call this BEFORE attempting to provision anything real. " +
+			"Call this BEFORE the first deployment, or when you need MORE CPU, memory or " +
+			"storage than an already-deployed app has. Do NOT call it to update an app that is " +
+			"already deployed: changing its code costs nothing extra, so call deploy directly " +
+			"(no plan, no new approval). " +
 			"You must have run your app inside this pod and checked it first, and " +
 			"describe that check in \"verification\" — the call is refused without it.",
 	}, client.presentDeploymentPlan)
@@ -67,8 +70,9 @@ func main() {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "deploy",
 		Description: "Build the current workspace into a container image and run it as " +
-			"a Teepin instance. Requires the customer to have approved the deployment " +
-			"plan first. IMPORTANT: for anyone (including the customer) to actually " +
+			"a Teepin instance. The first deployment requires the customer to have " +
+			"approved the deployment plan. If the app is already deployed, this updates it " +
+			"in place (same instance, same address) and needs no new plan or approval. IMPORTANT: for anyone (including the customer) to actually " +
 			"reach the deployed app, you MUST set ports to the port your app listens " +
 			"on inside the container (e.g. 80 for a typical web server on nginx). An " +
 			"instance deployed with no ports has no public endpoint at all — it will " +
@@ -290,6 +294,14 @@ const hoursPerMonth = 730.0
 func (c *teepinClient) presentDeploymentPlan(ctx context.Context, req *mcp.CallToolRequest, args presentDeploymentPlanArgs) (*mcp.CallToolResult, any, error) {
 	if len(args.Resources) == 0 {
 		return textResult("at least one resource is required")
+	}
+	// An app that is already deployed and approved, asked for at a size it
+	// already has, is an update, not a new purchase (see redeploy.go). If the
+	// state cannot be read, fall through and ask: never skip a cost on a guess.
+	if app, err := c.approvedDeployment(ctx); err != nil {
+		log.Printf("teepin-mcp-server: could not check for an existing deployment, presenting a plan: %v", err)
+	} else if fitsDeployed(app, args.Resources) {
+		return textResult(alreadyDeployedMessage, app.InstanceID, app.CPUUnits, app.MemoryGB)
 	}
 	if msg := checkVerification(args); msg != "" {
 		return textResult("%s", msg)
@@ -599,12 +611,25 @@ func (c *teepinClient) deploy(ctx context.Context, req *mcp.CallToolRequest, arg
 		deployed.ImageRef, deployed.InstanceID, deployed.Status, deployed.Endpoint, deployed.PricePerHour)
 }
 
-// isNotAvailable reports whether an error from doJSON came from a 404 —
-// the shape the control plane returns when a capability (like the build
-// pipeline) simply isn't configured on this deployment, as opposed to a
-// genuine build failure that should be surfaced verbatim.
+// isNotAvailable reports whether an error from doJSON is the control plane
+// saying the build pipeline is not configured on this deployment, as opposed
+// to a genuine failure that should be surfaced verbatim.
+//
+// Only THAT case. Several other things 404 on the deploy route (the session
+// is gone, or its earlier instance no longer exists in the cluster), and a
+// blanket "status 404" check reported every one of them to the agent as
+// "deployment is not possible here, stop trying": wrong, and it led the agent
+// to tell the customer to deploy by hand. Anything else is now reported with
+// the control plane's own message.
 func isNotAvailable(err error) bool {
-	return strings.Contains(err.Error(), "status 404")
+	msg := err.Error()
+	if !strings.Contains(msg, "status 404") {
+		return false
+	}
+	// The control plane's own statement that it has no build pipeline, or
+	// the router's bare "404 page not found" for a deploy route that does not
+	// exist at all (a control plane too old to have it).
+	return strings.Contains(msg, pipelineUnavailableText) || strings.Contains(msg, "404 page not found")
 }
 
 // --- attach_domain ---
