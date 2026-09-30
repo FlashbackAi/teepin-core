@@ -52,17 +52,20 @@ var ErrAccountClosed = errors.New("this account is closed")
 
 // TopUp is one credit purchase attempt, from creation to settlement.
 type TopUp struct {
-	ID                   uuid.UUID  `json:"id"`
-	AccountID            uuid.UUID  `json:"account_id"`
-	Amount               float64    `json:"amount"`
-	Currency             string     `json:"currency"`
-	Provider             string     `json:"provider"`
-	Status               string     `json:"status"` // pending, processing, succeeded, failed
-	PaymentMethodSummary string     `json:"payment_method_summary,omitempty"`
-	FailureReason        string     `json:"failure_reason,omitempty"`
-	ReceiptInvoiceID     *uuid.UUID `json:"receipt_invoice_id,omitempty"`
-	SucceededAt          *time.Time `json:"succeeded_at,omitempty"`
-	CreatedAt            time.Time  `json:"created_at"`
+	ID                   uuid.UUID `json:"id"`
+	AccountID            uuid.UUID `json:"account_id"`
+	Amount               float64   `json:"amount"`
+	Currency             string    `json:"currency"`
+	Provider             string    `json:"provider"`
+	Status               string    `json:"status"` // pending, processing, succeeded, failed
+	PaymentMethodSummary string    `json:"payment_method_summary,omitempty"`
+	// Source is "manual" (bought in the console) or "auto" (charged by the
+	// customer's automatic recharge rule).
+	Source           string     `json:"source"`
+	FailureReason    string     `json:"failure_reason,omitempty"`
+	ReceiptInvoiceID *uuid.UUID `json:"receipt_invoice_id,omitempty"`
+	SucceededAt      *time.Time `json:"succeeded_at,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
 }
 
 // TopUpIntent is what the browser needs to collect a top-up payment.
@@ -417,12 +420,12 @@ func (s *Service) insertCreditPurchaseReceipt(ctx context.Context, tx *sql.Tx, b
 // topUpColumns is the shared select list for TopUp scans.
 const topUpColumns = `id, account_id, amount, currency, provider, status,
 	COALESCE(payment_method_summary, ''), COALESCE(failure_reason, ''),
-	receipt_invoice_id, succeeded_at, created_at`
+	receipt_invoice_id, succeeded_at, created_at, source`
 
 func scanTopUp(scan func(dest ...any) error) (TopUp, error) {
 	var t TopUp
 	err := scan(&t.ID, &t.AccountID, &t.Amount, &t.Currency, &t.Provider, &t.Status,
-		&t.PaymentMethodSummary, &t.FailureReason, &t.ReceiptInvoiceID, &t.SucceededAt, &t.CreatedAt)
+		&t.PaymentMethodSummary, &t.FailureReason, &t.ReceiptInvoiceID, &t.SucceededAt, &t.CreatedAt, &t.Source)
 	return t, err
 }
 

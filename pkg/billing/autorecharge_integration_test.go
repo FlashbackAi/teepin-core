@@ -398,3 +398,115 @@ func TestAutoRechargeIntegration_QuietsLowCreditWarningsOnlyWhileHealthy(t *test
 		t.Errorf("level = %v, want out_of_credit to always show", r.Level)
 	}
 }
+
+// itCardWith seeds a verified card that is or is not the default.
+func itCardWith(t *testing.T, db *sql.DB, account uuid.UUID, last4 string, expYear int, isDefault bool, verifiedAgo time.Duration) string {
+	t.Helper()
+	pm := "pm_" + uuid.NewString()[:8]
+	if _, err := db.Exec(`
+		INSERT INTO billing.payment_methods
+			(account_id, stripe_customer_id, stripe_payment_method_id, type, last4, brand, exp_month, exp_year,
+			 is_default, status, verified_at)
+		VALUES ($1, 'cus_it', $2, 'card', $3, 'visa', 12, $4, $5, 'verified', NOW() - make_interval(secs => $6))`,
+		account, pm, last4, expYear, isDefault, verifiedAgo.Seconds()); err != nil {
+		t.Fatalf("seed card: %v", err)
+	}
+	return pm
+}
+
+// The case a customer hit: one saved card that was never marked default. It
+// must be used, shown by name, and made the default when they turn the rule on.
+func TestAutoRechargeIntegration_UsesASavedCardThatIsNotMarkedDefault(t *testing.T) {
+	h := newAutoHarness(t, 1)
+	ctx := context.Background()
+	pm := itCardWith(t, h.db, h.acct, "4242", time.Now().Year()+2, false, time.Hour)
+
+	ar, err := h.svc.GetAutoRecharge(ctx, h.acct)
+	if err != nil || !ar.HasCard || ar.CardLast4 != "4242" || ar.CardBrand != "visa" {
+		t.Fatalf("GetAutoRecharge = %+v, %v; want the non-default card offered", ar, err)
+	}
+	h.enable(10, 50, 250)
+
+	var isDefault bool
+	if err := h.db.QueryRow(`SELECT is_default FROM billing.payment_methods WHERE stripe_payment_method_id = $1`, pm).Scan(&isDefault); err != nil || !isDefault {
+		t.Errorf("the card being charged was not made the default (is_default=%v, err=%v)", isDefault, err)
+	}
+	h.r.Attempt(ctx, h.acct)
+	if h.gw.autoCalls != 1 || h.gw.lastAutoPM != pm {
+		t.Fatalf("charge calls=%d pm=%q, want one charge on %s", h.gw.autoCalls, h.gw.lastAutoPM, pm)
+	}
+}
+
+// A real default beats a newer card; making a card default never steals the
+// default from another.
+func TestAutoRechargeIntegration_PrefersTheDefaultCard(t *testing.T) {
+	h := newAutoHarness(t, 1)
+	def := itCardWith(t, h.db, h.acct, "1111", time.Now().Year()+2, true, 48*time.Hour)
+	itCardWith(t, h.db, h.acct, "2222", time.Now().Year()+2, false, time.Minute) // newer, not default
+	h.enable(10, 50, 250)
+	h.r.Attempt(context.Background(), h.acct)
+	if h.gw.lastAutoPM != def {
+		t.Fatalf("charged %q, want the default card %q", h.gw.lastAutoPM, def)
+	}
+}
+
+// An expired default is skipped for a valid card; with none valid it is refused.
+func TestAutoRechargeIntegration_SkipsExpiredCards(t *testing.T) {
+	h := newAutoHarness(t, 1)
+	ctx := context.Background()
+	itCardWith(t, h.db, h.acct, "0001", time.Now().Year()-1, true, time.Hour)
+	if err := h.svc.SetAutoRecharge(ctx, h.acct, uuid.Nil, AutoRechargeSettings{Enabled: true, Threshold: 10, Amount: 50, MonthlyCap: 250}); !errors.Is(err, ErrNoDefaultCard) {
+		t.Fatalf("only an expired card: err = %v, want ErrNoDefaultCard", err)
+	}
+	good := itCardWith(t, h.db, h.acct, "0002", time.Now().Year()+2, false, time.Minute)
+	h.enable(10, 50, 250)
+	h.r.Attempt(ctx, h.acct)
+	if h.gw.lastAutoPM != good {
+		t.Fatalf("charged %q, want the valid card %q (the expired default must be skipped)", h.gw.lastAutoPM, good)
+	}
+}
+
+// Removing the default while another valid card remains keeps the rule on.
+func TestAutoRechargeIntegration_RemovingTheDefaultKeepsItOnWhenAnotherCardRemains(t *testing.T) {
+	h := newAutoHarness(t, 1)
+	itCardWith(t, h.db, h.acct, "1111", time.Now().Year()+2, true, time.Hour)
+	itCardWith(t, h.db, h.acct, "2222", time.Now().Year()+2, false, time.Minute)
+	h.enable(10, 50, 250)
+	if _, err := h.db.Exec(`UPDATE billing.payment_methods SET status = 'removed', is_default = FALSE WHERE account_id = $1 AND last4 = '1111'`, h.acct); err != nil {
+		t.Fatal(err)
+	}
+	h.svc.DisableAutoRechargeIfNoCard(context.Background(), h.acct)
+	if enabled, _, _ := h.state(); !enabled {
+		t.Error("switched off though a valid card remains")
+	}
+}
+
+// The purchase history says which charges were automatic.
+func TestAutoRechargeIntegration_HistoryLabelsAutomaticCharges(t *testing.T) {
+	h := newAutoHarness(t, 1)
+	itCard(t, h.db, h.acct, time.Now().Year()+2)
+	h.enable(10, 50, 250)
+	h.r.Attempt(context.Background(), h.acct)
+	// The history lists settled payments only; Stripe's webhook settles this one.
+	var pi string
+	if err := h.db.QueryRow(`SELECT stripe_payment_intent_id FROM billing.credit_topups WHERE account_id = $1 AND source = 'auto'`, h.acct).Scan(&pi); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.svc.SettleTopUpByPaymentIntent(context.Background(), pi, 5000, "usd", "Visa ending 4242"); err != nil {
+		t.Fatalf("settle: %v", err)
+	}
+
+	tops, err := h.svc.ListTopUps(context.Background(), h.acct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var auto int
+	for _, tu := range tops {
+		if tu.Source == "auto" {
+			auto++
+		}
+	}
+	if auto != 1 {
+		t.Fatalf("history = %+v, want exactly one automatic charge", tops)
+	}
+}

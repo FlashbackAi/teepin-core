@@ -267,6 +267,8 @@ func autoRechargeView(ar *billing.AutoRecharge) gin.H {
 		"consecutive_failures": ar.ConsecutiveFailures,
 		"disabled_reason":      ar.DisabledReason,
 		"has_card":             ar.HasCard,
+		"card_brand":           ar.CardBrand,
+		"card_last4":           ar.CardLast4,
 		"limits": gin.H{
 			"min_threshold":   billing.MinAutoThreshold,
 			"min_amount":      billing.MinTopUp,

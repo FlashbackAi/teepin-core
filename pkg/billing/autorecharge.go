@@ -76,8 +76,11 @@ type AutoRecharge struct {
 	DisabledReason string
 	// SpentThisMonth is what automatic charges have used of the monthly cap.
 	SpentThisMonth float64
-	// HasCard is true when the account has a valid saved default card.
+	// HasCard is true when the account has a valid saved card to charge.
 	HasCard bool
+	// CardBrand / CardLast4 name the card that would be charged.
+	CardBrand string
+	CardLast4 string
 }
 
 func validateAutoRecharge(in AutoRechargeSettings) error {
@@ -113,28 +116,40 @@ func (s *Service) autoRechargeSpent(ctx context.Context, accountID uuid.UUID) (f
 	return spent.Float64, nil
 }
 
-// defaultCard returns the account's valid default card: Stripe's payment
-// method id, or "" when there is none (missing, unverified, or expired).
-func (s *Service) defaultCard(ctx context.Context, accountID uuid.UUID) (string, error) {
-	var pm string
-	var expMonth, expYear sql.NullInt64
+// savedCard is a card automatic recharge can charge.
+type savedCard struct {
+	ID         uuid.UUID
+	StripePMID string
+	Brand      string
+	Last4      string
+	IsDefault  bool
+}
+
+// chargeableCard returns the card automatic recharge charges, or nil when the
+// account has none it can use. The default card is preferred; when there is no
+// valid default, the most recently verified card that has not expired is used.
+// A customer with one saved card that was never marked default plainly means
+// it to be used, and insisting on the flag would tell them to "add a card"
+// while their card sits in the Payments tab.
+func (s *Service) chargeableCard(ctx context.Context, accountID uuid.UUID) (*savedCard, error) {
+	now := time.Now().UTC()
+	var c savedCard
 	err := s.db.QueryRowContext(ctx, `
-		SELECT stripe_payment_method_id, exp_month, exp_year FROM billing.payment_methods
-		WHERE account_id = $1 AND is_default AND status = 'verified'
-		LIMIT 1`, accountID).Scan(&pm, &expMonth, &expYear)
+		SELECT id, stripe_payment_method_id, COALESCE(brand, ''), COALESCE(last4, ''), is_default
+		FROM billing.payment_methods
+		WHERE account_id = $1 AND status = 'verified'
+		  AND (exp_year IS NULL OR exp_month IS NULL
+		       OR exp_year > $2 OR (exp_year = $2 AND exp_month >= $3))
+		ORDER BY is_default DESC, verified_at DESC NULLS LAST, created_at DESC
+		LIMIT 1`, accountID, now.Year(), int(now.Month())).
+		Scan(&c.ID, &c.StripePMID, &c.Brand, &c.Last4, &c.IsDefault)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", nil
+		return nil, nil
 	}
 	if err != nil {
-		return "", fmt.Errorf("failed to read the default card: %w", err)
+		return nil, fmt.Errorf("failed to read the saved card: %w", err)
 	}
-	if expYear.Valid && expMonth.Valid {
-		now := time.Now().UTC()
-		if int(expYear.Int64) < now.Year() || (int(expYear.Int64) == now.Year() && int(expMonth.Int64) < int(now.Month())) {
-			return "", nil
-		}
-	}
-	return pm, nil
+	return &c, nil
 }
 
 // GetAutoRecharge returns the account's rule. Before any is saved it returns
@@ -161,11 +176,13 @@ func (s *Service) GetAutoRecharge(ctx context.Context, accountID uuid.UUID) (*Au
 		return nil, err
 	}
 	out.SpentThisMonth = spent
-	card, err := s.defaultCard(ctx, accountID)
+	card, err := s.chargeableCard(ctx, accountID)
 	if err != nil {
 		return nil, err
 	}
-	out.HasCard = card != ""
+	if card != nil {
+		out.HasCard, out.CardBrand, out.CardLast4 = true, card.Brand, card.Last4
+	}
 	return out, nil
 }
 
@@ -177,12 +194,25 @@ func (s *Service) SetAutoRecharge(ctx context.Context, accountID, userID uuid.UU
 		return err
 	}
 	if in.Enabled {
-		card, err := s.defaultCard(ctx, accountID)
+		card, err := s.chargeableCard(ctx, accountID)
 		if err != nil {
 			return err
 		}
-		if card == "" {
+		if card == nil {
 			return ErrNoDefaultCard
+		}
+		if !card.IsDefault {
+			// Make the card being charged the account's default, so the
+			// Payments tab shows the same card the customer agreed to. Only when
+			// no other card holds the default.
+			if _, err := s.db.ExecContext(ctx, `
+				UPDATE billing.payment_methods SET is_default = TRUE, updated_at = NOW()
+				WHERE id = $1 AND account_id = $2
+				  AND NOT EXISTS (SELECT 1 FROM billing.payment_methods
+				                  WHERE account_id = $2 AND is_default AND status = 'verified')`,
+				card.ID, accountID); err != nil {
+				log.Printf("WARN: could not mark card %s as the default for %s: %v", card.ID, accountID, err)
+			}
 		}
 	}
 	var by any
@@ -218,8 +248,8 @@ func (s *Service) SetAutoRecharge(ctx context.Context, accountID, userID uuid.UU
 // no longer has a valid default card (it was removed). Called after a card is
 // removed; a no-op when the rule is off or a valid card remains.
 func (s *Service) DisableAutoRechargeIfNoCard(ctx context.Context, accountID uuid.UUID) {
-	card, err := s.defaultCard(ctx, accountID)
-	if err != nil || card != "" {
+	card, err := s.chargeableCard(ctx, accountID)
+	if err != nil || card != nil {
 		return
 	}
 	res, err := s.db.ExecContext(ctx, `
@@ -420,17 +450,17 @@ func (r *AutoRecharger) Attempt(ctx context.Context, accountID uuid.UUID) {
 		return
 	}
 
-	pm, err := r.billing.defaultCard(ctx, accountID)
+	card, err := r.billing.chargeableCard(ctx, accountID)
 	if err != nil {
 		log.Printf("WARN: automatic recharge for %s: %v", accountID, err)
 		return
 	}
-	if pm == "" {
+	if card == nil {
 		r.switchOff(ctx, accountID, cfg, "there is no valid saved card")
 		return
 	}
 
-	r.charge(ctx, accountID, cfg, pm)
+	r.charge(ctx, accountID, cfg, card.StripePMID)
 }
 
 func (r *AutoRecharger) capReached(ctx context.Context, id uuid.UUID, cfg autoConfig, spent float64) {
