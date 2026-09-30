@@ -71,7 +71,9 @@ func (c *teepinClient) askUser(_ context.Context, _ *mcp.CallToolRequest, args a
 		return textResult("keep the question under %d characters", maxQuestionChars)
 	}
 	if n := len(args.Options); n < minOptions || n > maxOptions {
-		return textResult("give between %d and %d options (got %d)", minOptions, maxOptions, n)
+		return textResult("give between %d and %d options (got %d). If there are more than %d good candidates, "+
+			"offer your best %d and set allow_other to true so the customer can name another; do not list "+
+			"options in a chat message instead.", minOptions, maxOptions, n, maxOptions, maxOptions)
 	}
 	seen := map[string]bool{}
 	opts := make([]questionOption, 0, len(args.Options))
@@ -166,7 +168,9 @@ func registerPromptTools(server *mcp.Server, client *teepinClient) {
 		Description: "Ask the customer a question with 2 to 4 answers to pick from (and optionally let " +
 			"them type their own) when a decision is theirs to make: which service to use, what the app " +
 			"should do next, a preference you cannot infer. Prefer this to guessing or asking in plain " +
-			"chat. After calling it, END YOUR TURN: the answer arrives as your next message.",
+			"chat, and never put the options in a chat message or a table. If there are more than four " +
+			"good candidates, offer your best three or four and set allow_other so the customer can name " +
+			"another. After calling it, END YOUR TURN: the answer arrives as your next message.",
 	}, client.askUser)
 
 	mcp.AddTool(server, &mcp.Tool{

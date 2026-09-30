@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -114,6 +115,11 @@ var (
 // in KUMBHA-DESIGN.md, minus the HTTP transport (pkg/api/kumbha_handlers.go
 // owns stages 1-2 and 10-11; this is stages 3-9).
 type Gateway struct {
+	// zeroPriceWarned rate-limits the warning about a model billed at $0, so a
+	// busy build does not repeat it on every completion.
+	zeroMu          sync.Mutex
+	zeroPriceWarned map[string]time.Time
+
 	store   *Store
 	models  ModelBackend
 	gate    ProvisionGate
@@ -532,6 +538,9 @@ func (g *Gateway) Complete(ctx context.Context, sess *Session, req inference.Req
 	end := time.Now()
 
 	cost := g.cost(ctx, sess.ModelRoute, resp.Usage)
+	if cost == 0 && resp.Usage.InputTokens+resp.Usage.OutputTokens > 0 {
+		g.warnZeroPrice(sess.ModelRoute, resp.Usage)
+	}
 
 	// From here the model has answered and its tokens are spent, so nothing
 	// below may turn the response into an error. The harness retries a failed
@@ -579,6 +588,29 @@ func (g *Gateway) Complete(ctx context.Context, sess *Session, req inference.Req
 	}
 
 	return &CompletionResult{Response: resp, Cost: cost, Spent: newSpent, Budget: sess.Budget}, nil
+}
+
+// zeroPriceWarnEvery is how often a model billed at $0 is reported.
+const zeroPriceWarnEvery = time.Hour
+
+// warnZeroPrice reports, at most once an hour per model, that a completion was
+// served and priced at $0, so nothing was drawn from the customer's credit.
+// A price of $0 is a valid choice for a deliberately free model, but it is also
+// the default for every new catalog entry, and a model left at the default is
+// otherwise given away without a trace.
+func (g *Gateway) warnZeroPrice(route string, usage inference.Usage) {
+	g.zeroMu.Lock()
+	defer g.zeroMu.Unlock()
+	now := time.Now()
+	if last, ok := g.zeroPriceWarned[route]; ok && now.Sub(last) < zeroPriceWarnEvery {
+		return
+	}
+	if g.zeroPriceWarned == nil {
+		g.zeroPriceWarned = make(map[string]time.Time)
+	}
+	g.zeroPriceWarned[route] = now
+	log.Printf("WARN: kumbha: model %q served %d tokens but is priced at $0, so no credit was consumed; set its price in the model catalog if this is not intended",
+		route, usage.InputTokens+usage.OutputTokens)
 }
 
 // rates returns the per-million-token input/output rates to charge for a

@@ -4,9 +4,13 @@
 package kumbha
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -741,5 +745,35 @@ func TestGateway_Complete_SessionAccrualFaultStillBillsAccount(t *testing.T) {
 	}
 	if len(usage.records) != 2 || len(usage.consumed) != 2 {
 		t.Errorf("account not billed: records=%d consumed=%v", len(usage.records), usage.consumed)
+	}
+}
+
+// A model left at the default $0 price is otherwise given away without a
+// trace, so a served completion at $0 is reported - once an hour per model.
+func TestGateway_WarnsOncePerHourWhenAModelIsPricedAtZero(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	gw := NewGateway(nil, nil, nil, &fakePricing{}, &fakeUsageRecorder{})
+	u := inference.Usage{InputTokens: 100, OutputTokens: 50}
+	gw.warnZeroPrice("teepin/free", u)
+	gw.warnZeroPrice("teepin/free", u) // same model, same hour: silent
+	gw.warnZeroPrice("teepin/other", u)
+
+	out := buf.String()
+	if strings.Count(out, `"teepin/free"`) != 1 || strings.Count(out, `"teepin/other"`) != 1 {
+		t.Fatalf("warnings:\n%s", out)
+	}
+	if !strings.Contains(out, "priced at $0") || !strings.Contains(out, "150 tokens") {
+		t.Errorf("warning lacks the explanation:\n%s", out)
+	}
+
+	// After the window it is reported again.
+	gw.zeroPriceWarned["teepin/free"] = time.Now().Add(-2 * time.Hour)
+	buf.Reset()
+	gw.warnZeroPrice("teepin/free", u)
+	if !strings.Contains(buf.String(), `"teepin/free"`) {
+		t.Error("not reported again after the hour")
 	}
 }
