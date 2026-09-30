@@ -68,7 +68,7 @@ type SESSender struct {
 }
 
 // NewSESSender builds a sender from an SES v2 client and a From address such
-// as "Teepin <billing@example.com>".
+// as "Teepin <support@example.com>".
 func NewSESSender(client *sesv2.Client, from string) (*SESSender, error) {
 	if from == "" {
 		return nil, errors.New("a From address is required")
