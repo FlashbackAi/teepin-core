@@ -12,10 +12,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
+	"github.com/FlashbackAi/teepin-core/pkg/auth"
 	"github.com/FlashbackAi/teepin-core/pkg/billing"
+	"github.com/FlashbackAi/teepin-core/pkg/compute"
 )
 
 func runRequireCredit(t *testing.T, s *Server) *httptest.ResponseRecorder {
@@ -120,5 +123,44 @@ func TestStorageAccess_FailsClosedWhenUnreadable(t *testing.T) {
 	rec := runStorageAccess(t, &Server{credit: &fakeCredit{err: errors.New("db down")}})
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status %d, want 503", rec.Code)
+	}
+}
+
+func callStorageHold(t *testing.T, s *Server, withAccount bool) *httptest.ResponseRecorder {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+	if withAccount {
+		// An account and NO project, as the console sends before it has chosen one.
+		c.Set(string(auth.AccountIDKey), uuid.New())
+	}
+	s.GetStorageHold(c)
+	return w
+}
+
+// A hold belongs to the account. The console can ask before it has picked a
+// project, and a 401 here made it treat the user as signed out.
+func TestGetStorageHold_NeedsNoProject(t *testing.T) {
+	s := &Server{store: nil, credit: &fakeCredit{balance: 5}}
+	if w := callStorageHold(t, s, true); w.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200 without a project", w.Code)
+	}
+	// With a store configured (as in production) it must still not demand one.
+	db, _, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s = &Server{store: compute.NewStore(db), credit: &fakeCredit{balance: 0}}
+	if w := callStorageHold(t, s, true); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"held":true`) {
+		t.Fatalf("status %d body %s, want 200 held:true without a project", w.Code, w.Body)
+	}
+}
+
+func TestGetStorageHold_NoAccountIs401(t *testing.T) {
+	if w := callStorageHold(t, &Server{credit: &fakeCredit{}}, false); w.Code != http.StatusUnauthorized {
+		t.Fatalf("status %d, want 401", w.Code)
 	}
 }

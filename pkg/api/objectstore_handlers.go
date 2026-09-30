@@ -17,6 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
+	"github.com/FlashbackAi/teepin-core/pkg/auth"
 	"github.com/FlashbackAi/teepin-core/pkg/billing"
 	"github.com/FlashbackAi/teepin-core/pkg/models"
 	"github.com/FlashbackAi/teepin-core/pkg/objectstore"
@@ -129,8 +130,13 @@ func (s *Server) requireStorageAccess(c *gin.Context, accountID uuid.UUID) bool 
 // GetStorageHold handles GET /v1/storage/hold: whether the account's stored
 // data is currently on hold and when it will be deleted.
 func (s *Server) GetStorageHold(c *gin.Context) {
-	_, accountID, ok := s.requireScope(c)
-	if !ok {
+	// A hold belongs to the ACCOUNT, so this needs no project. Using
+	// requireScope here answered 401 to a request without a project header
+	// (the console can ask before it has chosen one), and the console reads any
+	// 401 as "signed out".
+	accountID, ok := auth.GetAccountID(c)
+	if !ok || accountID == uuid.Nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "account authentication required"})
 		return
 	}
 	resp := gin.H{"held": false}
