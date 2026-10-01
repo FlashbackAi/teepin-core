@@ -63,6 +63,9 @@ type openAIToolCall struct {
 // any type other than "function" is rejected rather than skipped: silently
 // dropping a tool the harness declared is exactly the failure this file
 // exists to end.
+// maxStrictTools is the most strict tools Anthropic accepts in one request.
+const maxStrictTools = 20
+
 func toAnthropicTools(extra map[string]json.RawMessage) ([]anthropic.ToolUnionParam, error) {
 	raw, ok := extra["tools"]
 	if !ok || isJSONNull(raw) {
@@ -74,6 +77,7 @@ func toAnthropicTools(extra map[string]json.RawMessage) ([]anthropic.ToolUnionPa
 	}
 
 	out := make([]anthropic.ToolUnionParam, 0, len(tools))
+	strictCount := 0
 	for _, t := range tools {
 		if t.Type != "function" {
 			return nil, fmt.Errorf("unsupported tool type %q", t.Type)
@@ -87,7 +91,21 @@ func toAnthropicTools(extra map[string]json.RawMessage) ([]anthropic.ToolUnionPa
 			tool.Description = anthropic.String(t.Function.Description)
 		}
 		if t.Function.Strict != nil {
-			tool.Strict = anthropic.Bool(*t.Function.Strict)
+			// Anthropic refuses a request with more than maxStrictTools strict
+			// tools ("Too many strict tools (22). The maximum ... is 20"). A
+			// harness with many tools (the builder has over twenty) marks them
+			// all strict, which made every such call fail outright. The first
+			// ones keep it; the rest are sent as ordinary tools, which the
+			// harness still validates on its side.
+			strict := *t.Function.Strict
+			if strict {
+				if strictCount >= maxStrictTools {
+					strict = false
+				} else {
+					strictCount++
+				}
+			}
+			tool.Strict = anthropic.Bool(strict)
 		}
 		out = append(out, anthropic.ToolUnionParam{OfTool: &tool})
 	}

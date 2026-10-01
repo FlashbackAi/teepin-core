@@ -291,3 +291,35 @@ func TestServeSession_WithoutHistoryStillReportsAGoneAgent(t *testing.T) {
 type errString string
 
 func (e errString) Error() string { return string(e) }
+
+// Regression for the repeated feed seen on 2026-10-01: when a pod's log stream
+// ended while the pod still read as running (just after the agent crashed), the
+// tail retried and replayed the log from its first line, so every event reached
+// the browser again.
+func TestTailLogs_RetryDoesNotResendLinesAlreadyDelivered(t *testing.T) {
+	line := func(s string) string { return "{\"type\":\"action\",\"summary\":\"" + s + "\"}\n" }
+	fc := &streamRetryCluster{
+		calls: []scriptedStreamCall{
+			{write: []byte(line("a") + line("b"))},             // stream drops
+			{write: []byte(line("a") + line("b") + line("c"))}, // replayed from the start, plus one new line
+		},
+		instanceStat: &cluster.InstanceStatus{Status: "running"},
+	}
+	h := newTestEventsHandler(fc)
+	events := make(chan json.RawMessage, 20)
+	if _, err := h.tailLogs(context.Background(), cluster.Scope{}, "kumbha-agent-x", events, nil); err != nil {
+		t.Fatalf("tailLogs: %v", err)
+	}
+	close(events)
+	var got []string
+	for ev := range events {
+		var m struct {
+			Summary string `json:"summary"`
+		}
+		_ = json.Unmarshal(ev, &m)
+		got = append(got, m.Summary)
+	}
+	if strings.Join(got, ",") != "a,b,c" {
+		t.Fatalf("events = %v, want a,b,c exactly once each", got)
+	}
+}

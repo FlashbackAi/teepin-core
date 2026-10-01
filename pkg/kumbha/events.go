@@ -197,6 +197,12 @@ type logLineWriter struct {
 	// it is how the recorder stores events with no browser attached.
 	lineNo int
 	onLine func(lineNo int, sanitized json.RawMessage)
+	// skip is how many leading lines an earlier attempt already delivered.
+	// Each StreamLogs attempt replays the pod's log from its first line, so a
+	// retry would otherwise send every line again (the browser saw the whole
+	// feed repeated whenever a pod's stream ended while the pod still read as
+	// running, e.g. just after the agent crashed).
+	skip int
 }
 
 func (w *logLineWriter) Write(p []byte) (int, error) {
@@ -212,6 +218,9 @@ func (w *logLineWriter) Write(p []byte) (int, error) {
 		line := w.buf[:i]
 		w.buf = w.buf[i+1:]
 		w.lineNo++
+		if w.lineNo <= w.skip {
+			continue
+		}
 		if sanitized, ok := sanitizeEventLine(line); ok {
 			if w.onLine != nil {
 				w.onLine(w.lineNo, sanitized)
@@ -358,11 +367,15 @@ func (h *EventsHandler) streamLogsWithRetry(ctx context.Context, scope cluster.S
 // a caller can tell "the pod is gone" from "it ran and ended".
 func (h *EventsHandler) tailLogs(ctx context.Context, scope cluster.Scope, instanceID string, events chan<- json.RawMessage, onLine func(int, json.RawMessage)) (sawAny bool, err error) {
 	coldStartDeadline := time.Now().Add(h.streamRetryBudget)
+	delivered := 0 // lines already handed on by earlier attempts
 
 	for {
-		writer := &logLineWriter{events: events, onLine: onLine}
+		writer := &logLineWriter{events: events, onLine: onLine, skip: delivered}
 		err := h.cluster.StreamLogs(ctx, scope, instanceID, cluster.LogOptions{Follow: true}, writer)
 		sawAny = sawAny || writer.sawData
+		if writer.lineNo > delivered {
+			delivered = writer.lineNo
+		}
 
 		if ctx.Err() != nil {
 			return sawAny, ctx.Err()

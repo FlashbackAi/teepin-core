@@ -298,3 +298,43 @@ func TestAnthropic_Complete_RejectsUntranslatableToolBeforeDispatch(t *testing.T
 		t.Errorf("got %v, want ErrProviderRejected", err)
 	}
 }
+
+// Regression for 2026-10-01: a builder on Claude failed every call with "Too
+// many strict tools (22). The maximum number of strict tools supported is 20".
+// Past the limit the remaining tools must go out as ordinary tools.
+func TestToAnthropicTools_CapsStrictToolsAtAnthropicsLimit(t *testing.T) {
+	var tools []map[string]any
+	for i := 0; i < maxStrictTools+3; i++ {
+		tools = append(tools, map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":       "tool_" + string(rune('a'+i)),
+				"parameters": map[string]any{"type": "object", "properties": map[string]any{}},
+				"strict":     true,
+			},
+		})
+	}
+	// One tool that is not strict stays that way and does not use up the allowance.
+	tools = append(tools, map[string]any{
+		"type":     "function",
+		"function": map[string]any{"name": "plain", "parameters": map[string]any{"type": "object"}},
+	})
+	raw, _ := json.Marshal(tools)
+
+	out, err := toAnthropicTools(map[string]json.RawMessage{"tools": raw})
+	if err != nil {
+		t.Fatalf("toAnthropicTools: %v", err)
+	}
+	strict := 0
+	for i, tool := range out {
+		if tool.OfTool.Strict.Valid() && tool.OfTool.Strict.Value {
+			strict++
+			if i >= maxStrictTools {
+				t.Errorf("tool %d is strict; only the first %d may be", i, maxStrictTools)
+			}
+		}
+	}
+	if strict != maxStrictTools {
+		t.Fatalf("%d strict tools went out, want exactly %d", strict, maxStrictTools)
+	}
+}
