@@ -14,6 +14,30 @@ import (
 // ErrNotFound means the model_route does not exist in the catalog.
 var ErrNotFound = errors.New("model not found in catalog")
 
+// ErrPricingRequired means the change would make a model available (enabled,
+// offered to customers, or usable by Teepin Build) while it has no price. A model
+// left at the default $0 is served for free without a trace, so the catalog
+// refuses to switch one on until both its input and output prices are set.
+var ErrPricingRequired = errors.New("set the model's input and output price (both above zero) before making it available")
+
+// Priced reports whether the model has a customer price on both sides.
+func (m *Model) Priced() bool {
+	return m.InputPricePerMillion > 0 && m.OutputPricePerMillion > 0
+}
+
+// pricedSQL is the catalog's own definition of "priced", for use in a WHERE
+// clause so the rule is enforced in the same statement as the change.
+const pricedSQL = `(input_price_per_million > 0 AND output_price_per_million > 0)`
+
+// whyNotUpdated explains an UPDATE that touched no row: the model does not exist,
+// or it exists and the pricing rule refused the change.
+func (s *Service) whyNotUpdated(ctx context.Context, modelRoute string) error {
+	if _, err := s.GetModel(ctx, modelRoute); err != nil {
+		return err // ErrNotFound, or a read failure
+	}
+	return ErrPricingRequired
+}
+
 // Service manages Teepin Inference's model catalog and pricing.
 type Service struct {
 	db *sql.DB
@@ -69,21 +93,56 @@ func (m *Model) validate() error {
 
 // RegisterModel creates or updates a catalog entry's capabilities and how
 // it is served. Pricing, availability and the API key are intentionally
-// NOT part of this call — SetPricing, SetVendorCost, SetAvailability and
+// NOT part of this call - SetPricing, SetVendorCost, SetAvailability and
 // SetAPIKeyRef are separate, so editing a model's capabilities can never
 // disturb a price, a Kumbha ordering, or a stored key an admin already set
 // (the upsert below leaves those columns alone).
+//
+// A model registered as enabled must already be priced; use
+// RegisterModelWithPricing to set the price in the same call.
 func (s *Service) RegisterModel(ctx context.Context, m Model) error {
+	return s.RegisterModelWithPricing(ctx, m, nil, nil)
+}
+
+// RegisterModelWithPricing is RegisterModel plus an optional price. A nil price
+// leaves whatever is stored untouched (a new model starts at 0); a given one is
+// written with the rest. Registering a model as enabled is refused unless it ends
+// up with both prices above zero, whether from this call or already stored.
+func (s *Service) RegisterModelWithPricing(ctx context.Context, m Model, inputPrice, outputPrice *float64) error {
 	if err := m.validate(); err != nil {
 		return err
+	}
+	if (inputPrice != nil && *inputPrice < 0) || (outputPrice != nil && *outputPrice < 0) {
+		return fmt.Errorf("rates must be non-negative")
+	}
+	bothGiven := inputPrice != nil && outputPrice != nil && *inputPrice > 0 && *outputPrice > 0
+	if m.Enabled && !bothGiven {
+		// Not fully priced by this call, so what is already stored decides.
+		effective := Model{}
+		if existing, err := s.GetModel(ctx, m.ModelRoute); err == nil {
+			effective = *existing
+		} else if !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		if inputPrice != nil {
+			effective.InputPricePerMillion = *inputPrice
+		}
+		if outputPrice != nil {
+			effective.OutputPricePerMillion = *outputPrice
+		}
+		if !effective.Priced() {
+			return ErrPricingRequired
+		}
 	}
 
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO inference.models
 			(model_route, display_name, cost_class, engine, context_window,
 			 supports_tools, supports_vision, supports_audio, enabled,
-			 provider, provider_model, base_url, max_output_tokens, updated_by, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
+			 provider, provider_model, base_url, max_output_tokens, updated_by,
+			 input_price_per_million, output_price_per_million, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+		        COALESCE($15::numeric, 0), COALESCE($16::numeric, 0), NOW())
 		ON CONFLICT (model_route) DO UPDATE SET
 			display_name      = EXCLUDED.display_name,
 			cost_class        = EXCLUDED.cost_class,
@@ -97,11 +156,14 @@ func (s *Service) RegisterModel(ctx context.Context, m Model) error {
 			provider_model    = EXCLUDED.provider_model,
 			base_url          = EXCLUDED.base_url,
 			max_output_tokens = EXCLUDED.max_output_tokens,
+			input_price_per_million  = COALESCE($15::numeric, inference.models.input_price_per_million),
+			output_price_per_million = COALESCE($16::numeric, inference.models.output_price_per_million),
 			updated_by        = EXCLUDED.updated_by,
 			updated_at        = NOW()
 	`, m.ModelRoute, m.DisplayName, string(m.CostClass), m.Engine, m.ContextWindow,
 		m.SupportsTools, m.SupportsVision, m.SupportsAudio, m.Enabled,
-		string(m.Provider), m.ProviderModel, m.BaseURL, m.MaxOutputTokens, m.UpdatedBy)
+		string(m.Provider), m.ProviderModel, m.BaseURL, m.MaxOutputTokens, m.UpdatedBy,
+		inputPrice, outputPrice)
 	if err != nil {
 		return fmt.Errorf("failed to register model %q: %w", m.ModelRoute, err)
 	}
@@ -119,20 +181,24 @@ type Availability struct {
 
 // SetAvailability updates whether a model is offered to customers and
 // whether (and in what order) the Kumbha build agent may use it.
+//
+// Turning either availability ON requires the model to be priced; the check is
+// part of the UPDATE itself, so there is no window between checking and changing.
 func (s *Service) SetAvailability(ctx context.Context, modelRoute string, a Availability, updatedBy string) error {
+	switchingOn := (a.OfferedToCustomers != nil && *a.OfferedToCustomers) || (a.KumbhaEnabled != nil && *a.KumbhaEnabled)
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE inference.models
 		SET offered_to_customers = COALESCE($1, offered_to_customers),
 		    kumbha_enabled       = COALESCE($2, kumbha_enabled),
 		    kumbha_priority      = COALESCE($3, kumbha_priority),
 		    updated_by = $4, updated_at = NOW()
-		WHERE model_route = $5
-	`, a.OfferedToCustomers, a.KumbhaEnabled, a.KumbhaPriority, updatedBy, modelRoute)
+		WHERE model_route = $5 AND (NOT $6::boolean OR `+pricedSQL+`)
+	`, a.OfferedToCustomers, a.KumbhaEnabled, a.KumbhaPriority, updatedBy, modelRoute, switchingOn)
 	if err != nil {
 		return fmt.Errorf("failed to set availability for %q: %w", modelRoute, err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrNotFound
+		return s.whyNotUpdated(ctx, modelRoute)
 	}
 	return nil
 }
@@ -167,8 +233,10 @@ func (s *Service) ListKumbhaModels(ctx context.Context) ([]Model, error) {
 }
 
 // SetPricing updates a model's customer-facing per-million-token rates.
-// Zero is valid ("do not charge"), same contract as every other rate this
-// platform exposes.
+// Zero is allowed while a model is switched off (it is simply not priced yet),
+// but never on an enabled one: it would be served for free. To clear the price of
+// a live model, disable it first. (Enabled is what makes a model live: the
+// customer and Teepin Build flags only choose where an enabled model is offered.)
 func (s *Service) SetPricing(ctx context.Context, modelRoute string, inputRate, outputRate float64, updatedBy string) error {
 	if inputRate < 0 || outputRate < 0 {
 		return fmt.Errorf("rates must be non-negative")
@@ -178,12 +246,13 @@ func (s *Service) SetPricing(ctx context.Context, modelRoute string, inputRate, 
 		SET input_price_per_million = $1, output_price_per_million = $2,
 		    updated_by = $3, updated_at = NOW()
 		WHERE model_route = $4
+		  AND (($1::numeric > 0 AND $2::numeric > 0) OR NOT enabled)
 	`, inputRate, outputRate, updatedBy, modelRoute)
 	if err != nil {
 		return fmt.Errorf("failed to set pricing for %q: %w", modelRoute, err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrNotFound
+		return s.whyNotUpdated(ctx, modelRoute)
 	}
 	log.Printf("Model catalog: %q priced at $%.4f/M input, $%.4f/M output by %s", modelRoute, inputRate, outputRate, updatedBy)
 	return nil
@@ -219,17 +288,20 @@ func (s *Service) SetVendorCost(ctx context.Context, modelRoute string, vendorIn
 // SetEnabled gates whether the router may consider this model. Retiring a
 // model (enabled=false) keeps its pricing/audit history rather than
 // deleting the row.
+//
+// Enabling requires the model to be priced (see ErrPricingRequired); disabling
+// never does.
 func (s *Service) SetEnabled(ctx context.Context, modelRoute string, enabled bool, updatedBy string) error {
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE inference.models
 		SET enabled = $1, updated_by = $2, updated_at = NOW()
-		WHERE model_route = $3
+		WHERE model_route = $3 AND (NOT $1::boolean OR `+pricedSQL+`)
 	`, enabled, updatedBy, modelRoute)
 	if err != nil {
 		return fmt.Errorf("failed to set enabled for %q: %w", modelRoute, err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrNotFound
+		return s.whyNotUpdated(ctx, modelRoute)
 	}
 	return nil
 }
@@ -246,6 +318,17 @@ func (s *Service) ModelPricing(ctx context.Context, modelRoute string) (input, o
 		return 0, 0, false
 	}
 	return m.InputPricePerMillion, m.OutputPricePerMillion, true
+}
+
+// ModelVendorCost returns what a route costs Teepin per million tokens, nil for
+// whichever is unrecorded (and for both on a model Teepin runs itself). Lets
+// Kumbha's gateway record the margin on each usage line.
+func (s *Service) ModelVendorCost(ctx context.Context, modelRoute string) (input, output *float64) {
+	m, err := s.GetModel(ctx, modelRoute)
+	if err != nil {
+		return nil, nil
+	}
+	return m.VendorInputCostPerMillion, m.VendorOutputCostPerMillion
 }
 
 // GetModel returns one catalog entry.

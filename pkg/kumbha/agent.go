@@ -178,22 +178,23 @@ func (g *Gateway) checkModelAvailable(ctx context.Context, route string) error {
 	return fmt.Errorf("%w: %q is no longer a Kumbha-enabled model", errNoKumbhaModels, route)
 }
 
-// routeContextWindow returns the catalog's input window (tokens) for route,
-// or 0 when it is unknown — no such model, no window recorded, or the model
-// list could not be read. Best-effort by design: the agent uses it only to
-// decide when to condense its history, and 0 makes it fall back to an
-// event-count trigger, so a lookup failure never blocks a launch.
-func (g *Gateway) routeContextWindow(ctx context.Context, route string) int {
+// routeLimits returns the catalog's input window and maximum answer length
+// (both in tokens) for route, or 0 for whichever is unknown: no such model, no
+// value recorded, or the model list could not be read. Best-effort by design:
+// the agent uses them to size its history condenser and to tell its harness the
+// model's real limits, and 0 makes it fall back to an event-count trigger and the
+// harness's own defaults, so a lookup failure never blocks a launch.
+func (g *Gateway) routeLimits(ctx context.Context, route string) (window, maxOutput int) {
 	models, err := g.kumbhaModels(ctx)
 	if err != nil {
-		return 0
+		return 0, 0
 	}
 	for _, m := range models {
 		if m.Route == route {
-			return m.ContextWindow
+			return m.ContextWindow, m.MaxOutputTokens
 		}
 	}
-	return 0
+	return 0, 0
 }
 
 // CapacityCandidate is one node's identity plus free room — the minimum
@@ -317,6 +318,8 @@ func (g *Gateway) LaunchAgent(ctx context.Context, sess *Session, prompt string,
 	// though this pod is never customer-visible.
 	podID := AgentPodNamePrefix + sess.ID.String()[:8]
 
+	window, maxOutput := g.routeLimits(ctx, sess.ModelRoute)
+
 	spec := cluster.InstanceSpec{
 		InstanceID: podID,
 		AccountID:  sess.AccountID.String(),
@@ -350,7 +353,8 @@ func (g *Gateway) LaunchAgent(ctx context.Context, sess *Session, prompt string,
 			// The route's input window in tokens ("0" when unknown). run.py
 			// sizes its history condenser from it, so a small-window model
 			// condenses early instead of failing on an oversized request.
-			"TEEPIN_CONTEXT_WINDOW": strconv.Itoa(g.routeContextWindow(ctx, sess.ModelRoute)),
+			"TEEPIN_CONTEXT_WINDOW":    strconv.Itoa(window),
+			"TEEPIN_MAX_OUTPUT_TOKENS": strconv.Itoa(maxOutput),
 			// run.py's own working directory defaults to "/workspace" — the
 			// pod's ephemeral, non-persistent root filesystem — while the
 			// PVC this spec mounts (below, via StorageGB) lands at /data.
@@ -403,6 +407,7 @@ func (g *Gateway) LaunchAgent(ctx context.Context, sess *Session, prompt string,
 		return fmt.Errorf("agent launched but could not be recorded on the session: %w", err)
 	}
 	sess.AgentInstanceID = podID
+	g.noteAgentLaunched(ctx, sess)
 	return nil
 }
 

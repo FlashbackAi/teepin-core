@@ -40,7 +40,7 @@ const maxScreenshotBytes = 5 << 20
 // POST /v1/kumbha/sessions/:id/screenshot
 func (s *Server) UploadKumbhaScreenshot(c *gin.Context) {
 	if s.kumbha == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha Gateway is not available on this deployment"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Teepin Build is not available on this deployment"})
 		return
 	}
 
@@ -52,7 +52,7 @@ func (s *Server) UploadKumbhaScreenshot(c *gin.Context) {
 
 	callerSession, ok := auth.GetSessionID(c)
 	if !ok {
-		c.JSON(http.StatusForbidden, gin.H{"error": "this endpoint requires a Kumbha session credential"})
+		c.JSON(http.StatusForbidden, gin.H{"error": "this endpoint requires a Teepin Build session credential"})
 		return
 	}
 	if callerSession != sessionID {
@@ -92,7 +92,7 @@ func (s *Server) UploadKumbhaScreenshot(c *gin.Context) {
 // GET /v1/kumbha/sessions/:id/screenshot
 func (s *Server) GetKumbhaScreenshot(c *gin.Context) {
 	if s.kumbha == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha Gateway is not available on this deployment"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Teepin Build is not available on this deployment"})
 		return
 	}
 

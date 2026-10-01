@@ -325,16 +325,9 @@ func (s *Service) SettleTopUpByPaymentIntent(ctx context.Context, piID string, r
 		return tx.Commit()
 	}
 
-	receiptID, invoiceNumber, err := s.insertCreditPurchaseReceipt(ctx, tx, bill, amount, topUpCurrency, methodSummary)
+	receiptID, invoiceNumber, err := s.recordPurchase(ctx, tx, bill, accountID, topUpID, amount, topUpCurrency, methodSummary)
 	if err != nil {
 		return err
-	}
-
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO billing.credit_transactions (account_id, amount, kind, reason, topup_id)
-		VALUES ($1, $2, 'purchase', $3, $4)
-	`, accountID, amount, "Credit purchase ("+invoiceNumber+")", topUpID); err != nil {
-		return fmt.Errorf("failed to record credit purchase: %w", err)
 	}
 
 	if _, err := tx.ExecContext(ctx, `
@@ -349,28 +342,51 @@ func (s *Service) SettleTopUpByPaymentIntent(ctx context.Context, piID string, r
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit top-up settlement: %w", err)
 	}
-	// The purchase is spendable now; do not let a pre-flight keep judging on
-	// the balance from before it.
-	s.balances.forget(accountID)
-	// Tell the customer once the credit is real and the receipt (with its PDF,
-	// below) exists. Deferred so every return path after the commit runs it.
-	defer s.notifySettled(TopUpReceiptNotice{
+	s.afterSettled(ctx, TopUpReceiptNotice{
 		AccountID: accountID, ReceiptID: receiptID, ReceiptNumber: invoiceNumber,
 		Amount: amount, Currency: topUpCurrency, PaymentMethod: methodSummary,
-	})
+	}, topUpID)
+	return nil
+}
 
-	// The credit and the receipt record are committed; the PDF is a derived
-	// document and must not undo them if rendering or storage fails.
-	if s.renderInvoicePDF == nil || s.pdfStore == nil {
-		return nil // PDF storage not wired (local dev)
-	}
-	receipt, err := s.GetInvoice(ctx, receiptID)
+// recordPurchase writes, inside the settlement transaction, the paid receipt
+// and the ledger row that turns a confirmed payment into spendable credit. Both
+// payment methods (card via Stripe, USDC on Solana) settle through this, so a
+// purchase looks the same whichever way it was paid. The credit and its receipt
+// exist together or not at all.
+func (s *Service) recordPurchase(ctx context.Context, tx *sql.Tx, bill *billTo, accountID, topUpID uuid.UUID, amount float64, currency, methodSummary string) (receiptID uuid.UUID, invoiceNumber string, err error) {
+	receiptID, invoiceNumber, err = s.insertCreditPurchaseReceipt(ctx, tx, bill, amount, currency, methodSummary)
 	if err != nil {
-		log.Printf("WARN: top-up %s credited but loading receipt %s for its PDF failed: %v", topUpID, invoiceNumber, err)
-		return nil
+		return uuid.Nil, "", err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO billing.credit_transactions (account_id, amount, kind, reason, topup_id)
+		VALUES ($1, $2, 'purchase', $3, $4)
+	`, accountID, amount, "Credit purchase ("+invoiceNumber+")", topUpID); err != nil {
+		return uuid.Nil, "", fmt.Errorf("failed to record credit purchase: %w", err)
+	}
+	return receiptID, invoiceNumber, nil
+}
+
+// afterSettled runs once a settlement has committed: the new credit is
+// spendable now (so no pre-flight may keep judging on the balance from before
+// it), the receipt's PDF is rendered, and the customer is told. The credit and
+// the receipt record are already committed; the PDF is a derived document and
+// must not undo them if rendering or storage fails. The customer is told last,
+// whichever way this returns, so the email never precedes the receipt.
+func (s *Service) afterSettled(ctx context.Context, n TopUpReceiptNotice, topUpID uuid.UUID) {
+	s.balances.forget(n.AccountID)
+	defer s.notifySettled(n)
+
+	if s.renderInvoicePDF == nil || s.pdfStore == nil {
+		return // PDF storage not wired (local dev)
+	}
+	receipt, err := s.GetInvoice(ctx, n.ReceiptID)
+	if err != nil {
+		log.Printf("WARN: top-up %s credited but loading receipt %s for its PDF failed: %v", topUpID, n.ReceiptNumber, err)
+		return
 	}
 	s.generateAndStorePDF(ctx, receipt)
-	return nil
 }
 
 // insertCreditPurchaseReceipt writes a paid receipt for a credit purchase

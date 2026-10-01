@@ -157,6 +157,21 @@ func (g *Gateway) Status(ctx context.Context, m modelcatalog.Model) ModelStatus 
 	return ModelStatus{State: StateServing, Detail: fmt.Sprintf("%d mounted backend(s)", len(candidates))}
 }
 
+// Unservable returns why a customer should not be offered this model right
+// now, or "" when it can be used. A state that is merely unknown (never
+// checked, or a provider with no health check) counts as usable: silence is
+// not a failure. Phrased for a customer, never naming a backend.
+func (s ModelStatus) Unservable() string {
+	switch s.State {
+	case StateNoBackend:
+		return "Not running right now"
+	case StateUnhealthy:
+		return "Temporarily unavailable"
+	default:
+		return ""
+	}
+}
+
 const healthCheckTimeout = 10 * time.Second
 
 // CheckExternalHealth runs one round of health checks over every enabled

@@ -37,7 +37,7 @@ type StatementResource struct {
 }
 
 // StatementService groups a project's usage by service ("GPU compute",
-// "Kumbha", "Object storage", ...).
+// "Teepin Build", "Object storage", ...).
 type StatementService struct {
 	Service   string
 	Amount    float64

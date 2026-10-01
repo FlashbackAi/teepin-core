@@ -72,7 +72,7 @@ func writeSecretError(c *gin.Context, err error) {
 // The value is never logged, echoed, or returned.
 func (s *Server) PutKumbhaSecret(c *gin.Context) {
 	if s.kumbha == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha Gateway is not available on this deployment"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Teepin Build is not available on this deployment"})
 		return
 	}
 	if refuseAgentCredential(c) {
@@ -109,7 +109,7 @@ func (s *Server) PutKumbhaSecret(c *gin.Context) {
 // values. GET /v1/kumbha/sessions/:id/secrets
 func (s *Server) ListKumbhaSecrets(c *gin.Context) {
 	if s.kumbha == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha Gateway is not available on this deployment"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Teepin Build is not available on this deployment"})
 		return
 	}
 	if refuseAgentCredential(c) {
@@ -140,7 +140,7 @@ func (s *Server) ListKumbhaSecrets(c *gin.Context) {
 // DELETE /v1/kumbha/sessions/:id/secrets/:name
 func (s *Server) DeleteKumbhaSecret(c *gin.Context) {
 	if s.kumbha == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha Gateway is not available on this deployment"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Teepin Build is not available on this deployment"})
 		return
 	}
 	if refuseAgentCredential(c) {

@@ -101,7 +101,7 @@ func TestRender_UsageInvoiceShowsCatalogNamesNotRawTypes(t *testing.T) {
 	doc := render(t, usageInvoice())
 
 	mustContain(t, doc,
-		"CPU compute", "Kumbha",
+		"CPU compute", "Teepin Build",
 		"teepin/fast", "input tokens", "output tokens",
 		"45.01M tokens", "2.07M tokens", "176.08 hours",
 	)
@@ -184,7 +184,7 @@ func TestRender_LegacyUsageInvoiceIsClassifiedOnTheFly(t *testing.T) {
 	inv.LineItems[0].Description = "cpu.home"
 	inv.LineItems[2].Description = "kumbha/teepin/fast:input"
 	doc := render(t, inv)
-	mustContain(t, doc, "CPU compute", "Kumbha")
+	mustContain(t, doc, "CPU compute", "Teepin Build")
 	mustNotContain(t, doc, "cpu.home", "kumbha/teepin/fast:input")
 }
 

@@ -777,3 +777,208 @@ func TestGateway_WarnsOncePerHourWhenAModelIsPricedAtZero(t *testing.T) {
 		t.Error("not reported again after the hour")
 	}
 }
+
+// A completion that pushes the session past its budget has already been
+// answered by the model, so it is recorded, billed to the account and
+// delivered - not refused (which left it unbilled and made the harness retry,
+// paying the model again each time).
+func TestGateway_Complete_OvershootingTheBudgetIsStillBilledAndDelivered(t *testing.T) {
+	store, mock := newMockStore(t)
+	usage := &fakeUsageRecorder{}
+	result, err := completeWith(t, mock, store, usage, func() {
+		row := sqlmock.NewRows([]string{"status", "budget", "spent"}).AddRow("open", 1.0, 0.999)
+		// The first accrual refuses (over budget); the served-answer path then
+		// records it past the budget.
+		mock.ExpectBegin()
+		mock.ExpectQuery(`SELECT status, budget, spent FROM billing\.inference_sessions`).WillReturnRows(row)
+		mock.ExpectRollback()
+		mock.ExpectBegin()
+		mock.ExpectQuery(`SELECT status, budget, spent FROM billing\.inference_sessions`).
+			WillReturnRows(sqlmock.NewRows([]string{"status", "budget", "spent"}).AddRow("open", 1.0, 0.999))
+		mock.ExpectExec(`UPDATE billing\.inference_sessions SET spent`).WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectExec(`INSERT INTO billing\.inference_session_usage`).WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectCommit()
+	})
+	if err != nil || result == nil {
+		t.Fatalf("a served completion was refused for overshooting the budget: %v", err)
+	}
+	if len(usage.records) != 2 || len(usage.consumed) != 2 {
+		t.Errorf("account not billed for the overshoot: records=%d consumed=%v", len(usage.records), usage.consumed)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+// If the session was closed while the model was working, the tokens are still
+// owed and the answer is still returned.
+func TestGateway_Complete_SessionClosedMidFlightStillBillsAndDelivers(t *testing.T) {
+	store, mock := newMockStore(t)
+	usage := &fakeUsageRecorder{}
+	result, err := completeWith(t, mock, store, usage, func() {
+		mock.ExpectBegin()
+		mock.ExpectQuery(`SELECT status, budget, spent FROM billing\.inference_sessions`).
+			WillReturnRows(sqlmock.NewRows([]string{"status", "budget", "spent"}).AddRow("closed", 5.0, 0.0))
+		mock.ExpectRollback()
+	})
+	if err != nil || result == nil {
+		t.Fatalf("a served completion was refused because its session closed: %v", err)
+	}
+	if len(usage.records) != 2 || len(usage.consumed) != 2 {
+		t.Errorf("account not billed: records=%d consumed=%v", len(usage.records), usage.consumed)
+	}
+}
+
+// withUnavailable marks routes as down on top of a StaticModels backend.
+type withUnavailable struct {
+	StaticModels
+	down map[string]string
+}
+
+func (w withUnavailable) KumbhaModels(ctx context.Context) ([]Model, error) {
+	models, err := w.StaticModels.KumbhaModels(ctx)
+	for i := range models {
+		models[i].Unavailable = w.down[models[i].Route]
+	}
+	return models, err
+}
+
+// A build cannot be started on a model that cannot serve: it would fail at its
+// first step. The refusal names the model so the customer can pick another.
+func TestGateway_CreateSession_UnavailableModelIsRefused(t *testing.T) {
+	store, _ := newMockStore(t)
+	models := withUnavailable{
+		StaticModels: StaticModels{{Route: "teepin/a", Provider: &fakeProvider{}}, {Route: "teepin/b", Provider: &fakeProvider{}}},
+		down:         map[string]string{"teepin/a": "Not running right now"},
+	}
+	gw := NewGateway(store, models, &fakeGate{allowed: true}, &fakePricing{}, &fakeUsageRecorder{})
+	_, err := gw.CreateSession(context.Background(), uuid.New(), uuid.New(), 5.0, "test", "teepin/a")
+	if !errors.Is(err, ErrModelUnavailable) {
+		t.Fatalf("got %v, want ErrModelUnavailable", err)
+	}
+}
+
+// With no model named, the default skips a model that is down rather than
+// binding the session to it.
+func TestGateway_CreateSession_DefaultSkipsUnavailableModels(t *testing.T) {
+	store, mock := newMockStore(t)
+	accountID, projectID := uuid.New(), uuid.New()
+	models := withUnavailable{
+		StaticModels: StaticModels{{Route: "teepin/a", Provider: &fakeProvider{}}, {Route: "teepin/b", Provider: &fakeProvider{}}},
+		down:         map[string]string{"teepin/a": "Not running right now"},
+	}
+	mock.ExpectQuery(`INSERT INTO billing\.inference_sessions`).
+		WithArgs(accountID, projectID, 5.0, "test", "teepin/b").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "spent", "status", "started_at"}).
+			AddRow(uuid.New(), 0.0, "open", time.Now()))
+	gw := NewGateway(store, models, &fakeGate{allowed: true}, &fakePricing{}, &fakeUsageRecorder{})
+	if _, err := gw.CreateSession(context.Background(), accountID, projectID, 5.0, "test", ""); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+}
+
+func TestGateway_CreateSession_EveryModelDownIsRefused(t *testing.T) {
+	store, _ := newMockStore(t)
+	models := withUnavailable{
+		StaticModels: StaticModels{{Route: "teepin/a", Provider: &fakeProvider{}}},
+		down:         map[string]string{"teepin/a": "Not running right now"},
+	}
+	gw := NewGateway(store, models, &fakeGate{allowed: true}, &fakePricing{}, &fakeUsageRecorder{})
+	if _, err := gw.CreateSession(context.Background(), uuid.New(), uuid.New(), 5.0, "test", ""); !errors.Is(err, ErrModelUnavailable) {
+		t.Fatalf("got %v, want ErrModelUnavailable", err)
+	}
+}
+
+// The console shows how full the builder's context is: the size of the last
+// request to the model against the model's window. Unknown stays unknown.
+func TestGateway_ContextUsage_ReportsTheLastRequestAgainstTheWindow(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessID, accountID := uuid.New(), uuid.New()
+	expectAccrueOK(mock, sessID, accountID)
+	provider := &fakeProvider{name: "vllm", usage: inference.Usage{InputTokens: 12000, OutputTokens: 100}}
+	models := StaticModels{{Route: "teepin/fast", Engine: "vllm", ContextWindow: 32768, Provider: provider}}
+	gw := NewGateway(store, models, nil, &fakePricing{in: 2, out: 8}, &fakeUsageRecorder{})
+	sess := &Session{ID: sessID, AccountID: accountID, Status: "open", Budget: 5, ModelRoute: "teepin/fast"}
+
+	if _, _, ok := gw.ContextUsage(context.Background(), sess); ok {
+		t.Fatal("a context size was reported before any request")
+	}
+	if _, err := gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/fast"}); err != nil {
+		t.Fatal(err)
+	}
+	tokens, window, ok := gw.ContextUsage(context.Background(), sess)
+	if !ok || tokens != 12000 || window != 32768 {
+		t.Errorf("ContextUsage = (%d, %d, %v), want (12000, 32768, true)", tokens, window, ok)
+	}
+	// Another session is unaffected.
+	if _, _, ok := gw.ContextUsage(context.Background(), &Session{ID: uuid.New(), ModelRoute: "teepin/fast"}); ok {
+		t.Error("a different session inherited the reading")
+	}
+	// A stale reading is not shown as current.
+	gw.contextMu.Lock()
+	gw.contextSeen[sessID] = contextReading{tokens: 12000, at: time.Now().Add(-2 * contextReadingTTL)}
+	gw.contextMu.Unlock()
+	if _, _, ok := gw.ContextUsage(context.Background(), sess); ok {
+		t.Error("a stale reading was reported as current")
+	}
+}
+
+type fakeVendorCost struct{ in, out *float64 }
+
+func (f fakeVendorCost) ModelVendorCost(context.Context, string) (*float64, *float64) {
+	return f.in, f.out
+}
+
+// Each usage line records what the call cost Teepin (cost_basis), with the
+// prompt-cache discount on input, while the customer's charge is unchanged.
+func TestGateway_Complete_RecordsWhatTheCallCostTeepin(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessID, accountID := uuid.New(), uuid.New()
+	expectAccrueOK(mock, sessID, accountID)
+	three, fifteen := 3.0, 15.0
+	// 17,300 input tokens: 1,000 fresh, 16,000 read from the cache, 300 written.
+	provider := &fakeProvider{name: "anthropic", usage: inference.Usage{InputTokens: 17300, OutputTokens: 500, CachedInputTokens: 16000, CacheWriteTokens: 300}}
+	models := StaticModels{{Route: "teepin/fast", Engine: "anthropic", Provider: provider}}
+	usage := &fakeUsageRecorder{}
+	gw := NewGateway(store, models, nil, &fakePricing{in: 4, out: 20}, usage).WithVendorCost(fakeVendorCost{in: &three, out: &fifteen})
+	sess := &Session{ID: sessID, AccountID: accountID, Status: "open", Budget: 5, ModelRoute: "teepin/fast"}
+	if _, err := gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/fast"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(usage.records) != 2 {
+		t.Fatalf("records = %d, want input and output", len(usage.records))
+	}
+	in, out := usage.records[0], usage.records[1]
+	wantInBasis := (1000 + 16000*0.10 + 300*1.25) / 1e6 * 3
+	if d := in.CostBasis - wantInBasis; d < -1e-12 || d > 1e-12 {
+		t.Errorf("input cost basis = %v, want %v (cache-aware)", in.CostBasis, wantInBasis)
+	}
+	if d := out.CostBasis - 500.0/1e6*15; d < -1e-12 || d > 1e-12 {
+		t.Errorf("output cost basis = %v", out.CostBasis)
+	}
+	// The customer is charged on ALL input tokens at our rate, caching or not.
+	if want := 17300.0 / 1e6 * 4; in.TotalCost < want-1e-12 || in.TotalCost > want+1e-12 {
+		t.Errorf("customer charge = %v, want %v: caching must not change the bill", in.TotalCost, want)
+	}
+}
+
+// With no vendor cost recorded (or a self-hosted model) the basis stays 0
+// (unattributed), never a made-up figure.
+func TestGateway_Complete_NoVendorCostLeavesTheBasisUnattributed(t *testing.T) {
+	store, mock := newMockStore(t)
+	sessID, accountID := uuid.New(), uuid.New()
+	expectAccrueOK(mock, sessID, accountID)
+	provider := &fakeProvider{name: "vllm", usage: inference.Usage{InputTokens: 1000, OutputTokens: 500}}
+	models := StaticModels{{Route: "teepin/fast", Engine: "vllm", Provider: provider}}
+	usage := &fakeUsageRecorder{}
+	gw := NewGateway(store, models, nil, &fakePricing{in: 2, out: 8}, usage).WithVendorCost(fakeVendorCost{})
+	sess := &Session{ID: sessID, AccountID: accountID, Status: "open", Budget: 5, ModelRoute: "teepin/fast"}
+	if _, err := gw.Complete(context.Background(), sess, inference.Request{Model: "teepin/fast"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range usage.records {
+		if r.CostBasis != 0 {
+			t.Errorf("%s cost basis = %v, want 0 (unattributed)", r.ResourceType, r.CostBasis)
+		}
+	}
+}

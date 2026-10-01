@@ -359,7 +359,12 @@ func (b *kumbhaModelBackend) KumbhaModels(ctx context.Context) ([]kumbha.Model, 
 	}
 	out := make([]kumbha.Model, 0, len(models))
 	for _, m := range models {
+		unavailable := ""
+		if b.gateway != nil {
+			unavailable = b.gateway.Status(ctx, m).Unservable()
+		}
 		out = append(out, kumbha.Model{
+			Unavailable:           unavailable,
 			Route:                 m.ModelRoute,
 			DisplayName:           m.DisplayName,
 			Engine:                m.Engine,
@@ -369,6 +374,7 @@ func (b *kumbhaModelBackend) KumbhaModels(ctx context.Context) ([]kumbha.Model, 
 			SupportsVision:        m.SupportsVision,
 			SupportsAudio:         m.SupportsAudio,
 			ContextWindow:         m.ContextWindow,
+			MaxOutputTokens:       m.MaxOutputTokens,
 			InputPricePerMillion:  m.InputPricePerMillion,
 			OutputPricePerMillion: m.OutputPricePerMillion,
 		})

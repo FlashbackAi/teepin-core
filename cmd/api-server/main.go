@@ -52,6 +52,7 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/objectstore/shelbybackend"
 	"github.com/FlashbackAi/teepin-core/pkg/payments"
 	"github.com/FlashbackAi/teepin-core/pkg/ratelimit"
+	"github.com/FlashbackAi/teepin-core/pkg/solana"
 	"github.com/FlashbackAi/teepin-core/pkg/statuspage"
 	s3storage "github.com/FlashbackAi/teepin-core/pkg/storage/s3"
 )
@@ -189,6 +190,44 @@ func main() {
 		// below the customer's threshold. Off for every account until the
 		// customer turns it on.
 		go billing.NewAutoRecharger(dbClient.DB(), billingService, billingMailer).Start(context.Background())
+
+		// USDC on Solana: customers pay a Solana Pay request into Teepin's wallet
+		// and the watcher turns each finalized payment into credit. Off unless
+		// TEEPIN_SOLANA_NETWORK is set; once it is, incomplete or malformed
+		// settings stop startup, because a payment address that is silently wrong
+		// would send customers' money to the wrong place. Teepin holds no keys: only
+		// the PUBLIC address is configured. The RPC URL carries a provider key and is
+		// never logged.
+		if network := os.Getenv("TEEPIN_SOLANA_NETWORK"); network != "" {
+			solanaNetwork, err := solana.ParseNetwork(network)
+			if err != nil {
+				log.Fatalf("TEEPIN_SOLANA_NETWORK: %v", err)
+			}
+			mint, err := solana.USDCMint(solanaNetwork)
+			if err != nil {
+				log.Fatalf("TEEPIN_SOLANA_NETWORK: %v", err)
+			}
+			rpcURL := os.Getenv("TEEPIN_SOLANA_RPC_URL")
+			if rpcURL == "" && solanaNetwork == solana.Devnet {
+				rpcURL = "https://api.devnet.solana.com" // public and keyless; fine for testing
+			}
+			if rpcURL == "" {
+				log.Fatalf("TEEPIN_SOLANA_RPC_URL is required for %s", solanaNetwork)
+			}
+			rpcClient, err := solana.NewHTTPClient(rpcURL)
+			if err != nil {
+				log.Fatalf("TEEPIN_SOLANA_RPC_URL: %v", err)
+			}
+			if _, err := billingService.WithSolana(billing.SolanaConfig{
+				Network: solanaNetwork, Recipient: os.Getenv("TEEPIN_SOLANA_RECIPIENT"), Mint: mint,
+			}, rpcClient); err != nil {
+				log.Fatalf("TEEPIN_SOLANA_RECIPIENT: %v", err)
+			}
+			go billing.NewCryptoWatcher(billingService).Start(context.Background())
+			log.Printf("USDC payments enabled on Solana %s", solanaNetwork)
+		} else {
+			log.Println("USDC payments not configured (TEEPIN_SOLANA_NETWORK unset)")
+		}
 	}
 
 	// Home-compute pilot: consumer-grade nodes as CPU capacity. Behind a
@@ -515,6 +554,7 @@ func main() {
 			usage = billingService
 		}
 		publicInferenceHandler = api.NewInferenceHandler(inferenceGateway, modelCatalogService, usage)
+		publicInferenceHandler.WithModelStatus(inferenceGateway)
 		if billingService != nil {
 			// Refuse requests the account has no credit to pay for. Guarded
 			// so a nil billingService never becomes a typed-nil interface.
@@ -827,6 +867,11 @@ func main() {
 	// later, once checkOrigin exists — mirroring execTickets/execHandler's
 	// own two-stage construction for the same reason.
 	var kumbhaEventTickets *kumbha.EventTicketStore
+	// The agent's activity feed is kept in the database (migration 068), so it
+	// outlives the pod. The recorder tails each agent pod's log itself; the
+	// store is shared with the relay for replay.
+	var kumbhaEventStore *kumbha.Store
+	var kumbhaRecorder *kumbha.Recorder
 
 	// Kumbha Gateway: Teepin auth + sessions + credits around the build
 	// agent's model calls (KUMBHA-DESIGN.md). Kumbha has no models of its
@@ -844,6 +889,7 @@ func main() {
 		log.Println("WARN: TEEPIN_KUMBHA_ENABLED is set, but Kumbha needs the database and Teepin Inference — Kumbha Gateway disabled")
 	} else {
 		kumbhaStore := kumbha.NewStore(dbClient.DB())
+		kumbhaEventStore = kumbhaStore
 		// Secrets a customer enters for their app are stored sealed under
 		// the platform encryption key. Without it the console cannot offer
 		// a secure field at all (saving answers 404) and the agent's
@@ -860,6 +906,7 @@ func main() {
 		kumbhaGateway := kumbha.NewGateway(kumbhaStore, newKumbhaModelBackend(modelCatalogService, inferenceGateway),
 			billingService, billingService, billingService).
 			WithModelPricing(modelCatalogService).
+			WithVendorCost(modelCatalogService).
 			WithCreditGuard(billingService)
 
 		// Capacity-aware placement for Kumbha's own agent/screenshot
@@ -930,6 +977,13 @@ func main() {
 		} else {
 			log.Println("Kumbha agent pod orchestration not configured (TEEPIN_KUMBHA_AGENT_IMAGE unset) — LaunchAgent unavailable")
 		}
+
+		// Start recording each agent pod's feed the moment it launches. The
+		// recorder itself is built with the event relay below; Ensure is a
+		// no-op until then.
+		kumbhaGateway = kumbhaGateway.WithAgentLaunchHook(func(sess *kumbha.Session, launchSeq int) {
+			kumbhaRecorder.Ensure(sess.ID, sess.ProjectID, sess.AgentInstanceID, launchSeq)
+		})
 
 		apiServer = apiServer.WithKumbha(kumbhaGateway)
 
@@ -1097,6 +1151,10 @@ func main() {
 	var kumbhaEventsHandler *kumbha.EventsHandler
 	if kumbhaEventTickets != nil {
 		kumbhaEventsHandler = kumbha.NewEventsHandler(clusterClient, kumbhaEventTickets, checkOrigin)
+		if kumbhaEventStore != nil {
+			kumbhaRecorder = kumbha.NewRecorder(kumbhaEventsHandler, kumbhaEventStore)
+			kumbhaEventsHandler.WithHistory(kumbhaEventStore, kumbhaRecorder)
+		}
 		log.Println("Kumbha event relay enabled (agent activity streamed over the existing log pipeline)")
 	}
 
@@ -1517,6 +1575,8 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 				billing.GET("/credits/auto-recharge", billingHandler.GetAutoRecharge)
 				billing.PUT("/credits/auto-recharge", billingHandler.PutAutoRecharge)
 				billing.POST("/credits/topups", billingHandler.CreateCreditTopUp)
+				billing.GET("/credits/crypto", billingHandler.GetCryptoTopUpConfig)
+				billing.POST("/credits/crypto-topups", billingHandler.CreateCryptoTopUp)
 				billing.GET("/credits/topups", billingHandler.ListCreditTopUps)
 				billing.GET("/credits/topups/:id", billingHandler.GetCreditTopUp)
 				billing.GET("/pricing", billingHandler.GetPricing)
@@ -1546,6 +1606,9 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 			// (removed — a session is always resumable via a new message).
 			kumbhaGroup.POST("/sessions/:id/stop", apiServer.StopKumbhaAgent)
 			kumbhaGroup.POST("/sessions/:id/approve-deploy", apiServer.ApproveKumbhaDeploy)
+			// The agent records each deployment plan it presents; the
+			// customer's approval then names one of them.
+			kumbhaGroup.POST("/sessions/:id/plans", apiServer.RecordKumbhaPlan)
 			kumbhaGroup.PATCH("/sessions/:id/budget", apiServer.UpdateKumbhaBudget)
 			// Secrets the customer enters for their app. Deliberately NOT on
 			// the agent's route allowlist: the value must never pass through

@@ -165,6 +165,7 @@ func TestCreateInstance_InjectsTheCustomersSecretsIntoTheAppSpec(t *testing.T) {
 	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
 		WithArgs(sessionID, testAccountID).
 		WillReturnRows(approvedSessionRow(sessionID))
+	expectNoApprovedPlan(mock, sessionID)
 	mock.ExpectQuery(`SELECT k\.name, k\.sealed`).WithArgs(sessionID, testAccountID).
 		WillReturnRows(sqlmock.NewRows([]string{"name", "sealed"}).AddRow("AMADEUS_CLIENT_ID", sealed))
 	mock.ExpectQuery(`INSERT INTO compute\.instances`).WillReturnRows(

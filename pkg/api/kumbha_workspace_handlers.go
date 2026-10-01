@@ -58,7 +58,7 @@ type workspaceSaveRequest struct {
 // PUT /v1/kumbha/sessions/:id/workspace
 func (s *Server) UploadKumbhaWorkspace(c *gin.Context) {
 	if s.kumbha == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha Gateway is not available on this deployment"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Teepin Build is not available on this deployment"})
 		return
 	}
 
@@ -74,7 +74,7 @@ func (s *Server) UploadKumbhaWorkspace(c *gin.Context) {
 	// can pass that reaches another session's row.
 	callerSession, ok := auth.GetSessionID(c)
 	if !ok {
-		c.JSON(http.StatusForbidden, gin.H{"error": "this endpoint requires a Kumbha session credential"})
+		c.JSON(http.StatusForbidden, gin.H{"error": "this endpoint requires a Teepin Build session credential"})
 		return
 	}
 	if callerSession != sessionID {
@@ -102,7 +102,7 @@ func (s *Server) UploadKumbhaWorkspace(c *gin.Context) {
 // POST /v1/kumbha/sessions/:id/workspace
 func (s *Server) SaveKumbhaWorkspace(c *gin.Context) {
 	if s.kumbha == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha Gateway is not available on this deployment"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Teepin Build is not available on this deployment"})
 		return
 	}
 
@@ -181,7 +181,7 @@ func (s *Server) GetKumbhaWorkspace(c *gin.Context) {
 // GET /v1/kumbha/sessions/:id/workspace/versions
 func (s *Server) ListKumbhaWorkspaceVersions(c *gin.Context) {
 	if s.kumbha == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha Gateway is not available on this deployment"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Teepin Build is not available on this deployment"})
 		return
 	}
 
@@ -217,7 +217,7 @@ type rollbackWorkspaceRequest struct {
 // POST /v1/kumbha/sessions/:id/workspace/rollback
 func (s *Server) RollbackKumbhaWorkspace(c *gin.Context) {
 	if s.kumbha == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha Gateway is not available on this deployment"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Teepin Build is not available on this deployment"})
 		return
 	}
 
@@ -284,7 +284,7 @@ func (s *Server) DownloadKumbhaWorkspace(c *gin.Context) {
 // own account, and either the current version or an explicit ?version=N.
 func (s *Server) loadCustomerWorkspace(c *gin.Context) (*kumbha.Snapshot, uuid.UUID, bool) {
 	if s.kumbha == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha Gateway is not available on this deployment"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Teepin Build is not available on this deployment"})
 		return nil, uuid.Nil, false
 	}
 

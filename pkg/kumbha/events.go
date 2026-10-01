@@ -191,6 +191,12 @@ type logLineWriter struct {
 	// never reachable yet" (retry) apart from "it streamed real output,
 	// then legitimately ended" (stop, same as before this existed).
 	sawData bool
+	// lineNo counts every complete line written so far (parseable or not),
+	// so a line has the same number each time a pod's log is replayed from
+	// its start. onLine, if set, is told each accepted line with its number;
+	// it is how the recorder stores events with no browser attached.
+	lineNo int
+	onLine func(lineNo int, sanitized json.RawMessage)
 }
 
 func (w *logLineWriter) Write(p []byte) (int, error) {
@@ -205,7 +211,11 @@ func (w *logLineWriter) Write(p []byte) (int, error) {
 		}
 		line := w.buf[:i]
 		w.buf = w.buf[i+1:]
+		w.lineNo++
 		if sanitized, ok := sanitizeEventLine(line); ok {
+			if w.onLine != nil {
+				w.onLine(w.lineNo, sanitized)
+			}
 			select {
 			case w.events <- sanitized:
 			default:
@@ -246,6 +256,33 @@ type EventsHandler struct {
 	// sleeps; NewEventsHandler sets the real production values.
 	streamRetryInterval time.Duration
 	streamRetryBudget   time.Duration
+
+	// history and recorder keep the feed beyond the pod's own log (see
+	// WithHistory). Both nil leaves the relay exactly as it was: a live tail
+	// of the pod and nothing else.
+	history  EventHistory
+	recorder *Recorder
+}
+
+// WithHistory makes the relay replay stored events before the live tail (the
+// feed of earlier agent launches, whose pods and logs are gone) and fall back
+// to them when the current pod's log cannot be read. recorder, if set, is
+// started for the session so events are kept even with no browser open.
+func (h *EventsHandler) WithHistory(history EventHistory, recorder *Recorder) *EventsHandler {
+	h.history = history
+	h.recorder = recorder
+	return h
+}
+
+// sendStored writes stored event payloads to the browser, oldest first.
+func (h *EventsHandler) sendStored(conn *websocket.Conn, events []json.RawMessage) error {
+	for _, ev := range events {
+		_ = conn.SetWriteDeadline(time.Now().Add(eventsWriteWait))
+		if err := conn.WriteMessage(websocket.TextMessage, ev); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 const (
@@ -312,23 +349,32 @@ type wsServerFrame struct {
 // Only once the pod is confirmed gone (or its status can no longer be
 // read) is this treated as a legitimate end and the error returned.
 func (h *EventsHandler) streamLogsWithRetry(ctx context.Context, scope cluster.Scope, instanceID string, events chan<- json.RawMessage) error {
+	_, err := h.tailLogs(ctx, scope, instanceID, events, nil)
+	return err
+}
+
+// tailLogs is streamLogsWithRetry's body. events may be nil (the recorder only
+// wants onLine). sawAny reports whether the pod's log ever yielded a byte, so
+// a caller can tell "the pod is gone" from "it ran and ended".
+func (h *EventsHandler) tailLogs(ctx context.Context, scope cluster.Scope, instanceID string, events chan<- json.RawMessage, onLine func(int, json.RawMessage)) (sawAny bool, err error) {
 	coldStartDeadline := time.Now().Add(h.streamRetryBudget)
 
 	for {
-		writer := &logLineWriter{events: events}
+		writer := &logLineWriter{events: events, onLine: onLine}
 		err := h.cluster.StreamLogs(ctx, scope, instanceID, cluster.LogOptions{Follow: true}, writer)
+		sawAny = sawAny || writer.sawData
 
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return sawAny, ctx.Err()
 		}
 
 		if !writer.sawData {
 			if time.Now().After(coldStartDeadline) {
-				return err
+				return sawAny, err
 			}
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return sawAny, ctx.Err()
 			case <-time.After(h.streamRetryInterval):
 				continue
 			}
@@ -338,13 +384,13 @@ func (h *EventsHandler) streamLogsWithRetry(ctx context.Context, scope cluster.S
 		if statusErr == nil && status.Status == "running" {
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return sawAny, ctx.Err()
 			case <-time.After(h.streamRetryInterval):
 				continue
 			}
 		}
 
-		return err
+		return sawAny, err
 	}
 }
 
@@ -384,9 +430,29 @@ func (h *EventsHandler) ServeSession(w http.ResponseWriter, r *http.Request, ses
 		closeWithError(conn, wsCloseAuthFailed, "expired", "the session ticket is invalid, expired, or already used")
 		return
 	}
+	sessionUUID := ticket.SessionID
+	launchSeq := 0
+	if h.history != nil {
+		if seq, err := h.history.AgentLaunchSeq(r.Context(), sessionUUID); err == nil {
+			launchSeq = seq
+		}
+	}
 	if ticket.AgentInstanceID == "" {
+		// No pod to tail. A session that already ran still has its history.
+		if h.history != nil && launchSeq > 0 {
+			if stored, err := h.history.ListEvents(r.Context(), sessionUUID, 0, launchSeq); err == nil && len(stored) > 0 {
+				if h.sendStored(conn, stored) == nil {
+					_ = conn.SetWriteDeadline(time.Now().Add(eventsWriteWait))
+					_ = conn.WriteJSON(wsServerFrame{Type: "closed"})
+				}
+				return
+			}
+		}
 		closeWithError(conn, wsCloseNotFound, "not_found", "this session has no agent running yet")
 		return
+	}
+	if h.recorder != nil && h.history != nil {
+		h.recorder.Ensure(sessionUUID, ticket.ProjectID, ticket.AgentInstanceID, launchSeq)
 	}
 
 	// THE actual bug behind every "activity stream keeps disconnecting"
@@ -420,12 +486,26 @@ func (h *EventsHandler) ServeSession(w http.ResponseWriter, r *http.Request, ses
 		}
 	}()
 
+	// Earlier launches first: their pods (and logs) are gone, so these come
+	// only from the store. The current launch's own events arrive from the
+	// live tail below, which replays the pod's log from its first line.
+	if h.history != nil && launchSeq > 1 {
+		if stored, err := h.history.ListEvents(ctx, sessionUUID, 0, launchSeq-1); err == nil {
+			if h.sendStored(conn, stored) != nil {
+				return
+			}
+		}
+	}
+
 	events := make(chan json.RawMessage, eventsChannelSize)
 	streamErr := make(chan error, 1)
+	sawLog := make(chan bool, 1)
 	scope := cluster.ProjectScope(ticket.ProjectID.String())
 	go func() {
 		defer close(events)
-		streamErr <- h.streamLogsWithRetry(ctx, scope, ticket.AgentInstanceID, events)
+		saw, err := h.tailLogs(ctx, scope, ticket.AgentInstanceID, events, nil)
+		sawLog <- saw
+		streamErr <- err
 	}()
 
 	pingTicker := time.NewTicker(eventsPingInterval)
@@ -448,7 +528,20 @@ func (h *EventsHandler) ServeSession(w http.ResponseWriter, r *http.Request, ses
 				// A nil error here is the normal "agent finished" case, not
 				// a failure, so it gets a plain "closed" frame rather than
 				// "error".
-				if err := <-streamErr; err != nil {
+				saw := <-sawLog
+				err := <-streamErr
+				if !saw && h.history != nil && ctx.Err() == nil {
+					// The pod's log was never readable (the pod is gone): the
+					// stored feed of this launch is what is left.
+					if stored, lerr := h.history.ListEvents(ctx, sessionUUID, launchSeq, launchSeq); lerr == nil && len(stored) > 0 {
+						if h.sendStored(conn, stored) == nil {
+							_ = conn.SetWriteDeadline(time.Now().Add(eventsWriteWait))
+							_ = conn.WriteJSON(wsServerFrame{Type: "closed"})
+						}
+						return
+					}
+				}
+				if err != nil {
 					closeWithError(conn, wsCloseNotFound, "stream_ended", err.Error())
 					return
 				}

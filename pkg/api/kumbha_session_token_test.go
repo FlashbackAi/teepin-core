@@ -32,6 +32,22 @@ func approvedSessionRow(sessionID uuid.UUID) *sqlmock.Rows {
 	}).AddRow(sessionID, testAccountID, uuid.New(), 5.0, 0.0, "open", nil, nil, nil, true, nowStub(), nil, false, nil, nil, "teepin/fast")
 }
 
+// expectNoApprovedPlan is the plan-gate query for a session with no plan bound
+// to it (the legacy case: the deploy_approved flag alone decides).
+func expectNoApprovedPlan(mock sqlmock.Sqlmock, sessionID uuid.UUID) {
+	mock.ExpectQuery(`FROM billing\.inference_sessions s\s+JOIN billing\.kumbha_plans`).
+		WithArgs(sessionID).
+		WillReturnRows(sqlmock.NewRows([]string{"resources"}))
+}
+
+// expectApprovedPlan is the same query for a session whose approved plan has
+// the given resources (a JSON array of plan lines).
+func expectApprovedPlan(mock sqlmock.Sqlmock, sessionID uuid.UUID, resourcesJSON string) {
+	mock.ExpectQuery(`FROM billing\.inference_sessions s\s+JOIN billing\.kumbha_plans`).
+		WithArgs(sessionID).
+		WillReturnRows(sqlmock.NewRows([]string{"resources"}).AddRow([]byte(resourcesJSON)))
+}
+
 // createInstanceAsSession calls CreateInstance carrying a session credential.
 func createInstanceAsSession(server *Server, sessionID uuid.UUID) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()

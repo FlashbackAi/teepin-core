@@ -10,7 +10,7 @@ import (
 
 // The service catalog turns the platform's internal usage identifiers
 // ("cpu.home", "kumbha/teepin/fast:input", "object_storage_gb_month") into the
-// names a customer reads on an invoice ("CPU compute", "Kumbha", "Object
+// names a customer reads on an invoice ("CPU compute", "Teepin Build", "Object
 // storage"). It is the single place that mapping lives: the invoice, the
 // billing summary and any future statement all classify through it, so a new
 // service is one added rule here instead of a hunt through several files.
@@ -61,7 +61,7 @@ var serviceRules = []catalogRule{
 	}},
 	{"kumbha/", func(_, rest, _ string) Presentation {
 		route, direction := splitDirection(rest)
-		return Presentation{Service: "Kumbha", Title: tokenTitle(route, direction), Rate: "per 1M tokens", Scale: 1e6}
+		return Presentation{Service: "Teepin Build", Title: tokenTitle(route, direction), Rate: "per 1M tokens", Scale: 1e6}
 	}},
 	{"inference/", func(_, rest, _ string) Presentation {
 		route, direction := splitDirection(rest)

@@ -87,7 +87,21 @@ type registerModelRequest struct {
 	// requires re-pasting its key.
 	APIKey string `json:"api_key,omitempty"`
 
+	// Customer prices per million tokens, set in the same call. Omitted leaves a
+	// stored price alone. A model cannot be enabled, or offered anywhere, without
+	// both prices above zero (modelcatalog.ErrPricingRequired).
+	InputPricePerMillion  *float64 `json:"input_price_per_million"`
+	OutputPricePerMillion *float64 `json:"output_price_per_million"`
+
 	availabilityRequest
+}
+
+// writePricingRequired answers a change the catalog refused for want of a price.
+func writePricingRequired(c *gin.Context) {
+	c.JSON(http.StatusConflict, gin.H{
+		"error": modelcatalog.ErrPricingRequired.Error(),
+		"code":  "pricing_required",
+	})
 }
 
 // availabilityRequest is where a model may be used; a nil field is left as
@@ -123,7 +137,7 @@ func (h *ModelCatalogHandler) RegisterModel(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	updatedBy := "admin-api"
-	err := h.catalog.RegisterModel(ctx, modelcatalog.Model{
+	err := h.catalog.RegisterModelWithPricing(ctx, modelcatalog.Model{
 		ModelRoute:      req.ModelRoute,
 		DisplayName:     req.DisplayName,
 		CostClass:       modelcatalog.CostClass(req.CostClass),
@@ -138,14 +152,24 @@ func (h *ModelCatalogHandler) RegisterModel(c *gin.Context) {
 		BaseURL:         req.BaseURL,
 		MaxOutputTokens: req.MaxOutputTokens,
 		UpdatedBy:       &updatedBy,
-	})
+	}, req.InputPricePerMillion, req.OutputPricePerMillion)
 	if err != nil {
+		if errors.Is(err, modelcatalog.ErrPricingRequired) {
+			writePricingRequired(c)
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
 	if req.availabilityRequest.any() {
 		if err := h.catalog.SetAvailability(ctx, req.ModelRoute, req.toAvailability(), updatedBy); err != nil {
+			if errors.Is(err, modelcatalog.ErrPricingRequired) {
+				// The model itself saved (switched off); only making it
+				// available was refused.
+				writePricingRequired(c)
+				return
+			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
@@ -244,6 +268,10 @@ func (h *ModelCatalogHandler) SetAvailability(c *gin.Context) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "model not found"})
 			return
 		}
+		if errors.Is(err, modelcatalog.ErrPricingRequired) {
+			writePricingRequired(c)
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -275,8 +303,8 @@ type setModelPricingRequest struct {
 }
 
 // SetPricing is PUT /v1/admin/inference/models/pricing?model_route=...
-// Zero is a valid rate ("do not charge"), same contract as every other
-// price this platform exposes.
+// Zero is accepted only while the model is switched off (not priced yet); a
+// model that is available must keep both prices above zero.
 func (h *ModelCatalogHandler) SetPricing(c *gin.Context) {
 	route := c.Query("model_route")
 	if route == "" {
@@ -291,6 +319,13 @@ func (h *ModelCatalogHandler) SetPricing(c *gin.Context) {
 	if err := h.catalog.SetPricing(c.Request.Context(), route, req.InputPricePerMillion, req.OutputPricePerMillion, "admin-api"); err != nil {
 		if errors.Is(err, modelcatalog.ErrNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "model not found"})
+			return
+		}
+		if errors.Is(err, modelcatalog.ErrPricingRequired) {
+			c.JSON(http.StatusConflict, gin.H{
+				"error": "this model is available, so both prices must stay above zero; take it out of service before clearing its price",
+				"code":  "pricing_required",
+			})
 			return
 		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -354,6 +389,10 @@ func (h *ModelCatalogHandler) SetEnabled(c *gin.Context) {
 	if err := h.catalog.SetEnabled(c.Request.Context(), route, req.Enabled, "admin-api"); err != nil {
 		if errors.Is(err, modelcatalog.ErrNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "model not found"})
+			return
+		}
+		if errors.Is(err, modelcatalog.ErrPricingRequired) {
+			writePricingRequired(c)
 			return
 		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})

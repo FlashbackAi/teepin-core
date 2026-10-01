@@ -73,6 +73,14 @@ type InferenceHandler struct {
 	catalog catalogReader
 	usage   usageRecorder
 	credit  creditChecker
+	status  ModelStatusSource
+}
+
+// WithModelStatus lets the Kumbha model list say which models can serve right
+// now, so the picker can disable the ones that cannot.
+func (h *InferenceHandler) WithModelStatus(src ModelStatusSource) *InferenceHandler {
+	h.status = src
+	return h
 }
 
 // creditChecker answers whether an account can pay for a request before it
@@ -459,6 +467,11 @@ func (h *InferenceHandler) settle(ctx context.Context, accountID, projectID uuid
 		}
 		if l.vendorPerMillon != nil {
 			record.CostBasis = float64(l.tokens) / 1e6 * *l.vendorPerMillon
+			if l.resource == "input" {
+				// What the input really cost Teepin, counting the prompt-cache
+				// discount; the customer's price above is unaffected.
+				record.CostBasis = inference.VendorInputCost(*usage, *l.vendorPerMillon)
+			}
 		}
 		if err := h.usage.RecordUsage(ctx, record); err != nil {
 			log.Printf("inference: failed to record %s for %s/%s: %v", l.resource, accountID, model.ModelRoute, err)
@@ -598,6 +611,10 @@ type kumbhaModelView struct {
 	Vision        bool    `json:"supports_vision"`
 	Audio         bool    `json:"supports_audio"`
 	Pricing       pricing `json:"pricing"`
+	// Available is false when the model cannot serve right now; Unavailable
+	// then says why, in words a customer can read.
+	Available   bool   `json:"available"`
+	Unavailable string `json:"unavailable_reason,omitempty"`
 }
 
 // GetKumbhaModels is GET /v1/kumbha/models: every enabled, Kumbha-enabled
@@ -630,7 +647,12 @@ func (h *InferenceHandler) GetKumbhaModels(c *gin.Context) {
 
 	out := make([]kumbhaModelView, 0, len(enabled))
 	for _, m := range enabled {
+		unavailable := ""
+		if h.status != nil {
+			unavailable = h.status.Status(c.Request.Context(), m).Unservable()
+		}
 		out = append(out, kumbhaModelView{
+			Available: unavailable == "", Unavailable: unavailable,
 			Route: m.ModelRoute, DisplayName: m.DisplayName,
 			Confidential:  m.Provider == modelcatalog.ProviderTinfoilConfidential,
 			SelfHosted:    !m.Provider.IsThirdParty(),

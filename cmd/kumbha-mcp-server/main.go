@@ -372,6 +372,9 @@ func (c *teepinClient) presentDeploymentPlan(ctx context.Context, req *mcp.CallT
 		// (and an operator reading the event log) sees with the plan.
 		Verification              string `json:"verification,omitempty"`
 		VerificationSkippedReason string `json:"verification_skipped_reason,omitempty"`
+		// PlanID names this plan on the control plane. The customer's approval
+		// carries it back, so what is approved is this plan, not "any plan".
+		PlanID string `json:"plan_id,omitempty"`
 	}{
 		Verification:              strings.TrimSpace(args.Verification),
 		VerificationSkippedReason: strings.TrimSpace(args.VerificationSkippedReason),
@@ -397,6 +400,12 @@ func (c *teepinClient) presentDeploymentPlan(ctx context.Context, req *mcp.CallT
 	// OpenHands event pipeline (an MCP call is an ordinary ActionEvent/
 	// ObservationEvent pair to the SDK), so no separate plumbing is
 	// needed to get it to the console.
+	planID, err := c.recordPlan(ctx, args.Resources)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to record the deployment plan: %w", err)
+	}
+	plan.PlanID = planID
+
 	body, err := json.Marshal(plan)
 	if err != nil {
 		return nil, nil, fmt.Errorf("encode deployment plan: %w", err)
@@ -404,6 +413,37 @@ func (c *teepinClient) presentDeploymentPlan(ctx context.Context, req *mcp.CallT
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: string(body)}},
 	}, nil, nil
+}
+
+// recordPlan stores the plan on the control plane and returns its id, so the
+// customer's approval can name it. A control plane that predates plan records
+// answers 404; the plan is then shown without an id and approved the old way,
+// rather than the agent being unable to present anything at all.
+func (c *teepinClient) recordPlan(ctx context.Context, resources []resourceRequest) (string, error) {
+	type line struct {
+		Name      string `json:"name"`
+		CPUUnits  int    `json:"cpu_units"`
+		MemoryGB  int    `json:"memory_gb"`
+		StorageGB int    `json:"storage_gb"`
+	}
+	body := struct {
+		Resources []line `json:"resources"`
+	}{}
+	for _, r := range resources {
+		body.Resources = append(body.Resources, line{r.Name, r.CPUUnits, r.MemoryGB, r.StorageGB})
+	}
+	var out struct {
+		PlanID string `json:"plan_id"`
+	}
+	err := c.doJSON(ctx, http.MethodPost, "/v1/kumbha/sessions/"+c.sessionID+"/plans", body, &out)
+	if err != nil {
+		if strings.Contains(err.Error(), "status 404") {
+			log.Printf("teepin-mcp-server: control plane does not record plans yet, presenting without a plan id: %v", err)
+			return "", nil
+		}
+		return "", err
+	}
+	return out.PlanID, nil
 }
 
 // --- create_instance ---

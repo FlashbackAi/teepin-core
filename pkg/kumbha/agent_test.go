@@ -231,8 +231,8 @@ func TestGateway_LaunchAgent_PassesTheRoutesContextWindow(t *testing.T) {
 			store, mock := newMockStore(t)
 			fc := &fakeCluster{}
 			models := StaticModels{
-				{Route: "teepin/other", Engine: "vllm", ContextWindow: 999999, Provider: &fakeProvider{name: "vllm"}},
-				{Route: "teepin/chosen", Engine: "vllm", ContextWindow: tc.window, Provider: &fakeProvider{name: "vllm"}},
+				{Route: "teepin/other", Engine: "vllm", ContextWindow: 999999, MaxOutputTokens: 1, Provider: &fakeProvider{name: "vllm"}},
+				{Route: "teepin/chosen", Engine: "vllm", ContextWindow: tc.window, MaxOutputTokens: map[bool]int{true: 8192}[tc.window > 0], Provider: &fakeProvider{name: "vllm"}},
 			}
 			gw := NewGateway(store, models, nil, &fakePricing{}, &fakeUsageRecorder{}).
 				WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest", CPUUnits: 2, MemoryGB: 4})
@@ -248,6 +248,13 @@ func TestGateway_LaunchAgent_PassesTheRoutesContextWindow(t *testing.T) {
 			}
 			if got := fc.created[0].Env["TEEPIN_CONTEXT_WINDOW"]; got != tc.want {
 				t.Errorf("TEEPIN_CONTEXT_WINDOW = %q, want %q (must come from the session's own route, not another model's)", got, tc.want)
+			}
+			wantOut := "0"
+			if tc.window > 0 {
+				wantOut = "8192"
+			}
+			if got := fc.created[0].Env["TEEPIN_MAX_OUTPUT_TOKENS"]; got != wantOut {
+				t.Errorf("TEEPIN_MAX_OUTPUT_TOKENS = %q, want %q (the session's own route, not another model's)", got, wantOut)
 			}
 		})
 	}

@@ -251,6 +251,8 @@ func (p *AnthropicProvider) Complete(ctx context.Context, req Request) (*Respons
 		maxTokens = p.maxOutputTokens
 	}
 
+	applyCacheBreakpoints(system, tools, messages)
+
 	resp, err := p.client.Messages.New(ctx, anthropic.MessageNewParams{
 		Model:      anthropic.Model(p.model),
 		MaxTokens:  int64(maxTokens),
@@ -274,9 +276,14 @@ func (p *AnthropicProvider) Complete(ctx context.Context, req Request) (*Respons
 		}
 	}
 
+	// With caching, Anthropic reports input_tokens as only the part it processed
+	// fresh; the cached parts come separately. The customer is billed on all of
+	// it, so they are summed back together here.
 	usage := Usage{
-		InputTokens:  int(resp.Usage.InputTokens),
-		OutputTokens: int(resp.Usage.OutputTokens),
+		InputTokens:       int(resp.Usage.InputTokens + resp.Usage.CacheReadInputTokens + resp.Usage.CacheCreationInputTokens),
+		OutputTokens:      int(resp.Usage.OutputTokens),
+		CachedInputTokens: int(resp.Usage.CacheReadInputTokens),
+		CacheWriteTokens:  int(resp.Usage.CacheCreationInputTokens),
 	}
 
 	// The response the gateway forwards to the caller is built fresh in
@@ -300,6 +307,9 @@ func (p *AnthropicProvider) Complete(ctx context.Context, req Request) (*Respons
 		Usage: openAIUsageBody{
 			PromptTokens:     usage.InputTokens,
 			CompletionTokens: usage.OutputTokens,
+			PromptTokensDetails: &openAIPromptDetails{
+				CachedTokens: usage.CachedInputTokens,
+			},
 		},
 	})
 	if err != nil {
@@ -369,6 +379,13 @@ type openAIResponseMessage struct {
 type openAIUsageBody struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
+	// PromptTokensDetails reports how much of the prompt came from the cache, in
+	// OpenAI's own shape, so a harness's cache-hit metrics work unchanged.
+	PromptTokensDetails *openAIPromptDetails `json:"prompt_tokens_details,omitempty"`
+}
+
+type openAIPromptDetails struct {
+	CachedTokens int `json:"cached_tokens"`
 }
 
 // mapAnthropicStopReason translates Anthropic's stop_reason vocabulary

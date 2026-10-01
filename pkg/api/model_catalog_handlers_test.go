@@ -95,7 +95,7 @@ func TestRegisterModel_Success(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	expectModelRow(mock, "teepin/qwen3-omni-7b", "node", "")
 
-	body := []byte(`{"model_route":"teepin/qwen3-omni-7b","display_name":"Qwen3 Omni 7B","cost_class":"own","engine":"vllm-omni","context_window":32768,"supports_tools":true,"supports_vision":true,"supports_audio":true,"enabled":true}`)
+	body := []byte(`{"model_route":"teepin/qwen3-omni-7b","display_name":"Qwen3 Omni 7B","cost_class":"own","engine":"vllm-omni","context_window":32768,"supports_tools":true,"supports_vision":true,"supports_audio":true,"enabled":true,"input_price_per_million":1,"output_price_per_million":4}`)
 	w := jsonRequest(h.RegisterModel, "POST", "/v1/admin/inference/models", body, nil)
 
 	if w.Code != 200 {
@@ -133,7 +133,7 @@ func TestRegisterModel_ExternalModelStoresKeyAndAvailability(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	off, on := false, true
 	mock.ExpectExec(`SET offered_to_customers = COALESCE`).
-		WithArgs(&off, &on, nil, "admin-api", "anthropic/claude-haiku-4-5").
+		WithArgs(&off, &on, nil, "admin-api", "anthropic/claude-haiku-4-5", true).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	expectModelRow(mock, "anthropic/claude-haiku-4-5", "anthropic", "") // storeAPIKey's lookup: no key yet
 	mock.ExpectExec(`SET api_key_ref = NULLIF`).
@@ -142,7 +142,7 @@ func TestRegisterModel_ExternalModelStoresKeyAndAvailability(t *testing.T) {
 	expectModelRow(mock, "anthropic/claude-haiku-4-5", "anthropic", "inference-model-key-x")
 
 	body := []byte(`{"model_route":"anthropic/claude-haiku-4-5","display_name":"Claude Haiku 4.5","cost_class":"frontier","engine":"anthropic",` +
-		`"provider":"anthropic","provider_model":"claude-haiku-4-5-20251001","api_key":"sk-ant-test","enabled":true,` +
+		`"provider":"anthropic","provider_model":"claude-haiku-4-5-20251001","api_key":"sk-ant-test","enabled":true,"input_price_per_million":1,"output_price_per_million":4,` +
 		`"offered_to_customers":false,"kumbha_enabled":true}`)
 	w := jsonRequest(h.RegisterModel, "POST", "/v1/admin/inference/models", body, nil)
 	if w.Code != 200 {
@@ -180,7 +180,7 @@ func TestRegisterModel_KeyRotationReusesExistingSecret(t *testing.T) {
 	expectModelRow(mock, "anthropic/claude-haiku-4-5", "anthropic", "kumbha-candidate-abc-api-key")
 
 	body := []byte(`{"model_route":"anthropic/claude-haiku-4-5","display_name":"Haiku","cost_class":"frontier","engine":"anthropic",` +
-		`"provider":"anthropic","provider_model":"claude-haiku-4-5-20251001","api_key":"sk-new","enabled":true}`)
+		`"provider":"anthropic","provider_model":"claude-haiku-4-5-20251001","api_key":"sk-new","enabled":true,"input_price_per_million":1,"output_price_per_million":4}`)
 	w := jsonRequest(h.RegisterModel, "POST", "/v1/admin/inference/models", body, nil)
 	if w.Code != 200 {
 		t.Fatalf("status = %d, body: %s", w.Code, w.Body.String())
@@ -200,7 +200,7 @@ func TestRegisterModel_KeyWithoutSecretsBackendWarns(t *testing.T) {
 	expectModelRow(mock, "anthropic/claude-haiku-4-5", "anthropic", "")
 
 	body := []byte(`{"model_route":"anthropic/claude-haiku-4-5","display_name":"Haiku","cost_class":"frontier","engine":"anthropic",` +
-		`"provider":"anthropic","provider_model":"claude-haiku-4-5-20251001","api_key":"sk-x","enabled":true}`)
+		`"provider":"anthropic","provider_model":"claude-haiku-4-5-20251001","api_key":"sk-x","enabled":true,"input_price_per_million":1,"output_price_per_million":4}`)
 	w := jsonRequest(h.RegisterModel, "POST", "/v1/admin/inference/models", body, nil)
 	if w.Code != 200 {
 		t.Fatalf("status = %d, body: %s", w.Code, w.Body.String())
@@ -254,6 +254,7 @@ func TestSetPricing_NotFound(t *testing.T) {
 
 	mock.ExpectExec(`UPDATE inference\.models\s+SET input_price_per_million`).
 		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery(`SELECT model_route, display_name, cost_class`).WithArgs("missing/model").WillReturnError(sql.ErrNoRows)
 
 	body := []byte(`{"input_price_per_million":0.1,"output_price_per_million":0.3}`)
 	w := jsonRequest(h.SetPricing, "PUT", "/v1/admin/inference/models/pricing?model_route=missing/model", body, nil)
@@ -278,7 +279,7 @@ func TestSetAvailability_UpdatesOnlyWhatWasSent(t *testing.T) {
 
 	priority := 2
 	mock.ExpectExec(`SET offered_to_customers = COALESCE`).
-		WithArgs(nil, nil, &priority, "admin-api", "teepin/a").
+		WithArgs(nil, nil, &priority, "admin-api", "teepin/a", false).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := jsonRequest(h.SetAvailability, "PUT", "/v1/admin/inference/models/availability?model_route=teepin/a", []byte(`{"kumbha_priority":2}`), nil)
@@ -360,5 +361,61 @@ func TestListModels_IncludesLiveStatus(t *testing.T) {
 	}
 	if len(resp.Models) != 1 || resp.Models[0].Status.State != "no_backend" {
 		t.Errorf("models = %+v, want one with status no_backend", resp.Models)
+	}
+}
+
+// Making a model available without a price is refused (409 pricing_required) at
+// every door: register-as-enabled, enable, offer to customers, add to Teepin Build.
+func TestPricingIsRequiredBeforeAModelCanBeMadeAvailable(t *testing.T) {
+	notEnabledRow := func(mock sqlmock.Sqlmock, route string) {
+		// The follow-up lookup that tells "missing" from "not priced": it exists.
+		expectModelRow(mock, route, "anthropic", "")
+	}
+	cases := []struct {
+		name   string
+		handle func(h *ModelCatalogHandler) gin.HandlerFunc
+		path   string
+		body   string
+		method string
+		prime  func(mock sqlmock.Sqlmock)
+	}{
+		{"enable", func(h *ModelCatalogHandler) gin.HandlerFunc { return h.SetEnabled }, "/x/enabled?model_route=teepin/a", `{"enabled":true}`, "PUT",
+			func(m sqlmock.Sqlmock) {
+				m.ExpectExec(`UPDATE inference\.models\s+SET enabled`).WillReturnResult(sqlmock.NewResult(0, 0))
+				notEnabledRow(m, "teepin/a")
+			}},
+		{"offer to customers", func(h *ModelCatalogHandler) gin.HandlerFunc { return h.SetAvailability }, "/x/availability?model_route=teepin/a", `{"offered_to_customers":true}`, "PUT",
+			func(m sqlmock.Sqlmock) {
+				m.ExpectExec(`SET offered_to_customers`).WillReturnResult(sqlmock.NewResult(0, 0))
+				notEnabledRow(m, "teepin/a")
+			}},
+		{"add to Teepin Build", func(h *ModelCatalogHandler) gin.HandlerFunc { return h.SetAvailability }, "/x/availability?model_route=teepin/a", `{"kumbha_enabled":true}`, "PUT",
+			func(m sqlmock.Sqlmock) {
+				m.ExpectExec(`SET offered_to_customers`).WillReturnResult(sqlmock.NewResult(0, 0))
+				notEnabledRow(m, "teepin/a")
+			}},
+		{"clear the price of a live model", func(h *ModelCatalogHandler) gin.HandlerFunc { return h.SetPricing }, "/x/pricing?model_route=teepin/a", `{"input_price_per_million":0,"output_price_per_million":0}`, "PUT",
+			func(m sqlmock.Sqlmock) {
+				m.ExpectExec(`UPDATE inference\.models\s+SET input_price_per_million`).WillReturnResult(sqlmock.NewResult(0, 0))
+				notEnabledRow(m, "teepin/a")
+			}},
+		{"register as enabled with no price", func(h *ModelCatalogHandler) gin.HandlerFunc { return h.RegisterModel }, "/x/models", `{"model_route":"teepin/new","display_name":"N","cost_class":"own","engine":"vllm","enabled":true}`, "POST",
+			func(m sqlmock.Sqlmock) {
+				m.ExpectQuery(`SELECT model_route, display_name, cost_class`).WithArgs("teepin/new").WillReturnError(sql.ErrNoRows)
+			}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h, mock, done := newModelCatalogHandlerMock(t)
+			defer done()
+			tc.prime(mock)
+			w := jsonRequest(tc.handle(h), tc.method, tc.path, []byte(tc.body), nil)
+			if w.Code != 409 || !strings.Contains(w.Body.String(), "pricing_required") {
+				t.Fatalf("status = %d body %s, want 409 pricing_required", w.Code, w.Body.String())
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Error(err)
+			}
+		})
 	}
 }

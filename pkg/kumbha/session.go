@@ -263,6 +263,21 @@ func (s *Store) Get(ctx context.Context, id, accountID uuid.UUID) (*Session, err
 // either way; closing it needs a per-session concurrency cap, not built
 // here.
 func (s *Store) Accrue(ctx context.Context, id, accountID uuid.UUID, cost float64, route, provider string, inputTokens, outputTokens int) (newSpent float64, err error) {
+	return s.accrue(ctx, id, accountID, cost, route, provider, inputTokens, outputTokens, false)
+}
+
+// AccrueServed records a completion the model has ALREADY answered, so its
+// tokens are spent and owed whatever the session's budget says. It does what
+// Accrue does but lets the spend pass the budget: refusing here would leave
+// the answer neither billed nor delivered (and the harness would retry it,
+// paying the model again each time). The overshoot is bounded by one
+// completion, because the next request is refused up front once spent has
+// reached the budget (Gateway.Complete's pre-flight check).
+func (s *Store) AccrueServed(ctx context.Context, id, accountID uuid.UUID, cost float64, route, provider string, inputTokens, outputTokens int) (newSpent float64, err error) {
+	return s.accrue(ctx, id, accountID, cost, route, provider, inputTokens, outputTokens, true)
+}
+
+func (s *Store) accrue(ctx context.Context, id, accountID uuid.UUID, cost float64, route, provider string, inputTokens, outputTokens int, allowOverrun bool) (newSpent float64, err error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, fmt.Errorf("failed to begin transaction: %w", err)
@@ -286,7 +301,7 @@ func (s *Store) Accrue(ctx context.Context, id, accountID uuid.UUID, cost float6
 		return 0, ErrSessionClosed
 	}
 	newSpent = spent + cost
-	if newSpent > budget {
+	if newSpent > budget && !allowOverrun {
 		return 0, ErrBudgetExhausted
 	}
 

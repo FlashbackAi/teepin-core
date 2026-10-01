@@ -6,6 +6,7 @@ package modelcatalog
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"testing"
 	"time"
@@ -26,9 +27,11 @@ func TestRegisterModel_UpsertsCatalogFieldsOnly(t *testing.T) {
 	s, mock, done := newMock(t)
 	defer done()
 
+	mock.ExpectQuery(`SELECT model_route, display_name, cost_class`).WithArgs("teepin/qwen3-omni-7b").
+		WillReturnRows(sqlmock.NewRows(modelRowColumns()).AddRow(modelRowValues("teepin/qwen3-omni-7b", 1.0, 4.0)...))
 	mock.ExpectExec(`INSERT INTO inference\.models`).
 		WithArgs("teepin/qwen3-omni-7b", "Qwen3 Omni 7B", "own", "vllm-omni", 32768,
-			true, true, true, true, "node", "", "", 4096, "op").
+			true, true, true, true, "node", "", "", 4096, "op", nil, nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	err := s.RegisterModel(context.Background(), Model{
@@ -86,10 +89,11 @@ func TestRegisterModel_ExternalModelCarriesProviderFields(t *testing.T) {
 
 	mock.ExpectExec(`INSERT INTO inference\.models`).
 		WithArgs("anthropic/claude-haiku-4-5", "Claude Haiku 4.5", "frontier", "anthropic", 200000,
-			true, false, false, true, "anthropic", "claude-haiku-4-5-20251001", "", 4096, "op").
+			true, false, false, true, "anthropic", "claude-haiku-4-5-20251001", "", 4096, "op", 3.0, 15.0).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	err := s.RegisterModel(context.Background(), Model{
+	three, fifteen := 3.0, 15.0
+	err := s.RegisterModelWithPricing(context.Background(), Model{
 		ModelRoute:    "anthropic/claude-haiku-4-5",
 		DisplayName:   "Claude Haiku 4.5",
 		CostClass:     CostClassFrontier,
@@ -100,7 +104,7 @@ func TestRegisterModel_ExternalModelCarriesProviderFields(t *testing.T) {
 		Provider:      ProviderAnthropic,
 		ProviderModel: "claude-haiku-4-5-20251001",
 		UpdatedBy:     strPtr("op"),
-	})
+	}, &three, &fifteen)
 	if err != nil {
 		t.Fatalf("RegisterModel: %v", err)
 	}
@@ -117,7 +121,7 @@ func TestSetAvailability_PartialUpdateLeavesNilFieldsAlone(t *testing.T) {
 
 	on := true
 	mock.ExpectExec(`SET offered_to_customers = COALESCE\(\$1, offered_to_customers\)`).
-		WithArgs(nil, &on, nil, "op", "anthropic/claude-haiku-4-5").
+		WithArgs(nil, &on, nil, "op", "anthropic/claude-haiku-4-5", true).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	if err := s.SetAvailability(context.Background(), "anthropic/claude-haiku-4-5", Availability{KumbhaEnabled: &on}, "op"); err != nil {
@@ -133,6 +137,7 @@ func TestSetAvailability_NotFound(t *testing.T) {
 	defer done()
 
 	mock.ExpectExec(`UPDATE inference\.models`).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery(`SELECT model_route, display_name, cost_class`).WithArgs("missing").WillReturnError(sql.ErrNoRows)
 	on := true
 	if err := s.SetAvailability(context.Background(), "missing", Availability{KumbhaEnabled: &on}, "op"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("got %v, want ErrNotFound", err)
@@ -188,6 +193,7 @@ func TestSetPricing_NotFound(t *testing.T) {
 
 	mock.ExpectExec(`UPDATE inference\.models`).
 		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery(`SELECT model_route, display_name, cost_class`).WithArgs("missing").WillReturnError(sql.ErrNoRows)
 
 	if err := s.SetPricing(context.Background(), "missing", 0.1, 0.2, "op"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("got %v, want ErrNotFound", err)
@@ -302,3 +308,14 @@ func modelRowColumns() []string {
 }
 
 func strPtr(s string) *string { return &s }
+
+// modelRowValues is one catalog row at the given customer prices.
+func modelRowValues(route string, in, out float64) []driver.Value {
+	return []driver.Value{
+		route, "Model", "own", "vllm", 32768,
+		true, false, false, in, out, nil, nil,
+		false, "node", "", "", 4096,
+		"", false, false, 0,
+		"op", time.Now(), time.Now(),
+	}
+}

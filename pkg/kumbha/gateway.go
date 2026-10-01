@@ -49,6 +49,14 @@ type ModelPricingProvider interface {
 	ModelPricing(ctx context.Context, modelRoute string) (input, output float64, ok bool)
 }
 
+// ModelVendorCostProvider supplies what a route costs Teepin per million tokens
+// (nil for either when unrecorded or when Teepin runs the model itself).
+// Implemented by modelcatalog.Service; optional, and used only to record the
+// margin on each usage line, never to price anything for the customer.
+type ModelVendorCostProvider interface {
+	ModelVendorCost(ctx context.Context, modelRoute string) (input, output *float64)
+}
+
 // CreditChecker answers whether an account can pay for a request before it
 // is served. Implemented by billing.Service. Optional on the Gateway.
 type CreditChecker interface {
@@ -109,6 +117,11 @@ var (
 
 	// errNoKumbhaModels means the catalog has no model enabled for Kumbha.
 	errNoKumbhaModels = fmt.Errorf("%w: no model is enabled for Kumbha", inference.ErrProviderUnavailable)
+
+	// ErrModelUnavailable means the chosen model cannot serve right now (its
+	// backend is not running or failed its health check). A build started on
+	// it would fail at the first step, so it is refused up front instead.
+	ErrModelUnavailable = fmt.Errorf("%w: the selected model is not available right now", inference.ErrProviderUnavailable)
 )
 
 // Gateway is the Kumbha Gateway's business logic — the request lifecycle
@@ -119,6 +132,17 @@ type Gateway struct {
 	// busy build does not repeat it on every completion.
 	zeroMu          sync.Mutex
 	zeroPriceWarned map[string]time.Time
+
+	// contextSeen remembers, per session, how large the last request to the model
+	// was, so the console can show how full the builder's context is. A display
+	// aid, not a record: it lives in memory, so a restart forgets it and the next
+	// completion fills it in again.
+	contextMu   sync.Mutex
+	contextSeen map[uuid.UUID]contextReading
+
+	// agentLaunched, if set, is told about every agent launch (see
+	// WithAgentLaunchHook in recorder.go).
+	agentLaunched func(sess *Session, launchSeq int)
 
 	store   *Store
 	models  ModelBackend
@@ -138,6 +162,10 @@ type Gateway struct {
 	// modelcatalog.Service exists.
 	modelPricing ModelPricingProvider
 
+	// vendorCost is OPTIONAL: when set, each completion's usage lines carry what
+	// they cost Teepin (cost_basis), so margin can be read off the ledger.
+	vendorCost ModelVendorCostProvider
+
 	// credit is OPTIONAL — nil means completions are not checked against the
 	// account's credit balance (tests, standalone mode). Set via
 	// WithCreditGuard.
@@ -155,6 +183,13 @@ type Gateway struct {
 // available).
 func NewGateway(store *Store, models ModelBackend, gate ProvisionGate, pricing PricingProvider, usage UsageRecorder) *Gateway {
 	return &Gateway{store: store, models: models, gate: gate, pricing: pricing, usage: usage}
+}
+
+// WithVendorCost records what each completion cost Teepin, from the model
+// catalog's vendor costs, on its usage lines.
+func (g *Gateway) WithVendorCost(p ModelVendorCostProvider) *Gateway {
+	g.vendorCost = p
+	return g
 }
 
 // WithModelPricing enables per-model pricing in cost(), preferred over the
@@ -223,10 +258,20 @@ func (g *Gateway) resolveModel(ctx context.Context, requestedRoute string) (Mode
 		return Model{}, err
 	}
 	if requestedRoute == "" {
-		return models[0], nil // lowest kumbha_priority, by ListKumbhaModels' own ORDER BY
+		// The lowest-priority model that can serve right now (the list is in
+		// kumbha_priority order), never one that is down.
+		for _, m := range models {
+			if m.Unavailable == "" {
+				return m, nil
+			}
+		}
+		return Model{}, ErrModelUnavailable
 	}
 	for _, m := range models {
 		if m.Route == requestedRoute {
+			if m.Unavailable != "" {
+				return Model{}, fmt.Errorf("%w: %s (%s)", ErrModelUnavailable, m.DisplayName, m.Unavailable)
+			}
 			return m, nil
 		}
 	}
@@ -557,11 +602,18 @@ func (g *Gateway) Complete(ctx context.Context, sess *Session, req inference.Req
 
 	newSpent, err := g.store.Accrue(bctx, sess.ID, sess.AccountID, cost,
 		req.Model, engine, resp.Usage.InputTokens, resp.Usage.OutputTokens)
+	if errors.Is(err, ErrBudgetExhausted) {
+		// This answer pushed the session past its budget. The model has already
+		// answered, so the tokens are owed: record them anyway (the budget stops
+		// the NEXT completion, up front) rather than refuse a response that was
+		// paid for and would only be retried.
+		newSpent, err = g.store.AccrueServed(bctx, sess.ID, sess.AccountID, cost,
+			req.Model, engine, resp.Usage.InputTokens, resp.Usage.OutputTokens)
+	}
 	if err != nil {
-		if errors.Is(err, ErrBudgetExhausted) || errors.Is(err, ErrSessionClosed) || errors.Is(err, ErrSessionNotFound) {
-			// A deliberate refusal by the session, not a recording fault.
-			return nil, fmt.Errorf("completion served but not accrued: %w", err)
-		}
+		// Whatever the reason (a recording fault, or the session closed or went
+		// away while the model was working), the account still pays for tokens
+		// that were generated, and the answer is still delivered.
 		log.Printf("ERROR: kumbha session %s: completion served but its spend was not recorded on the session (cost %.6f): %v", sess.ID, cost, err)
 		newSpent = sess.Spent + cost
 	}
@@ -574,20 +626,80 @@ func (g *Gateway) Complete(ctx context.Context, sess *Session, req inference.Req
 	// comment: settlement no longer happens there at all, so a session's
 	// `spent` counter and its invoice-visible cost never diverge.
 	inRate, outRate := g.rates(bctx, sess.ModelRoute)
+	var inBasis, outBasis float64
+	if g.vendorCost != nil {
+		// What this completion cost Teepin, not the customer: input counts the
+		// prompt-cache discount. Zero when the model is self-hosted or its vendor
+		// cost is not recorded (unattributed, never a made-up figure).
+		if vin, vout := g.vendorCost.ModelVendorCost(bctx, sess.ModelRoute); vin != nil || vout != nil {
+			if vin != nil {
+				inBasis = inference.VendorInputCost(resp.Usage, *vin)
+			}
+			if vout != nil {
+				outBasis = float64(resp.Usage.OutputTokens) / 1e6 * *vout
+			}
+		}
+	}
 	if resp.Usage.InputTokens > 0 {
 		if err := g.settleLine(bctx, sess, req.Model+":input", engine,
-			float64(resp.Usage.InputTokens), float64(resp.Usage.InputTokens)/1e6*inRate, start, end); err != nil {
+			float64(resp.Usage.InputTokens), float64(resp.Usage.InputTokens)/1e6*inRate, inBasis, start, end); err != nil {
 			log.Printf("ERROR: kumbha session %s: completion served but its input usage was not billed: %v", sess.ID, err)
 		}
 	}
 	if resp.Usage.OutputTokens > 0 {
 		if err := g.settleLine(bctx, sess, req.Model+":output", engine,
-			float64(resp.Usage.OutputTokens), float64(resp.Usage.OutputTokens)/1e6*outRate, start, end); err != nil {
+			float64(resp.Usage.OutputTokens), float64(resp.Usage.OutputTokens)/1e6*outRate, outBasis, start, end); err != nil {
 			log.Printf("ERROR: kumbha session %s: completion served but its output usage was not billed: %v", sess.ID, err)
 		}
 	}
 
+	g.noteContext(sess.ID, resp.Usage.InputTokens)
+
 	return &CompletionResult{Response: resp, Cost: cost, Spent: newSpent, Budget: sess.Budget}, nil
+}
+
+type contextReading struct {
+	tokens int
+	at     time.Time
+}
+
+// contextReadingTTL is how long an unrefreshed reading is kept; a build idle
+// for longer than this no longer has a meaningful "current" context size.
+const contextReadingTTL = 6 * time.Hour
+
+// noteContext records the size of the request just sent for a session.
+func (g *Gateway) noteContext(id uuid.UUID, tokens int) {
+	if tokens <= 0 {
+		return
+	}
+	g.contextMu.Lock()
+	defer g.contextMu.Unlock()
+	if g.contextSeen == nil {
+		g.contextSeen = make(map[uuid.UUID]contextReading)
+	}
+	now := time.Now()
+	if len(g.contextSeen) > 1024 { // bound the map: drop what has gone stale
+		for k, v := range g.contextSeen {
+			if now.Sub(v.at) > contextReadingTTL {
+				delete(g.contextSeen, k)
+			}
+		}
+	}
+	g.contextSeen[id] = contextReading{tokens: tokens, at: now}
+}
+
+// ContextUsage returns how many tokens the session's last request to the model
+// held and the model's window (0 when the catalog does not know it). ok is false
+// when nothing recent is known, which a caller should show as "unknown", not 0.
+func (g *Gateway) ContextUsage(ctx context.Context, sess *Session) (tokens, window int, ok bool) {
+	g.contextMu.Lock()
+	r, seen := g.contextSeen[sess.ID]
+	g.contextMu.Unlock()
+	if !seen || time.Since(r.at) > contextReadingTTL {
+		return 0, 0, false
+	}
+	window, _ = g.routeLimits(ctx, sess.ModelRoute)
+	return r.tokens, window, true
 }
 
 // zeroPriceWarnEvery is how often a model billed at $0 is reported.
@@ -713,7 +825,7 @@ func (g *Gateway) StopAgent(ctx context.Context, sess *Session) error {
 
 // settleLine writes one usage_records row for a session's (route,
 // direction) and draws it down against the account's credits.
-func (g *Gateway) settleLine(ctx context.Context, sess *Session, resourceType, provider string, quantity, totalCost float64, start, end time.Time) error {
+func (g *Gateway) settleLine(ctx context.Context, sess *Session, resourceType, provider string, quantity, totalCost, costBasis float64, start, end time.Time) error {
 	record := &billing.UsageRecord{
 		AccountID:    sess.AccountID,
 		ProjectID:    sess.ProjectID,
@@ -723,6 +835,7 @@ func (g *Gateway) settleLine(ctx context.Context, sess *Session, resourceType, p
 		Quantity:     quantity,
 		Unit:         "tokens",
 		TotalCost:    totalCost,
+		CostBasis:    costBasis,
 		Provider:     provider,
 		StartTime:    start,
 		EndTime:      end,

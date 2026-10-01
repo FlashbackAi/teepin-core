@@ -179,7 +179,7 @@ func TestDeploy_OnlyAMissingBuildPipelineIsADeadEnd(t *testing.T) {
 		return res.Content[0].(*mcp.TextContent).Text
 	}
 
-	if got := deployWith(`{"error":"the Kumbha build pipeline is not available on this deployment"}`); !strings.Contains(got, "DEPLOYMENT IS NOT POSSIBLE") {
+	if got := deployWith(`{"error":"Teepin Build: build pipeline is not available on this deployment"}`); !strings.Contains(got, "DEPLOYMENT IS NOT POSSIBLE") {
 		t.Errorf("a missing build pipeline should still be the dead end, got: %s", got)
 	}
 	for _, body := range []string{

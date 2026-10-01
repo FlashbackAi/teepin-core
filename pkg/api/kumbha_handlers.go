@@ -125,7 +125,7 @@ func kumbhaSessionResponse(sess *kumbha.Session) gin.H {
 // POST /v1/kumbha/sessions
 func (s *Server) CreateKumbhaSession(c *gin.Context) {
 	if s.kumbha == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha Gateway is not available on this deployment"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Teepin Build is not available on this deployment"})
 		return
 	}
 
@@ -147,6 +147,8 @@ func (s *Server) CreateKumbhaSession(c *gin.Context) {
 			c.JSON(http.StatusPaymentRequired, gin.H{"error": err.Error(), "code": "payment_method_required"})
 		case errors.Is(err, kumbha.ErrGateUnavailable):
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "unable to verify billing status, please retry"})
+		case errors.Is(err, kumbha.ErrModelUnavailable):
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "that model is not available right now, please choose another", "code": "model_unavailable"})
 		default:
 			// Budget validation errors and an unknown model alias are the
 			// other failure modes from CreateSession, and both are the
@@ -166,7 +168,7 @@ func (s *Server) CreateKumbhaSession(c *gin.Context) {
 				// will happen until it does, so this must not read as 201
 				// success.
 				c.JSON(http.StatusServiceUnavailable, gin.H{
-					"error": "the Kumbha agent is not available on this deployment yet",
+					"error": "the Teepin Build agent is not available on this deployment yet",
 					"code":  "agent_not_configured",
 				})
 				return
@@ -202,7 +204,7 @@ func (s *Server) CreateKumbhaSession(c *gin.Context) {
 // GET /v1/kumbha/sessions
 func (s *Server) ListKumbhaSessions(c *gin.Context) {
 	if s.kumbha == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha Gateway is not available on this deployment"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Teepin Build is not available on this deployment"})
 		return
 	}
 
@@ -247,7 +249,7 @@ type deleteKumbhaSessionsRequest struct {
 // POST /v1/kumbha/sessions/bulk-delete
 func (s *Server) DeleteKumbhaSessions(c *gin.Context) {
 	if s.kumbha == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha Gateway is not available on this deployment"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Teepin Build is not available on this deployment"})
 		return
 	}
 
@@ -313,7 +315,7 @@ func (s *Server) DeleteKumbhaSessions(c *gin.Context) {
 // POST /v1/kumbha/sessions/:id/stop
 func (s *Server) StopKumbhaAgent(c *gin.Context) {
 	if s.kumbha == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha Gateway is not available on this deployment"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Teepin Build is not available on this deployment"})
 		return
 	}
 
@@ -344,7 +346,7 @@ func (s *Server) StopKumbhaAgent(c *gin.Context) {
 			return
 		}
 		if errors.Is(err, kumbha.ErrAgentNotConfigured) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha agent is not available on this deployment"})
+			c.JSON(http.StatusNotFound, gin.H{"error": "the Teepin Build agent is not available on this deployment"})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -383,7 +385,7 @@ const workspaceFetchTokenTTL = 20 * time.Minute
 // POST /v1/kumbha/sessions/:id/build
 func (s *Server) BuildKumbhaSession(c *gin.Context) {
 	if s.kumbha == nil || s.kumbhaBuild == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha build pipeline is not available on this deployment"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Teepin Build: build pipeline is not available on this deployment"})
 		return
 	}
 
@@ -497,7 +499,7 @@ func (s *Server) buildKumbhaImage(ctx context.Context, sess *kumbha.Session, acc
 	fetchToken, archiveURL, err := s.kumbha.MintWorkspaceFetchToken(sess, workspaceFetchTokenTTL)
 	if err != nil {
 		if errors.Is(err, kumbha.ErrAgentNotConfigured) {
-			return "", http.StatusNotFound, gin.H{"error": "the Kumbha build pipeline is not available on this deployment"}
+			return "", http.StatusNotFound, gin.H{"error": "Teepin Build: build pipeline is not available on this deployment"}
 		}
 		return "", http.StatusInternalServerError, gin.H{"error": err.Error()}
 	}
@@ -645,7 +647,7 @@ const deployLockStaleAfter = deployFlowTimeout + 2*time.Minute
 
 func (s *Server) DeployKumbhaSession(c *gin.Context) {
 	if s.kumbha == nil || s.kumbhaBuild == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha build pipeline is not available on this deployment"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Teepin Build: build pipeline is not available on this deployment"})
 		return
 	}
 
@@ -741,6 +743,13 @@ func (s *Server) DeployKumbhaSession(c *gin.Context) {
 			log.Printf("WARN: could not release deploy lock for Kumbha session %s: %v", sessionID, err)
 		}
 	}()
+
+	// A deploy may only use what the approved plan covers; an update that fits
+	// inside it needs nothing new. Checked once the lock is held so a refused
+	// deploy releases it like any other early exit.
+	if !s.refuseUnapprovedResources(c, sessionID, req.CPUUnits, req.MemoryGB, req.StorageGB) {
+		return
+	}
 
 	imageRef, status, body := s.buildKumbhaImage(ctx, sess, accountID, req.DockerfilePath)
 	if status != 0 {
@@ -1521,7 +1530,7 @@ func joinTail(lines []string, limit int) string {
 // GET /v1/kumbha/sessions/:id
 func (s *Server) GetKumbhaSession(c *gin.Context) {
 	if s.kumbha == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha Gateway is not available on this deployment"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Teepin Build is not available on this deployment"})
 		return
 	}
 
@@ -1547,8 +1556,16 @@ func (s *Server) GetKumbhaSession(c *gin.Context) {
 	}
 
 	resp := kumbhaSessionResponse(sess)
+	s.enrichApprovedPlan(c.Request.Context(), resp, sess)
 	s.enrichKumbhaAgentRunning(c.Request.Context(), resp, sess)
 	s.enrichKumbhaAppStatus(c.Request.Context(), resp, sess, projectID)
+	if tokens, window, ok := s.kumbha.ContextUsage(c.Request.Context(), sess); ok {
+		// How full the builder's working memory is. Absent when unknown.
+		resp["context_tokens"] = tokens
+		if window > 0 {
+			resp["context_window"] = window
+		}
+	}
 
 	c.JSON(http.StatusOK, resp)
 }
@@ -1638,7 +1655,7 @@ type kumbhaSessionInstance struct {
 // GET /v1/kumbha/sessions/:id/instances
 func (s *Server) ListKumbhaSessionInstances(c *gin.Context) {
 	if s.kumbha == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha Gateway is not available on this deployment"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Teepin Build is not available on this deployment"})
 		return
 	}
 	if s.store == nil {
@@ -1698,7 +1715,7 @@ func (s *Server) ListKumbhaSessionInstances(c *gin.Context) {
 // POST /v1/kumbha/sessions/:id/approve-deploy
 func (s *Server) ApproveKumbhaDeploy(c *gin.Context) {
 	if s.kumbha == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha Gateway is not available on this deployment"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Teepin Build is not available on this deployment"})
 		return
 	}
 
@@ -1713,7 +1730,15 @@ func (s *Server) ApproveKumbhaDeploy(c *gin.Context) {
 		return
 	}
 
-	if err := s.kumbha.ApproveDeploy(c.Request.Context(), sessionID, accountID); err != nil {
+	planID, ok := parseApprovePlanID(c)
+	if !ok {
+		return
+	}
+	if err := s.kumbha.ApprovePlan(c.Request.Context(), sessionID, accountID, planID); err != nil {
+		if errors.Is(err, kumbha.ErrPlanNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "that deployment plan was not found for this session"})
+			return
+		}
 		if errors.Is(err, kumbha.ErrSessionNotFound) {
 			// Covers "not found", "wrong account", and "not open" alike —
 			// approving a closed session's spend has nothing to apply to.
@@ -1729,7 +1754,9 @@ func (s *Server) ApproveKumbhaDeploy(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, kumbhaSessionResponse(sess))
+	resp := kumbhaSessionResponse(sess)
+	s.enrichApprovedPlan(c.Request.Context(), resp, sess)
+	c.JSON(http.StatusOK, resp)
 }
 
 // updateKumbhaBudgetRequest is the console's "raise budget" control on
@@ -1738,7 +1765,15 @@ func (s *Server) ApproveKumbhaDeploy(c *gin.Context) {
 // removed BUDGET_PRESETS).
 type updateKumbhaBudgetRequest struct {
 	Budget float64 `json:"budget" binding:"required"`
+	// Resume also tells the builder to carry on, for a build that paused when
+	// it reached its budget: the raise and the restart are one action, so a
+	// customer never has to raise it and then separately find a way to continue.
+	Resume bool `json:"resume"`
 }
+
+// budgetResumeMessage is what the builder is told when a build resumes after
+// its budget was raised. It appears in the chat as the customer's own message.
+const budgetResumeMessage = "I raised the build budget. Please continue where you left off."
 
 // UpdateKumbhaBudget raises an open session's pre-authorised spend cap.
 // A raise only — see Gateway.IncreaseBudget's own doc comment for why a
@@ -1747,7 +1782,7 @@ type updateKumbhaBudgetRequest struct {
 // PATCH /v1/kumbha/sessions/:id/budget
 func (s *Server) UpdateKumbhaBudget(c *gin.Context) {
 	if s.kumbha == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha Gateway is not available on this deployment"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Teepin Build is not available on this deployment"})
 		return
 	}
 
@@ -1794,7 +1829,20 @@ func (s *Server) UpdateKumbhaBudget(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, kumbhaSessionResponse(sess))
+	resp := kumbhaSessionResponse(sess)
+	if req.Resume {
+		// The raise has already taken effect and stays even if the restart
+		// fails; the failure is reported so the console can say so instead of
+		// leaving a customer waiting on a builder that never started.
+		if _, err := s.kumbha.DeliverMessage(c.Request.Context(), sess, budgetResumeMessage, nil); err != nil {
+			log.Printf("WARN: kumbha session %s: budget raised but the build could not resume: %v", sessionID, err)
+			resp["resumed"] = false
+			resp["resume_error"] = "The budget was raised, but the build could not be restarted. Send a message to continue."
+		} else {
+			resp["resumed"] = true
+		}
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // CreateKumbhaEventTicket issues a short-lived, single-use ticket for the
@@ -1806,7 +1854,7 @@ func (s *Server) UpdateKumbhaBudget(c *gin.Context) {
 // POST /v1/kumbha/sessions/:id/events
 func (s *Server) CreateKumbhaEventTicket(c *gin.Context) {
 	if s.kumbha == nil || s.kumbhaEventTickets == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha Gateway is not available on this deployment"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Teepin Build is not available on this deployment"})
 		return
 	}
 
@@ -1908,7 +1956,7 @@ func parseCompletionRequest(body []byte) (inference.Request, error) {
 // POST /v1/kumbha/chat/completions
 func (s *Server) KumbhaChatCompletions(c *gin.Context) {
 	if s.kumbha == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha Gateway is not available on this deployment"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Teepin Build is not available on this deployment"})
 		return
 	}
 
@@ -1979,8 +2027,14 @@ func (s *Server) KumbhaChatCompletions(c *gin.Context) {
 	// the console. Logged for every call, success or not.
 	completeStart := time.Now()
 	result, err := s.kumbha.Complete(c.Request.Context(), sess, req)
-	log.Printf("kumbha: completion session=%s route=%s messages=%d took=%s ok=%t",
-		sess.ID, req.Model, len(req.Messages), time.Since(completeStart).Round(time.Millisecond), err == nil)
+	// Input and cache-read tokens make the cost of context visible per call:
+	// a healthy long build shows most of its input served from the cache.
+	var inputTokens, cachedTokens int
+	if result != nil && result.Response != nil {
+		inputTokens, cachedTokens = result.Response.Usage.InputTokens, result.Response.Usage.CachedInputTokens
+	}
+	log.Printf("kumbha: completion session=%s route=%s messages=%d input_tokens=%d cached_tokens=%d took=%s ok=%t",
+		sess.ID, req.Model, len(req.Messages), inputTokens, cachedTokens, time.Since(completeStart).Round(time.Millisecond), err == nil)
 	if err != nil {
 		switch {
 		case errors.Is(err, kumbha.ErrSessionClosed):
@@ -2045,7 +2099,7 @@ type sendKumbhaMessageRequest struct {
 // POST /v1/kumbha/sessions/:id/messages
 func (s *Server) SendKumbhaMessage(c *gin.Context) {
 	if s.kumbha == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha Gateway is not available on this deployment"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Teepin Build is not available on this deployment"})
 		return
 	}
 
@@ -2082,7 +2136,7 @@ func (s *Server) SendKumbhaMessage(c *gin.Context) {
 			errors.Is(err, kumbha.ErrInvalidAttachment), errors.Is(err, kumbha.ErrTooManyAttachments):
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		case errors.Is(err, kumbha.ErrAgentNotConfigured):
-			c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha agent is not available on this deployment"})
+			c.JSON(http.StatusNotFound, gin.H{"error": "the Teepin Build agent is not available on this deployment"})
 		case errors.Is(err, kumbha.ErrSessionClosed):
 			c.JSON(http.StatusConflict, gin.H{"error": "session is closed", "code": "session_closed"})
 		case errors.Is(err, kumbha.ErrAgentRouteUnavailable):
@@ -2110,7 +2164,7 @@ func (s *Server) SendKumbhaMessage(c *gin.Context) {
 // GET /v1/kumbha/sessions/:id/messages/poll
 func (s *Server) PollKumbhaMessages(c *gin.Context) {
 	if s.kumbha == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "the Kumbha Gateway is not available on this deployment"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Teepin Build is not available on this deployment"})
 		return
 	}
 
@@ -2122,7 +2176,7 @@ func (s *Server) PollKumbhaMessages(c *gin.Context) {
 
 	callerSession, ok := auth.GetSessionID(c)
 	if !ok {
-		c.JSON(http.StatusForbidden, gin.H{"error": "this endpoint requires a Kumbha session credential"})
+		c.JSON(http.StatusForbidden, gin.H{"error": "this endpoint requires a Teepin Build session credential"})
 		return
 	}
 	if callerSession != sessionID {

@@ -686,6 +686,7 @@ func TestDeployKumbhaSession_NoWorkspaceIs409(t *testing.T) {
 		WithArgs(sessionID, testAccountID).
 		WillReturnRows(deployApprovedSessionRow(sessionID))
 	expectDeployLockAcquired(mock, sessionID)
+	expectNoApprovedPlan(mock, sessionID)
 	mock.ExpectQuery(`SELECT current_workspace_version FROM billing\.inference_sessions`).
 		WithArgs(sessionID, testAccountID).
 		WillReturnRows(sqlmock.NewRows([]string{"current_workspace_version"}).AddRow(nil))
@@ -2439,5 +2440,78 @@ func TestRedactImageRef(t *testing.T) {
 				t.Errorf("redactImageRef(%q) = %q still leaks registry/account details", tc.input, got)
 			}
 		})
+	}
+}
+
+func budgetSessionRow(id, projectID uuid.UUID, budget, spent float64) *sqlmock.Rows {
+	return sqlmock.NewRows([]string{
+		"id", "account_id", "project_id", "budget", "spent", "status", "label",
+		"agent_instance_id", "app_instance_id", "deploy_approved", "started_at", "ended_at",
+		"last_deploy_failed", "last_deploy_error", "last_deploy_at", "model_alias",
+	}).AddRow(id, testAccountID, projectID, budget, spent, "open", nil, nil, nil, false, nowStub(), nil, false, nil, nil, "teepin/fast")
+}
+
+// A build that paused at its budget is raised AND restarted in one request:
+// the customer never has to raise it and then find another way to continue.
+func TestUpdateKumbhaBudget_ResumeRestartsAPausedBuild(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	fc := newFakeCluster()
+	models := kumbha.StaticModels{{Route: "teepin/fast", Engine: "vllm", Provider: &stubProvider{}}}
+	gw := kumbha.NewGateway(kStore, models, allowGate{}, &fakeKPricing{}, noopUsageRecorder{}).
+		WithAgent(fc, fakeMintKumbhaToken, kumbha.AgentConfig{})
+	server := (&Server{store: cStore}).WithKumbha(gw)
+
+	sessionID, projectID := uuid.New(), uuid.New()
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).WithArgs(sessionID, testAccountID).
+		WillReturnRows(budgetSessionRow(sessionID, projectID, 10, 10))
+	mock.ExpectExec(`UPDATE billing\.inference_sessions SET budget`).WithArgs(20.0, sessionID, testAccountID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).WithArgs(sessionID, testAccountID).
+		WillReturnRows(budgetSessionRow(sessionID, projectID, 20, 10))
+	// No pod is running, so the resume relaunches one.
+	mock.ExpectExec(`UPDATE billing\.inference_sessions SET agent_instance_id`).
+		WithArgs(sessionID, "kumbha-agent-"+sessionID.String()[:8]).WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := kumbhaRequest(server.UpdateKumbhaBudget, http.MethodPatch, "/v1/kumbha/sessions/"+sessionID.String()+"/budget",
+		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, map[string]any{"budget": 20.0, "resume": true}, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d (body: %s)", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["budget"] != 20.0 || resp["resumed"] != true {
+		t.Errorf("response = %v, want budget 20 and resumed true", resp)
+	}
+	if _, ok := fc.instances["kumbha-agent-"+sessionID.String()[:8]]; !ok {
+		t.Error("the build was not restarted")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+// If the restart cannot happen, the raise still stands and the customer is told.
+func TestUpdateKumbhaBudget_ResumeFailureKeepsTheRaiseAndSaysSo(t *testing.T) {
+	mock, kStore, cStore := newMockKumbhaDB(t)
+	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{}, noopUsageRecorder{}) // no agent configured
+	server := (&Server{store: cStore}).WithKumbha(gw)
+
+	sessionID, projectID := uuid.New(), uuid.New()
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).WithArgs(sessionID, testAccountID).
+		WillReturnRows(budgetSessionRow(sessionID, projectID, 10, 10))
+	mock.ExpectExec(`UPDATE billing\.inference_sessions SET budget`).WithArgs(20.0, sessionID, testAccountID).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).WithArgs(sessionID, testAccountID).
+		WillReturnRows(budgetSessionRow(sessionID, projectID, 20, 10))
+
+	w := kumbhaRequest(server.UpdateKumbhaBudget, http.MethodPatch, "/v1/kumbha/sessions/"+sessionID.String()+"/budget",
+		gin.Params{{Key: "id", Value: sessionID.String()}}, projectID, map[string]any{"budget": 20.0, "resume": true}, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d (body: %s)", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["budget"] != 20.0 || resp["resumed"] != false || resp["resume_error"] == "" {
+		t.Errorf("response = %v, want the raise kept, resumed false and an explanation", resp)
 	}
 }

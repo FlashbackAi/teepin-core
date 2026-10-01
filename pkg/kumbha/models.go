@@ -62,9 +62,17 @@ type Model struct {
 	// catalog does not know it. The agent pod uses it to decide when to
 	// condense its conversation history (see LaunchAgent's
 	// TEEPIN_CONTEXT_WINDOW).
-	ContextWindow         int
+	ContextWindow int
+	// MaxOutputTokens is the most the model can write in one answer, 0 when the
+	// catalog does not know it. The agent tells its harness so a single answer
+	// is never asked to be longer than the model can give.
+	MaxOutputTokens       int
 	InputPricePerMillion  float64
 	OutputPricePerMillion float64
+	// Unavailable is why the model cannot be used right now ("Not running
+	// right now"), empty when it can. A build cannot be started on it; the
+	// picker shows it disabled with this reason.
+	Unavailable string
 }
 
 // ModelBackend lists Kumbha's models and serves completions against them.
@@ -84,10 +92,11 @@ type ModelBackend interface {
 
 // StaticModel is one entry of a StaticModels backend.
 type StaticModel struct {
-	Route         string
-	Engine        string
-	ContextWindow int
-	Provider      inference.Provider
+	Route           string
+	Engine          string
+	ContextWindow   int
+	MaxOutputTokens int
+	Provider        inference.Provider
 }
 
 // StaticModels is a fixed, in-memory ModelBackend: its models are listed in
@@ -98,7 +107,7 @@ type StaticModels []StaticModel
 func (s StaticModels) KumbhaModels(context.Context) ([]Model, error) {
 	out := make([]Model, 0, len(s))
 	for _, m := range s {
-		out = append(out, Model{Route: m.Route, Engine: m.Engine, ContextWindow: m.ContextWindow})
+		out = append(out, Model{Route: m.Route, Engine: m.Engine, ContextWindow: m.ContextWindow, MaxOutputTokens: m.MaxOutputTokens})
 	}
 	return out, nil
 }

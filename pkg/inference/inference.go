@@ -80,8 +80,17 @@ type Request struct {
 // Usage is the token accounting for one call — the input to metering, and
 // the only reason the gateway parses provider responses at all.
 type Usage struct {
+	// InputTokens is EVERY token sent to the model, however it was served:
+	// freshly processed, read from the prompt cache, or written to it. This is
+	// the figure customers are billed on, so caching never changes a bill.
 	InputTokens  int
 	OutputTokens int
+	// CachedInputTokens is the part of InputTokens read back from the prompt
+	// cache (cheap and fast for Teepin). CacheWriteTokens is the part written to
+	// it on this call (dearer than ordinary input). Both are zero for backends
+	// that do not report them. Kept for the cost and hit-rate picture only.
+	CachedInputTokens int
+	CacheWriteTokens  int
 }
 
 // Response carries the backend's reply verbatim plus the accounting parsed
@@ -215,6 +224,10 @@ func EstimateTokens(req Request) int {
 	for _, m := range req.Messages {
 		bytes += len(m)
 	}
+	// Tool definitions are sent with every request and, for an agent with a
+	// browser, run to ~16k tokens: leaving them out made the estimate low enough
+	// to let requests through that the backend then refused.
+	bytes += len(req.Extra["tools"])
 	// A small per-message allowance for the role/formatting scaffolding
 	// every chat format wraps around content.
 	return bytes/4 + len(req.Messages)*4
@@ -231,7 +244,10 @@ func FitsContext(req Request, caps Capabilities) error {
 	}
 	need := EstimateTokens(req) + req.MaxTokens
 	if need > caps.ContextWindow {
-		return fmt.Errorf("%w: approximately %d tokens needed, window is %d",
+		// "context length exceeded" is the phrase agent harnesses recognise as
+		// "shorten the conversation and retry" (they summarise their history in
+		// response); a different wording would surface as a hard failure.
+		return fmt.Errorf("%w: context length exceeded: approximately %d tokens needed, window is %d",
 			ErrContextTooLarge, need, caps.ContextWindow)
 	}
 	return nil

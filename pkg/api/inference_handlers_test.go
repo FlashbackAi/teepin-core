@@ -666,3 +666,60 @@ func TestInferencePreflightCost(t *testing.T) {
 		t.Errorf("over-limit request cost = %v, want %v", got, want)
 	}
 }
+
+type statusByRoute map[string]inferencegateway.ModelStatus
+
+func (s statusByRoute) Status(_ context.Context, m modelcatalog.Model) inferencegateway.ModelStatus {
+	if st, ok := s[m.ModelRoute]; ok {
+		return st
+	}
+	return inferencegateway.ModelStatus{State: inferencegateway.StateUnknown}
+}
+
+// The build composer's picker is told which models can serve right now, so it
+// can disable the rest; a model whose state is merely unknown stays usable.
+func TestGetKumbhaModels_ReportsWhichModelsCanServe(t *testing.T) {
+	cat := fakeCatalog{models: map[string]modelcatalog.Model{
+		"teepin/up":      {ModelRoute: "teepin/up", DisplayName: "Up", Enabled: true, KumbhaEnabled: true, KumbhaPriority: 1},
+		"teepin/down":    {ModelRoute: "teepin/down", DisplayName: "Down", Enabled: true, KumbhaEnabled: true, KumbhaPriority: 2},
+		"teepin/sick":    {ModelRoute: "teepin/sick", DisplayName: "Sick", Enabled: true, KumbhaEnabled: true, KumbhaPriority: 3},
+		"teepin/unknown": {ModelRoute: "teepin/unknown", DisplayName: "Unknown", Enabled: true, KumbhaEnabled: true, KumbhaPriority: 4},
+	}}
+	h := NewInferenceHandler(&fakeGW{}, cat, nil).WithModelStatus(statusByRoute{
+		"teepin/up":   {State: inferencegateway.StateServing},
+		"teepin/down": {State: inferencegateway.StateNoBackend, Detail: "node-7 is offline"},
+		"teepin/sick": {State: inferencegateway.StateUnhealthy, Detail: "connection refused to 10.0.0.5"},
+	})
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Set(string(auth.AccountIDKey), uuid.New())
+		c.Next()
+	})
+	r.GET("/v1/kumbha/models", h.GetKumbhaModels)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/kumbha/models", nil))
+
+	var out struct {
+		Data []kumbhaModelView `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	want := map[string]bool{"teepin/up": true, "teepin/down": false, "teepin/sick": false, "teepin/unknown": true}
+	for _, m := range out.Data {
+		if m.Available != want[m.Route] {
+			t.Errorf("%s: available = %v, want %v", m.Route, m.Available, want[m.Route])
+		}
+		if !m.Available && m.Unavailable == "" {
+			t.Errorf("%s is unavailable but gives no reason", m.Route)
+		}
+	}
+	// The reason is for customers: it never carries the operator's detail
+	// (node names, internal addresses).
+	body := rec.Body.String()
+	if strings.Contains(body, "node-7") || strings.Contains(body, "10.0.0.5") {
+		t.Errorf("response leaks backend detail: %s", body)
+	}
+}

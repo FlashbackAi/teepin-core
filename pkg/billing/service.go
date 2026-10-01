@@ -59,6 +59,9 @@ type Service struct {
 	onTopUpSettled func(context.Context, TopUpReceiptNotice)
 	onTopUpFailed  func(context.Context, TopUpFailureNotice)
 
+	// solana accepts USDC payments when configured; see crypto_topups.go.
+	solana *solanaPay
+
 	// balances caches recent balances for pre-flight checks; see
 	// credit_guard.go. Zero value is ready to use.
 	balances balanceCache

@@ -661,6 +661,11 @@ func (s *Server) CreateInstance(c *gin.Context) {
 			})
 			return
 		}
+		// What the agent asks for must be covered by the plan the customer
+		// approved, not merely by "some plan was approved".
+		if !s.refuseUnapprovedResources(c, kumbhaSessionID, req.CPUUnits, parseMemoryGB(req.Memory), req.StorageGB) {
+			return
+		}
 
 		// The secrets the customer entered for this build go into the app's
 		// environment here, on the control plane: the agent never held their

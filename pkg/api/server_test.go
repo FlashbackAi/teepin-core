@@ -1284,6 +1284,7 @@ func TestCreateInstance_CheckspointsKumbhaWorkspaceWhenSessionLinked(t *testing.
 	mock.ExpectQuery(`SELECT .+ FROM billing\.inference_sessions`).
 		WithArgs(sessionID, testAccountID).
 		WillReturnRows(approvedSessionRow(sessionID))
+	expectNoApprovedPlan(mock, sessionID)
 	mock.ExpectQuery(`INSERT INTO compute\.instances`).
 		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),

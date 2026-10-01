@@ -52,6 +52,10 @@ var sessionAllowedRoutes = map[string]bool{
 	// Screenshot pod upload.
 	"POST /v1/kumbha/sessions/:id/screenshot": true,
 
+	// The agent records each deployment plan it presents, so the customer's
+	// approval can name it. (Approving is the customer's, and not here.)
+	"POST /v1/kumbha/sessions/:id/plans": true,
+
 	// teepin-mcp-server verbs. deploy and create_instance are additionally
 	// gated server-side on the session's deploy_approved flag.
 	"POST /v1/kumbha/sessions/:id/deploy": true,

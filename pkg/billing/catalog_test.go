@@ -14,8 +14,8 @@ func TestClassify(t *testing.T) {
 		{"cpu.home", "CPU compute", "CPU compute (on-demand node)"},
 		{"cpu.small", "CPU compute", "CPU Small"},
 		{"gpu.h100.mig-2g", "GPU compute", "GPU H100 MIG 2g"},
-		{"kumbha/teepin/fast:input", "Kumbha", "teepin/fast — input tokens"},
-		{"kumbha/teepin/fast:output", "Kumbha", "teepin/fast — output tokens"},
+		{"kumbha/teepin/fast:input", "Teepin Build", "teepin/fast — input tokens"},
+		{"kumbha/teepin/fast:output", "Teepin Build", "teepin/fast — output tokens"},
 		{"inference/teepin/qwen3-30b-a3b:input", "Inference", "teepin/qwen3-30b-a3b — input tokens"},
 		{"inference/teepin/qwen3-30b-a3b:output", "Inference", "teepin/qwen3-30b-a3b — output tokens"},
 		// Rows written before inference usage carried the model in the type.
