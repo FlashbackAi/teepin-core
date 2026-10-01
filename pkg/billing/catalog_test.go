@@ -24,8 +24,10 @@ func TestClassify(t *testing.T) {
 		{"object_storage_gb_month", "Object storage", "Storage"},
 		{"object_storage_gb_egress", "Object storage", "Data transfer out"},
 		{"storage_gb", "Block storage", "Persistent volume"},
-		{"", "Other charges", "Other usage"},
-		{"   ", "Other charges", "Other usage"},
+		{"", "Compute", "Compute (instance type not recorded)"},
+		{"   ", "Compute", "Compute (instance type not recorded)"},
+		{"compute", "Compute", "Compute"},
+		{"compute (stopped, disk only)", "Compute", "Compute (stopped, disk only)"},
 		{"something.new-thing", "Other charges", "Something New Thing"},
 	}
 	for _, c := range cases {

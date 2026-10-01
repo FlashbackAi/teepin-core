@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -54,7 +55,7 @@ func (c *UsageCollector) collectStoppedStorage(ctx context.Context, accountID *u
 			AccountID:    d.AccountID,
 			ProjectID:    d.ProjectID,
 			InstanceID:   d.ID,
-			ResourceType: d.InstanceType + " (stopped, disk only)",
+			ResourceType: computeTypeOrDefault(d.InstanceType) + " (stopped, disk only)",
 			Quantity:     hours,
 			Unit:         "hours",
 			UnitPrice:    perHour,
@@ -103,4 +104,13 @@ func (c *UsageCollector) stoppedDisks(ctx context.Context, accountID *uuid.UUID)
 		out = append(out, d)
 	}
 	return out, rows.Err()
+}
+
+// computeTypeOrDefault names an instance's type for a usage record, falling
+// back to "compute" when none was recorded so the record never reads as blank.
+func computeTypeOrDefault(instanceType string) string {
+	if strings.TrimSpace(instanceType) == "" {
+		return "compute"
+	}
+	return instanceType
 }

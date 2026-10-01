@@ -5,6 +5,7 @@ package billing
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"time"
 
@@ -46,47 +47,27 @@ type AccountSummary struct {
 // while projects act as cost centres, which is how AWS and GCP behave
 // and what finance teams expect.
 func (s *Service) GetAccountSummary(ctx context.Context, accountID uuid.UUID, start, end time.Time) (*AccountSummary, error) {
-	// resource_type holds the instance type ("gpu.h100.1g.10gb") for
-	// compute, or "kumbha/<route>:input"/":output" for Kumbha's own LLM
-	// spend (see pkg/kumbha.Gateway.settleLine) — either way, it maps to
-	// a customer-facing service name. Grouping in SQL keeps the whole
-	// summary to a single round trip.
+	// Grouped by resource type in SQL and named in Go through the service
+	// catalog (Classify), so the Bills page, the statement and the invoice all
+	// use ONE definition of "which service is this". This used to be a second,
+	// hand-written CASE here that had drifted from the catalog: object-storage
+	// usage and untyped compute both fell into "Other" on the Bills page while
+	// the invoice named them properly.
 	//
-	// The Kumbha case matters beyond labelling: without it, Kumbha's
-	// "tokens"-unit rows fell into the SAME 'Other' bucket a compute
-	// instance's "hours"-unit rows can also land in when its own
-	// resource_type happens not to match any pattern above — two
-	// DIFFERENT (service, unit) groups that both render the label
-	// "Other". The console keys each service row by that label alone
-	// (billing/page.tsx), so two same-named rows for one project produced
-	// a duplicate React key crash. Invisible before 2026-08-30: Kumbha
-	// billing only ever settled once, at session-close, so the account
-	// summary rarely saw both an "Other" compute row and an "Other"
-	// Kumbha row in the same query; continuous per-completion settlement
-	// (Gateway.Complete) made the collision a live, ordinary occurrence
-	// instead of a rare coincidence.
+	// Rows are also split by instance, so the number of distinct instances of a
+	// service is exact when several resource types map to the same service (an
+	// instance whose type was recorded late appears under two types).
 	const query = `
-		SELECT p.id, p.name,
-		       CASE
-		         WHEN u.resource_type LIKE 'gpu.%'     THEN 'GPU compute'
-		         WHEN u.resource_type LIKE 'cpu.%'     THEN 'CPU compute'
-		         WHEN u.resource_type LIKE 'storage%'  THEN 'Storage'
-		         WHEN u.resource_type LIKE 'network%'  THEN 'Networking'
-		         WHEN u.resource_type LIKE 'kumbha/%'  THEN 'Kumbha'
-		         WHEN u.resource_type LIKE 'inference/%' THEN 'Inference'
-		         ELSE 'Other'
-		       END AS service,
-		       u.unit,
-		       SUM(u.quantity)                AS quantity,
-		       SUM(u.total_cost)              AS cost,
-		       COUNT(DISTINCT u.instance_id)  AS instances
+		SELECT p.id, p.name, COALESCE(u.resource_type, ''), u.unit, u.instance_id,
+		       SUM(u.quantity)   AS quantity,
+		       SUM(u.total_cost) AS cost
 		FROM billing.usage_records u
 		JOIN auth.projects p ON p.id = u.project_id
 		WHERE u.account_id = $1
 		  AND u.start_time >= $2
 		  AND u.end_time   <= $3
-		GROUP BY p.id, p.name, service, u.unit
-		ORDER BY p.name, service
+		GROUP BY p.id, p.name, u.resource_type, u.unit, u.instance_id
+		ORDER BY p.name, u.resource_type
 	`
 
 	rows, err := s.db.QueryContext(ctx, query, accountID, start, end)
@@ -103,17 +84,26 @@ func (s *Service) GetAccountSummary(ctx context.Context, accountID uuid.UUID, st
 		Projects:    []ProjectLine{},
 	}
 
-	// Rows arrive ordered by project, so accumulate into the current one.
+	type lineKey struct {
+		project uuid.UUID
+		service string
+		unit    string
+	}
 	byProject := map[uuid.UUID]int{} // project ID -> index in Projects
+	lineIdx := map[lineKey]int{}     // (project, service, unit) -> index in that project's Services
+	instances := map[lineKey]map[string]bool{}
 
 	for rows.Next() {
 		var (
 			projectID   uuid.UUID
 			projectName string
-			line        ServiceLine
+			resource    string
+			unit        string
+			instanceID  sql.NullString
+			quantity    float64
+			cost        float64
 		)
-		if err := rows.Scan(&projectID, &projectName, &line.Service, &line.Unit,
-			&line.Quantity, &line.Cost, &line.Instances); err != nil {
+		if err := rows.Scan(&projectID, &projectName, &resource, &unit, &instanceID, &quantity, &cost); err != nil {
 			return nil, fmt.Errorf("failed to scan usage row: %w", err)
 		}
 
@@ -128,9 +118,25 @@ func (s *Service) GetAccountSummary(ctx context.Context, accountID uuid.UUID, st
 			byProject[projectID] = idx
 		}
 
-		summary.Projects[idx].Services = append(summary.Projects[idx].Services, line)
-		summary.Projects[idx].Cost += line.Cost
-		summary.TotalCost += line.Cost
+		service := Classify(resource).Service
+		key := lineKey{projectID, service, unit}
+		li, ok := lineIdx[key]
+		if !ok {
+			summary.Projects[idx].Services = append(summary.Projects[idx].Services, ServiceLine{Service: service, Unit: unit})
+			li = len(summary.Projects[idx].Services) - 1
+			lineIdx[key] = li
+			instances[key] = map[string]bool{}
+		}
+		line := &summary.Projects[idx].Services[li]
+		line.Quantity += quantity
+		line.Cost += cost
+		if instanceID.Valid && instanceID.String != "" {
+			instances[key][instanceID.String] = true
+			line.Instances = len(instances[key])
+		}
+
+		summary.Projects[idx].Cost += cost
+		summary.TotalCost += cost
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("failed to read usage rows: %w", err)

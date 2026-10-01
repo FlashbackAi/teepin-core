@@ -50,6 +50,15 @@ var serviceRules = []catalogRule{
 		}
 		return Presentation{Service: "CPU compute", Title: title, Rate: "per hour", Scale: 1}
 	}},
+	// Compute whose instance type was never recorded. Usage records take their
+	// resource type from the instance's type at billing time; an instance
+	// created without one (older instances, and paths that did not set it)
+	// wrote a blank type, which used to surface as "Other usage". It is still
+	// an instance running, so it is presented as compute. "compute" is also the
+	// base the stopped-disk records use when there is no type to name.
+	{"compute", func(_, rest, _ string) Presentation {
+		return Presentation{Service: "Compute", Title: "Compute" + rest, Rate: "per hour", Scale: 1}
+	}},
 	{"kumbha/", func(_, rest, _ string) Presentation {
 		route, direction := splitDirection(rest)
 		return Presentation{Service: "Kumbha", Title: tokenTitle(route, direction), Rate: "per 1M tokens", Scale: 1e6}
@@ -79,7 +88,9 @@ var serviceRules = []catalogRule{
 func Classify(resourceType string) Presentation {
 	rt := strings.TrimSpace(resourceType)
 	if rt == "" {
-		return Presentation{Service: "Other charges", Title: "Other usage", Scale: 1}
+		// Only compute metering can write a blank type (see the "compute" rule).
+		// No rate: with the type unknown, so is what the price is quoted per.
+		return Presentation{Service: "Compute", Title: "Compute (instance type not recorded)", Scale: 1}
 	}
 	for _, r := range serviceRules {
 		if strings.HasPrefix(rt, r.prefix) {
