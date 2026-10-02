@@ -47,12 +47,44 @@ func callPlan(t *testing.T, args map[string]any) (string, bool) {
 // A model that sends an empty "resources" array (valid to the schema, useless to
 // the plan) is told what it sent and shown a correct call. A live GLM-5.3 build
 // got a bare "at least one resource is required" fifteen times and never fixed it.
+// The call it is shown describes the app at the top level, the shape GLM can send.
 func TestPresentDeploymentPlan_EmptyResourcesRefusalShowsTheShape(t *testing.T) {
 	text, _ := callPlan(t, map[string]any{"resources": []any{}, "verification": "x"})
-	for _, want := range []string{"at least one resource is required", "non-empty array", "fields: resources, verification", "cpu_units", `"name": "guestbook"`} {
+	for _, want := range []string{"at least one resource is required", "top level", "fields: resources, verification", "cpu_units", `"name": "guestbook"`} {
 		if !strings.Contains(text, want) {
 			t.Errorf("refusal %q does not mention %q", text, want)
 		}
+	}
+	if strings.Contains(planExample, `"resources"`) {
+		t.Errorf("the example still shows a resources list, the shape GLM loses: %s", planExample)
+	}
+}
+
+// The exact shape a GLM build sends: the app at the top level and an empty
+// "resources" list. It must be accepted by the schema and priced.
+func TestPresentDeploymentPlan_TopLevelAppPassesTheSchemaAndIsPriced(t *testing.T) {
+	c := newTestClient(t, planPricingMux())
+	server := mcp.NewServer(&mcp.Implementation{Name: "teepin", Version: "test"}, nil)
+	mcp.AddTool(server, &mcp.Tool{Name: "present_deployment_plan", Description: "plan"}, c.presentDeploymentPlan)
+	ctx := context.Background()
+	st, ct := mcp.NewInMemoryTransports()
+	if _, err := server.Connect(ctx, st, nil); err != nil {
+		t.Fatal(err)
+	}
+	session, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "test"}, nil).Connect(ctx, ct, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "present_deployment_plan", Arguments: map[string]any{
+		"name": "task-monitor", "cpu_units": 1, "memory_gb": 1, "resources": []any{}, "verification": testVerification,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := res.Content[0].(*mcp.TextContent).Text
+	if !isPricedPlan(text) || !strings.Contains(text, `"name":"task-monitor"`) || !strings.Contains(text, "cost_per_hour") {
+		t.Fatalf("a top-level app was not priced: %s", text)
 	}
 }
 

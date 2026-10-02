@@ -43,13 +43,15 @@ const (
 )
 
 // A call that passes validation, shown to the agent in the tool description and
-// in every refusal. A live GLM build sent the same question with no options 10
-// times because the refusal said what was wrong but never showed a valid call.
-const askUserExample = `{"question":"How should I fill the process table's rows?","options":[` +
-	`{"label":"Sample data","description":"Invent realistic process names and values"},` +
-	`{"label":"Totals only","description":"Show only the system totals from the screenshot"}],"allow_other":true}`
+// in every refusal. The options are top-level fields, not a list: GLM-5.3's tool
+// calls arrive with every list of objects empty ("options": [] in the model's raw
+// arguments, 10 times in a row in one build, 2026-10-02), while plain text
+// fields come through.
+const askUserExample = `{"question":"How should I fill the process table's rows?",` +
+	`"option_1":"Sample data","option_1_description":"Invent realistic process names and values",` +
+	`"option_2":"Totals only","option_2_description":"Show only the system totals from the screenshot","allow_other":true}`
 
-const askUserNote ="The question is now shown to the customer. End your turn now without doing anything else: " +
+const askUserNote = "The question is now shown to the customer. End your turn now without doing anything else: " +
 	"their answer will arrive as your next message."
 
 const requestSecretNote = "The customer is entering this in a secure field. You will NEVER see the value. " +
@@ -64,9 +66,33 @@ type questionOption struct {
 }
 
 type askUserArgs struct {
-	Question   string           `json:"question" jsonschema:"one clear question"`
-	Options    []questionOption `json:"options" jsonschema:"2 to 4 distinct answers, best recommendation first"`
+	Question           string `json:"question" jsonschema:"one clear question"`
+	Option1            string `json:"option_1,omitempty" jsonschema:"the first answer the customer can pick, your best recommendation"`
+	Option1Description string `json:"option_1_description,omitempty" jsonschema:"one line saying what picking option_1 means"`
+	Option2            string `json:"option_2,omitempty" jsonschema:"the second answer the customer can pick"`
+	Option2Description string `json:"option_2_description,omitempty" jsonschema:"one line saying what picking option_2 means"`
+	Option3            string `json:"option_3,omitempty" jsonschema:"a third answer, if there is one"`
+	Option3Description string `json:"option_3_description,omitempty"`
+	Option4            string `json:"option_4,omitempty" jsonschema:"a fourth answer, if there is one"`
+	Option4Description string `json:"option_4_description,omitempty"`
+	// Options is the older list form, still read for a model that fills it.
+	Options    []questionOption `json:"options,omitempty" jsonschema:"leave out: use option_1 to option_4 instead"`
 	AllowOther bool             `json:"allow_other,omitempty" jsonschema:"let the customer type their own answer instead"`
+}
+
+// allOptions is the answers in order: option_1 to option_4 that are set, then
+// any given in the older "options" list.
+func (a askUserArgs) allOptions() []questionOption {
+	var out []questionOption
+	for _, o := range []questionOption{
+		{a.Option1, a.Option1Description}, {a.Option2, a.Option2Description},
+		{a.Option3, a.Option3Description}, {a.Option4, a.Option4Description},
+	} {
+		if strings.TrimSpace(o.Label) != "" {
+			out = append(out, o)
+		}
+	}
+	return append(out, a.Options...)
 }
 
 func (c *teepinClient) askUser(_ context.Context, _ *mcp.CallToolRequest, args askUserArgs) (*mcp.CallToolResult, any, error) {
@@ -77,15 +103,17 @@ func (c *teepinClient) askUser(_ context.Context, _ *mcp.CallToolRequest, args a
 	if len([]rune(q)) > maxQuestionChars {
 		return textResult("keep the question under %d characters", maxQuestionChars)
 	}
-	if n := len(args.Options); n < minOptions || n > maxOptions {
-		return textResult("give between %d and %d options (got %d). Even an open question needs your best %d to %d "+
-			"likely answers as options; set allow_other to true so the customer can type their own instead. "+
-			"Do not list options in a chat message instead. A working call: %s",
+	given := args.allOptions()
+	if n := len(given); n < minOptions || n > maxOptions {
+		return textResult("give between %d and %d answers to pick from (got %d), as option_1, option_2 and so on at the "+
+			"top level of the call. Even an open question needs your best %d to %d likely answers; set allow_other to "+
+			"true so the customer can type their own instead. Do not list them in a chat message instead. "+
+			"A working call: %s",
 			minOptions, maxOptions, n, minOptions, maxOptions, askUserExample)
 	}
 	seen := map[string]bool{}
-	opts := make([]questionOption, 0, len(args.Options))
-	for _, o := range args.Options {
+	opts := make([]questionOption, 0, len(given))
+	for _, o := range given {
 		label := strings.TrimSpace(o.Label)
 		if label == "" {
 			return textResult("every option needs a label")
@@ -173,7 +201,8 @@ func jsonResult(v any) (*mcp.CallToolResult, any, error) {
 func registerPromptTools(server *mcp.Server, client *teepinClient) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "ask_user",
-		Description: "Ask the customer a question with 2 to 4 answers to pick from (and optionally let " +
+		Description: "Ask the customer a question with 2 to 4 answers to pick from, given as option_1, option_2 " +
+			"(up to option_4), each with an optional option_N_description (and optionally let " +
 			"them type their own) when a decision is theirs to make: which service to use, what the app " +
 			"should do next, a preference you cannot infer. Prefer this to guessing or asking in plain " +
 			"chat, and never put the options in a chat message or a table. If there are more than four " +

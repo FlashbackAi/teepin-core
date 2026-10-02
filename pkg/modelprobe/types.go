@@ -28,6 +28,13 @@ const (
 	// the request. Informational: a model can pass the plain test and still
 	// lose the thread with that many tools.
 	CapToolsMany Capability = "tools_many"
+	// CapToolsLists: a native tool call can carry a list of objects as an
+	// argument. GLM-5.3's passed every other tool check while every list of
+	// objects in its builds arrived empty ("resources": [], "options": []),
+	// 2026-10-02. A failure moves building to the text protocol when that
+	// works; otherwise native stays, since the builder's own tools avoid
+	// lists of objects.
+	CapToolsLists Capability = "tools_lists"
 	// CapVision: the model reads an image.
 	CapVision Capability = "vision"
 	// CapAudio: the model hears a sound clip.
@@ -35,7 +42,7 @@ const (
 )
 
 // AllCapabilities is every capability the prober tests, in report order.
-var AllCapabilities = []Capability{CapTools, CapToolsMany, CapBuild, CapBuildText, CapVision, CapAudio}
+var AllCapabilities = []Capability{CapTools, CapToolsMany, CapToolsLists, CapBuild, CapBuildText, CapVision, CapAudio}
 
 // Status is the outcome of testing one capability.
 type Status string
@@ -134,7 +141,8 @@ const (
 // evidence, falling back to the operator's declaration where there is none.
 //
 //   - native tool calls that pass both the single-step test and the build task:
-//     native;
+//     native, unless they lose lists of objects and the text protocol passes
+//     its build task, in which case text;
 //   - otherwise the text protocol passing the build task: text;
 //   - with no conclusive evidence, a declared-tools model keeps working natively
 //     (a model registered before checks existed is not locked out);
@@ -144,6 +152,12 @@ func BuildMode(rep *Report, declaredTools bool) (mode ToolMode, ok bool) {
 	nativeBroken := tools == StatusFailed || build == StatusFailed
 	switch {
 	case tools == StatusPassed && !nativeBroken:
+		// Lost lists of objects are a reason to prefer text only when text is
+		// proven to work: native still builds, because the builder's tools take
+		// plain fields, and a model must never be locked out on this alone.
+		if rep.Check(CapToolsLists).Status == StatusFailed && text == StatusPassed {
+			return ToolModeText, true
+		}
 		return ToolModeNative, true
 	case text == StatusPassed:
 		return ToolModeText, true

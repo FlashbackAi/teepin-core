@@ -34,6 +34,7 @@ type fakeModel struct {
 	ignoresTool bool // never uses a tool result
 	truncated   bool // runs out of output tokens before answering
 	toolsBreak  bool // answers 502 only when the request carries tools
+	dropsLists  bool // tool calls lose lists of objects, as GLM-5.3's did
 	calls       int
 }
 
@@ -111,6 +112,13 @@ func (f *fakeModel) Complete(_ context.Context, req inference.Request) (*inferen
 		}
 		_ = json.Unmarshal(req.Extra["tools"], &tools)
 		switch {
+		case strings.Contains(text, "add_to_order"):
+			if f.dropsLists {
+				return toolReply("add_to_order", `{"items":[]}`, f.badArgs), nil
+			}
+			m := regexp.MustCompile(`Add (\d+) (\w+) and (\d+) (\w+)`).FindStringSubmatch(text)
+			return toolReply("add_to_order", fmt.Sprintf(`{"items":[{"name":%q,"quantity":%s},{"name":%q,"quantity":%s}]}`,
+				m[2], m[1], m[4], m[3]), f.badArgs), nil
 		case strings.Contains(text, "weather"):
 			city := regexp.MustCompile(`in ([A-Z][a-z]+)`).FindStringSubmatch(text)[1]
 			return toolReply("get_weather", fmt.Sprintf(`{"city":%q}`, city), f.badArgs), nil
@@ -206,7 +214,7 @@ func countBeeps(b64 string) int {
 
 // singleStepCapabilities are the capabilities the plain fake model can answer;
 // the build tasks need the scripted builder (agentloop_test.go).
-var singleStepCapabilities = []Capability{CapTools, CapToolsMany, CapVision, CapAudio}
+var singleStepCapabilities = []Capability{CapTools, CapToolsMany, CapToolsLists, CapVision, CapAudio}
 
 func runner(m inference.Provider) *Runner {
 	return &Runner{Provider: m, Route: "teepin/test", CallTimeout: time.Second, Now: func() time.Time { return time.Unix(0, 0) }}
@@ -243,6 +251,37 @@ func TestRunner_TextOnlyModelFailsToolsWithAReason(t *testing.T) {
 	got := runner(&fakeModel{noTools: true}).RunCapability(context.Background(), CapTools)
 	if got.Status != StatusFailed || !strings.Contains(got.Detail, "step 1") || !strings.Contains(got.Detail, "instead of calling a tool") {
 		t.Errorf("got %s: %q", got.Status, got.Detail)
+	}
+}
+
+// The GLM-5.3 shape: every other tool check passes, and a list of objects
+// arrives empty. The lists check must fail and say so; the plain one must not.
+func TestRunner_ALostListOfObjectsFailsOnlyTheListsCheck(t *testing.T) {
+	r := runner(&fakeModel{dropsLists: true})
+	if got := r.RunCapability(context.Background(), CapTools); got.Status != StatusPassed {
+		t.Errorf("tools: %s (%s)", got.Status, got.Detail)
+	}
+	got := r.RunCapability(context.Background(), CapToolsLists)
+	if got.Status != StatusFailed || !strings.Contains(got.Detail, "arrived empty") {
+		t.Errorf("tools_lists: %s %q", got.Status, got.Detail)
+	}
+}
+
+func TestCheckOrder(t *testing.T) {
+	want := map[string]int{"apples": 2, "pears": 3}
+	ok := toolCall{args: `{"items":[{"name":"Apples","quantity":2},{"name":"pear","quantity":3}]}`}
+	if err := checkOrder(ok, want); err != nil {
+		t.Errorf("a full list failed: %v", err)
+	}
+	for args, wantErr := range map[string]string{
+		`{"items":[]}`: "arrived empty",
+		`{"items":[{"name":"apples","quantity":2}]}`:                               "3 pears is missing",
+		`{"items":[{"name":"apples","quantity":2},{"name":"pears","quantity":4}]}`: "3 pears is missing",
+		`{not json`: "not valid JSON",
+	} {
+		if err := checkOrder(toolCall{args: args}, want); err == nil || !strings.Contains(err.Error(), wantErr) {
+			t.Errorf("%s: err = %v, want %q", args, err, wantErr)
+		}
 	}
 }
 

@@ -240,6 +240,10 @@ func TestBuildMode(t *testing.T) {
 		{"never checked, not declared: cannot build", nil, false, ""},
 		{"tools check could not run, declared: native", rep(st(CapTools, StatusError)), true, ToolModeNative},
 		{"tools check could not run, not declared: cannot build", rep(st(CapTools, StatusError)), false, ""},
+		{"native works but loses lists of objects, text works: text", rep(st(CapTools, StatusPassed), st(CapToolsLists, StatusFailed), st(CapBuild, StatusPassed), st(CapBuildText, StatusPassed)), false, ToolModeText},
+		{"native loses lists of objects, text fails: native, never locked out", rep(st(CapTools, StatusPassed), st(CapToolsLists, StatusFailed), st(CapBuild, StatusPassed), st(CapBuildText, StatusFailed)), false, ToolModeNative},
+		{"native loses lists of objects, text not checked: native", rep(st(CapTools, StatusPassed), st(CapToolsLists, StatusFailed)), false, ToolModeNative},
+		{"lists check passed: native even if text passed too", rep(st(CapTools, StatusPassed), st(CapToolsLists, StatusPassed), st(CapBuildText, StatusPassed)), false, ToolModeNative},
 	} {
 		got, ok := BuildMode(tc.rep, tc.declared)
 		if got != tc.want || ok != (tc.want != "") {
@@ -306,6 +310,25 @@ func TestService_RunsTheTextBuildTaskOnlyWhenNativeToolsDoNotWork(t *testing.T) 
 		t.Errorf("build_text = %s (%s)", rep.Check(CapBuildText).Status, rep.Check(CapBuildText).Detail)
 	}
 	if mode, ok := BuildMode(rep, true); !ok || mode != ToolModeText {
+		t.Errorf("mode = %q ok = %v, want text", mode, ok)
+	}
+}
+
+// A model like GLM-5.3: native tool calls pass, but lists of objects arrive
+// empty. The text build task runs, and when it passes the model builds in text.
+func TestService_LostListsOfObjectsRunTheTextBuildTask(t *testing.T) {
+	svc, _ := newService(&comboModel{probes: &fakeModel{dropsLists: true}, builder: &fakeBuilder{}}, "teepin/test")
+	rep, err := svc.Check(context.Background(), "teepin/test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Check(CapTools).Status != StatusPassed || rep.Check(CapToolsLists).Status != StatusFailed {
+		t.Fatalf("tools = %s, tools_lists = %s (%s)", rep.Check(CapTools).Status, rep.Check(CapToolsLists).Status, rep.Check(CapToolsLists).Detail)
+	}
+	if rep.Check(CapBuildText).Status != StatusPassed {
+		t.Errorf("build_text = %s (%s)", rep.Check(CapBuildText).Status, rep.Check(CapBuildText).Detail)
+	}
+	if mode, ok := BuildMode(rep, false); !ok || mode != ToolModeText {
 		t.Errorf("mode = %q ok = %v, want text", mode, ok)
 	}
 }

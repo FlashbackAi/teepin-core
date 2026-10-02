@@ -66,9 +66,9 @@ func main() {
 		Description: "Create a running Teepin compute instance from a container image. " +
 			"Requires the customer to have approved the deployment plan first — call " +
 			"present_deployment_plan and wait if you have not done that yet. IMPORTANT: " +
-			"for anyone to reach the instance, you MUST set ports to the port the " +
-			"container listens on — an instance created with no ports has no public " +
-			"endpoint at all.",
+			"for anyone to reach the instance, you MUST set port to the port the " +
+			"container listens on (a plain number, e.g. \"port\": 80) — an instance created with no port has no public " +
+			"endpoint at all. Give environment variables as env_vars, one NAME=value per line.",
 	}, client.createInstance)
 
 	mcp.AddTool(server, &mcp.Tool{
@@ -78,10 +78,10 @@ func main() {
 			"a Teepin instance. The first deployment requires the customer to have " +
 			"approved the deployment plan. If the app is already deployed, this updates it " +
 			"in place (same instance, same address) and needs no new plan or approval. IMPORTANT: for anyone (including the customer) to actually " +
-			"reach the deployed app, you MUST set ports to the port your app listens " +
-			"on inside the container (e.g. 80 for a typical web server on nginx). An " +
-			"instance deployed with no ports has no public endpoint at all — it will " +
-			"show as running, but nobody can open it.",
+			"reach the deployed app, you MUST set port to the port your app listens " +
+			"on inside the container, as a plain number (e.g. \"port\": 80 for a typical web server on nginx). An " +
+			"instance deployed with no port has no public endpoint at all — it will " +
+			"show as running, but nobody can open it. Give environment variables as env_vars, one NAME=value per line.",
 	}, client.deploy)
 
 	mcp.AddTool(server, &mcp.Tool{
@@ -240,8 +240,19 @@ type resourceRequest struct {
 	StorageGB int    `json:"storage_gb,omitempty" jsonschema:"persistent volume size; 0 for none"`
 }
 
+// presentDeploymentPlanArgs describes the app at the top level (name and
+// sizes) rather than only as a list of resource objects. GLM-5.3's tool calls
+// arrive with every list of objects empty ("resources": [] in the model's raw
+// arguments, in every GLM session on 2026-10-02, while text and numbers come
+// through), so a plan that could only be described as a list could never be
+// presented. Plain top-level fields survive. "resources" stays for a model
+// that can fill it, and for a second service on top of the main one.
 type presentDeploymentPlanArgs struct {
-	Resources []resourceRequest `json:"resources" jsonschema:"every compute resource this build will need"`
+	Name      string            `json:"name,omitempty" jsonschema:"the app's name, e.g. task-monitor"`
+	CPUUnits  int               `json:"cpu_units,omitempty" jsonschema:"vCPU cores for the app, e.g. 1"`
+	MemoryGB  int               `json:"memory_gb,omitempty" jsonschema:"memory for the app in GB, e.g. 1"`
+	StorageGB int               `json:"storage_gb,omitempty" jsonschema:"persistent volume size in GB; leave out for none"`
+	Resources []resourceRequest `json:"resources,omitempty" jsonschema:"ONLY for extra services beyond the app described by name/cpu_units/memory_gb; leave out for a single app"`
 	// Verification is the agent's own account of running its app in this pod
 	// and checking it. Required unless VerificationSkippedReason is given.
 	Verification string `json:"verification,omitempty" jsonschema:"REQUIRED unless verification_skipped_reason is set: in plain words, what you started inside this pod, the localhost address you opened or requested, and what you saw. Run and check the app BEFORE presenting a plan."`
@@ -309,9 +320,23 @@ const hoursPerMonth = 730.0
 // one in front of it, not a bare "at least one resource is required": a live
 // GLM-5.3 build called this tool five times in a row with the same mistake
 // (2026-10-02) because nothing said what a correct call looks like.
-const planExample = `{"resources": [{"name": "guestbook", "cpu_units": 1, "memory_gb": 1}], ` +
+const planExample = `{"name": "guestbook", "cpu_units": 1, "memory_gb": 1, ` +
 	`"verification": "Started the app in the background, opened it in the browser tool, signed twice and reloaded; both entries were listed."}` +
-	` ("resources" is an array of objects; each needs "name" and a positive integer in "cpu_units" and/or "memory_gb".)`
+	` (Describe the app with "name" and a positive integer in "cpu_units" and/or "memory_gb", at the top level.)`
+
+// allResources is every resource the call asks for: the app described at the
+// top level first, then any listed in "resources".
+func (a presentDeploymentPlanArgs) allResources() []resourceRequest {
+	var out []resourceRequest
+	if strings.TrimSpace(a.Name) != "" || a.CPUUnits > 0 || a.MemoryGB > 0 || a.StorageGB > 0 {
+		name := strings.TrimSpace(a.Name)
+		if name == "" {
+			name = "app"
+		}
+		out = append(out, resourceRequest{Name: name, CPUUnits: a.CPUUnits, MemoryGB: a.MemoryGB, StorageGB: a.StorageGB})
+	}
+	return append(out, a.Resources...)
+}
 
 // receivedFields names the top-level fields the model actually sent, so a
 // refusal can say what it got and an operator can see it in the pod log.
@@ -332,17 +357,19 @@ func receivedFields(req *mcp.CallToolRequest) string {
 }
 
 func (c *teepinClient) presentDeploymentPlan(ctx context.Context, req *mcp.CallToolRequest, args presentDeploymentPlanArgs) (*mcp.CallToolResult, any, error) {
-	if len(args.Resources) == 0 {
+	resources := args.allResources()
+	if len(resources) == 0 {
 		got := receivedFields(req)
 		log.Printf("teepin-mcp-server: present_deployment_plan refused, no resources (%s)", got)
-		return textResult("at least one resource is required: \"resources\" must be a non-empty array. You sent %s. Call it again with the array filled in, for example: %s", got, planExample)
+		return textResult("at least one resource is required: describe the app with \"name\", \"cpu_units\" and \"memory_gb\" "+
+			"at the top level of the call (not inside \"resources\"). You sent %s. Call it again like this: %s", got, planExample)
 	}
 	// An app that is already deployed and approved, asked for at a size it
 	// already has, is an update, not a new purchase (see redeploy.go). If the
 	// state cannot be read, fall through and ask: never skip a cost on a guess.
 	if app, err := c.approvedDeployment(ctx); err != nil {
 		log.Printf("teepin-mcp-server: could not check for an existing deployment, presenting a plan: %v", err)
-	} else if fitsDeployed(app, args.Resources) {
+	} else if fitsDeployed(app, resources) {
 		return textResult(alreadyDeployedMessage, app.InstanceID, app.CPUUnits, app.MemoryGB)
 	}
 	if msg := checkVerification(args); msg != "" {
@@ -359,7 +386,7 @@ func (c *teepinClient) presentDeploymentPlan(ctx context.Context, req *mcp.CallT
 	// rather than a bogus "success" it has no reason to doubt (found live
 	// 2026-08-24: the agent retried this tool 6 times with 6 different
 	// wrong shapes because every one of them "succeeded").
-	for _, r := range args.Resources {
+	for _, r := range resources {
 		if strings.TrimSpace(r.Name) == "" {
 			return textResult("every resource requires a non-empty \"name\"")
 		}
@@ -411,7 +438,7 @@ func (c *teepinClient) presentDeploymentPlan(ctx context.Context, req *mcp.CallT
 		VerificationSkippedReason: strings.TrimSpace(args.VerificationSkippedReason),
 	}
 
-	for _, r := range args.Resources {
+	for _, r := range resources {
 		hourly := float64(r.CPUUnits)*pricing.CPUPricePerCoreHour + float64(r.MemoryGB)*pricing.MemoryPricePerGBHour
 		if r.StorageGB > 0 {
 			hourly += float64(r.StorageGB) * pricing.StoragePricePerGBMonth / hoursPerMonth
@@ -431,7 +458,7 @@ func (c *teepinClient) presentDeploymentPlan(ctx context.Context, req *mcp.CallT
 	// OpenHands event pipeline (an MCP call is an ordinary ActionEvent/
 	// ObservationEvent pair to the SDK), so no separate plumbing is
 	// needed to get it to the console.
-	planID, err := c.recordPlan(ctx, args.Resources)
+	planID, err := c.recordPlan(ctx, resources)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to record the deployment plan: %w", err)
 	}
@@ -509,12 +536,59 @@ func envMap(vars []envVar) map[string]string {
 	return m
 }
 
+// The port and environment can also be given as plain top-level fields: "port"
+// (with an optional "protocol") and "env_vars" as NAME=value lines. GLM-5.3's
+// tool calls arrive with every list of objects empty (seen for resources and
+// options, 2026-10-02), so "ports" and "env" would silently reach a deploy
+// empty, leaving an app nobody can open. Text and numbers come through.
+
+// allPorts is the ports listed in "ports" plus the one in "port", without
+// repeating a port that is in both.
+func allPorts(ports []portArg, port int, protocol string) []portArg {
+	if port <= 0 {
+		return ports
+	}
+	for _, p := range ports {
+		if p.Container == port {
+			return ports
+		}
+	}
+	return append(append([]portArg{}, ports...), portArg{Container: port, Protocol: strings.TrimSpace(protocol)})
+}
+
+// allEnv merges "env" with "env_vars" (one NAME=value per line; blank lines and
+// lines starting with # are skipped). A later line overrides an earlier one and
+// env_vars overrides env, like repeated keys in a JSON object. The error names
+// the first line that is not NAME=value.
+func allEnv(vars []envVar, envVars string) (map[string]string, error) {
+	m := envMap(vars)
+	for _, line := range strings.Split(envVars, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		name, value, ok := strings.Cut(line, "=")
+		name = strings.TrimSpace(name)
+		if !ok || name == "" {
+			return nil, fmt.Errorf("env_vars line %q is not NAME=value", line)
+		}
+		if m == nil {
+			m = map[string]string{}
+		}
+		m[name] = value
+	}
+	return m, nil
+}
+
 type createInstanceArgs struct {
 	Name      string    `json:"name"`
 	Image     string    `json:"image" jsonschema:"a container image reference already pushed somewhere pullable"`
 	CPUUnits  int       `json:"cpu_units"`
 	MemoryGB  int       `json:"memory_gb"`
 	StorageGB int       `json:"storage_gb,omitempty"`
+	Port      int       `json:"port,omitempty" jsonschema:"the port your app listens on inside the container; set this for the instance to get a public address"`
+	Protocol  string    `json:"protocol,omitempty" jsonschema:"tcp or udp for port; defaults to tcp"`
+	EnvVars   string    `json:"env_vars,omitempty" jsonschema:"NON-SECRET environment variables, one NAME=value per line. Never put a credential here: ask for it with request_secret"`
 	Ports     []portArg `json:"ports,omitempty"`
 	// Env is an array of {name, value} objects, not a free-form JSON
 	// object: Anthropic's strict tool-calling mode rejects a schema that
@@ -538,7 +612,12 @@ func (c *teepinClient) createInstance(ctx context.Context, req *mcp.CallToolRequ
 		return textResult(notApprovedMessage)
 	}
 
-	instance, err := c.provisionInstance(ctx, args.Name, args.Image, args.CPUUnits, args.MemoryGB, args.StorageGB, args.Ports, envMap(args.Env), args.Command, args.Args)
+	env, err := allEnv(args.Env, args.EnvVars)
+	if err != nil {
+		return textResult("%v", err)
+	}
+	instance, err := c.provisionInstance(ctx, args.Name, args.Image, args.CPUUnits, args.MemoryGB, args.StorageGB,
+		allPorts(args.Ports, args.Port, args.Protocol), env, args.Command, args.Args)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -593,6 +672,9 @@ type deployArgs struct {
 	CPUUnits       int       `json:"cpu_units"`
 	MemoryGB       int       `json:"memory_gb"`
 	StorageGB      int       `json:"storage_gb,omitempty"`
+	Port           int       `json:"port,omitempty" jsonschema:"the port your app listens on inside the container, e.g. 80 for nginx; set this or nobody can open the app"`
+	Protocol       string    `json:"protocol,omitempty" jsonschema:"tcp or udp for port; defaults to tcp"`
+	EnvVars        string    `json:"env_vars,omitempty" jsonschema:"NON-SECRET environment variables, one NAME=value per line. Never put a credential here: ask for it with request_secret"`
 	Ports          []portArg `json:"ports,omitempty"`
 	// See createInstanceArgs.Env's own doc comment — same array-of-objects
 	// shape, same strict-tool-calling reason.
@@ -632,17 +714,21 @@ func (c *teepinClient) deploy(ctx context.Context, req *mcp.CallToolRequest, arg
 		dockerfilePath = "Dockerfile"
 	}
 
+	env, err := allEnv(args.Env, args.EnvVars)
+	if err != nil {
+		return textResult("%v", err)
+	}
 	body := map[string]any{
 		"dockerfile_path": dockerfilePath,
 		"name":            args.Name,
 		"cpu_units":       args.CPUUnits,
 		"memory_gb":       args.MemoryGB,
 		"storage_gb":      args.StorageGB,
-		"env":             envMap(args.Env),
+		"env":             env,
 	}
-	if len(args.Ports) > 0 {
-		portsOut := make([]map[string]any, len(args.Ports))
-		for i, p := range args.Ports {
+	if ports := allPorts(args.Ports, args.Port, args.Protocol); len(ports) > 0 {
+		portsOut := make([]map[string]any, len(ports))
+		for i, p := range ports {
 			portsOut[i] = map[string]any{"container": p.Container, "protocol": p.Protocol}
 		}
 		body["ports"] = portsOut

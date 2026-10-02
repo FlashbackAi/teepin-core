@@ -290,6 +290,70 @@ func (r *Runner) toolsManyAttempt(ctx context.Context, n int) error {
 	return checkAdd(tc, a, b)
 }
 
+// orderTool takes its whole input as a list of objects, the argument shape
+// GLM-5.3's native tool calls lost in every build (2026-10-02).
+var orderTool = tool("add_to_order", "Add items to the customer's order.",
+	map[string]any{"items": map[string]any{
+		"type":        "array",
+		"description": "Every item to add, one object per item",
+		"items": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"name":     map[string]any{"type": "string", "description": "What the item is"},
+				"quantity": map[string]any{"type": "integer", "description": "How many"},
+			},
+			"required": []string{"name", "quantity"},
+		},
+	}}, "items")
+
+// toolsListsAttempt: one call whose argument is a list of two objects, which
+// must arrive with both objects and their fields.
+func (r *Runner) toolsListsAttempt(ctx context.Context, n int) error {
+	fruit := [][2]string{{"apples", "pears"}, {"lemons", "plums"}, {"figs", "dates"}}[n%3]
+	qa, qb := 2+n, 3+n
+	rep, err := r.ask(ctx, []any{userMsg(fmt.Sprintf(
+		"Add %d %s and %d %s to my order. Use the add_to_order tool once, with both items.", qa, fruit[0], qb, fruit[1]))},
+		map[string]any{"tools": []any{orderTool}, "tool_choice": "auto"}, probeTokens)
+	if err != nil {
+		return err
+	}
+	tc, err := firstCall(rep, "add_to_order")
+	if err != nil {
+		return err
+	}
+	return checkOrder(tc, map[string]int{fruit[0]: qa, fruit[1]: qb})
+}
+
+// checkOrder reports whether the call's items list holds every wanted item with
+// its quantity. An empty list is named as such: it is the failure this checks for.
+func checkOrder(tc toolCall, want map[string]int) error {
+	var args struct {
+		Items []struct {
+			Name     string  `json:"name"`
+			Quantity float64 `json:"quantity"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(tc.args), &args); err != nil {
+		return fmt.Errorf("the arguments were not valid JSON (%q)", trim(tc.args))
+	}
+	if len(args.Items) == 0 {
+		return fmt.Errorf("the list of objects arrived empty (%q)", trim(tc.args))
+	}
+	for name, qty := range want {
+		found := false
+		for _, it := range args.Items {
+			if strings.Contains(strings.ToLower(it.Name), strings.TrimSuffix(name, "s")) && int(it.Quantity) == qty {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("%d %s is missing from the list (%q)", qty, name, trim(tc.args))
+		}
+	}
+	return nil
+}
+
 // --- vision and audio ---
 
 func (r *Runner) visionAttempt(ctx context.Context, n int) error {
@@ -378,6 +442,8 @@ func (r *Runner) RunCapability(ctx context.Context, c Capability) Check {
 		attempt = r.toolsAttempt
 	case CapToolsMany:
 		attempt = r.toolsManyAttempt
+	case CapToolsLists:
+		attempt = r.toolsListsAttempt
 	case CapVision:
 		attempt = r.visionAttempt
 	case CapAudio:
@@ -425,7 +491,7 @@ func (r *Runner) RunCapability(ctx context.Context, c Capability) Check {
 		// but errors every time tools are included does not support them (a
 		// router that chokes on the tools field answers 502). Telling that from
 		// an outage takes one plain request.
-		if (c == CapTools || c == CapToolsMany) && out.Passed == 0 && r.baselineWorks(ctx) {
+		if (c == CapTools || c == CapToolsMany || c == CapToolsLists) && out.Passed == 0 && r.baselineWorks(ctx) {
 			out.Status = StatusFailed
 			out.Detail = "the backend answers a plain request but errors when tools are included: " + trim(lastOutage)
 		} else {
