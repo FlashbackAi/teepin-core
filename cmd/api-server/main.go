@@ -1188,6 +1188,13 @@ func main() {
 		log.Println("Kumbha event relay enabled (agent activity streamed over the existing log pipeline)")
 	}
 
+	// Image-pull credentials for the nodes, minted here and pushed to each agent
+	// (see startRegistryAuthSync): ECR tokens last 12 hours, and a per-node timer
+	// misses refreshes whenever the machine sleeps.
+	startRegistryAuthSync(context.Background(), agentRegistry,
+		getEnv("TEEPIN_KUMBHA_AGENT_IMAGE", ""),
+		getEnv("TEEPIN_KUMBHA_AGENT_IMAGE_PULL_SECRET", ""), getEnv("TEEPIN_KUMBHA_BUILD_IMAGE_PULL_SECRET", ""))
+
 	// Setup router
 	router := setupRouter(apiServer, authHandler, accountHandler, authMiddleware, billingHandler, registryHandler, adminHandler, webhookHandler, nodeHandler, modelCatalogHandler, nodeServicesHandler, playgroundHandler, nodeModelCacheHandler, publicInferenceHandler, rateLimitMiddleware, proxyHandler, execHandler, kumbhaEventsHandler, getEnv("TEEPIN_DOMAIN", "teepin.com"))
 

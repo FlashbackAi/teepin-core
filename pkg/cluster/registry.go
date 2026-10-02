@@ -433,6 +433,9 @@ func (s *AgentSession) Close() {
 type Registry struct {
 	mu       sync.RWMutex
 	sessions map[string]*AgentSession
+	// onConnect, if set, is called (in its own goroutine) each time an agent
+	// registers. See SetOnConnect.
+	onConnect func(providerID string)
 }
 
 func NewRegistry() *Registry {
@@ -449,10 +452,14 @@ func (r *Registry) Add(session *AgentSession) {
 	r.mu.Lock()
 	previous, exists := r.sessions[session.ProviderID]
 	r.sessions[session.ProviderID] = session
+	hook := r.onConnect
 	r.mu.Unlock()
 
 	if exists {
 		previous.Close()
+	}
+	if hook != nil {
+		go hook(session.ProviderID)
 	}
 }
 

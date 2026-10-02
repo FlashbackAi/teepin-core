@@ -351,6 +351,9 @@ func (r *Runner) handleCommand(ctx context.Context, s stream, msg *agentpb.Contr
 	case *agentpb.ControlMessage_StopInstance:
 		r.handleStop(ctx, s, msg.RequestId, payload.StopInstance)
 
+	case *agentpb.ControlMessage_RegistryAuth:
+		r.handleRegistryAuth(ctx, s, msg.RequestId, payload.RegistryAuth)
+
 	case *agentpb.ControlMessage_FetchLogs:
 		r.handleLogs(ctx, s, msg.RequestId, payload.FetchLogs)
 
@@ -1644,4 +1647,28 @@ func (r *Runner) handleDeleteCachedModel(s stream, requestID string, cmd *agentp
 		log.Printf("Delete cached model %s failed: %v", cmd.RepoId, err)
 		r.replyError(s, requestID, agentpb.ErrorCode_ERROR_CODE_CLUSTER_ERROR, err.Error())
 	}
+}
+
+// handleRegistryAuth stores a registry credential the control plane sent as the
+// imagePullSecret pods reference, so image pulls keep working without anyone
+// refreshing a token by hand on this node. The password is never logged.
+func (r *Runner) handleRegistryAuth(ctx context.Context, s stream, requestID string, cmd *agentpb.RegistryAuthCommand) {
+	applier, ok := r.cfg.Cluster.(cluster.RegistryAuthApplier)
+	if !ok {
+		r.replyError(s, requestID, agentpb.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "this agent cannot store registry credentials")
+		return
+	}
+	err := applier.ApplyRegistryAuth(ctx, cluster.RegistryAuth{
+		SecretName: cmd.SecretName, Server: cmd.Server, Username: cmd.Username, Password: cmd.Password,
+	})
+	if err != nil {
+		log.Printf("Registry credential for %s (secret %s) could not be stored: %v", cmd.Server, cmd.SecretName, err)
+		r.replyError(s, requestID, agentpb.ErrorCode_ERROR_CODE_CLUSTER_ERROR, err.Error())
+		return
+	}
+	log.Printf("Registry credential for %s refreshed (secret %s)", cmd.Server, cmd.SecretName)
+	_ = r.send(s, &agentpb.AgentMessage{
+		RequestId: requestID,
+		Payload:   &agentpb.AgentMessage_Result{Result: &agentpb.CommandResult{Success: true}},
+	})
 }

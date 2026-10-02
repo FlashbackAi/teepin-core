@@ -143,8 +143,16 @@ cat > /etc/systemd/system/teepin-kumbha-ecr-refresh.timer <<EOF
 Description=Periodically refresh the Kumbha agent image's ECR pull secret
 
 [Timer]
+# A wall-clock schedule, not OnUnitActiveSec. A monotonic timer stops counting
+# while the machine sleeps (or a WSL instance is stopped), so a node that was
+# suspended overnight missed its refresh, its 12-hour token expired and every
+# new pod sat in ImagePullBackOff (found live 2026-10-02: last run 12h earlier).
+# OnCalendar with Persistent=true runs a missed refresh as soon as the machine
+# is back. The control plane also pushes a fresh credential to every connected
+# agent (pkg/registryauth), which is the primary mechanism; this timer is the
+# fallback for an agent build that predates it.
 OnBootSec=2min
-OnUnitActiveSec=$INTERVAL
+OnCalendar=*-*-* *:00,30:00
 Persistent=true
 
 [Install]
@@ -153,7 +161,7 @@ EOF
 
 systemctl daemon-reload
 systemctl enable --now teepin-kumbha-ecr-refresh.timer
-info "timer installed, refreshing every $INTERVAL."
+info "timer installed, refreshing every 30 minutes (and at once after a sleep or boot)."
 info "IMPORTANT: fill in $CREDS_FILE with the IAM user's access key, then run once by hand to confirm:"
 info "  sudo systemctl start teepin-kumbha-ecr-refresh.service"
 info "  sudo journalctl -u teepin-kumbha-ecr-refresh.service -n 50"

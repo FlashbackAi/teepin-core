@@ -21,7 +21,7 @@ func TestFriendlyStartDetail(t *testing.T) {
 		{"cannot fetch the image", "failed", "ImagePullBackOff", "could not be fetched"},
 		{"no room", "failed", "Unschedulable", "no machine has room"},
 		{"out of memory", "failed", "OOMKilled", "ran out of memory"},
-		{"failed for another reason", "failed", "CrashLoopBackOff", "failed to start"},
+		{"failed for another reason", "failed", "CrashLoopBackOff", "stopped with an error"},
 		{"gone", "missing", "", "not running"},
 		{"running says nothing", "running", "", ""},
 		{"a normal end says nothing", "terminated", "Completed", ""},

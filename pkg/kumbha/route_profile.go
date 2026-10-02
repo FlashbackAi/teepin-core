@@ -101,7 +101,7 @@ func friendlyStartDetail(status, message string) string {
 		case strings.Contains(m, "oomkilled"):
 			return "The builder ran out of memory and stopped."
 		default:
-			return "The builder's environment failed to start."
+			return "The builder's environment stopped with an error."
 		}
 	case "missing":
 		return "The builder is not running."

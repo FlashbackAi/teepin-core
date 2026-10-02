@@ -59,6 +59,7 @@ message ControlMessage {
     ExecInput             exec_input      = 10; // interactive exec: stdin/resize/cancel, same request_id
     DeleteCachedModelCommand delete_cached_model = 11; // remove one downloaded model from the node's model cache
     StopInstanceCommand   stop_instance   = 12; // end the pod, KEEP the persistent volume (out-of-credit hold)
+    RegistryAuthCommand   registry_auth   = 13; // refresh the node's image-pull credentials for a private registry
   }
 }
 
@@ -239,6 +240,20 @@ message ExecCommand {
 // to a direct child of its cache directory. Deleting an absent model is
 // NOT_FOUND. Whether the model is currently mounted is the control plane's
 // call (it owns the mount rows); the agent does not second-guess it.
+// RegistryAuthCommand hands the node a fresh credential for a private image
+// registry (ECR, whose tokens expire after 12 hours). The agent stores it as a
+// kubernetes.io/dockerconfigjson Secret named secret_name in the workload
+// namespace, replacing whatever was there, so every pod that references that
+// secret (the Kumbha agent pods and the apps it builds) can pull without anyone
+// refreshing it by hand on the node. The control plane sends it when the agent
+// connects and again on a timer well inside the token lifetime.
+message RegistryAuthCommand {
+  string secret_name = 1;  // the imagePullSecret pods already reference
+  string server      = 2;  // "880254196251.dkr.ecr.us-east-1.amazonaws.com"
+  string username    = 3;  // "AWS" for ECR
+  string password    = 4;  // the token; never logged
+}
+
 message DeleteCachedModelCommand {
   string repo_id = 1;
 }
