@@ -25,6 +25,7 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/inferencegateway"
 	"github.com/FlashbackAi/teepin-core/pkg/kumbha"
 	"github.com/FlashbackAi/teepin-core/pkg/modelcatalog"
+	"github.com/FlashbackAi/teepin-core/pkg/modelprobe"
 	"github.com/FlashbackAi/teepin-core/pkg/nodes"
 	"github.com/FlashbackAi/teepin-core/pkg/payments"
 )
@@ -346,7 +347,39 @@ func (a *hiddenWorkloadAdapter) HiddenUsageByNode(ctx context.Context) (map[stri
 type kumbhaModelBackend struct {
 	catalog *modelcatalog.Service
 	gateway *inferencegateway.Gateway
+	// reports, when set, is the evidence of what each model was seen to do
+	// (pkg/modelprobe). Without it a model is taken at its declared flags.
+	reports interface {
+		All(ctx context.Context) (map[string]*modelprobe.Report, error)
+	}
 }
+
+// WithProbeReports makes the builder's model list follow what each model was
+// actually seen to do, not only what an operator ticked.
+func (b *kumbhaModelBackend) WithProbeReports(r interface {
+	All(ctx context.Context) (map[string]*modelprobe.Report, error)
+}) *kumbhaModelBackend {
+	b.reports = r
+	return b
+}
+
+// builderCapabilities is what the builder may treat a model as able to do, and
+// why it is unavailable if it is. unavailable is the reason already found (an
+// empty string when the model is up); a model that cannot call tools is
+// unavailable for building whatever else is true of it.
+func builderCapabilities(m modelcatalog.Model, rep *modelprobe.Report, unavailable string) (tools, vision, audio bool, why string) {
+	tools, _ = modelprobe.Effective(rep, modelprobe.CapTools, m.SupportsTools)
+	vision, _ = modelprobe.Effective(rep, modelprobe.CapVision, m.SupportsVision)
+	audio, _ = modelprobe.Effective(rep, modelprobe.CapAudio, m.SupportsAudio)
+	if unavailable == "" && !tools {
+		unavailable = notBuildCapable
+	}
+	return tools, vision, audio, unavailable
+}
+
+// notBuildCapable is why a model without working tool calls is not offered for
+// builds. Phrased for a customer.
+const notBuildCapable = "Can't use tools, which building needs"
 
 func newKumbhaModelBackend(catalog *modelcatalog.Service, gateway *inferencegateway.Gateway) *kumbhaModelBackend {
 	return &kumbhaModelBackend{catalog: catalog, gateway: gateway}
@@ -357,12 +390,21 @@ func (b *kumbhaModelBackend) KumbhaModels(ctx context.Context) ([]kumbha.Model, 
 	if err != nil {
 		return nil, err
 	}
+	var reports map[string]*modelprobe.Report
+	if b.reports != nil {
+		reports, _ = b.reports.All(ctx)
+	}
 	out := make([]kumbha.Model, 0, len(models))
 	for _, m := range models {
 		unavailable := ""
 		if b.gateway != nil {
 			unavailable = b.gateway.Status(ctx, m).Unservable()
 		}
+		// Evidence wins over the checkbox: a builder acts only through tool
+		// calls, so a model that failed its tool check is not offered, and one
+		// that passed is, whatever was ticked. With no evidence yet the
+		// declared flag stands.
+		tools, vision, audio, unavailable := builderCapabilities(m, reports[m.ModelRoute], unavailable)
 		out = append(out, kumbha.Model{
 			Unavailable:           unavailable,
 			Route:                 m.ModelRoute,
@@ -370,9 +412,9 @@ func (b *kumbhaModelBackend) KumbhaModels(ctx context.Context) ([]kumbha.Model, 
 			Engine:                m.Engine,
 			Confidential:          m.Provider == modelcatalog.ProviderTinfoilConfidential,
 			SelfHosted:            !m.Provider.IsThirdParty(),
-			SupportsTools:         m.SupportsTools,
-			SupportsVision:        m.SupportsVision,
-			SupportsAudio:         m.SupportsAudio,
+			SupportsTools:         tools,
+			SupportsVision:        vision,
+			SupportsAudio:         audio,
 			ContextWindow:         m.ContextWindow,
 			MaxOutputTokens:       m.MaxOutputTokens,
 			InputPricePerMillion:  m.InputPricePerMillion,

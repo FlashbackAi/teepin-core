@@ -10,6 +10,8 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/cluster"
 	"github.com/FlashbackAi/teepin-core/pkg/compute"
 	"github.com/FlashbackAi/teepin-core/pkg/kumbha"
+	"github.com/FlashbackAi/teepin-core/pkg/modelcatalog"
+	"github.com/FlashbackAi/teepin-core/pkg/modelprobe"
 )
 
 // fakeStatusCluster implements only ListInstanceStatuses — the only
@@ -83,5 +85,48 @@ func TestHiddenWorkloadAdapter_UnrecognisedPrefixCountsNothing(t *testing.T) {
 	}
 	if len(usage) != 0 {
 		t.Errorf("usage = %+v, want empty (no recognised hidden pod)", usage)
+	}
+}
+
+func TestBuilderCapabilities_FollowsEvidenceThenTheDeclaredFlags(t *testing.T) {
+	passed := func(c modelprobe.Capability) modelprobe.Check {
+		return modelprobe.Check{Capability: c, Status: modelprobe.StatusPassed}
+	}
+	failed := func(c modelprobe.Capability) modelprobe.Check {
+		return modelprobe.Check{Capability: c, Status: modelprobe.StatusFailed}
+	}
+
+	for _, tc := range []struct {
+		name        string
+		declared    modelcatalog.Model
+		rep         *modelprobe.Report
+		unavailable string
+		wantTools   bool
+		wantWhy     string
+	}{
+		{"declared tools, never checked: allowed (a model registered before checks existed)",
+			modelcatalog.Model{SupportsTools: true}, nil, "", true, ""},
+		{"no tools declared, never checked: not for building",
+			modelcatalog.Model{}, nil, "", false, notBuildCapable},
+		{"declared tools but failed its check: not for building",
+			modelcatalog.Model{SupportsTools: true}, &modelprobe.Report{Checks: []modelprobe.Check{failed(modelprobe.CapTools)}}, "", false, notBuildCapable},
+		{"not declared but passed its check: allowed",
+			modelcatalog.Model{}, &modelprobe.Report{Checks: []modelprobe.Check{passed(modelprobe.CapTools)}}, "", true, ""},
+		{"an outage reason is kept ahead of the tools reason",
+			modelcatalog.Model{}, nil, "Temporarily unavailable", false, "Temporarily unavailable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tools, _, _, why := builderCapabilities(tc.declared, tc.rep, tc.unavailable)
+			if tools != tc.wantTools || why != tc.wantWhy {
+				t.Errorf("tools = %v why = %q; want %v %q", tools, why, tc.wantTools, tc.wantWhy)
+			}
+		})
+	}
+
+	// Vision follows evidence per model, not one global switch.
+	_, vision, _, _ := builderCapabilities(modelcatalog.Model{SupportsTools: true, SupportsVision: true},
+		&modelprobe.Report{Checks: []modelprobe.Check{failed(modelprobe.CapVision)}}, "")
+	if vision {
+		t.Error("a model that failed its vision check must not be treated as seeing images")
 	}
 }

@@ -44,6 +44,7 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/inferencereconciler"
 	"github.com/FlashbackAi/teepin-core/pkg/kumbha"
 	"github.com/FlashbackAi/teepin-core/pkg/modelcatalog"
+	"github.com/FlashbackAi/teepin-core/pkg/modelprobe"
 	"github.com/FlashbackAi/teepin-core/pkg/networking"
 	"github.com/FlashbackAi/teepin-core/pkg/nodes"
 	"github.com/FlashbackAi/teepin-core/pkg/nodeservices"
@@ -280,6 +281,9 @@ func main() {
 	var nodeServicesHandler *api.NodeServicesHandler
 	var nodeServicesService *nodeservices.Service
 	var modelCatalogService *modelcatalog.Service
+	// What each model was actually seen to do (pkg/modelprobe), kept per model.
+	var modelProbeStore *modelprobe.Store
+	var modelProbeService *modelprobe.Service
 	if dbClient != nil {
 		modelCatalogService = modelcatalog.NewService(dbClient.DB())
 		modelCatalogHandler = api.NewModelCatalogHandler(modelCatalogService)
@@ -533,6 +537,22 @@ func main() {
 		}
 		if modelCatalogHandler != nil {
 			modelCatalogHandler.WithModelStatus(inferenceGateway)
+		}
+		// Capability checks: a model is tested through the very provider real
+		// traffic uses, and its results decide what it may be used for.
+		modelProbeStore = modelprobe.NewStore(dbClient.DB())
+		modelProbeService = modelprobe.NewService(modelCatalogService, inferenceGateway, modelProbeStore)
+		if modelCatalogHandler != nil {
+			modelCatalogHandler.WithProbes(modelProbeService)
+		}
+		// Models registered before checks existed get evidence once, shortly
+		// after start (a few cents of tokens each). Off with
+		// TEEPIN_MODEL_PROBE_ON_START=false.
+		if getEnvBool("TEEPIN_MODEL_PROBE_ON_START", true) {
+			go func() {
+				time.Sleep(45 * time.Second)
+				modelProbeService.CheckMissing(context.Background())
+			}()
 		}
 		go inferenceGateway.StartHealthChecks(context.Background(),
 			time.Duration(getEnvInt("TEEPIN_MODEL_HEALTH_INTERVAL_SECONDS", 60))*time.Second)
@@ -903,7 +923,14 @@ func main() {
 		} else {
 			log.Println("ENCRYPTION_KEY not set: Kumbha builds cannot store customer secrets")
 		}
-		kumbhaGateway := kumbha.NewGateway(kumbhaStore, newKumbhaModelBackend(modelCatalogService, inferenceGateway),
+		kumbhaModels := newKumbhaModelBackend(modelCatalogService, inferenceGateway)
+		// The builder's model list follows what each model was seen to do.
+		// TEEPIN_MODEL_PROBE_GATING=false is the way out if a check ever
+		// misjudges a model: the builder then goes back to the declared flags.
+		if modelProbeStore != nil && getEnvBool("TEEPIN_MODEL_PROBE_GATING", true) {
+			kumbhaModels = kumbhaModels.WithProbeReports(modelProbeStore)
+		}
+		kumbhaGateway := kumbha.NewGateway(kumbhaStore, kumbhaModels,
 			billingService, billingService, billingService).
 			WithModelPricing(modelCatalogService).
 			WithVendorCost(modelCatalogService).
@@ -1789,6 +1816,9 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 					admin.PUT("/inference/models/vendor-cost", modelCatalogHandler.SetVendorCost)
 					admin.PUT("/inference/models/enabled", modelCatalogHandler.SetEnabled)
 					admin.PUT("/inference/models/availability", modelCatalogHandler.SetAvailability)
+					admin.POST("/inference/models/check", modelCatalogHandler.CheckModel)
+					admin.GET("/inference/models/capabilities", modelCatalogHandler.ModelCapabilities)
+					admin.POST("/inference/models/discover", modelCatalogHandler.DiscoverModel)
 					admin.DELETE("/inference/models", modelCatalogHandler.DeleteModel)
 				}
 

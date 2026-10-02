@@ -14,6 +14,7 @@ import (
 
 	"github.com/FlashbackAi/teepin-core/pkg/inferencegateway"
 	"github.com/FlashbackAi/teepin-core/pkg/modelcatalog"
+	"github.com/FlashbackAi/teepin-core/pkg/modelprobe"
 )
 
 // ModelCatalogHandler serves the admin-only model registry: every model the
@@ -30,6 +31,10 @@ type ModelCatalogHandler struct {
 	// makes an api_key in a registration a reported, non-fatal failure.
 	secrets     inferencegateway.SecretsClient
 	environment string
+
+	// probes checks what each model can really do (see model_probe_handlers.go);
+	// nil leaves capability checking off.
+	probes ModelProber
 }
 
 // ModelStatusSource reports whether a model can be served right now —
@@ -137,6 +142,10 @@ func (h *ModelCatalogHandler) RegisterModel(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	updatedBy := "admin-api"
+	var prevModel *modelcatalog.Model // nil for a new model
+	if h.probes != nil {
+		prevModel, _ = h.catalog.GetModel(ctx, req.ModelRoute)
+	}
 	err := h.catalog.RegisterModelWithPricing(ctx, modelcatalog.Model{
 		ModelRoute:      req.ModelRoute,
 		DisplayName:     req.DisplayName,
@@ -189,6 +198,9 @@ func (h *ModelCatalogHandler) RegisterModel(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	// A new model, or one whose backend changed, is checked in the background:
+	// what it can really do is found out, not taken from the checkboxes.
+	h.afterRegister(context.WithoutCancel(ctx), prevModel, *m, req.APIKey != "")
 	if warning != "" {
 		c.JSON(http.StatusOK, gin.H{"model": m, "warning": warning})
 		return
@@ -221,6 +233,9 @@ func (h *ModelCatalogHandler) storeAPIKey(ctx context.Context, modelRoute, key s
 type catalogModelView struct {
 	modelcatalog.Model
 	Status *inferencegateway.ModelStatus `json:"status,omitempty"`
+	// Capabilities is what the model was seen to do, and what the platform
+	// therefore treats it as able to do. Absent when checking is off.
+	Capabilities *capabilityView `json:"capabilities,omitempty"`
 }
 
 // ListModels is GET /v1/admin/inference/models — every catalog entry,
@@ -233,9 +248,16 @@ func (h *ModelCatalogHandler) ListModels(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	var reports map[string]*modelprobe.Report
+	if h.probes != nil {
+		reports, _ = h.probes.Reports(ctx)
+	}
 	views := make([]catalogModelView, 0, len(models))
 	for _, m := range models {
 		v := catalogModelView{Model: m}
+		if h.probes != nil {
+			v.Capabilities = buildCapabilityView(m, reports[m.ModelRoute], h.probes.IsRunning(m.ModelRoute))
+		}
 		if h.status != nil && m.Enabled {
 			st := h.status.Status(ctx, m)
 			v.Status = &st
