@@ -23,6 +23,7 @@ type reply struct {
 }
 
 type toolCall struct {
+	id   string
 	name string
 	args string
 }
@@ -85,6 +86,7 @@ func parseReply(body json.RawMessage) (reply, error) {
 			Message      struct {
 				Content   json.RawMessage `json:"content"`
 				ToolCalls []struct {
+					ID       string `json:"id"`
 					Function struct {
 						Name      string          `json:"name"`
 						Arguments json.RawMessage `json:"arguments"`
@@ -125,7 +127,7 @@ func parseReply(body json.RawMessage) (reply, error) {
 		if json.Unmarshal(tc.Function.Arguments, &asString) == nil {
 			args = asString
 		}
-		out.toolCalls = append(out.toolCalls, toolCall{name: tc.Function.Name, args: args})
+		out.toolCalls = append(out.toolCalls, toolCall{id: tc.ID, name: tc.Function.Name, args: args})
 	}
 	return out, nil
 }
@@ -356,6 +358,17 @@ func (r *Runner) defaults() {
 	}
 }
 
+// baselineWorks reports whether the model answers a plain request with no
+// tools, vision or audio: the control for "is the backend up at all".
+func (r *Runner) baselineWorks(ctx context.Context) bool {
+	rep, err := r.ask(ctx, []any{userMsg("Reply with the single word OK.")}, nil, probeTokens)
+	if err != nil {
+		var inc inconclusive
+		return !errors.As(err, &inc) && rep.content != ""
+	}
+	return rep.content != "" || rep.truncated
+}
+
 // RunCapability tests one capability and reports the outcome.
 func (r *Runner) RunCapability(ctx context.Context, c Capability) Check {
 	r.defaults()
@@ -369,6 +382,10 @@ func (r *Runner) RunCapability(ctx context.Context, c Capability) Check {
 		attempt = r.visionAttempt
 	case CapAudio:
 		attempt = r.audioAttempt
+	case CapBuild:
+		attempt = func(ctx context.Context, n int) error { return r.buildAttempt(ctx, n, false) }
+	case CapBuildText:
+		attempt = func(ctx context.Context, n int) error { return r.buildAttempt(ctx, n, true) }
 	default:
 		return Check{Capability: c, Status: StatusUntested, CheckedAt: r.Now()}
 	}
@@ -403,9 +420,18 @@ func (r *Runner) RunCapability(ctx context.Context, c Capability) Check {
 		out.Status = StatusPassed
 		out.Detail = fmt.Sprintf("%d of %d attempts did it", out.Passed, out.Attempts)
 	case outages > 0 && out.Passed+outages >= r.Required:
-		// Not enough conclusive attempts to call it either way.
-		out.Status = StatusError
-		out.Detail = "could not finish the check: " + trim(lastOutage)
+		// Not enough conclusive attempts to call it either way, unless the
+		// errors are specific to tools: a backend that answers a plain request
+		// but errors every time tools are included does not support them (a
+		// router that chokes on the tools field answers 502). Telling that from
+		// an outage takes one plain request.
+		if (c == CapTools || c == CapToolsMany) && out.Passed == 0 && r.baselineWorks(ctx) {
+			out.Status = StatusFailed
+			out.Detail = "the backend answers a plain request but errors when tools are included: " + trim(lastOutage)
+		} else {
+			out.Status = StatusError
+			out.Detail = "could not finish the check: " + trim(lastOutage)
+		}
 	default:
 		out.Status = StatusFailed
 		out.Detail = trim(lastFailure)

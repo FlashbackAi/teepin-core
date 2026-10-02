@@ -35,7 +35,7 @@ const (
 )
 
 // AllCapabilities is every capability the prober tests, in report order.
-var AllCapabilities = []Capability{CapTools, CapToolsMany, CapVision, CapAudio}
+var AllCapabilities = []Capability{CapTools, CapToolsMany, CapBuild, CapBuildText, CapVision, CapAudio}
 
 // Status is the outcome of testing one capability.
 type Status string
@@ -116,4 +116,68 @@ func Effective(r *Report, c Capability, declared bool) (ok bool, basis string) {
 		}
 		return false, "not declared"
 	}
+}
+
+// ToolMode is how the build agent talks to a model about tools.
+type ToolMode string
+
+const (
+	// ToolModeNative sends tools as structured tool definitions and reads
+	// structured calls back.
+	ToolModeNative ToolMode = "native"
+	// ToolModeText describes the tools in the prompt and reads function calls
+	// out of the reply, for a model whose native tool calls do not work.
+	ToolModeText ToolMode = "text"
+)
+
+// BuildMode decides how (and whether) a model can be used for building, from the
+// evidence, falling back to the operator's declaration where there is none.
+//
+//   - native tool calls that pass both the single-step test and the build task:
+//     native;
+//   - otherwise the text protocol passing the build task: text;
+//   - with no conclusive evidence, a declared-tools model keeps working natively
+//     (a model registered before checks existed is not locked out);
+//   - anything else cannot build.
+func BuildMode(rep *Report, declaredTools bool) (mode ToolMode, ok bool) {
+	tools, build, text := rep.Check(CapTools).Status, rep.Check(CapBuild).Status, rep.Check(CapBuildText).Status
+	nativeBroken := tools == StatusFailed || build == StatusFailed
+	switch {
+	case tools == StatusPassed && !nativeBroken:
+		return ToolModeNative, true
+	case text == StatusPassed:
+		return ToolModeText, true
+	case !nativeBroken && tools != StatusPassed && declaredTools:
+		return ToolModeNative, true
+	}
+	return "", false
+}
+
+// NotBuildCapable is why a model that cannot call tools, natively or by text, is
+// not offered for builds. Phrased for a customer.
+const NotBuildCapable = "Can't use tools, which building needs"
+
+// BuilderView is what the build agent may treat a model as able to do.
+type BuilderView struct {
+	// Tools: the model can be used for building at all, in some ToolMode.
+	Tools         bool
+	Mode          ToolMode
+	Vision, Audio bool
+	// Unavailable is why the model is not offered for building ("" when it is):
+	// a reason already found (an outage) first, else that it cannot call tools.
+	Unavailable string
+}
+
+// Builder is the single rule behind both the builder's model list and the
+// picker's, so they cannot disagree. A model that cannot use tools in any mode
+// is unavailable for building whatever else is true of it, because the builder
+// acts only through tool calls.
+func Builder(supportsTools, supportsVision, supportsAudio bool, rep *Report, unavailable string) BuilderView {
+	mode, ok := BuildMode(rep, supportsTools)
+	vision, _ := Effective(rep, CapVision, supportsVision)
+	audio, _ := Effective(rep, CapAudio, supportsAudio)
+	if unavailable == "" && !ok {
+		unavailable = NotBuildCapable
+	}
+	return BuilderView{Tools: ok, Mode: mode, Vision: vision, Audio: audio, Unavailable: unavailable}
 }

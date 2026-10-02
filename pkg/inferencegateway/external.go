@@ -48,6 +48,7 @@ func newExternalProvider(m modelcatalog.Model, apiKey string) (inference.Provide
 			Model:         m.ProviderModel,
 			APIKey:        apiKey,
 			ContextWindow: m.ContextWindow,
+			SupportsTools: m.SupportsTools,
 		})
 	default:
 		return nil, fmt.Errorf("model %q is not served by an external provider", m.ModelRoute)

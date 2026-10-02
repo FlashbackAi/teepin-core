@@ -33,6 +33,7 @@ type fakeModel struct {
 	outage      error
 	ignoresTool bool // never uses a tool result
 	truncated   bool // runs out of output tokens before answering
+	toolsBreak  bool // answers 502 only when the request carries tools
 	calls       int
 }
 
@@ -62,6 +63,9 @@ func (f *fakeModel) Complete(_ context.Context, req inference.Request) (*inferen
 			"message":       map[string]any{"role": "assistant", "content": "Let me think about"},
 		}}})
 		return &inference.Response{Body: b}, nil
+	}
+	if _, has := req.Extra["tools"]; has && f.toolsBreak {
+		return nil, fmt.Errorf("%w: upstream status 502", inference.ErrProviderUnavailable)
 	}
 	var msgs []wireMsg
 	for _, raw := range req.Messages {
@@ -93,6 +97,9 @@ func (f *fakeModel) Complete(_ context.Context, req inference.Request) (*inferen
 
 	var text string
 	_ = json.Unmarshal(last.Content, &text)
+	if strings.Contains(text, "Build a web page") {
+		return textReply("I do not know how to do that."), nil // the build task needs fakeBuilder
+	}
 	if _, has := req.Extra["tools"]; has {
 		if f.noTools {
 			return textReply("I would use a tool, but here is my answer instead."), nil
@@ -197,6 +204,10 @@ func countBeeps(b64 string) int {
 	return beeps
 }
 
+// singleStepCapabilities are the capabilities the plain fake model can answer;
+// the build tasks need the scripted builder (agentloop_test.go).
+var singleStepCapabilities = []Capability{CapTools, CapToolsMany, CapVision, CapAudio}
+
 func runner(m inference.Provider) *Runner {
 	return &Runner{Provider: m, Route: "teepin/test", CallTimeout: time.Second, Now: func() time.Time { return time.Unix(0, 0) }}
 }
@@ -220,7 +231,7 @@ func TestFixtures_SayWhatTheQuestionsClaim(t *testing.T) {
 
 func TestRunner_CapableModelPassesEverything(t *testing.T) {
 	r := runner(&fakeModel{})
-	for _, c := range AllCapabilities {
+	for _, c := range singleStepCapabilities {
 		got := r.RunCapability(context.Background(), c)
 		if got.Status != StatusPassed {
 			t.Errorf("%s: %s (%s)", c, got.Status, got.Detail)
@@ -329,5 +340,19 @@ func TestRunner_ACutOffReplyIsNotEvidenceAgainstTheCapability(t *testing.T) {
 		if got.Status != StatusError || !strings.Contains(got.Detail, "ran out of output tokens") {
 			t.Errorf("%s: %s (%s), want error", c, got.Status, got.Detail)
 		}
+	}
+}
+
+// A router that answers plain requests but errors whenever tools are included
+// does not support tools. Reading that as an outage would leave the question
+// open forever; a real outage (everything fails) still stays inconclusive.
+func TestRunner_ErrorsThatOnlyHappenWithToolsCountAsFailing(t *testing.T) {
+	got := runner(&fakeModel{toolsBreak: true}).RunCapability(context.Background(), CapTools)
+	if got.Status != StatusFailed || !strings.Contains(got.Detail, "plain request but errors when tools are included") {
+		t.Errorf("got %s: %q", got.Status, got.Detail)
+	}
+	got = runner(&fakeModel{outage: errors.New("503")}).RunCapability(context.Background(), CapTools)
+	if got.Status != StatusError {
+		t.Errorf("a total outage must stay inconclusive: %s (%s)", got.Status, got.Detail)
 	}
 }

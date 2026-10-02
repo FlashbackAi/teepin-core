@@ -20,6 +20,7 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/inference"
 	"github.com/FlashbackAi/teepin-core/pkg/inferencegateway"
 	"github.com/FlashbackAi/teepin-core/pkg/modelcatalog"
+	"github.com/FlashbackAi/teepin-core/pkg/modelprobe"
 )
 
 type fakeGW struct {
@@ -721,5 +722,63 @@ func TestGetKumbhaModels_ReportsWhichModelsCanServe(t *testing.T) {
 	body := rec.Body.String()
 	if strings.Contains(body, "node-7") || strings.Contains(body, "10.0.0.5") {
 		t.Errorf("response leaks backend detail: %s", body)
+	}
+}
+
+type reportsByRoute map[string]*modelprobe.Report
+
+func (r reportsByRoute) All(context.Context) (map[string]*modelprobe.Report, error) { return r, nil }
+
+// The picker follows what each model was seen to do: a model that cannot call
+// tools is unavailable for building (with a reason a customer can read) however
+// its checkbox is ticked, and one that passed its check is available even if it
+// was never ticked. Vision and audio follow the evidence per model too.
+func TestGetKumbhaModels_FollowsCapabilityEvidence(t *testing.T) {
+	cat := fakeCatalog{models: map[string]modelcatalog.Model{
+		"teepin/omni":     {ModelRoute: "teepin/omni", Enabled: true, KumbhaEnabled: true, KumbhaPriority: 1, SupportsTools: false, SupportsVision: true},
+		"teepin/liar":     {ModelRoute: "teepin/liar", Enabled: true, KumbhaEnabled: true, KumbhaPriority: 2, SupportsTools: true},
+		"teepin/modest":   {ModelRoute: "teepin/modest", Enabled: true, KumbhaEnabled: true, KumbhaPriority: 3, SupportsTools: false},
+		"teepin/untested": {ModelRoute: "teepin/untested", Enabled: true, KumbhaEnabled: true, KumbhaPriority: 4, SupportsTools: true},
+	}}
+	check := func(c modelprobe.Capability, s modelprobe.Status) modelprobe.Check {
+		return modelprobe.Check{Capability: c, Status: s}
+	}
+	h := NewInferenceHandler(&fakeGW{}, cat, nil).WithProbeReports(reportsByRoute{
+		"teepin/omni":   {Checks: []modelprobe.Check{check(modelprobe.CapTools, modelprobe.StatusError), check(modelprobe.CapVision, modelprobe.StatusPassed)}},
+		"teepin/liar":   {Checks: []modelprobe.Check{check(modelprobe.CapTools, modelprobe.StatusFailed)}},
+		"teepin/modest": {Checks: []modelprobe.Check{check(modelprobe.CapTools, modelprobe.StatusPassed)}},
+	})
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(func(c *gin.Context) { c.Set(string(auth.AccountIDKey), uuid.New()); c.Next() })
+	r.GET("/v1/kumbha/models", h.GetKumbhaModels)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/kumbha/models", nil))
+	var out struct {
+		Data []kumbhaModelView `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	byRoute := map[string]kumbhaModelView{}
+	for _, m := range out.Data {
+		byRoute[m.Route] = m
+	}
+	for route, want := range map[string]bool{
+		"teepin/omni":     false, // tools never declared, check could not confirm
+		"teepin/liar":     false, // declared tools, failed the check
+		"teepin/modest":   true,  // never declared, passed the check
+		"teepin/untested": true,  // declared, not checked yet: the declaration stands
+	} {
+		if byRoute[route].Available != want {
+			t.Errorf("%s: available = %v, want %v", route, byRoute[route].Available, want)
+		}
+		if !want && byRoute[route].Unavailable != modelprobe.NotBuildCapable {
+			t.Errorf("%s: reason = %q", route, byRoute[route].Unavailable)
+		}
+	}
+	if !byRoute["teepin/omni"].Vision {
+		t.Error("vision passed its check and must be reported")
 	}
 }

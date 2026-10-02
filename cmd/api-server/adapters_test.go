@@ -116,17 +116,16 @@ func TestBuilderCapabilities_FollowsEvidenceThenTheDeclaredFlags(t *testing.T) {
 			modelcatalog.Model{}, nil, "Temporarily unavailable", false, "Temporarily unavailable"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			tools, _, _, why := builderCapabilities(tc.declared, tc.rep, tc.unavailable)
-			if tools != tc.wantTools || why != tc.wantWhy {
-				t.Errorf("tools = %v why = %q; want %v %q", tools, why, tc.wantTools, tc.wantWhy)
+			v := builderCapabilities(tc.declared, tc.rep, tc.unavailable)
+			if v.Tools != tc.wantTools || v.Unavailable != tc.wantWhy {
+				t.Errorf("tools = %v why = %q; want %v %q", v.Tools, v.Unavailable, tc.wantTools, tc.wantWhy)
 			}
 		})
 	}
 
 	// Vision follows evidence per model, not one global switch.
-	_, vision, _, _ := builderCapabilities(modelcatalog.Model{SupportsTools: true, SupportsVision: true},
-		&modelprobe.Report{Checks: []modelprobe.Check{failed(modelprobe.CapVision)}}, "")
-	if vision {
+	if v := builderCapabilities(modelcatalog.Model{SupportsTools: true, SupportsVision: true},
+		&modelprobe.Report{Checks: []modelprobe.Check{failed(modelprobe.CapVision)}}, ""); v.Vision {
 		t.Error("a model that failed its vision check must not be treated as seeing images")
 	}
 }

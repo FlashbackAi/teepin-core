@@ -106,6 +106,10 @@ type TinfoilConfidentialConfig struct {
 	// ContextWindow in tokens. Zero disables the pre-dispatch fit check,
 	// same convention as VLLMConfig.
 	ContextWindow int
+	// SupportsTools is what the catalog says about this model's native tool
+	// calls. The enclave router fronts many models, some of which cannot call
+	// tools, so it is the model's own flag, never assumed true for all of them.
+	SupportsTools bool
 }
 
 // NewTinfoilConfidential builds a confidential-inference provider, performing
@@ -153,7 +157,7 @@ func NewTinfoilConfidential(cfg TinfoilConfidentialConfig) (*TinfoilConfidential
 			apiKey:  cfg.APIKey,
 			caps: Capabilities{
 				ContextWindow: cfg.ContextWindow,
-				SupportsTools: true,
+				SupportsTools: cfg.SupportsTools,
 				SupportsJSON:  true,
 				CostClass:     CostClassFrontier,
 			},

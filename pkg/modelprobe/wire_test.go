@@ -53,7 +53,7 @@ func TestProbes_OverTheRealOpenAICompatibleProvider(t *testing.T) {
 
 	p := inference.NewVLLM(inference.VLLMConfig{BaseURL: srv.URL, Model: "served-model", SupportsTools: true})
 	r := runner(p)
-	for _, c := range AllCapabilities {
+	for _, c := range singleStepCapabilities {
 		if got := r.RunCapability(context.Background(), c); got.Status != StatusPassed {
 			t.Errorf("%s over HTTP: %s (%s)", c, got.Status, got.Detail)
 		}

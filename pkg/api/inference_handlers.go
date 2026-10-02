@@ -23,6 +23,7 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/inference"
 	"github.com/FlashbackAi/teepin-core/pkg/inferencegateway"
 	"github.com/FlashbackAi/teepin-core/pkg/modelcatalog"
+	"github.com/FlashbackAi/teepin-core/pkg/modelprobe"
 )
 
 // Permissions an API key carries for Teepin Inference.
@@ -74,6 +75,21 @@ type InferenceHandler struct {
 	usage   usageRecorder
 	credit  creditChecker
 	status  ModelStatusSource
+	// reports, when set, is what each model was seen to do (pkg/modelprobe);
+	// the Kumbha model list follows it instead of the declared flags alone.
+	reports interface {
+		All(ctx context.Context) (map[string]*modelprobe.Report, error)
+	}
+}
+
+// WithProbeReports makes the Kumbha model list follow the evidence of what each
+// model can do: a model that cannot call tools is shown as unavailable for
+// building, with the reason, and is never the default.
+func (h *InferenceHandler) WithProbeReports(r interface {
+	All(ctx context.Context) (map[string]*modelprobe.Report, error)
+}) *InferenceHandler {
+	h.reports = r
+	return h
 }
 
 // WithModelStatus lets the Kumbha model list say which models can serve right
@@ -645,18 +661,27 @@ func (h *InferenceHandler) GetKumbhaModels(c *gin.Context) {
 		return enabled[i].KumbhaPriority < enabled[j].KumbhaPriority
 	})
 
+	var reports map[string]*modelprobe.Report
+	if h.reports != nil {
+		reports, _ = h.reports.All(c.Request.Context())
+	}
 	out := make([]kumbhaModelView, 0, len(enabled))
 	for _, m := range enabled {
 		unavailable := ""
 		if h.status != nil {
 			unavailable = h.status.Status(c.Request.Context(), m).Unservable()
 		}
+		tools, vision, audio := m.SupportsTools, m.SupportsVision, m.SupportsAudio
+		if h.reports != nil {
+			v := modelprobe.Builder(tools, vision, audio, reports[m.ModelRoute], unavailable)
+			tools, vision, audio, unavailable = v.Tools, v.Vision, v.Audio, v.Unavailable
+		}
 		out = append(out, kumbhaModelView{
 			Available: unavailable == "", Unavailable: unavailable,
 			Route: m.ModelRoute, DisplayName: m.DisplayName,
 			Confidential:  m.Provider == modelcatalog.ProviderTinfoilConfidential,
 			SelfHosted:    !m.Provider.IsThirdParty(),
-			SupportsTools: m.SupportsTools, Vision: m.SupportsVision, Audio: m.SupportsAudio,
+			SupportsTools: tools, Vision: vision, Audio: audio,
 			Pricing: pricing{InputPerMillion: m.InputPricePerMillion, OutputPerMillion: m.OutputPricePerMillion},
 		})
 	}

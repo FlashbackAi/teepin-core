@@ -122,10 +122,16 @@ func (s *Service) Check(ctx context.Context, route string, only ...Capability) (
 		if len(only) > 0 && !want[c] {
 			continue
 		}
-		// The many-tools test only means something for a model whose plain tool
-		// test passes; asking a model that cannot call tools to pick from
-		// twenty-six wastes calls and proves nothing.
-		if c == CapToolsMany && rep.Check(CapTools).Status != StatusPassed {
+		// The many-tools test and the build task over native tool calls only mean
+		// something for a model whose plain tool test passes; asking a model that
+		// cannot call tools to pick from twenty-six, or to run a whole task with
+		// them, wastes calls and proves nothing.
+		if (c == CapToolsMany || c == CapBuild) && rep.Check(CapTools).Status != StatusPassed {
+			continue
+		}
+		// The text-protocol build task is the fallback for a model whose native
+		// tool calls do not work, so it only runs when they do not.
+		if c == CapBuildText && rep.Check(CapTools).Status != StatusFailed && rep.Check(CapBuild).Status != StatusFailed {
 			continue
 		}
 		rep.Checks = append(rep.Checks, runner.RunCapability(ctx, c))

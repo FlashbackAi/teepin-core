@@ -319,6 +319,7 @@ func (g *Gateway) LaunchAgent(ctx context.Context, sess *Session, prompt string,
 	podID := AgentPodNamePrefix + sess.ID.String()[:8]
 
 	window, maxOutput := g.routeLimits(ctx, sess.ModelRoute)
+	vision, toolMode := g.launchProfile(ctx, sess.ModelRoute)
 
 	spec := cluster.InstanceSpec{
 		InstanceID: podID,
@@ -334,7 +335,10 @@ func (g *Gateway) LaunchAgent(ctx context.Context, sess *Session, prompt string,
 			"TEEPIN_SESSION_ID":     sess.ID.String(),
 			"TEEPIN_PROMPT":         internalScratchPathInstruction + prompt,
 			"TEEPIN_API_BASE_URL":   g.agentConfig.APIBaseURL,
-			"TEEPIN_VISION_CAPABLE": strconv.FormatBool(g.agentConfig.VisionCapable),
+			"TEEPIN_VISION_CAPABLE": strconv.FormatBool(vision),
+			// "native" or "text": how the harness talks to this model about
+			// tools (see launchProfile).
+			"TEEPIN_TOOL_MODE": toolMode,
 			// JSON-encoded []Attachment, empty string when there are none —
 			// run.py decodes this once at startup to build the initial
 			// prompt's real Message (with ImageContent) or to materialize

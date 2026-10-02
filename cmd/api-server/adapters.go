@@ -363,23 +363,16 @@ func (b *kumbhaModelBackend) WithProbeReports(r interface {
 	return b
 }
 
-// builderCapabilities is what the builder may treat a model as able to do, and
-// why it is unavailable if it is. unavailable is the reason already found (an
-// empty string when the model is up); a model that cannot call tools is
-// unavailable for building whatever else is true of it.
-func builderCapabilities(m modelcatalog.Model, rep *modelprobe.Report, unavailable string) (tools, vision, audio bool, why string) {
-	tools, _ = modelprobe.Effective(rep, modelprobe.CapTools, m.SupportsTools)
-	vision, _ = modelprobe.Effective(rep, modelprobe.CapVision, m.SupportsVision)
-	audio, _ = modelprobe.Effective(rep, modelprobe.CapAudio, m.SupportsAudio)
-	if unavailable == "" && !tools {
-		unavailable = notBuildCapable
-	}
-	return tools, vision, audio, unavailable
+// builderCapabilities is what the builder may treat a model as able to do, how
+// it talks to the model about tools, and why it is unavailable if it is.
+// unavailable is the reason already found (an empty string when the model is up).
+func builderCapabilities(m modelcatalog.Model, rep *modelprobe.Report, unavailable string) modelprobe.BuilderView {
+	return modelprobe.Builder(m.SupportsTools, m.SupportsVision, m.SupportsAudio, rep, unavailable)
 }
 
 // notBuildCapable is why a model without working tool calls is not offered for
 // builds. Phrased for a customer.
-const notBuildCapable = "Can't use tools, which building needs"
+const notBuildCapable = modelprobe.NotBuildCapable
 
 func newKumbhaModelBackend(catalog *modelcatalog.Service, gateway *inferencegateway.Gateway) *kumbhaModelBackend {
 	return &kumbhaModelBackend{catalog: catalog, gateway: gateway}
@@ -404,7 +397,8 @@ func (b *kumbhaModelBackend) KumbhaModels(ctx context.Context) ([]kumbha.Model, 
 		// calls, so a model that failed its tool check is not offered, and one
 		// that passed is, whatever was ticked. With no evidence yet the
 		// declared flag stands.
-		tools, vision, audio, unavailable := builderCapabilities(m, reports[m.ModelRoute], unavailable)
+		view := builderCapabilities(m, reports[m.ModelRoute], unavailable)
+		unavailable = view.Unavailable
 		out = append(out, kumbha.Model{
 			Unavailable:           unavailable,
 			Route:                 m.ModelRoute,
@@ -412,9 +406,10 @@ func (b *kumbhaModelBackend) KumbhaModels(ctx context.Context) ([]kumbha.Model, 
 			Engine:                m.Engine,
 			Confidential:          m.Provider == modelcatalog.ProviderTinfoilConfidential,
 			SelfHosted:            !m.Provider.IsThirdParty(),
-			SupportsTools:         tools,
-			SupportsVision:        vision,
-			SupportsAudio:         audio,
+			SupportsTools:         view.Tools,
+			SupportsVision:        view.Vision,
+			SupportsAudio:         view.Audio,
+			ToolMode:              string(view.Mode),
 			ContextWindow:         m.ContextWindow,
 			MaxOutputTokens:       m.MaxOutputTokens,
 			InputPricePerMillion:  m.InputPricePerMillion,

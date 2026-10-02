@@ -108,7 +108,7 @@ func TestService_CheckStoresMetadataAndEveryCapability(t *testing.T) {
 	if rep.Metadata == nil || rep.Metadata.ContextWindow != 131072 || rep.Metadata.Source != "test" {
 		t.Errorf("metadata = %+v", rep.Metadata)
 	}
-	for _, c := range AllCapabilities {
+	for _, c := range singleStepCapabilities {
 		if rep.Check(c).Status != StatusPassed {
 			t.Errorf("%s = %s (%s)", c, rep.Check(c).Status, rep.Check(c).Detail)
 		}

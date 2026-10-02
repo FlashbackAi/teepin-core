@@ -387,34 +387,54 @@ func TestGateway_LaunchAgent_NoCapacityListerConfiguredLeavesProviderIDEmpty(t *
 	}
 }
 
-// TestGateway_LaunchAgent_PropagatesVisionCapableFlag covers AgentConfig.
-// VisionCapable reaching the pod as TEEPIN_VISION_CAPABLE — what
-// browser_tool.py's get_shared_browser() reads to decide whether
-// browser_screenshot attaches an actual image or stays text-only. Both
-// values are asserted (not just the non-default one) since the SAFE
-// default (false) not silently flipping to true is the more
-// safety-critical direction to catch a regression in.
-func TestGateway_LaunchAgent_PropagatesVisionCapableFlag(t *testing.T) {
-	for _, visionCapable := range []bool{false, true} {
+// The pod is told whether its model can see images and how it talks to the
+// model about tools. Vision follows the MODEL (what it was seen to do), with the
+// operator's global setting only as the fallback when the model cannot be found;
+// the safe default (false) not silently flipping to true is the direction most
+// worth guarding.
+func TestGateway_LaunchAgent_TellsThePodWhatItsModelCanDo(t *testing.T) {
+	launch := func(t *testing.T, models ModelBackend, cfgVision bool, route string) map[string]string {
+		t.Helper()
 		store, mock := newMockStore(t)
 		fc := &fakeCluster{}
-		gw := NewGateway(store, testAgentModels(), nil, &fakePricing{}, &fakeUsageRecorder{}).
-			WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest", VisionCapable: visionCapable})
-
+		gw := NewGateway(store, models, nil, &fakePricing{}, &fakeUsageRecorder{}).
+			WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest", VisionCapable: cfgVision})
 		sessID := uuid.New()
-		sess := &Session{ID: sessID, AccountID: uuid.New(), ProjectID: uuid.New(), ModelRoute: "teepin/qwen3-30b-a3b"}
-
+		sess := &Session{ID: sessID, AccountID: uuid.New(), ProjectID: uuid.New(), ModelRoute: route}
 		mock.ExpectExec(`UPDATE billing\.inference_sessions SET agent_instance_id`).
 			WithArgs(sessID, "kumbha-agent-"+sessID.String()[:8]).
 			WillReturnResult(sqlmock.NewResult(0, 1))
-
 		if err := gw.LaunchAgent(context.Background(), sess, "build me a booking app", nil); err != nil {
 			t.Fatalf("LaunchAgent: %v", err)
 		}
+		return fc.created[0].Env
+	}
+	route := "teepin/qwen3-30b-a3b"
+	model := func(vision bool, mode string) StaticModels {
+		return StaticModels{{Route: route, Engine: "vllm", SupportsVision: vision, ToolMode: mode, Provider: &fakeProvider{name: "vllm"}}}
+	}
 
-		want := strconv.FormatBool(visionCapable)
-		if got := fc.created[0].Env["TEEPIN_VISION_CAPABLE"]; got != want {
-			t.Errorf("VisionCapable=%v: TEEPIN_VISION_CAPABLE = %q, want %q", visionCapable, got, want)
+	for _, vision := range []bool{false, true} {
+		// The operator's switch is the opposite, to show the model wins.
+		env := launch(t, model(vision, ""), !vision, route)
+		if got, want := env["TEEPIN_VISION_CAPABLE"], strconv.FormatBool(vision); got != want {
+			t.Errorf("model vision=%v: TEEPIN_VISION_CAPABLE = %q, want %q", vision, got, want)
+		}
+		if env["TEEPIN_TOOL_MODE"] != "native" {
+			t.Errorf("tool mode = %q, want native by default", env["TEEPIN_TOOL_MODE"])
+		}
+	}
+	if env := launch(t, model(false, "text"), false, route); env["TEEPIN_TOOL_MODE"] != "text" {
+		t.Errorf("a model that needs the text protocol: tool mode = %q", env["TEEPIN_TOOL_MODE"])
+	}
+	// The model list cannot be read (the launch fails open then): the operator's
+	// setting stands and the mode is native.
+	for _, global := range []bool{false, true} {
+		gw := NewGateway(nil, nil, nil, &fakePricing{}, &fakeUsageRecorder{}).
+			WithAgent(&fakeCluster{}, fakeMintToken, AgentConfig{VisionCapable: global})
+		vision, mode := gw.launchProfile(context.Background(), route)
+		if vision != global || mode != "native" {
+			t.Errorf("unreadable model list, global=%v: vision=%v mode=%q", global, vision, mode)
 		}
 	}
 }

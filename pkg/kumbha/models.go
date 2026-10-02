@@ -54,8 +54,13 @@ type Model struct {
 	// infrastructure to the customer, same posture as leased GPU/CPU
 	// compute. False means a genuine vendor API Teepin merely calls
 	// (Anthropic, an arbitrary OpenAI-compatible endpoint).
-	SelfHosted     bool
-	SupportsTools  bool
+	SelfHosted    bool
+	SupportsTools bool
+	// ToolMode is how the build agent should talk to this model about tools:
+	// "native" (structured tool calls) or "text" (the harness's prompt-based
+	// protocol, for a model whose native calls do not work). Empty means the
+	// agent's default, native.
+	ToolMode       string
 	SupportsVision bool
 	SupportsAudio  bool
 	// ContextWindow is the model's input window in tokens, 0 when the
@@ -96,7 +101,10 @@ type StaticModel struct {
 	Engine          string
 	ContextWindow   int
 	MaxOutputTokens int
-	Provider        inference.Provider
+	SupportsVision  bool
+	// ToolMode is "native" (the default when empty) or "text".
+	ToolMode string
+	Provider inference.Provider
 }
 
 // StaticModels is a fixed, in-memory ModelBackend: its models are listed in
@@ -107,7 +115,8 @@ type StaticModels []StaticModel
 func (s StaticModels) KumbhaModels(context.Context) ([]Model, error) {
 	out := make([]Model, 0, len(s))
 	for _, m := range s {
-		out = append(out, Model{Route: m.Route, Engine: m.Engine, ContextWindow: m.ContextWindow, MaxOutputTokens: m.MaxOutputTokens})
+		out = append(out, Model{Route: m.Route, Engine: m.Engine, ContextWindow: m.ContextWindow, MaxOutputTokens: m.MaxOutputTokens,
+			SupportsVision: m.SupportsVision, ToolMode: m.ToolMode})
 	}
 	return out, nil
 }

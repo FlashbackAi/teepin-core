@@ -575,6 +575,9 @@ func main() {
 		}
 		publicInferenceHandler = api.NewInferenceHandler(inferenceGateway, modelCatalogService, usage)
 		publicInferenceHandler.WithModelStatus(inferenceGateway)
+		if modelProbeStore != nil && getEnvBool("TEEPIN_MODEL_PROBE_GATING", true) {
+			publicInferenceHandler.WithProbeReports(modelProbeStore)
+		}
 		if billingService != nil {
 			// Refuse requests the account has no credit to pay for. Guarded
 			// so a nil billingService never becomes a typed-nil interface.

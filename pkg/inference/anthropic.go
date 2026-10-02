@@ -112,6 +112,60 @@ type openAIMessage struct {
 	ToolCallID string           `json:"tool_call_id"`
 }
 
+// userBlocks turns a user message's content into Anthropic blocks. Text parts
+// stay text; an image part (OpenAI's image_url, either a data: URL or an
+// https URL) becomes an image block, so a model that can see is actually shown
+// the picture. Before this the image was dropped silently and the model
+// answered about something it had never seen. Other part types (audio) have no
+// Anthropic equivalent and are left out, as before.
+func userBlocks(content json.RawMessage, text string) ([]anthropic.ContentBlockParamUnion, error) {
+	var parts []struct {
+		Type     string `json:"type"`
+		Text     string `json:"text"`
+		ImageURL struct {
+			URL string `json:"url"`
+		} `json:"image_url"`
+	}
+	if len(content) == 0 || json.Unmarshal(content, &parts) != nil {
+		return textBlocks(text), nil // a bare string, or nothing
+	}
+	var blocks []anthropic.ContentBlockParamUnion
+	for _, part := range parts {
+		switch part.Type {
+		case "text":
+			if part.Text != "" {
+				blocks = append(blocks, anthropic.NewTextBlock(part.Text))
+			}
+		case "image_url":
+			block, err := imageBlock(part.ImageURL.URL)
+			if err != nil {
+				return nil, err
+			}
+			blocks = append(blocks, block)
+		}
+	}
+	return blocks, nil
+}
+
+// anthropicImageTypes are the formats Anthropic accepts.
+var anthropicImageTypes = map[string]bool{"image/jpeg": true, "image/png": true, "image/gif": true, "image/webp": true}
+
+// imageBlock builds an image block from a data: URL (base64) or an https URL.
+func imageBlock(url string) (anthropic.ContentBlockParamUnion, error) {
+	if rest, ok := strings.CutPrefix(url, "data:"); ok {
+		meta, data, found := strings.Cut(rest, ",")
+		mediaType, isB64 := strings.CutSuffix(meta, ";base64")
+		if !found || !isB64 || !anthropicImageTypes[mediaType] {
+			return anthropic.ContentBlockParamUnion{}, fmt.Errorf("unsupported image: only base64 data URLs of jpeg, png, gif or webp are accepted")
+		}
+		return anthropic.NewImageBlockBase64(mediaType, data), nil
+	}
+	if strings.HasPrefix(url, "https://") {
+		return anthropic.NewImageBlock(anthropic.URLImageSourceParam{URL: url}), nil
+	}
+	return anthropic.ContentBlockParamUnion{}, fmt.Errorf("unsupported image URL: it must be an https URL or a base64 data URL")
+}
+
 // extractText pulls plain text out of an OpenAI-shaped content field,
 // which is either a bare string or an array of typed parts
 // ([{"type":"text","text":"..."}, ...], OpenAI's multimodal shape).
@@ -187,7 +241,11 @@ func toAnthropicMessages(raws []json.RawMessage) ([]anthropic.TextBlockParam, []
 			// direction, since treating an unknown role as assistant could
 			// let untrusted content masquerade as the model's own prior
 			// turn.
-			messages = appendTurn(messages, anthropic.MessageParamRoleUser, textBlocks(text))
+			blocks, err := userBlocks(m.Content, text)
+			if err != nil {
+				return nil, nil, err
+			}
+			messages = appendTurn(messages, anthropic.MessageParamRoleUser, blocks)
 		}
 	}
 	return system, messages, nil
