@@ -176,6 +176,44 @@ func TestAgentClient_StreamLogsRoutesToOwningProvider(t *testing.T) {
 	}
 }
 
+// A follow request for a pod whose container has not started is answered by the
+// node with a failed Result, not a log chunk. That used to be dropped, leaving the
+// follow stream waiting forever: the console's feed stayed empty for a builder pod
+// that was still pulling its image (found live 2026-10-02). The stream must end so
+// the caller's cold-start retry can run.
+func TestAgentClient_StreamLogsEndsWhenTheNodeRefusesTheRequest(t *testing.T) {
+	var s *AgentSession
+	s = NewAgentSession("provider-1", "us-east", "test", "", func(msg *agentpb.ControlMessage) error {
+		switch msg.Payload.(type) {
+		case *agentpb.ControlMessage_CreateInstance:
+			go s.deliverResult(msg.RequestId, &agentpb.CommandResult{Success: true})
+		case *agentpb.ControlMessage_FetchLogs:
+			go s.deliverResult(msg.RequestId, &agentpb.CommandResult{
+				Success: false, ErrorMessage: "container is waiting to start: ContainerCreating",
+			})
+		}
+		return nil
+	})
+	c := NewAgentClient(registryWith(s))
+	if _, err := c.CreateInstance(context.Background(), InstanceSpec{InstanceID: "inst-a", ProviderID: "provider-1"}); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+
+	done := make(chan error, 1)
+	var buf bytes.Buffer
+	go func() {
+		done <- c.StreamLogs(context.Background(), AllTenants(), "inst-a", LogOptions{Follow: true}, &buf)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("a refused follow request left StreamLogs waiting forever")
+	}
+	if buf.Len() != 0 {
+		t.Errorf("logs = %q, want none", buf.String())
+	}
+}
+
 func TestAgentClient_NoAgentIsUnavailable(t *testing.T) {
 	c := NewAgentClient(NewRegistry())
 

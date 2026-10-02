@@ -187,6 +187,7 @@ func (s *AgentSession) dispatch(ctx context.Context, msg *agentpb.ControlMessage
 func (s *AgentSession) deliverResult(requestID string, result *agentpb.CommandResult) {
 	s.mu.Lock()
 	ch, ok := s.pending[requestID]
+	_, isLogStream := s.logStreams[requestID]
 	s.mu.Unlock()
 
 	if ok {
@@ -196,6 +197,17 @@ func (s *AgentSession) deliverResult(requestID string, result *agentpb.CommandRe
 		case ch <- result:
 		default:
 		}
+		return
+	}
+
+	// A log request has no pending entry: its answer is a stream of chunks. The
+	// only Result it ever gets is a failure (the pod's container has not started
+	// yet, the pod is gone). Dropping it left a follow stream waiting for data
+	// that was never coming, so a log tail opened while a builder pod was still
+	// pulling its image never retried and the feed stayed empty. End the stream so
+	// the caller's retry takes over.
+	if isLogStream && result != nil && !result.Success {
+		s.deliverLogChunk(requestID, &agentpb.LogChunk{Eof: true})
 	}
 }
 
