@@ -419,6 +419,38 @@ func (b *kumbhaModelBackend) KumbhaModels(ctx context.Context) ([]kumbha.Model, 
 	return out, nil
 }
 
+// ImageReaders lists the models set to describe a build's attached images, in
+// priority order. A reader's ability to see is what it was actually seen to do
+// where there is evidence, else what was declared, the same rule the builder
+// list follows; one that is down is listed with the reason, and skipped by the
+// caller.
+func (b *kumbhaModelBackend) ImageReaders(ctx context.Context) ([]kumbha.Model, error) {
+	models, err := b.catalog.ListImageReaders(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var reports map[string]*modelprobe.Report
+	if b.reports != nil {
+		reports, _ = b.reports.All(ctx)
+	}
+	out := make([]kumbha.Model, 0, len(models))
+	for _, m := range models {
+		unavailable := ""
+		if b.gateway != nil {
+			unavailable = b.gateway.Status(ctx, m).Unservable()
+		}
+		sees, _ := modelprobe.Effective(reports[m.ModelRoute], modelprobe.CapVision, m.SupportsVision)
+		out = append(out, kumbha.Model{
+			Route:          m.ModelRoute,
+			DisplayName:    m.DisplayName,
+			Engine:         m.Engine,
+			Unavailable:    unavailable,
+			SupportsVision: sees,
+		})
+	}
+	return out, nil
+}
+
 func (b *kumbhaModelBackend) Complete(ctx context.Context, accountID string, req inference.Request) (*inference.Response, error) {
 	resp, err := b.gateway.Complete(ctx, accountID, req)
 	// The gateway declining to dispatch (a concurrency ceiling already

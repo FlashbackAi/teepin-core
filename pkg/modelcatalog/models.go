@@ -117,6 +117,10 @@ type Model struct {
 	// models are tried in ascending KumbhaPriority order.
 	KumbhaEnabled  bool `json:"kumbha_enabled"`
 	KumbhaPriority int  `json:"kumbha_priority"`
+	// KumbhaImageReader makes the model the one that describes images attached
+	// to a build, for a builder model that cannot see them. It is independent of
+	// KumbhaEnabled: a model can read images without being offered as a builder.
+	KumbhaImageReader bool `json:"kumbha_image_reader"`
 
 	UpdatedBy *string   `json:"updated_by,omitempty"`
 	CreatedAt time.Time `json:"created_at"`

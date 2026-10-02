@@ -1646,6 +1646,7 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 			// The agent records each deployment plan it presents; the
 			// customer's approval then names one of them.
 			kumbhaGroup.POST("/sessions/:id/plans", apiServer.RecordKumbhaPlan)
+			kumbhaGroup.POST("/sessions/:id/describe-image", apiServer.DescribeKumbhaImage)
 			kumbhaGroup.PATCH("/sessions/:id/budget", apiServer.UpdateKumbhaBudget)
 			// Secrets the customer enters for their app. Deliberately NOT on
 			// the agent's route allowlist: the value must never pass through

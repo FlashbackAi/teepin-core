@@ -28,6 +28,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -53,7 +54,8 @@ func main() {
 			"already deployed: changing its code costs nothing extra, so call deploy directly " +
 			"(no plan, no new approval). " +
 			"You must have run your app inside this pod and checked it first, and " +
-			"describe that check in \"verification\" — the call is refused without it.",
+			"describe that check in \"verification\" — the call is refused without it. " +
+			"Arguments, for example: " + planExample,
 	}, client.presentDeploymentPlan)
 
 	registerPromptTools(server, client)
@@ -302,9 +304,38 @@ func checkVerification(args presentDeploymentPlanArgs) string {
 // charged, not a second formula that could drift from it.
 const hoursPerMonth = 730.0
 
+// planExample is the argument shape shown in the tool's description and in a
+// refusal about the shape. A model that sent the wrong shape once needs the right
+// one in front of it, not a bare "at least one resource is required": a live
+// GLM-5.3 build called this tool five times in a row with the same mistake
+// (2026-10-02) because nothing said what a correct call looks like.
+const planExample = `{"resources": [{"name": "guestbook", "cpu_units": 1, "memory_gb": 1}], ` +
+	`"verification": "Started the app in the background, opened it in the browser tool, signed twice and reloaded; both entries were listed."}` +
+	` ("resources" is an array of objects; each needs "name" and a positive integer in "cpu_units" and/or "memory_gb".)`
+
+// receivedFields names the top-level fields the model actually sent, so a
+// refusal can say what it got and an operator can see it in the pod log.
+func receivedFields(req *mcp.CallToolRequest) string {
+	if req == nil || req.Params == nil || len(req.Params.Arguments) == 0 {
+		return "no arguments"
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(req.Params.Arguments, &m); err != nil {
+		return "arguments that were not a JSON object"
+	}
+	names := make([]string, 0, len(m))
+	for k := range m {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	return "fields: " + strings.Join(names, ", ")
+}
+
 func (c *teepinClient) presentDeploymentPlan(ctx context.Context, req *mcp.CallToolRequest, args presentDeploymentPlanArgs) (*mcp.CallToolResult, any, error) {
 	if len(args.Resources) == 0 {
-		return textResult("at least one resource is required")
+		got := receivedFields(req)
+		log.Printf("teepin-mcp-server: present_deployment_plan refused, no resources (%s)", got)
+		return textResult("at least one resource is required: \"resources\" must be a non-empty array. You sent %s. Call it again with the array filled in, for example: %s", got, planExample)
 	}
 	// An app that is already deployed and approved, asked for at a size it
 	// already has, is an update, not a new purchase (see redeploy.go). If the

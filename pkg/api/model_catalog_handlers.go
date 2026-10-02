@@ -115,6 +115,7 @@ type availabilityRequest struct {
 	OfferedToCustomers *bool `json:"offered_to_customers"`
 	KumbhaEnabled      *bool `json:"kumbha_enabled"`
 	KumbhaPriority     *int  `json:"kumbha_priority"`
+	KumbhaImageReader  *bool `json:"kumbha_image_reader"`
 }
 
 func (r availabilityRequest) toAvailability() modelcatalog.Availability {
@@ -122,11 +123,12 @@ func (r availabilityRequest) toAvailability() modelcatalog.Availability {
 		OfferedToCustomers: r.OfferedToCustomers,
 		KumbhaEnabled:      r.KumbhaEnabled,
 		KumbhaPriority:     r.KumbhaPriority,
+		KumbhaImageReader:  r.KumbhaImageReader,
 	}
 }
 
 func (r availabilityRequest) any() bool {
-	return r.OfferedToCustomers != nil || r.KumbhaEnabled != nil || r.KumbhaPriority != nil
+	return r.OfferedToCustomers != nil || r.KumbhaEnabled != nil || r.KumbhaPriority != nil || r.KumbhaImageReader != nil
 }
 
 // RegisterModel is POST /v1/admin/inference/models — creates or updates a
@@ -282,8 +284,14 @@ func (h *ModelCatalogHandler) SetAvailability(c *gin.Context) {
 		return
 	}
 	if !req.any() {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "set at least one of offered_to_customers, kumbha_enabled, kumbha_priority"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "set at least one of offered_to_customers, kumbha_enabled, kumbha_priority, kumbha_image_reader"})
 		return
+	}
+	if req.KumbhaImageReader != nil && *req.KumbhaImageReader {
+		if msg := h.cannotReadImages(c.Request.Context(), route); msg != "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": msg, "code": "not_vision_capable"})
+			return
+		}
 	}
 	if err := h.catalog.SetAvailability(c.Request.Context(), route, req.toAvailability(), "admin-api"); err != nil {
 		if errors.Is(err, modelcatalog.ErrNotFound) {
@@ -298,6 +306,25 @@ func (h *ModelCatalogHandler) SetAvailability(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "availability updated", "model_route": route})
+}
+
+// cannotReadImages returns why a model cannot be an image reader, or "" when it
+// can. The same rule as everywhere else: what the model was seen to do wins over
+// what was ticked; with no evidence yet, the declared flag stands. A model that
+// does not exist is left for SetAvailability to report.
+func (h *ModelCatalogHandler) cannotReadImages(ctx context.Context, route string) string {
+	m, err := h.catalog.GetModel(ctx, route)
+	if err != nil || m == nil {
+		return ""
+	}
+	var rep *modelprobe.Report
+	if h.probes != nil {
+		rep, _ = h.probes.Latest(ctx, route)
+	}
+	if ok, basis := modelprobe.Effective(rep, modelprobe.CapVision, m.SupportsVision); !ok {
+		return "this model cannot read images (" + basis + "): run its capability check, or declare it vision-capable, before making it the image reader"
+	}
+	return ""
 }
 
 // GetModel is GET /v1/admin/inference/models/one?model_route=...

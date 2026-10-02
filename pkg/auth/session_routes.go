@@ -56,6 +56,10 @@ var sessionAllowedRoutes = map[string]bool{
 	// approval can name it. (Approving is the customer's, and not here.)
 	"POST /v1/kumbha/sessions/:id/plans": true,
 
+	// The agent has the platform's image reader describe an image the customer
+	// attached, because the builder model cannot see images. Billed to the build.
+	"POST /v1/kumbha/sessions/:id/describe-image": true,
+
 	// teepin-mcp-server verbs. deploy and create_instance are additionally
 	// gated server-side on the session's deploy_approved flag.
 	"POST /v1/kumbha/sessions/:id/deploy": true,

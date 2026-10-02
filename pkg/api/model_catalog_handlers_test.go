@@ -50,7 +50,7 @@ func modelRows() []string {
 		"vendor_input_cost_per_million", "vendor_output_cost_per_million",
 		"enabled", "provider", "provider_model", "base_url", "max_output_tokens",
 		"api_key_ref", "offered_to_customers", "kumbha_enabled", "kumbha_priority",
-		"updated_by", "created_at", "updated_at",
+		"kumbha_image_reader", "updated_by", "created_at", "updated_at",
 	}
 }
 
@@ -63,7 +63,7 @@ func expectModelRow(mock sqlmock.Sqlmock, route, provider, apiKeyRef string) {
 			route, "Model", "frontier", "anthropic", 200000,
 			true, false, false, 0.0, 0.0, nil, nil,
 			true, provider, "claude-haiku-4-5-20251001", "", 4096,
-			apiKeyRef, false, true, 0,
+			apiKeyRef, false, true, 0, false,
 			"admin-api", time.Now(), time.Now(),
 		))
 }
@@ -133,7 +133,7 @@ func TestRegisterModel_ExternalModelStoresKeyAndAvailability(t *testing.T) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	off, on := false, true
 	mock.ExpectExec(`SET offered_to_customers = COALESCE`).
-		WithArgs(&off, &on, nil, "admin-api", "anthropic/claude-haiku-4-5", true).
+		WithArgs(&off, &on, nil, nil, "admin-api", "anthropic/claude-haiku-4-5", true).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	expectModelRow(mock, "anthropic/claude-haiku-4-5", "anthropic", "") // storeAPIKey's lookup: no key yet
 	mock.ExpectExec(`SET api_key_ref = NULLIF`).
@@ -279,7 +279,7 @@ func TestSetAvailability_UpdatesOnlyWhatWasSent(t *testing.T) {
 
 	priority := 2
 	mock.ExpectExec(`SET offered_to_customers = COALESCE`).
-		WithArgs(nil, nil, &priority, "admin-api", "teepin/a", false).
+		WithArgs(nil, nil, &priority, nil, "admin-api", "teepin/a", false).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	w := jsonRequest(h.SetAvailability, "PUT", "/v1/admin/inference/models/availability?model_route=teepin/a", []byte(`{"kumbha_priority":2}`), nil)
@@ -288,6 +288,69 @@ func TestSetAvailability_UpdatesOnlyWhatWasSent(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("unmet: %v", err)
+	}
+}
+
+// expectVisionModelRow primes one GetModel lookup of a model that does (or does
+// not) declare vision.
+func expectVisionModelRow(mock sqlmock.Sqlmock, route string, vision bool) {
+	mock.ExpectQuery(`SELECT model_route, display_name, cost_class`).
+		WithArgs(route).
+		WillReturnRows(sqlmock.NewRows(modelRows()).AddRow(
+			route, "Omni", "own", "vllm", 32768,
+			true, vision, false, 0.1, 0.3, nil, nil,
+			true, "node", "", "", 4096,
+			"", false, false, 0, false,
+			"admin-api", time.Now(), time.Now(),
+		))
+}
+
+// A model becomes the image reader only if it can see: declared (or verified)
+// vision. Otherwise every build that attaches an image would get nonsense back.
+func TestSetAvailability_ImageReaderNeedsAModelThatCanSee(t *testing.T) {
+	h, mock, done := newModelCatalogHandlerMock(t)
+	defer done()
+	expectVisionModelRow(mock, "teepin/glm", false)
+
+	w := jsonRequest(h.SetAvailability, "PUT", "/v1/admin/inference/models/availability?model_route=teepin/glm", []byte(`{"kumbha_image_reader":true}`), nil)
+	if w.Code != 400 || !strings.Contains(w.Body.String(), "not_vision_capable") {
+		t.Fatalf("status = %d body = %s, want 400 not_vision_capable", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("the update ran for a model that cannot see: %v", err)
+	}
+}
+
+func TestSetAvailability_ImageReaderOnForAModelThatCanSee(t *testing.T) {
+	h, mock, done := newModelCatalogHandlerMock(t)
+	defer done()
+	expectVisionModelRow(mock, "teepin/omni", true)
+	on := true
+	mock.ExpectExec(`kumbha_image_reader`).
+		WithArgs(nil, nil, nil, &on, "admin-api", "teepin/omni", true).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := jsonRequest(h.SetAvailability, "PUT", "/v1/admin/inference/models/availability?model_route=teepin/omni", []byte(`{"kumbha_image_reader":true}`), nil)
+	if w.Code != 200 {
+		t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
+	}
+}
+
+// Turning the role OFF never needs the model to be able to see.
+func TestSetAvailability_ImageReaderOffNeedsNoCheck(t *testing.T) {
+	h, mock, done := newModelCatalogHandlerMock(t)
+	defer done()
+	off := false
+	mock.ExpectExec(`kumbha_image_reader`).
+		WithArgs(nil, nil, nil, &off, "admin-api", "teepin/glm", false).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	w := jsonRequest(h.SetAvailability, "PUT", "/v1/admin/inference/models/availability?model_route=teepin/glm", []byte(`{"kumbha_image_reader":false}`), nil)
+	if w.Code != 200 {
+		t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
 	}
 }
 
@@ -343,7 +406,7 @@ func TestListModels_IncludesLiveStatus(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows(modelRows()).AddRow(
 			"teepin/qwen3-30b-a3b", "Qwen", "own", "mlx", 8000,
 			false, false, false, 0.0, 0.0, nil, nil,
-			true, "node", "", "", 4096, "", true, false, 0,
+			true, "node", "", "", 4096, "", true, false, 0, false,
 			"op", time.Now(), time.Now(),
 		))
 

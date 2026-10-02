@@ -177,6 +177,7 @@ type Availability struct {
 	OfferedToCustomers *bool
 	KumbhaEnabled      *bool
 	KumbhaPriority     *int
+	KumbhaImageReader  *bool
 }
 
 // SetAvailability updates whether a model is offered to customers and
@@ -185,15 +186,18 @@ type Availability struct {
 // Turning either availability ON requires the model to be priced; the check is
 // part of the UPDATE itself, so there is no window between checking and changing.
 func (s *Service) SetAvailability(ctx context.Context, modelRoute string, a Availability, updatedBy string) error {
-	switchingOn := (a.OfferedToCustomers != nil && *a.OfferedToCustomers) || (a.KumbhaEnabled != nil && *a.KumbhaEnabled)
+	switchingOn := (a.OfferedToCustomers != nil && *a.OfferedToCustomers) ||
+		(a.KumbhaEnabled != nil && *a.KumbhaEnabled) ||
+		(a.KumbhaImageReader != nil && *a.KumbhaImageReader)
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE inference.models
 		SET offered_to_customers = COALESCE($1, offered_to_customers),
 		    kumbha_enabled       = COALESCE($2, kumbha_enabled),
 		    kumbha_priority      = COALESCE($3, kumbha_priority),
-		    updated_by = $4, updated_at = NOW()
-		WHERE model_route = $5 AND (NOT $6::boolean OR `+pricedSQL+`)
-	`, a.OfferedToCustomers, a.KumbhaEnabled, a.KumbhaPriority, updatedBy, modelRoute, switchingOn)
+		    kumbha_image_reader  = COALESCE($4, kumbha_image_reader),
+		    updated_by = $5, updated_at = NOW()
+		WHERE model_route = $6 AND (NOT $7::boolean OR `+pricedSQL+`)
+	`, a.OfferedToCustomers, a.KumbhaEnabled, a.KumbhaPriority, a.KumbhaImageReader, updatedBy, modelRoute, switchingOn)
 	if err != nil {
 		return fmt.Errorf("failed to set availability for %q: %w", modelRoute, err)
 	}
@@ -230,6 +234,13 @@ func (s *Service) SetAPIKeyRef(ctx context.Context, modelRoute, ref, updatedBy s
 func (s *Service) ListKumbhaModels(ctx context.Context) ([]Model, error) {
 	return s.queryModels(ctx,
 		selectModelsSQL+` WHERE enabled AND kumbha_enabled ORDER BY kumbha_priority, model_route`)
+}
+
+// ListImageReaders returns every enabled model set as an image reader, in
+// kumbha_priority order. The caller uses the first one that can serve.
+func (s *Service) ListImageReaders(ctx context.Context) ([]Model, error) {
+	return s.queryModels(ctx,
+		selectModelsSQL+` WHERE enabled AND kumbha_image_reader ORDER BY kumbha_priority, model_route`)
 }
 
 // SetPricing updates a model's customer-facing per-million-token rates.
@@ -393,7 +404,7 @@ const selectModelsSQL = `
 	       vendor_input_cost_per_million, vendor_output_cost_per_million,
 	       enabled, provider, provider_model, base_url, max_output_tokens,
 	       COALESCE(api_key_ref, ''), offered_to_customers, kumbha_enabled, kumbha_priority,
-	       updated_by, created_at, updated_at
+	       kumbha_image_reader, updated_by, created_at, updated_at
 	FROM inference.models`
 
 // row is satisfied by both *sql.Row and *sql.Rows, so scanModel/scanModelRow
@@ -414,7 +425,7 @@ func scanModelRow(r row) (*Model, error) {
 		&m.VendorInputCostPerMillion, &m.VendorOutputCostPerMillion,
 		&m.Enabled, &provider, &m.ProviderModel, &m.BaseURL, &m.MaxOutputTokens,
 		&m.APIKeyRef, &m.OfferedToCustomers, &m.KumbhaEnabled, &m.KumbhaPriority,
-		&m.UpdatedBy, &m.CreatedAt, &m.UpdatedAt,
+		&m.KumbhaImageReader, &m.UpdatedBy, &m.CreatedAt, &m.UpdatedAt,
 	); err != nil {
 		return nil, err
 	}

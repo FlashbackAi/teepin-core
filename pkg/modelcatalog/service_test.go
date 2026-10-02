@@ -121,7 +121,7 @@ func TestSetAvailability_PartialUpdateLeavesNilFieldsAlone(t *testing.T) {
 
 	on := true
 	mock.ExpectExec(`SET offered_to_customers = COALESCE\(\$1, offered_to_customers\)`).
-		WithArgs(nil, &on, nil, "op", "anthropic/claude-haiku-4-5", true).
+		WithArgs(nil, &on, nil, nil, "op", "anthropic/claude-haiku-4-5", true).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	if err := s.SetAvailability(context.Background(), "anthropic/claude-haiku-4-5", Availability{KumbhaEnabled: &on}, "op"); err != nil {
@@ -141,6 +141,55 @@ func TestSetAvailability_NotFound(t *testing.T) {
 	on := true
 	if err := s.SetAvailability(context.Background(), "missing", Availability{KumbhaEnabled: &on}, "op"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("got %v, want ErrNotFound", err)
+	}
+}
+
+// The image-reader role is its own switch: setting it touches only that column,
+// and turning it on needs a priced model, because every description it writes is
+// billed to a build.
+func TestSetAvailability_ImageReaderIsItsOwnSwitch(t *testing.T) {
+	s, mock, done := newMock(t)
+	defer done()
+
+	on := true
+	mock.ExpectExec(`kumbha_image_reader\s+= COALESCE\(\$4, kumbha_image_reader\)`).
+		WithArgs(nil, nil, nil, &on, "op", "teepin/qwen3-omni", true).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := s.SetAvailability(context.Background(), "teepin/qwen3-omni", Availability{KumbhaImageReader: &on}, "op"); err != nil {
+		t.Fatalf("SetAvailability: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
+	}
+}
+
+func TestSetAvailability_TurningTheImageReaderOffDoesNotNeedAPrice(t *testing.T) {
+	s, mock, done := newMock(t)
+	defer done()
+
+	off := false
+	mock.ExpectExec(`kumbha_image_reader`).
+		WithArgs(nil, nil, nil, &off, "op", "teepin/qwen3-omni", false).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := s.SetAvailability(context.Background(), "teepin/qwen3-omni", Availability{KumbhaImageReader: &off}, "op"); err != nil {
+		t.Fatalf("SetAvailability: %v", err)
+	}
+}
+
+func TestListImageReaders_OnlyEnabledReadersInPriorityOrder(t *testing.T) {
+	s, mock, done := newMock(t)
+	defer done()
+
+	mock.ExpectQuery(`WHERE enabled AND kumbha_image_reader ORDER BY kumbha_priority, model_route`).
+		WillReturnRows(sqlmock.NewRows(modelRowColumns()))
+
+	if _, err := s.ListImageReaders(context.Background()); err != nil {
+		t.Fatalf("ListImageReaders: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("unmet: %v", err)
 	}
 }
 
@@ -233,7 +282,7 @@ func TestGetModel_ReturnsFullRow(t *testing.T) {
 			4.5, 18.0,
 			&vendorIn, &vendorOut,
 			true, "anthropic", "claude-sonnet-5", "", 8192,
-			"inference-model-key-abc", false, true, 1,
+			"inference-model-key-abc", false, true, 1, true,
 			"op", now, now,
 		))
 
@@ -255,6 +304,9 @@ func TestGetModel_ReturnsFullRow(t *testing.T) {
 	}
 	if m.OfferedToCustomers || !m.KumbhaEnabled || m.KumbhaPriority != 1 {
 		t.Errorf("availability = customers %v, kumbha %v/%d", m.OfferedToCustomers, m.KumbhaEnabled, m.KumbhaPriority)
+	}
+	if !m.KumbhaImageReader {
+		t.Error("KumbhaImageReader was not read from the row")
 	}
 }
 
@@ -303,7 +355,7 @@ func modelRowColumns() []string {
 		"vendor_input_cost_per_million", "vendor_output_cost_per_million",
 		"enabled", "provider", "provider_model", "base_url", "max_output_tokens",
 		"api_key_ref", "offered_to_customers", "kumbha_enabled", "kumbha_priority",
-		"updated_by", "created_at", "updated_at",
+		"kumbha_image_reader", "updated_by", "created_at", "updated_at",
 	}
 }
 
@@ -315,7 +367,7 @@ func modelRowValues(route string, in, out float64) []driver.Value {
 		route, "Model", "own", "vllm", 32768,
 		true, false, false, in, out, nil, nil,
 		false, "node", "", "", 4096,
-		"", false, false, 0,
+		"", false, false, 0, false,
 		"op", time.Now(), time.Now(),
 	}
 }

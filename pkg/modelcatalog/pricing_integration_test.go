@@ -185,3 +185,93 @@ func TestPricingIntegration_RegisterWithPriceAndLaterEditsKeepIt(t *testing.T) {
 		t.Errorf("unknown model: %v, want ErrNotFound (not pricing_required)", err)
 	}
 }
+
+// The image-reader role is its own switch, follows the same "priced before
+// available" rule, and is listed only while the model is enabled.
+func TestPricingIntegration_ImageReaderIsItsOwnPricedSwitch(t *testing.T) {
+	s := pricingDB(t)
+	ctx := context.Background()
+	on, off := true, false
+	route := newRoute()
+
+	if err := register(t, s, route, false, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if mustGet(t, s, route).KumbhaImageReader {
+		t.Fatal("a new model must not be an image reader")
+	}
+	// Unpriced: refused, and nothing changed.
+	if err := s.SetAvailability(ctx, route, Availability{KumbhaImageReader: &on}, "it"); !errors.Is(err, ErrPricingRequired) {
+		t.Fatalf("image reader on, unpriced: %v, want ErrPricingRequired", err)
+	}
+	if mustGet(t, s, route).KumbhaImageReader {
+		t.Fatal("a refused change still took effect")
+	}
+
+	if err := s.SetPricing(ctx, route, 0.1, 0.3, "it"); err != nil {
+		t.Fatal(err)
+	}
+	// Priced but not enabled: the flag can be set, yet the model is not listed as a reader.
+	if err := s.SetAvailability(ctx, route, Availability{KumbhaImageReader: &on}, "it"); err != nil {
+		t.Fatalf("image reader on, priced: %v", err)
+	}
+	if got := readerRoutes(t, s); contains(got, route) {
+		t.Fatalf("a disabled model was listed as a reader: %v", got)
+	}
+	if err := s.SetEnabled(ctx, route, true, "it"); err != nil {
+		t.Fatal(err)
+	}
+	m := mustGet(t, s, route)
+	if !m.KumbhaImageReader || m.KumbhaEnabled {
+		t.Fatalf("reader=%v builder=%v: the roles must be independent", m.KumbhaImageReader, m.KumbhaEnabled)
+	}
+	if got := readerRoutes(t, s); !contains(got, route) {
+		t.Fatalf("an enabled reader is not listed: %v", got)
+	}
+	if got := builderRoutes(t, s); contains(got, route) {
+		t.Fatalf("a reader that is not a builder was listed as a builder: %v", got)
+	}
+
+	// Switching it off needs no price and delists it; the builder flag is untouched.
+	if err := s.SetAvailability(ctx, route, Availability{KumbhaImageReader: &off}, "it"); err != nil {
+		t.Fatal(err)
+	}
+	if got := readerRoutes(t, s); contains(got, route) {
+		t.Fatalf("an ex-reader is still listed: %v", got)
+	}
+}
+
+func readerRoutes(t *testing.T, s *Service) []string {
+	t.Helper()
+	ms, err := s.ListImageReaders(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return routesOf(ms)
+}
+
+func builderRoutes(t *testing.T, s *Service) []string {
+	t.Helper()
+	ms, err := s.ListKumbhaModels(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return routesOf(ms)
+}
+
+func routesOf(ms []Model) []string {
+	out := make([]string, 0, len(ms))
+	for _, m := range ms {
+		out = append(out, m.ModelRoute)
+	}
+	return out
+}
+
+func contains(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}

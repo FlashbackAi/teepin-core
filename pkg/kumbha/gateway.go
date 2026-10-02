@@ -531,6 +531,17 @@ func (g *Gateway) Complete(ctx context.Context, sess *Session, req inference.Req
 	if req.Model != sess.ModelRoute {
 		return nil, fmt.Errorf("%w: session is bound to %q, not %q", inference.ErrUnknownModel, sess.ModelRoute, req.Model)
 	}
+	return g.serve(ctx, sess, sess.ModelRoute, "", true, req)
+}
+
+// serve runs one completion on route and bills it to the session: the credit
+// check, the dispatch, the cost, the session's spend and the usage lines. It is
+// the whole of Complete after the route check, so the builder's own calls and the
+// image reader's (a different model, billed to the same build) are metered the
+// same way. engine, when given, names the serving backend for the usage record;
+// empty looks it up from the builder list. countsAsContext says whether the
+// request's size is the builder's context reading.
+func (g *Gateway) serve(ctx context.Context, sess *Session, route, engine string, countsAsContext bool, req inference.Request) (*CompletionResult, error) {
 	// A Gateway built with models=nil (see NewGateway's own doc comment: "a
 	// deployment that only manages sessions") can never actually reach here
 	// in production — CreateSession's resolveModel already refuses to bind
@@ -545,7 +556,7 @@ func (g *Gateway) Complete(ctx context.Context, sess *Session, req inference.Req
 	// Fails closed: an unreadable balance refuses the completion (the agent
 	// harness retries), it does not open an unmetered hole.
 	if g.credit != nil {
-		inRate, outRate := g.rates(ctx, sess.ModelRoute)
+		inRate, outRate := g.rates(ctx, route)
 		out := req.MaxTokens
 		if out <= 0 || out > completionOutputReserveTokens {
 			out = completionOutputReserveTokens
@@ -565,12 +576,13 @@ func (g *Gateway) Complete(ctx context.Context, sess *Session, req inference.Req
 	// for Kumbha mid-session (rare) falls back to an empty engine string
 	// rather than blocking an otherwise-servable completion; the
 	// underlying gateway call below doesn't consult kumbha_enabled at all.
-	engine := ""
-	if models, err := g.kumbhaModels(ctx); err == nil {
-		for _, m := range models {
-			if m.Route == sess.ModelRoute {
-				engine = m.Engine
-				break
+	if engine == "" {
+		if models, err := g.kumbhaModels(ctx); err == nil {
+			for _, m := range models {
+				if m.Route == route {
+					engine = m.Engine
+					break
+				}
 			}
 		}
 	}
@@ -582,9 +594,9 @@ func (g *Gateway) Complete(ctx context.Context, sess *Session, req inference.Req
 	}
 	end := time.Now()
 
-	cost := g.cost(ctx, sess.ModelRoute, resp.Usage)
+	cost := g.cost(ctx, route, resp.Usage)
 	if cost == 0 && resp.Usage.InputTokens+resp.Usage.OutputTokens > 0 {
-		g.warnZeroPrice(sess.ModelRoute, resp.Usage)
+		g.warnZeroPrice(route, resp.Usage)
 	}
 
 	// From here the model has answered and its tokens are spent, so nothing
@@ -625,13 +637,13 @@ func (g *Gateway) Complete(ctx context.Context, sess *Session, req inference.Req
 	// session's spend unrecorded indefinitely. See CloseSession's own doc
 	// comment: settlement no longer happens there at all, so a session's
 	// `spent` counter and its invoice-visible cost never diverge.
-	inRate, outRate := g.rates(bctx, sess.ModelRoute)
+	inRate, outRate := g.rates(bctx, route)
 	var inBasis, outBasis float64
 	if g.vendorCost != nil {
 		// What this completion cost Teepin, not the customer: input counts the
 		// prompt-cache discount. Zero when the model is self-hosted or its vendor
 		// cost is not recorded (unattributed, never a made-up figure).
-		if vin, vout := g.vendorCost.ModelVendorCost(bctx, sess.ModelRoute); vin != nil || vout != nil {
+		if vin, vout := g.vendorCost.ModelVendorCost(bctx, route); vin != nil || vout != nil {
 			if vin != nil {
 				inBasis = inference.VendorInputCost(resp.Usage, *vin)
 			}
@@ -653,7 +665,9 @@ func (g *Gateway) Complete(ctx context.Context, sess *Session, req inference.Req
 		}
 	}
 
-	g.noteContext(sess.ID, resp.Usage.InputTokens)
+	if countsAsContext {
+		g.noteContext(sess.ID, resp.Usage.InputTokens)
+	}
 
 	return &CompletionResult{Response: resp, Cost: cost, Spent: newSpent, Budget: sess.Budget}, nil
 }
