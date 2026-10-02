@@ -42,7 +42,14 @@ const (
 	maxDescriptionChars = 400
 )
 
-const askUserNote = "The question is now shown to the customer. End your turn now without doing anything else: " +
+// A call that passes validation, shown to the agent in the tool description and
+// in every refusal. A live GLM build sent the same question with no options 10
+// times because the refusal said what was wrong but never showed a valid call.
+const askUserExample = `{"question":"How should I fill the process table's rows?","options":[` +
+	`{"label":"Sample data","description":"Invent realistic process names and values"},` +
+	`{"label":"Totals only","description":"Show only the system totals from the screenshot"}],"allow_other":true}`
+
+const askUserNote ="The question is now shown to the customer. End your turn now without doing anything else: " +
 	"their answer will arrive as your next message."
 
 const requestSecretNote = "The customer is entering this in a secure field. You will NEVER see the value. " +
@@ -71,9 +78,10 @@ func (c *teepinClient) askUser(_ context.Context, _ *mcp.CallToolRequest, args a
 		return textResult("keep the question under %d characters", maxQuestionChars)
 	}
 	if n := len(args.Options); n < minOptions || n > maxOptions {
-		return textResult("give between %d and %d options (got %d). If there are more than %d good candidates, "+
-			"offer your best %d and set allow_other to true so the customer can name another; do not list "+
-			"options in a chat message instead.", minOptions, maxOptions, n, maxOptions, maxOptions)
+		return textResult("give between %d and %d options (got %d). Even an open question needs your best %d to %d "+
+			"likely answers as options; set allow_other to true so the customer can type their own instead. "+
+			"Do not list options in a chat message instead. A working call: %s",
+			minOptions, maxOptions, n, minOptions, maxOptions, askUserExample)
 	}
 	seen := map[string]bool{}
 	opts := make([]questionOption, 0, len(args.Options))
@@ -170,7 +178,9 @@ func registerPromptTools(server *mcp.Server, client *teepinClient) {
 			"should do next, a preference you cannot infer. Prefer this to guessing or asking in plain " +
 			"chat, and never put the options in a chat message or a table. If there are more than four " +
 			"good candidates, offer your best three or four and set allow_other so the customer can name " +
-			"another. After calling it, END YOUR TURN: the answer arrives as your next message.",
+			"another. Options are required even for an open question: give your best two or more likely " +
+			"answers and set allow_other. Example: " + askUserExample + " " +
+			"After calling it, END YOUR TURN: the answer arrives as your next message.",
 	}, client.askUser)
 
 	mcp.AddTool(server, &mcp.Tool{

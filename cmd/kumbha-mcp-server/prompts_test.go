@@ -86,6 +86,29 @@ func TestAskUser_Validation(t *testing.T) {
 	}
 }
 
+// A refusal that only says what is wrong, without a valid call to copy, let a
+// live build send the same option-less question 10 times. The example it shows
+// must itself be accepted, or the refusal teaches the wrong thing.
+func TestAskUser_RefusalShowsAWorkingCall(t *testing.T) {
+	var ex askUserArgs
+	if err := json.Unmarshal([]byte(askUserExample), &ex); err != nil {
+		t.Fatalf("the example is not valid JSON for the tool: %v", err)
+	}
+	if text := askText(t, ex); !isCard(text, "question") {
+		t.Fatalf("the example call is itself refused: %s", text)
+	}
+
+	refusal := askText(t, askUserArgs{Question: "How should I fill the table?", AllowOther: true})
+	if isCard(refusal, "question") {
+		t.Fatalf("no options produced a card: %s", refusal)
+	}
+	for _, want := range []string{"got 0", "allow_other", askUserExample} {
+		if !strings.Contains(refusal, want) {
+			t.Errorf("the refusal does not mention %q: %s", want, refusal)
+		}
+	}
+}
+
 func TestRequestSecret_ReturnsACardWithNoValueFieldAndNamesTheVariable(t *testing.T) {
 	text := secretText(t, requestSecretArgs{
 		Name: "AMADEUS_CLIENT_ID", Label: "Amadeus Client ID",
