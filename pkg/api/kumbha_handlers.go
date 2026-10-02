@@ -1585,6 +1585,14 @@ func (s *Server) enrichKumbhaAgentRunning(ctx context.Context, resp gin.H, sess 
 	if running, err := s.kumbha.IsAgentRunning(ctx, sess); err == nil {
 		resp["agent_running"] = running
 	}
+	// Why a build has not started, or has stopped: the pod's state in words safe
+	// for a customer (never the raw cluster message). Absent when unknown.
+	if st, err := s.kumbha.AgentStart(ctx, sess); err == nil && st.Status != "" {
+		resp["agent_status"] = st.Status
+		if st.Detail != "" {
+			resp["agent_status_detail"] = st.Detail
+		}
+	}
 }
 
 // enrichKumbhaAppStatus adds the deployed app's own live status —
