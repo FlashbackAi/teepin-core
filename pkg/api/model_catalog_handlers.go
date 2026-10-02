@@ -87,6 +87,10 @@ type registerModelRequest struct {
 	ProviderModel   string `json:"provider_model"`
 	BaseURL         string `json:"base_url"`
 	MaxOutputTokens int    `json:"max_output_tokens"`
+	// ReasoningEffort is "low", "medium", "high", "max", or empty for the model's
+	// own default. Written on every save like the fields above; the control
+	// center's model dialog always sends it.
+	ReasoningEffort string `json:"reasoning_effort"`
 	// APIKey is write-only — never returned by any endpoint. Empty leaves
 	// any key already stored untouched, so editing a model's settings never
 	// requires re-pasting its key.
@@ -149,6 +153,7 @@ func (h *ModelCatalogHandler) RegisterModel(c *gin.Context) {
 		prevModel, _ = h.catalog.GetModel(ctx, req.ModelRoute)
 	}
 	err := h.catalog.RegisterModelWithPricing(ctx, modelcatalog.Model{
+		ReasoningEffort: req.ReasoningEffort,
 		ModelRoute:      req.ModelRoute,
 		DisplayName:     req.DisplayName,
 		CostClass:       modelcatalog.CostClass(req.CostClass),

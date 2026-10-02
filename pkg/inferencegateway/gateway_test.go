@@ -69,7 +69,7 @@ func expectGetModel(mock sqlmock.Sqlmock, route string, m modelcatalog.Model) {
 			"supports_tools", "supports_vision", "supports_audio",
 			"input_price_per_million", "output_price_per_million",
 			"vendor_input_cost_per_million", "vendor_output_cost_per_million",
-			"enabled", "provider", "provider_model", "base_url", "max_output_tokens",
+			"enabled", "provider", "provider_model", "base_url", "max_output_tokens", "reasoning_effort",
 			"api_key_ref", "offered_to_customers", "kumbha_enabled", "kumbha_priority",
 			"kumbha_image_reader", "updated_by", "created_at", "updated_at",
 		}).AddRow(
@@ -77,7 +77,7 @@ func expectGetModel(mock sqlmock.Sqlmock, route string, m modelcatalog.Model) {
 			m.SupportsTools, m.SupportsVision, m.SupportsAudio,
 			m.InputPricePerMillion, m.OutputPricePerMillion,
 			m.VendorInputCostPerMillion, m.VendorOutputCostPerMillion,
-			m.Enabled, providerOrNode(m.Provider), m.ProviderModel, m.BaseURL, 4096,
+			m.Enabled, providerOrNode(m.Provider), m.ProviderModel, m.BaseURL, 4096, m.ReasoningEffort,
 			m.APIKeyRef, m.OfferedToCustomers, m.KumbhaEnabled, m.KumbhaPriority, m.KumbhaImageReader,
 			m.UpdatedBy, time.Now(), time.Now(),
 		))

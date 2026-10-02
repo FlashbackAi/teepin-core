@@ -197,6 +197,22 @@ func (g *Gateway) routeLimits(ctx context.Context, route string) (window, maxOut
 	return 0, 0
 }
 
+// routeReasoningEffort returns the catalog's reasoning effort for route, or ""
+// (the model's own default) when it has none or the list cannot be read.
+// Best-effort like routeLimits: a lookup failure never blocks a launch.
+func (g *Gateway) routeReasoningEffort(ctx context.Context, route string) string {
+	models, err := g.kumbhaModels(ctx)
+	if err != nil {
+		return ""
+	}
+	for _, m := range models {
+		if m.Route == route {
+			return m.ReasoningEffort
+		}
+	}
+	return ""
+}
+
 // CapacityCandidate is one node's identity plus free room — the minimum
 // pickNodeWithCapacity needs, deliberately NOT pkg/nodes.NodeCapacity
 // directly (that package's own HiddenWorkloadCounter doc comment already
@@ -359,6 +375,9 @@ func (g *Gateway) LaunchAgent(ctx context.Context, sess *Session, prompt string,
 			// condenses early instead of failing on an oversized request.
 			"TEEPIN_CONTEXT_WINDOW":    strconv.Itoa(window),
 			"TEEPIN_MAX_OUTPUT_TOKENS": strconv.Itoa(maxOutput),
+			// How hard the model thinks per answer, sent by run.py with every
+			// request; "" leaves the model's own default.
+			"TEEPIN_REASONING_EFFORT": g.routeReasoningEffort(ctx, sess.ModelRoute),
 			// run.py's own working directory defaults to "/workspace" — the
 			// pod's ephemeral, non-persistent root filesystem — while the
 			// PVC this spec mounts (below, via StorageGB) lands at /data.

@@ -48,7 +48,7 @@ func modelRows() []string {
 		"supports_tools", "supports_vision", "supports_audio",
 		"input_price_per_million", "output_price_per_million",
 		"vendor_input_cost_per_million", "vendor_output_cost_per_million",
-		"enabled", "provider", "provider_model", "base_url", "max_output_tokens",
+		"enabled", "provider", "provider_model", "base_url", "max_output_tokens", "reasoning_effort",
 		"api_key_ref", "offered_to_customers", "kumbha_enabled", "kumbha_priority",
 		"kumbha_image_reader", "updated_by", "created_at", "updated_at",
 	}
@@ -62,7 +62,7 @@ func expectModelRow(mock sqlmock.Sqlmock, route, provider, apiKeyRef string) {
 		WillReturnRows(sqlmock.NewRows(modelRows()).AddRow(
 			route, "Model", "frontier", "anthropic", 200000,
 			true, false, false, 0.0, 0.0, nil, nil,
-			true, provider, "claude-haiku-4-5-20251001", "", 4096,
+			true, provider, "claude-haiku-4-5-20251001", "", 4096, "",
 			apiKeyRef, false, true, 0, false,
 			"admin-api", time.Now(), time.Now(),
 		))
@@ -299,7 +299,7 @@ func expectVisionModelRow(mock sqlmock.Sqlmock, route string, vision bool) {
 		WillReturnRows(sqlmock.NewRows(modelRows()).AddRow(
 			route, "Omni", "own", "vllm", 32768,
 			true, vision, false, 0.1, 0.3, nil, nil,
-			true, "node", "", "", 4096,
+			true, "node", "", "", 4096, "",
 			"", false, false, 0, false,
 			"admin-api", time.Now(), time.Now(),
 		))
@@ -406,7 +406,7 @@ func TestListModels_IncludesLiveStatus(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows(modelRows()).AddRow(
 			"teepin/qwen3-30b-a3b", "Qwen", "own", "mlx", 8000,
 			false, false, false, 0.0, 0.0, nil, nil,
-			true, "node", "", "", 4096, "", true, false, 0, false,
+			true, "node", "", "", 4096, "", "", true, false, 0, false,
 			"op", time.Now(), time.Now(),
 		))
 

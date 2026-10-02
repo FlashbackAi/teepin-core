@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 )
 
 // ErrNotFound means the model_route does not exist in the catalog.
@@ -88,7 +89,28 @@ func (m *Model) validate() error {
 	if m.MaxOutputTokens <= 0 {
 		m.MaxOutputTokens = defaultMaxOutputTokens
 	}
+	m.ReasoningEffort = strings.ToLower(strings.TrimSpace(m.ReasoningEffort))
+	if !ValidReasoningEffort(m.ReasoningEffort) {
+		return fmt.Errorf("invalid reasoning_effort %q: use low, medium, high, max, or leave it empty for the model's default", m.ReasoningEffort)
+	}
 	return nil
+}
+
+// ReasoningEfforts are the values reasoning_effort may hold besides empty (the
+// same set the column's CHECK constraint allows, migration 071).
+var ReasoningEfforts = []string{"low", "medium", "high", "max"}
+
+// ValidReasoningEffort reports whether v may be stored as a reasoning effort.
+func ValidReasoningEffort(v string) bool {
+	if v == "" {
+		return true
+	}
+	for _, e := range ReasoningEfforts {
+		if v == e {
+			return true
+		}
+	}
+	return false
 }
 
 // RegisterModel creates or updates a catalog entry's capabilities and how
@@ -140,9 +162,9 @@ func (s *Service) RegisterModelWithPricing(ctx context.Context, m Model, inputPr
 			(model_route, display_name, cost_class, engine, context_window,
 			 supports_tools, supports_vision, supports_audio, enabled,
 			 provider, provider_model, base_url, max_output_tokens, updated_by,
-			 input_price_per_million, output_price_per_million, updated_at)
+			 input_price_per_million, output_price_per_million, reasoning_effort, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-		        COALESCE($15::numeric, 0), COALESCE($16::numeric, 0), NOW())
+		        COALESCE($15::numeric, 0), COALESCE($16::numeric, 0), $17, NOW())
 		ON CONFLICT (model_route) DO UPDATE SET
 			display_name      = EXCLUDED.display_name,
 			cost_class        = EXCLUDED.cost_class,
@@ -156,6 +178,7 @@ func (s *Service) RegisterModelWithPricing(ctx context.Context, m Model, inputPr
 			provider_model    = EXCLUDED.provider_model,
 			base_url          = EXCLUDED.base_url,
 			max_output_tokens = EXCLUDED.max_output_tokens,
+			reasoning_effort  = EXCLUDED.reasoning_effort,
 			input_price_per_million  = COALESCE($15::numeric, inference.models.input_price_per_million),
 			output_price_per_million = COALESCE($16::numeric, inference.models.output_price_per_million),
 			updated_by        = EXCLUDED.updated_by,
@@ -163,7 +186,7 @@ func (s *Service) RegisterModelWithPricing(ctx context.Context, m Model, inputPr
 	`, m.ModelRoute, m.DisplayName, string(m.CostClass), m.Engine, m.ContextWindow,
 		m.SupportsTools, m.SupportsVision, m.SupportsAudio, m.Enabled,
 		string(m.Provider), m.ProviderModel, m.BaseURL, m.MaxOutputTokens, m.UpdatedBy,
-		inputPrice, outputPrice)
+		inputPrice, outputPrice, m.ReasoningEffort)
 	if err != nil {
 		return fmt.Errorf("failed to register model %q: %w", m.ModelRoute, err)
 	}
@@ -402,7 +425,7 @@ const selectModelsSQL = `
 	       supports_tools, supports_vision, supports_audio,
 	       input_price_per_million, output_price_per_million,
 	       vendor_input_cost_per_million, vendor_output_cost_per_million,
-	       enabled, provider, provider_model, base_url, max_output_tokens,
+	       enabled, provider, provider_model, base_url, max_output_tokens, reasoning_effort,
 	       COALESCE(api_key_ref, ''), offered_to_customers, kumbha_enabled, kumbha_priority,
 	       kumbha_image_reader, updated_by, created_at, updated_at
 	FROM inference.models`
@@ -423,7 +446,7 @@ func scanModelRow(r row) (*Model, error) {
 		&m.SupportsTools, &m.SupportsVision, &m.SupportsAudio,
 		&m.InputPricePerMillion, &m.OutputPricePerMillion,
 		&m.VendorInputCostPerMillion, &m.VendorOutputCostPerMillion,
-		&m.Enabled, &provider, &m.ProviderModel, &m.BaseURL, &m.MaxOutputTokens,
+		&m.Enabled, &provider, &m.ProviderModel, &m.BaseURL, &m.MaxOutputTokens, &m.ReasoningEffort,
 		&m.APIKeyRef, &m.OfferedToCustomers, &m.KumbhaEnabled, &m.KumbhaPriority,
 		&m.KumbhaImageReader, &m.UpdatedBy, &m.CreatedAt, &m.UpdatedAt,
 	); err != nil {

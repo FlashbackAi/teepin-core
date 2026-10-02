@@ -31,7 +31,7 @@ func TestRegisterModel_UpsertsCatalogFieldsOnly(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows(modelRowColumns()).AddRow(modelRowValues("teepin/qwen3-omni-7b", 1.0, 4.0)...))
 	mock.ExpectExec(`INSERT INTO inference\.models`).
 		WithArgs("teepin/qwen3-omni-7b", "Qwen3 Omni 7B", "own", "vllm-omni", 32768,
-			true, true, true, true, "node", "", "", 4096, "op", nil, nil).
+			true, true, true, true, "node", "", "", 4096, "op", nil, nil, "").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	err := s.RegisterModel(context.Background(), Model{
@@ -81,6 +81,23 @@ func TestRegisterModel_Validation(t *testing.T) {
 	if err := s.RegisterModel(context.Background(), Model{ModelRoute: "x", Engine: "vllm", CostClass: CostClassOwn, Provider: "bogus"}); err == nil {
 		t.Error("invalid provider accepted")
 	}
+	if err := s.RegisterModel(context.Background(), Model{ModelRoute: "x", Engine: "vllm", CostClass: CostClassOwn, ReasoningEffort: "extreme"}); err == nil {
+		t.Error("invalid reasoning_effort accepted")
+	}
+}
+
+// Every value the column's CHECK constraint allows passes validation, in any
+// case, and is stored lower-case; empty (the model's own default) passes too.
+func TestValidate_ReasoningEffort(t *testing.T) {
+	for in, want := range map[string]string{"": "", "low": "low", " High ": "high", "MAX": "max", "medium": "medium"} {
+		m := Model{ModelRoute: "x", Engine: "vllm", CostClass: CostClassOwn, ReasoningEffort: in}
+		if err := m.validate(); err != nil {
+			t.Errorf("%q: %v", in, err)
+		}
+		if m.ReasoningEffort != want {
+			t.Errorf("%q stored as %q, want %q", in, m.ReasoningEffort, want)
+		}
+	}
 }
 
 func TestRegisterModel_ExternalModelCarriesProviderFields(t *testing.T) {
@@ -89,7 +106,7 @@ func TestRegisterModel_ExternalModelCarriesProviderFields(t *testing.T) {
 
 	mock.ExpectExec(`INSERT INTO inference\.models`).
 		WithArgs("anthropic/claude-haiku-4-5", "Claude Haiku 4.5", "frontier", "anthropic", 200000,
-			true, false, false, true, "anthropic", "claude-haiku-4-5-20251001", "", 4096, "op", 3.0, 15.0).
+			true, false, false, true, "anthropic", "claude-haiku-4-5-20251001", "", 4096, "op", 3.0, 15.0, "").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	three, fifteen := 3.0, 15.0
@@ -281,7 +298,7 @@ func TestGetModel_ReturnsFullRow(t *testing.T) {
 			true, true, false,
 			4.5, 18.0,
 			&vendorIn, &vendorOut,
-			true, "anthropic", "claude-sonnet-5", "", 8192,
+			true, "anthropic", "claude-sonnet-5", "", 8192, "high",
 			"inference-model-key-abc", false, true, 1, true,
 			"op", now, now,
 		))
@@ -298,6 +315,9 @@ func TestGetModel_ReturnsFullRow(t *testing.T) {
 	}
 	if m.Provider != ProviderAnthropic || m.ProviderModel != "claude-sonnet-5" || m.MaxOutputTokens != 8192 {
 		t.Errorf("provider fields = %q %q %d", m.Provider, m.ProviderModel, m.MaxOutputTokens)
+	}
+	if m.ReasoningEffort != "high" {
+		t.Errorf("ReasoningEffort = %q, want high", m.ReasoningEffort)
 	}
 	if !m.HasAPIKey || m.APIKeyRef != "inference-model-key-abc" {
 		t.Errorf("HasAPIKey = %v, APIKeyRef = %q", m.HasAPIKey, m.APIKeyRef)
@@ -353,7 +373,7 @@ func modelRowColumns() []string {
 		"supports_tools", "supports_vision", "supports_audio",
 		"input_price_per_million", "output_price_per_million",
 		"vendor_input_cost_per_million", "vendor_output_cost_per_million",
-		"enabled", "provider", "provider_model", "base_url", "max_output_tokens",
+		"enabled", "provider", "provider_model", "base_url", "max_output_tokens", "reasoning_effort",
 		"api_key_ref", "offered_to_customers", "kumbha_enabled", "kumbha_priority",
 		"kumbha_image_reader", "updated_by", "created_at", "updated_at",
 	}
@@ -366,7 +386,7 @@ func modelRowValues(route string, in, out float64) []driver.Value {
 	return []driver.Value{
 		route, "Model", "own", "vllm", 32768,
 		true, false, false, in, out, nil, nil,
-		false, "node", "", "", 4096,
+		false, "node", "", "", 4096, "",
 		"", false, false, 0, false,
 		"op", time.Now(), time.Now(),
 	}

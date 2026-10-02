@@ -412,6 +412,7 @@ func (b *kumbhaModelBackend) KumbhaModels(ctx context.Context) ([]kumbha.Model, 
 			ToolMode:              string(view.Mode),
 			ContextWindow:         m.ContextWindow,
 			MaxOutputTokens:       m.MaxOutputTokens,
+			ReasoningEffort:       m.ReasoningEffort,
 			InputPricePerMillion:  m.InputPricePerMillion,
 			OutputPricePerMillion: m.OutputPricePerMillion,
 		})

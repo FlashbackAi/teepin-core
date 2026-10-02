@@ -260,6 +260,32 @@ func TestGateway_LaunchAgent_PassesTheRoutesContextWindow(t *testing.T) {
 	}
 }
 
+// The agent sends the route's reasoning effort with every request; LaunchAgent
+// must hand it the session's own route's value, and "" when there is none.
+func TestGateway_LaunchAgent_PassesTheRoutesReasoningEffort(t *testing.T) {
+	for _, want := range []string{"high", ""} {
+		store, mock := newMockStore(t)
+		fc := &fakeCluster{}
+		models := StaticModels{
+			{Route: "teepin/other", Engine: "vllm", ReasoningEffort: "max", Provider: &fakeProvider{name: "vllm"}},
+			{Route: "teepin/chosen", Engine: "vllm", ReasoningEffort: want, Provider: &fakeProvider{name: "vllm"}},
+		}
+		gw := NewGateway(store, models, nil, &fakePricing{}, &fakeUsageRecorder{}).
+			WithAgent(fc, fakeMintToken, AgentConfig{Image: "kumbha-agent:latest", CPUUnits: 2, MemoryGB: 4})
+		sessID := uuid.New()
+		sess := &Session{ID: sessID, AccountID: uuid.New(), ProjectID: uuid.New(), ModelRoute: "teepin/chosen"}
+		mock.ExpectExec(`UPDATE billing\.inference_sessions SET agent_instance_id`).
+			WithArgs(sessID, sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		if err := gw.LaunchAgent(context.Background(), sess, "build", nil); err != nil {
+			t.Fatalf("LaunchAgent: %v", err)
+		}
+		if got, ok := fc.created[0].Env["TEEPIN_REASONING_EFFORT"]; !ok || got != want {
+			t.Errorf("TEEPIN_REASONING_EFFORT = %q (set: %v), want %q from the session's own route", got, ok, want)
+		}
+	}
+}
+
 func TestGateway_LaunchAgent_PicksNodeWithEnoughCapacity(t *testing.T) {
 	store, mock := newMockStore(t)
 	fc := &fakeCluster{}

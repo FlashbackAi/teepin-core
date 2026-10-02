@@ -71,7 +71,11 @@ type Model struct {
 	// MaxOutputTokens is the most the model can write in one answer, 0 when the
 	// catalog does not know it. The agent tells its harness so a single answer
 	// is never asked to be longer than the model can give.
-	MaxOutputTokens       int
+	MaxOutputTokens int
+	// ReasoningEffort is how hard the model thinks per answer ("low", "medium",
+	// "high", "max"), empty to leave the model's own default. The agent sends it
+	// with every request (see LaunchAgent's TEEPIN_REASONING_EFFORT).
+	ReasoningEffort       string
 	InputPricePerMillion  float64
 	OutputPricePerMillion float64
 	// Unavailable is why the model cannot be used right now ("Not running
@@ -101,6 +105,7 @@ type StaticModel struct {
 	Engine          string
 	ContextWindow   int
 	MaxOutputTokens int
+	ReasoningEffort string
 	SupportsVision  bool
 	// ToolMode is "native" (the default when empty) or "text".
 	ToolMode string
@@ -116,7 +121,7 @@ func (s StaticModels) KumbhaModels(context.Context) ([]Model, error) {
 	out := make([]Model, 0, len(s))
 	for _, m := range s {
 		out = append(out, Model{Route: m.Route, Engine: m.Engine, ContextWindow: m.ContextWindow, MaxOutputTokens: m.MaxOutputTokens,
-			SupportsVision: m.SupportsVision, ToolMode: m.ToolMode})
+			ReasoningEffort: m.ReasoningEffort, SupportsVision: m.SupportsVision, ToolMode: m.ToolMode})
 	}
 	return out, nil
 }

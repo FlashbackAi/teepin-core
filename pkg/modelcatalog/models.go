@@ -101,6 +101,10 @@ type Model struct {
 	ProviderModel   string   `json:"provider_model"`
 	BaseURL         string   `json:"base_url"`
 	MaxOutputTokens int      `json:"max_output_tokens"`
+	// ReasoningEffort is how hard the model thinks before each answer ("low",
+	// "medium", "high", "max"), sent with every Teepin Build request. Empty sends
+	// nothing and leaves the model's own default (GLM-5.3's is "max").
+	ReasoningEffort string `json:"reasoning_effort"`
 	// APIKeyRef names the Secrets Manager secret holding this model's API
 	// key, without the "teepin/<environment>/" prefix. Empty means none is
 	// stored. Never serialized: only HasAPIKey reaches an API response.
