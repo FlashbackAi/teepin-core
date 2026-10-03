@@ -47,16 +47,16 @@ func (f *fakeECRAPI) CreateRepository(_ context.Context, params *ecr.CreateRepos
 func TestImagePrefix_ReusesExistingRepository(t *testing.T) {
 	api := &fakeECRAPI{
 		describeOut: &ecr.DescribeRepositoriesOutput{
-			Repositories: []types.Repository{{RepositoryUri: aws.String("123.dkr.ecr.us-east-1.amazonaws.com/teepin/kumbha-builds-dev")}},
+			Repositories: []types.Repository{{RepositoryUri: aws.String("123.dkr.ecr.us-east-1.amazonaws.com/teepin/build-apps-dev")}},
 		},
 	}
-	s := &Service{client: api, RepositoryName: "teepin/kumbha-builds-dev"}
+	s := &Service{client: api, RepositoryName: "teepin/build-apps-dev"}
 
 	uri, err := s.ImagePrefix(context.Background(), uuid.New(), "unused")
 	if err != nil {
 		t.Fatalf("ImagePrefix: %v", err)
 	}
-	if uri != "123.dkr.ecr.us-east-1.amazonaws.com/teepin/kumbha-builds-dev" {
+	if uri != "123.dkr.ecr.us-east-1.amazonaws.com/teepin/build-apps-dev" {
 		t.Errorf("uri = %q, want the existing repository's URI", uri)
 	}
 	if len(api.createCalls) != 0 {
@@ -68,20 +68,20 @@ func TestImagePrefix_CreatesRepositoryWhenNotFound(t *testing.T) {
 	api := &fakeECRAPI{
 		describeErr: &types.RepositoryNotFoundException{},
 		createOut: &ecr.CreateRepositoryOutput{
-			Repository: &types.Repository{RepositoryUri: aws.String("123.dkr.ecr.us-east-1.amazonaws.com/teepin/kumbha-builds-dev")},
+			Repository: &types.Repository{RepositoryUri: aws.String("123.dkr.ecr.us-east-1.amazonaws.com/teepin/build-apps-dev")},
 		},
 	}
-	s := &Service{client: api, RepositoryName: "teepin/kumbha-builds-dev"}
+	s := &Service{client: api, RepositoryName: "teepin/build-apps-dev"}
 
 	uri, err := s.ImagePrefix(context.Background(), uuid.New(), "unused")
 	if err != nil {
 		t.Fatalf("ImagePrefix: %v", err)
 	}
-	if uri != "123.dkr.ecr.us-east-1.amazonaws.com/teepin/kumbha-builds-dev" {
+	if uri != "123.dkr.ecr.us-east-1.amazonaws.com/teepin/build-apps-dev" {
 		t.Errorf("uri = %q, want the newly created repository's URI", uri)
 	}
-	if len(api.createCalls) != 1 || api.createCalls[0] != "teepin/kumbha-builds-dev" {
-		t.Errorf("CreateRepository calls = %v, want exactly one for teepin/kumbha-builds-dev", api.createCalls)
+	if len(api.createCalls) != 1 || api.createCalls[0] != "teepin/build-apps-dev" {
+		t.Errorf("CreateRepository calls = %v, want exactly one for teepin/build-apps-dev", api.createCalls)
 	}
 }
 
@@ -95,7 +95,7 @@ func TestImagePrefix_CreateRepositoryUsesMutableTags(t *testing.T) {
 	var captured *ecr.CreateRepositoryInput
 	// Wrap CreateRepository to capture the full input, not just the name.
 	capturing := &capturingECRAPI{fakeECRAPI: api, onCreate: func(in *ecr.CreateRepositoryInput) { captured = in }}
-	s := &Service{client: capturing, RepositoryName: "teepin/kumbha-builds-dev"}
+	s := &Service{client: capturing, RepositoryName: "teepin/build-apps-dev"}
 
 	if _, err := s.ImagePrefix(context.Background(), uuid.New(), "unused"); err != nil {
 		t.Fatalf("ImagePrefix: %v", err)
@@ -121,13 +121,13 @@ func (c *capturingECRAPI) CreateRepository(ctx context.Context, params *ecr.Crea
 		return c.fakeECRAPI.createOut, c.fakeECRAPI.createErr
 	}
 	return &ecr.CreateRepositoryOutput{
-		Repository: &types.Repository{RepositoryUri: aws.String("123.dkr.ecr.us-east-1.amazonaws.com/teepin/kumbha-builds-dev")},
+		Repository: &types.Repository{RepositoryUri: aws.String("123.dkr.ecr.us-east-1.amazonaws.com/teepin/build-apps-dev")},
 	}, nil
 }
 
 func TestImagePrefix_PropagatesAmbiguousDescribeError(t *testing.T) {
 	api := &fakeECRAPI{describeErr: errors.New("network blip")}
-	s := &Service{client: api, RepositoryName: "teepin/kumbha-builds-dev"}
+	s := &Service{client: api, RepositoryName: "teepin/build-apps-dev"}
 
 	_, err := s.ImagePrefix(context.Background(), uuid.New(), "unused")
 	if err == nil {
@@ -149,7 +149,7 @@ func TestDockerConfigJSONForBuild_DecodesTokenIntoUsernamePassword(t *testing.T)
 			}},
 		},
 	}
-	s := &Service{client: api, RepositoryName: "teepin/kumbha-builds-dev"}
+	s := &Service{client: api, RepositoryName: "teepin/build-apps-dev"}
 
 	raw, err := s.DockerConfigJSONForBuild(context.Background(), uuid.New())
 	if err != nil {
@@ -190,7 +190,7 @@ func TestImageAuth_DecodesTokenIntoUsernamePassword(t *testing.T) {
 			}},
 		},
 	}
-	s := &Service{client: api, RepositoryName: "teepin/kumbha-builds-dev"}
+	s := &Service{client: api, RepositoryName: "teepin/build-apps-dev"}
 
 	username, password, err := s.ImageAuth(context.Background(), uuid.New())
 	if err != nil {
@@ -203,7 +203,7 @@ func TestImageAuth_DecodesTokenIntoUsernamePassword(t *testing.T) {
 
 func TestImageAuth_NoAuthorizationDataIsError(t *testing.T) {
 	api := &fakeECRAPI{tokenOut: &ecr.GetAuthorizationTokenOutput{}}
-	s := &Service{client: api, RepositoryName: "teepin/kumbha-builds-dev"}
+	s := &Service{client: api, RepositoryName: "teepin/build-apps-dev"}
 
 	if _, _, err := s.ImageAuth(context.Background(), uuid.New()); err == nil {
 		t.Error("got nil error for an empty AuthorizationData response, want an error")
@@ -212,7 +212,7 @@ func TestImageAuth_NoAuthorizationDataIsError(t *testing.T) {
 
 func TestDockerConfigJSONForBuild_NoAuthorizationDataIsError(t *testing.T) {
 	api := &fakeECRAPI{tokenOut: &ecr.GetAuthorizationTokenOutput{}}
-	s := &Service{client: api, RepositoryName: "teepin/kumbha-builds-dev"}
+	s := &Service{client: api, RepositoryName: "teepin/build-apps-dev"}
 
 	if _, err := s.DockerConfigJSONForBuild(context.Background(), uuid.New()); err == nil {
 		t.Error("got nil error for an empty AuthorizationData response, want an error")
@@ -221,7 +221,7 @@ func TestDockerConfigJSONForBuild_NoAuthorizationDataIsError(t *testing.T) {
 
 func TestDockerConfigJSONForBuild_PropagatesAPIError(t *testing.T) {
 	api := &fakeECRAPI{tokenErr: errors.New("access denied")}
-	s := &Service{client: api, RepositoryName: "teepin/kumbha-builds-dev"}
+	s := &Service{client: api, RepositoryName: "teepin/build-apps-dev"}
 
 	if _, err := s.DockerConfigJSONForBuild(context.Background(), uuid.New()); err == nil {
 		t.Error("got nil error for a failed GetAuthorizationToken call, want it propagated")

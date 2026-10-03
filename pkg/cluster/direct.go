@@ -81,8 +81,6 @@ const (
 	// customer's CPU compute list showed "build-agent-<id>" with a
 	// working Delete button.
 	labelBuildAgent = "teepin.io/build-agent"
-	// labelLegacyBuildAgent is the label's former name, kept until every node and pod carries the new one (ROADMAP: Teepin Build rename).
-	labelLegacyBuildAgent = "teepin.io/kumbha-agent"
 
 	// Consumed by the networking Service selector.
 	labelInstanceShort = "teepin.io/instance"
@@ -447,7 +445,7 @@ func instanceSelector(scope Scope, instanceID string) string {
 func managedSelector(scope Scope) string {
 	selector := fmt.Sprintf("%s=true", labelManaged)
 	if !scope.IncludeHidden {
-		selector += fmt.Sprintf(",%s!=true,%s!=true", labelBuildAgent, labelLegacyBuildAgent)
+		selector += fmt.Sprintf(",%s!=true", labelBuildAgent)
 	}
 	return appendScope(selector, scope)
 }
@@ -505,7 +503,7 @@ func (c *DirectClient) remove(ctx context.Context, scope Scope, instanceID strin
 	// a customer's ordinary instance delete is entirely unaffected.
 	isBuildAgent := false
 	for _, pod := range pods.Items {
-		if pod.Labels[labelBuildAgent] == "true" || pod.Labels[labelLegacyBuildAgent] == "true" {
+		if pod.Labels[labelBuildAgent] == "true" {
 			isBuildAgent = true
 		}
 		if delErr := c.k8s.CoreV1().Pods(workloadNamespace).Delete(

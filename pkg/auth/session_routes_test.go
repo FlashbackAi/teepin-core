@@ -181,14 +181,3 @@ func TestOptionalAuth_SessionTokenRouteAllowlist(t *testing.T) {
 		t.Errorf("status = %d, want 403", w.Code)
 	}
 }
-
-// An agent image still using the former "/v1/kumbha/" prefix keeps exactly the
-// same access during the rename, and no more.
-func TestSessionMayCall_FormerPrefixMapsToTheSameAllowlist(t *testing.T) {
-	if !SessionMayCall("POST", "/v1/kumbha/chat/completions") || !SessionMayCall("GET", "/v1/kumbha/sessions/:id/messages/poll") {
-		t.Error("an allowed route under the former prefix was refused")
-	}
-	if SessionMayCall("PUT", "/v1/kumbha/sessions/:id/secrets/:name") || SessionMayCall("POST", "/v1/kumbha/sessions/:id/approve-deploy") {
-		t.Error("the former prefix granted a route that is not on the allowlist")
-	}
-}

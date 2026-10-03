@@ -31,8 +31,6 @@ const (
 	// string for the same reason, so this follows that established
 	// convention rather than inventing a different one.
 	hiddenLabel = "teepin.io/build-agent"
-	// legacyHiddenLabel is the label's former name, kept until every node and pod carries the new one (ROADMAP: Teepin Build rename).
-	legacyHiddenLabel = "teepin.io/kumbha-agent"
 )
 
 // engineConfig names the container image that serves each engine this
@@ -208,7 +206,7 @@ func buildInstanceSpec(instanceID string, cfg inferencegateway.ModelServiceConfi
 		MemoryGB:   cfg.MemoryGB,
 		StorageGB:  cfg.StorageGB,
 		NodeName:   nodeName,
-		Labels:     map[string]string{hiddenLabel: "true", legacyHiddenLabel: "true"},
+		Labels:     map[string]string{hiddenLabel: "true"},
 		Ports:      []cluster.PortMapping{{Container: servePort, Protocol: "tcp"}},
 	}
 	if nodeClass == "home" {

@@ -48,7 +48,7 @@ func startRegistryAuthSync(ctx context.Context, registry *cluster.Registry, agen
 		secrets = append(secrets, extra)
 	}
 	if len(secrets) == 0 {
-		secrets = []string{"teepin-kumbha-ecr"}
+		secrets = []string{"teepin-build-ecr"}
 	}
 	syncer := registryauth.NewSyncer(registry, src, secrets, time.Duration(getEnvInt("TEEPIN_REGISTRY_AUTH_INTERVAL_MINUTES", 180))*time.Minute)
 	registry.SetOnConnect(syncer.OnConnect)

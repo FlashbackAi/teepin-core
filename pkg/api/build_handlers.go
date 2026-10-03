@@ -906,7 +906,7 @@ func (s *Server) DeployBuildSession(c *gin.Context) {
 // reach a customer-facing response — flagged in ROADMAP.md 2026-08-31
 // (found live while debugging the screenshot endpoint: a browser's
 // Network tab showed
-// "880254196251.dkr.ecr.us-east-1.amazonaws.com/teepin/kumbha-builds-dev:..."
+// "880254196251.dkr.ecr.us-east-1.amazonaws.com/teepin/build-apps-dev:..."
 // verbatim), fixed 2026-09-02. The customer never chose this image or
 // interacts with the registry directly — it is Teepin's own internal
 // build artifact — so nothing about seeing it is a legitimate need, only
@@ -1081,7 +1081,7 @@ func (s *Server) triggerGithubPush(sessionID, accountID uuid.UUID, imageRef stri
 			}
 		}
 
-		if err := s.githubStore.PushSnapshot(ctx, sessionID, snap.Files, "Deploy: "+imageRef); err != nil {
+		if err := s.githubStore.PushSnapshot(ctx, repo, snap.Files, "Deploy: "+imageRef); err != nil {
 			log.Printf("WARN: could not push Teepin Build session %s to GitHub storage: %v", sessionID, err)
 		}
 	}()

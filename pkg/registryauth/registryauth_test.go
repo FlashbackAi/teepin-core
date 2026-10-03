@@ -64,13 +64,13 @@ func goodCred(now time.Time) Credential {
 func TestPushAll_ReachesEveryNodeAndOneFailureDoesNotStopTheRest(t *testing.T) {
 	src := &fakeSource{cred: goodCred(time.Now())}
 	p := &fakePusher{providers: []string{"a", "b", "c"}, failFor: map[string]int{"b": 99}}
-	s := NewSyncer(p, src, []string{"teepin-kumbha-ecr"}, time.Hour)
+	s := NewSyncer(p, src, []string{"teepin-build-ecr"}, time.Hour)
 	s.PushAll(context.Background())
 	if len(p.pushes) != 2 || p.pushes[0].provider != "a" || p.pushes[1].provider != "c" {
 		t.Fatalf("pushes = %+v, want a and c", p.pushes)
 	}
 	got := p.pushes[0].auth
-	if got.SecretName != "teepin-kumbha-ecr" || got.Server != "123.dkr.ecr.us-east-1.amazonaws.com" || got.Username != "AWS" || got.Password != "tok" {
+	if got.SecretName != "teepin-build-ecr" || got.Server != "123.dkr.ecr.us-east-1.amazonaws.com" || got.Username != "AWS" || got.Password != "tok" {
 		t.Errorf("auth = %+v", got)
 	}
 }

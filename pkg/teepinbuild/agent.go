@@ -88,10 +88,6 @@ type TokenMinter func(accountID, projectID, sessionID uuid.UUID, ttl time.Durati
 // LaunchAgent's doc comment).
 const agentLabel = "teepin.io/build-agent"
 
-// legacyAgentLabel is the label's former name, kept until every node and pod carries the new one (ROADMAP: Teepin Build rename). Home nodes running
-// an older agent binary only recognise this one.
-const legacyAgentLabel = "teepin.io/kumbha-agent"
-
 // AgentPodNamePrefix identifies a Teepin Build agent pod by its instance ID —
 // used by pkg/nodes' hidden-workload capacity accounting (see
 // nodes.HiddenWorkloadCounter) to recognise one of these pods in a live
@@ -288,6 +284,15 @@ func (g *Gateway) pickNodeWithCapacity(ctx context.Context, cpuUnits, memoryGB i
 		}
 	}
 	if best == "" {
+		// Say which resource ran short on which node: the customer-facing
+		// error is deliberately generic, and "9 vCPU free" in the console
+		// hides that memory is what ran out.
+		for _, c := range candidates {
+			log.Printf("WARN: build placement: node %s has %d vCPU / %d GB free, need %d vCPU / %d GB", c.ProviderID, c.FreeCPU, c.FreeMemGB, cpuUnits, memoryGB)
+		}
+		if len(candidates) == 0 {
+			log.Printf("WARN: build placement: no online home node reported capacity, need %d vCPU / %d GB", cpuUnits, memoryGB)
+		}
 		return "", ErrNoCapacity
 	}
 	return best, nil
@@ -396,7 +401,7 @@ func (g *Gateway) LaunchAgent(ctx context.Context, sess *Session, prompt string,
 			// proving the two were never the same storage.
 			"TEEPIN_WORKSPACE": "/data",
 		},
-		Labels:             map[string]string{agentLabel: "true", legacyAgentLabel: "true"},
+		Labels:             map[string]string{agentLabel: "true"},
 		CPUUnits:           g.agentConfig.CPUUnits,
 		MemoryGB:           g.agentConfig.MemoryGB,
 		StorageGB:          g.agentConfig.StorageGB,
@@ -596,7 +601,7 @@ func (g *Gateway) CaptureScreenshot(ctx context.Context, sess *Session, targetUR
 			"TEEPIN_UPLOAD_URL": uploadURL,
 			"TEEPIN_TOKEN":      token,
 		},
-		Labels:          map[string]string{agentLabel: "true", legacyAgentLabel: "true"},
+		Labels:          map[string]string{agentLabel: "true"},
 		CPUUnits:        ScreenshotCPUUnits,
 		MemoryGB:        ScreenshotMemoryGB,
 		NeverRestart:    true,

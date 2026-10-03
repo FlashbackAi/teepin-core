@@ -56,10 +56,11 @@ type ProvisionGate interface {
 type GithubStore interface {
 	// ProvisionRepo creates (or finds, idempotently) sessionID's repo.
 	ProvisionRepo(ctx context.Context, sessionID uuid.UUID) (string, error)
-	// PushSnapshot commits files to sessionID's repo. Returns only error —
-	// deliberately no repo name/URL, so pkg/api has nothing to
-	// accidentally leak into a customer-facing response.
-	PushSnapshot(ctx context.Context, sessionID uuid.UUID, files []teepinbuild.WorkspaceFile, message string) error
+	// PushSnapshot commits files to the named repo (the name ProvisionRepo
+	// returned and the session recorded). Returns only error — deliberately
+	// no repo name/URL, so pkg/api has nothing to accidentally leak into a
+	// customer-facing response.
+	PushSnapshot(ctx context.Context, repo string, files []teepinbuild.WorkspaceFile, message string) error
 }
 
 type Server struct {

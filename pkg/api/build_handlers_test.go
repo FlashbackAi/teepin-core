@@ -170,7 +170,7 @@ func (fakeGithubStore) ProvisionRepo(context.Context, uuid.UUID) (string, error)
 	return "", errors.New("fakeGithubStore: not configured for this test")
 }
 
-func (fakeGithubStore) PushSnapshot(context.Context, uuid.UUID, []teepinbuild.WorkspaceFile, string) error {
+func (fakeGithubStore) PushSnapshot(context.Context, string, []teepinbuild.WorkspaceFile, string) error {
 	return errors.New("fakeGithubStore: not configured for this test")
 }
 
@@ -2416,7 +2416,7 @@ func TestRedactImageRef(t *testing.T) {
 	}{
 		{
 			name:  "full ECR reference",
-			input: "880254196251.dkr.ecr.us-east-1.amazonaws.com/teepin/kumbha-builds-dev:43368ae2",
+			input: "880254196251.dkr.ecr.us-east-1.amazonaws.com/teepin/build-apps-dev:43368ae2",
 			want:  "teepin-build-43368ae2",
 		},
 		{

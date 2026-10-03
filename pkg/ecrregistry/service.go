@@ -63,7 +63,7 @@ type ecrAPI interface {
 type Service struct {
 	client ecrAPI
 	// RepositoryName is the shared repository every project's build
-	// images push into (e.g. "teepin/kumbha-builds-dev").
+	// images push into (e.g. "teepin/build-apps-dev").
 	RepositoryName string
 }
 
@@ -86,7 +86,7 @@ func NewService(ctx context.Context, repositoryName string) (*Service, error) {
 // ImagePrefix ensures the shared build repository exists (idempotent —
 // mirrors ProvisionProjectRegistry's own "already provisioned, reuse it"
 // shape) and returns its pushable URI, e.g.
-// "123456789012.dkr.ecr.us-east-1.amazonaws.com/teepin/kumbha-builds-dev".
+// "123456789012.dkr.ecr.us-east-1.amazonaws.com/teepin/build-apps-dev".
 // projectName is accepted only to satisfy pkg/build.RegistryProvider —
 // Harbor uses it to name a per-project Project; ECR does not need it
 // here, since every project shares one repository (see the Service doc

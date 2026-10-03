@@ -28,23 +28,23 @@
 #   # timer, and runs an immediate refresh.
 #   sudo bash refresh-ecr-pull-secret.sh --install \
 #       --account-id 880254196251 --region us-east-1 \
-#       --secret-name teepin-kumbha-ecr --namespace default
+#       --secret-name teepin-build-ecr --namespace default
 #
 #   # Then populate the credentials file this created (see the path it
 #   # prints) with the access key from:
-#   #   aws iam create-access-key --user-name teepin-kumbha-ecr-puller-dev
+#   #   aws iam create-access-key --user-name teepin-build-ecr-puller-dev
 #
 #   # Manual one-off refresh (also what the systemd timer calls):
 #   sudo bash refresh-ecr-pull-secret.sh --once \
 #       --account-id 880254196251 --region us-east-1 \
-#       --secret-name teepin-kumbha-ecr --namespace default
+#       --secret-name teepin-build-ecr --namespace default
 
 set -euo pipefail
 
 MODE=""
 ACCOUNT_ID=""
 REGION="us-east-1"
-SECRET_NAME="teepin-kumbha-ecr"
+SECRET_NAME="teepin-build-ecr"
 NAMESPACE="default"
 CREDS_FILE="/etc/teepin/build-ecr-puller.env"
 INTERVAL="6h"   # well under the 12h token expiry
@@ -115,7 +115,7 @@ fi
 mkdir -p "$(dirname "$CREDS_FILE")"
 if [ ! -f "$CREDS_FILE" ]; then
     cat > "$CREDS_FILE" <<'EOF'
-# Populate from: aws iam create-access-key --user-name teepin-kumbha-ecr-puller-<env>
+# Populate from: aws iam create-access-key --user-name teepin-build-ecr-puller-<env>
 AWS_ACCESS_KEY_ID=
 AWS_SECRET_ACCESS_KEY=
 EOF
@@ -127,7 +127,17 @@ fi
 
 SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-cat > /etc/systemd/system/teepin-kumbha-ecr-refresh.service <<EOF
+# Remove the timer and service this script installed under its earlier name, so
+# a node that ran the old install does not keep refreshing a retired secret.
+# Delete this block once every node has been through this install once.
+old_unit="teepin-$(printf 'k%s' umbha)-ecr-refresh"
+if [ -f "/etc/systemd/system/${old_unit}.timer" ]; then
+    systemctl disable --now "${old_unit}.timer" 2>/dev/null || true
+    rm -f "/etc/systemd/system/${old_unit}.timer" "/etc/systemd/system/${old_unit}.service"
+    info "removed the old ${old_unit} timer"
+fi
+
+cat > /etc/systemd/system/teepin-build-ecr-refresh.service <<EOF
 [Unit]
 Description=Refresh the Teepin Build agent image's ECR pull secret
 After=network-online.target k3s.service
@@ -138,7 +148,7 @@ Type=oneshot
 ExecStart=/usr/bin/env bash $SCRIPT_PATH --once --account-id $ACCOUNT_ID --region $REGION --secret-name $SECRET_NAME --namespace $NAMESPACE --creds-file $CREDS_FILE
 EOF
 
-cat > /etc/systemd/system/teepin-kumbha-ecr-refresh.timer <<EOF
+cat > /etc/systemd/system/teepin-build-ecr-refresh.timer <<EOF
 [Unit]
 Description=Periodically refresh the Teepin Build agent image's ECR pull secret
 
@@ -160,8 +170,8 @@ WantedBy=timers.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now teepin-kumbha-ecr-refresh.timer
+systemctl enable --now teepin-build-ecr-refresh.timer
 info "timer installed, refreshing every 30 minutes (and at once after a sleep or boot)."
 info "IMPORTANT: fill in $CREDS_FILE with the IAM user's access key, then run once by hand to confirm:"
-info "  sudo systemctl start teepin-kumbha-ecr-refresh.service"
-info "  sudo journalctl -u teepin-kumbha-ecr-refresh.service -n 50"
+info "  sudo systemctl start teepin-build-ecr-refresh.service"
+info "  sudo journalctl -u teepin-build-ecr-refresh.service -n 50"

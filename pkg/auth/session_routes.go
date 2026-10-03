@@ -5,7 +5,6 @@ package auth
 
 import (
 	"net/http"
-	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -75,11 +74,6 @@ var sessionAllowedRoutes = map[string]bool{
 func SessionMayCall(method, routePattern string) bool {
 	if routePattern == "" {
 		return false
-	}
-	// "/v1/kumbha/" is Teepin Build's former route prefix, still served until
-	// every running agent image calls "/v1/build/" (see cmd/api-server).
-	if strings.HasPrefix(routePattern, "/v1/kumbha/") {
-		routePattern = "/v1/build/" + strings.TrimPrefix(routePattern, "/v1/kumbha/")
 	}
 	return sessionAllowedRoutes[method+" "+routePattern]
 }

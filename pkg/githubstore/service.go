@@ -72,9 +72,11 @@ func NewService(appID, installationID int64, privateKeyPEM []byte, org string) (
 // in or looked up. Mirrors the existing "build-agent-<short-id>" /
 // "inst-<short-id>" naming convention already used elsewhere in this
 // codebase (pkg/teepinbuild/agent.go's LaunchAgent, pkg/compute's instance
-// IDs).
+// IDs). Only ProvisionRepo derives it; every later push uses the name
+// recorded for the session, so a repo created under an earlier naming
+// scheme keeps working.
 func repoName(sessionID uuid.UUID) string {
-	return "kumbha-" + sessionID.String()[:8]
+	return "build-" + sessionID.String()[:8]
 }
 
 // ProvisionRepo creates a new, private repo for sessionID if one doesn't
@@ -134,8 +136,8 @@ func (s *Service) ProvisionRepo(ctx context.Context, sessionID uuid.UUID) (strin
 // are already excluded upstream (teepinbuild.SkippedFile), matching the
 // existing ZIP/version-history behaviour — this does not introduce a new
 // limitation.
-func (s *Service) PushSnapshot(ctx context.Context, sessionID uuid.UUID, files []teepinbuild.WorkspaceFile, message string) error {
-	name := repoName(sessionID)
+func (s *Service) PushSnapshot(ctx context.Context, repo string, files []teepinbuild.WorkspaceFile, message string) error {
+	name := repo
 
 	ref, resp, err := s.client.Git.GetRef(ctx, s.org, name, "refs/heads/"+defaultBranch)
 	var parentSHA string

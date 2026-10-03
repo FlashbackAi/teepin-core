@@ -116,7 +116,7 @@ ensure_ecr_pull_secret() {
     info "ensuring the ECR pull-secret refresh timer is installed..."
     if ! bash "$ecr_script" --install \
         --account-id "$ECR_ACCOUNT_ID" --region "$ECR_REGION" \
-        --secret-name teepin-kumbha-ecr --namespace default; then
+        --secret-name teepin-build-ecr --namespace default; then
         info "WARNING: ECR pull-secret timer setup failed (see the error above) — Teepin Build deploys to this node may fail to pull images."
         return
     fi
@@ -124,12 +124,12 @@ ensure_ecr_pull_secret() {
     local creds_file=/etc/teepin/build-ecr-puller.env
     if [ -s "$creds_file" ] && grep -q "^AWS_ACCESS_KEY_ID=.\+" "$creds_file" 2>/dev/null; then
         info "credential file already populated — forcing an immediate refresh to confirm it works..."
-        systemctl start teepin-kumbha-ecr-refresh.service \
-            || info "WARNING: the ECR pull-secret refresh failed to run — check: journalctl -u teepin-kumbha-ecr-refresh.service -n 50"
+        systemctl start teepin-build-ecr-refresh.service \
+            || info "WARNING: the ECR pull-secret refresh failed to run — check: journalctl -u teepin-build-ecr-refresh.service -n 50"
     else
         info "IMPORTANT: $creds_file has no AWS credentials yet — Teepin Build image pulls to this node WILL fail (403) until you populate it:"
-        info "  aws iam create-access-key --user-name teepin-kumbha-ecr-puller-<env>"
-        info "  sudo nano $creds_file   # then: sudo systemctl start teepin-kumbha-ecr-refresh.service"
+        info "  aws iam create-access-key --user-name teepin-build-ecr-puller-<env>"
+        info "  sudo nano $creds_file   # then: sudo systemctl start teepin-build-ecr-refresh.service"
     fi
 }
 

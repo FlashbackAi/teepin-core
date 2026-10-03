@@ -169,7 +169,7 @@ func TestPushSnapshot_FirstCommitToEmptyRepo(t *testing.T) {
 
 	svc := newTestService(t, mux)
 	files := []teepinbuild.WorkspaceFile{{Path: "index.html", Content: "<html></html>"}}
-	if err := svc.PushSnapshot(t.Context(), sessionID, files, "Deploy: v1"); err != nil {
+	if err := svc.PushSnapshot(t.Context(), name, files, "Deploy: v1"); err != nil {
 		t.Fatalf("PushSnapshot: %v", err)
 	}
 
@@ -230,7 +230,7 @@ func TestPushSnapshot_CommitOnTopOfHistory(t *testing.T) {
 
 	svc := newTestService(t, mux)
 	files := []teepinbuild.WorkspaceFile{{Path: "index.html", Content: "<html>v2</html>"}}
-	if err := svc.PushSnapshot(t.Context(), sessionID, files, "Deploy: v2"); err != nil {
+	if err := svc.PushSnapshot(t.Context(), name, files, "Deploy: v2"); err != nil {
 		t.Fatalf("PushSnapshot: %v", err)
 	}
 
@@ -254,7 +254,7 @@ func TestPushSnapshot_CommitOnTopOfHistory(t *testing.T) {
 // (not fail at runtime) if the signature ever grew a second return value.
 func TestPushSnapshot_SignatureCannotLeakRepoIdentity(t *testing.T) {
 	var f func(*Service) error = func(s *Service) error {
-		return s.PushSnapshot(t.Context(), uuid.New(), nil, "")
+		return s.PushSnapshot(t.Context(), "build-x", nil, "")
 	}
 	_ = f
 }

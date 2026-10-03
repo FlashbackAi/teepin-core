@@ -20,7 +20,7 @@ import (
 )
 
 func testAuth() RegistryAuth {
-	return RegistryAuth{SecretName: "teepin-kumbha-ecr", Server: "880254196251.dkr.ecr.us-east-1.amazonaws.com", Username: "AWS", Password: "token-1"}
+	return RegistryAuth{SecretName: "teepin-build-ecr", Server: "880254196251.dkr.ecr.us-east-1.amazonaws.com", Username: "AWS", Password: "token-1"}
 }
 
 func TestRegistryAuth_Validate(t *testing.T) {
@@ -49,7 +49,7 @@ func TestApplyRegistryAuth_CreatesThenReplacesThePullSecret(t *testing.T) {
 	if err := c.ApplyRegistryAuth(ctx, testAuth()); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	got, err := k8s.CoreV1().Secrets(workloadNamespace).Get(ctx, "teepin-kumbha-ecr", metav1.GetOptions{})
+	got, err := k8s.CoreV1().Secrets(workloadNamespace).Get(ctx, "teepin-build-ecr", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("secret not stored: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestApplyRegistryAuth_CreatesThenReplacesThePullSecret(t *testing.T) {
 	if err := c.ApplyRegistryAuth(ctx, next); err != nil {
 		t.Fatalf("update: %v", err)
 	}
-	got, _ = k8s.CoreV1().Secrets(workloadNamespace).Get(ctx, "teepin-kumbha-ecr", metav1.GetOptions{})
+	got, _ = k8s.CoreV1().Secrets(workloadNamespace).Get(ctx, "teepin-build-ecr", metav1.GetOptions{})
 	_ = json.Unmarshal(got.Data[corev1.DockerConfigJsonKey], &cfg)
 	if cfg.Auths["880254196251.dkr.ecr.us-east-1.amazonaws.com"].Password != "token-2" {
 		t.Error("the secret still holds the old token")
@@ -84,7 +84,7 @@ func TestApplyRegistryAuth_ReplacesASecretOfTheWrongType(t *testing.T) {
 	// The node's old hand-made secret may be an Opaque one; a secret's type
 	// cannot be edited, so it is replaced.
 	k8s := fake.NewSimpleClientset(&corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "teepin-kumbha-ecr", Namespace: workloadNamespace},
+		ObjectMeta: metav1.ObjectMeta{Name: "teepin-build-ecr", Namespace: workloadNamespace},
 		Type:       corev1.SecretTypeOpaque,
 		Data:       map[string][]byte{"x": []byte("y")},
 	})
@@ -92,7 +92,7 @@ func TestApplyRegistryAuth_ReplacesASecretOfTheWrongType(t *testing.T) {
 	if err := c.ApplyRegistryAuth(context.Background(), testAuth()); err != nil {
 		t.Fatal(err)
 	}
-	got, _ := k8s.CoreV1().Secrets(workloadNamespace).Get(context.Background(), "teepin-kumbha-ecr", metav1.GetOptions{})
+	got, _ := k8s.CoreV1().Secrets(workloadNamespace).Get(context.Background(), "teepin-build-ecr", metav1.GetOptions{})
 	if got.Type != corev1.SecretTypeDockerConfigJson {
 		t.Errorf("type = %s", got.Type)
 	}
@@ -130,7 +130,7 @@ func TestRegistryPushRegistryAuth(t *testing.T) {
 		t.Fatalf("push: %v", err)
 	}
 	cmd := msg.GetRegistryAuth()
-	if cmd.GetSecretName() != "teepin-kumbha-ecr" || cmd.GetServer() != testAuth().Server || cmd.GetPassword() != "token-1" {
+	if cmd.GetSecretName() != "teepin-build-ecr" || cmd.GetServer() != testAuth().Server || cmd.GetPassword() != "token-1" {
 		t.Errorf("sent %+v", cmd)
 	}
 	if _, err := run(&agentpb.CommandResult{ErrorMessage: "cannot write secret", ErrorCode: agentpb.ErrorCode_ERROR_CODE_CLUSTER_ERROR}); err == nil {

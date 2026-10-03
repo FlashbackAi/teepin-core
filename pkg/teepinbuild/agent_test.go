@@ -892,7 +892,7 @@ func TestGateway_CaptureScreenshot_Success(t *testing.T) {
 		WithAgent(fc, fakeMintToken, AgentConfig{
 			Image:           "build-agent:latest",
 			APIBaseURL:      "http://teepin-api.default.svc.cluster.local:8080",
-			ImagePullSecret: "teepin-kumbha-ecr",
+			ImagePullSecret: "teepin-build-ecr",
 		})
 
 	sessID, accountID, projectID := uuid.New(), uuid.New(), uuid.New()
@@ -925,7 +925,7 @@ func TestGateway_CaptureScreenshot_Success(t *testing.T) {
 	if spec.Labels[agentLabel] != "true" {
 		t.Error("capture pod is missing the label that hides it from the customer's Compute list")
 	}
-	if spec.ImagePullSecret != "teepin-kumbha-ecr" {
+	if spec.ImagePullSecret != "teepin-build-ecr" {
 		t.Errorf("ImagePullSecret = %q, want the agent image's own secret reused", spec.ImagePullSecret)
 	}
 	if !spec.NeverRestart {

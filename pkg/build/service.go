@@ -51,7 +51,7 @@ import (
 type RegistryProvider interface {
 	// ImagePrefix returns (provisioning the underlying repository/project
 	// if needed) the pushable image prefix for a project, e.g.
-	// "123456789012.dkr.ecr.us-east-1.amazonaws.com/teepin/kumbha-builds-dev"
+	// "123456789012.dkr.ecr.us-east-1.amazonaws.com/teepin/build-apps-dev"
 	// or "registry.teepin.cloud/teepin-myapp-abc123".
 	ImagePrefix(ctx context.Context, projectID uuid.UUID, projectName string) (string, error)
 	// DockerConfigJSONForBuild returns a marshaled .dockerconfigjson
@@ -108,9 +108,6 @@ type Config struct {
 // customer created or can meaningfully manage (it always finishes and
 // self-terminates within the build timeout).
 const hiddenFromComputeListLabel = "teepin.io/build-agent"
-
-// legacyHiddenLabel is the label's former name, kept until every node and pod carries the new one (ROADMAP: Teepin Build rename).
-const legacyHiddenLabel = "teepin.io/kumbha-agent"
 
 // DefaultConfig is used wherever an operator has not overridden a field —
 // see NewService.
@@ -437,7 +434,7 @@ exec /kaniko/executor --dockerfile="$TEEPIN_DOCKERFILE_PATH" --context=dir:///wo
 		Args:       []string{script},
 		// See hiddenFromComputeListLabel's own doc comment: this is
 		// Teepin's own build tooling, not a customer-managed instance.
-		Labels: map[string]string{hiddenFromComputeListLabel: "true", legacyHiddenLabel: "true"},
+		Labels: map[string]string{hiddenFromComputeListLabel: "true"},
 		Env: map[string]string{
 			"TEEPIN_TOKEN":           req.WorkspaceToken,
 			"TEEPIN_ARCHIVE_URL":     req.WorkspaceArchiveURL,

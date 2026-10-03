@@ -1377,15 +1377,15 @@ func TestImagePorts_UnresolvableImageReturns200WithEmptyPorts(t *testing.T) {
 // an ordinary customer image (any other registry) must never get it.
 func TestInstanceSpec_AutoAttachesBuiltImagePullSecretOnlyForItsOwnImages(t *testing.T) {
 	s := (&Server{}).WithBuiltImagePullSecret(
-		"880254196251.dkr.ecr.us-east-1.amazonaws.com/teepin/kumbha-builds-dev",
-		"teepin-kumbha-ecr",
+		"880254196251.dkr.ecr.us-east-1.amazonaws.com/teepin/build-apps-dev",
+		"teepin-build-ecr",
 	)
 
 	buildSpec := s.instanceSpec("inst-1", uuid.New(), uuid.New(), uuid.New(), &models.CreateInstanceRequest{
-		Image: "880254196251.dkr.ecr.us-east-1.amazonaws.com/teepin/kumbha-builds-dev:4ab155f0",
+		Image: "880254196251.dkr.ecr.us-east-1.amazonaws.com/teepin/build-apps-dev:4ab155f0",
 	}, nil)
-	if buildSpec.ImagePullSecret != "teepin-kumbha-ecr" {
-		t.Errorf("Teepin Build-built image: ImagePullSecret = %q, want \"teepin-kumbha-ecr\"", buildSpec.ImagePullSecret)
+	if buildSpec.ImagePullSecret != "teepin-build-ecr" {
+		t.Errorf("Teepin Build-built image: ImagePullSecret = %q, want \"teepin-build-ecr\"", buildSpec.ImagePullSecret)
 	}
 
 	ordinarySpec := s.instanceSpec("inst-2", uuid.New(), uuid.New(), uuid.New(), &models.CreateInstanceRequest{

@@ -45,9 +45,6 @@ const PortPlaceholder = "${TEEPIN_PORT}"
 // note in pkg/inferencereconciler on why it is redeclared, not imported.
 const hiddenLabel = "teepin.io/build-agent"
 
-// legacyHiddenLabel is the label's former name, kept until every node and pod carries the new one (ROADMAP: Teepin Build rename).
-const legacyHiddenLabel = "teepin.io/kumbha-agent"
-
 const (
 	statusPending    = "pending"
 	statusRunning    = "running"
@@ -333,7 +330,7 @@ func (r *Runtime) statusOf(inst *instance) cluster.InstanceStatus {
 		ObservedAt: time.Now().UTC(),
 		AccountID:  inst.spec.AccountID,
 		ProjectID:  inst.spec.ProjectID,
-		Hidden:     inst.spec.Labels[hiddenLabel] == "true" || inst.spec.Labels[legacyHiddenLabel] == "true",
+		Hidden:     inst.spec.Labels[hiddenLabel] == "true",
 	}
 }
 

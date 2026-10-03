@@ -1497,9 +1497,6 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 			v1.GET("/build/sessions/:id/events/attach", func(c *gin.Context) {
 				buildEventsHandler.ServeSession(c.Writer, c.Request, c.Param("id"))
 			})
-			v1.GET("/kumbha/sessions/:id/events/attach", func(c *gin.Context) { // former name, see the /build group
-				buildEventsHandler.ServeSession(c.Writer, c.Request, c.Param("id"))
-			})
 		}
 
 		// Node enrollment — UNAUTHENTICATED at the router because the
@@ -1628,11 +1625,8 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 		// handler here already 404s cleanly when apiServer was built
 		// without WithBuild, so the group is registered unconditionally
 		// rather than gated on a nil check here too.
-		// "/kumbha" is Teepin Build's former name. The same routes stay reachable
-		// under it only until every running agent image calls "/build"; remove
-		// it after the next agent image deploy (ROADMAP: Teepin Build rename).
-		for _, prefix := range []string{"/build", "/kumbha"} {
-			buildGroup := v1.Group(prefix)
+		{
+			buildGroup := v1.Group("/build")
 			if authMiddleware != nil {
 				buildGroup.Use(authMiddleware.RequireAuth())
 			}
@@ -1720,7 +1714,6 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 			v1.GET("/models", append(inferenceAuth, publicInferenceHandler.ListModels)...)
 			v1.GET("/models/attestation", append(inferenceAuth, publicInferenceHandler.GetAttestation)...)
 			v1.GET("/build/models", append(inferenceAuth, publicInferenceHandler.GetBuildModels)...)
-			v1.GET("/kumbha/models", append(inferenceAuth, publicInferenceHandler.GetBuildModels)...) // former name
 		}
 
 		storageGroup := v1.Group("/storage")

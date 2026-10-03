@@ -63,11 +63,6 @@ var serviceRules = []catalogRule{
 		route, direction := splitDirection(rest)
 		return Presentation{Service: "Teepin Build", Title: tokenTitle(route, direction), Rate: "per 1M tokens", Scale: 1e6}
 	}},
-	{"kumbha/", // former name, kept until every node and pod carries the new one (ROADMAP: Teepin Build rename)
-		func(_, rest, _ string) Presentation {
-			route, direction := splitDirection(rest)
-			return Presentation{Service: "Teepin Build", Title: tokenTitle(route, direction), Rate: "per 1M tokens", Scale: 1e6}
-		}},
 	{"inference/", func(_, rest, _ string) Presentation {
 		route, direction := splitDirection(rest)
 		return Presentation{Service: "Inference", Title: tokenTitle(route, direction), Rate: "per 1M tokens", Scale: 1e6}

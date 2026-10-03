@@ -337,7 +337,7 @@ func (c *AgentClient) createOrReplace(ctx context.Context, spec InstanceSpec, re
 		// excludes it before a status is even constructed) — nothing
 		// downstream will ever overwrite this with a wire update that
 		// forgets to set it.
-		Hidden: spec.Labels[labelBuildAgent] == "true" || spec.Labels[labelLegacyBuildAgent] == "true",
+		Hidden: spec.Labels[labelBuildAgent] == "true",
 	})
 
 	return &InstanceResult{
@@ -480,9 +480,7 @@ func (c *AgentClient) GetInstanceStatus(_ context.Context, scope Scope, instance
 // an already-wrong cached value. A prefix check has no state to
 // corrupt — it is recomputed fresh on every read from the one thing that
 // is always present and immutable: the instance's own ID.
-//
-// "kumbha-agent-" and "kumbha-shot-" are the former name, kept until every node and pod carries the new one (ROADMAP: Teepin Build rename).
-var hiddenInstanceIDPrefixes = []string{"build-agent-", "kaniko-build-", "build-shot-", "kumbha-agent-", "kumbha-shot-"}
+var hiddenInstanceIDPrefixes = []string{"build-agent-", "kaniko-build-", "build-shot-"}
 
 func isHiddenInstanceID(instanceID string) bool {
 	for _, prefix := range hiddenInstanceIDPrefixes {
