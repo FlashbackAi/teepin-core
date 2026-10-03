@@ -158,8 +158,8 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		// whose port auto-detection failed transiently) would otherwise
 		// reach here as a real "change" and get persisted, erasing a
 		// working endpoint the instance already had. Found live
-		// 2026-08-31 alongside the redeployKumbhaInstance port-detection
-		// fix (kumbha_handlers.go) — this is the same failure one layer
+		// 2026-08-31 alongside the redeployBuildInstance port-detection
+		// fix (build_handlers.go) — this is the same failure one layer
 		// further down, and closes it for every producer of
 		// InstanceStatus, not just that one call site.
 		observedEndpointEmpty := observed.EndpointURL == "" && observed.DNSName == "" &&

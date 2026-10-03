@@ -13,7 +13,7 @@ import (
 	"github.com/google/go-github/v88/github"
 	"github.com/google/uuid"
 
-	"github.com/FlashbackAi/teepin-core/pkg/kumbha"
+	"github.com/FlashbackAi/teepin-core/pkg/teepinbuild"
 )
 
 // newTestService builds a Service against a fake GitHub API server —
@@ -168,7 +168,7 @@ func TestPushSnapshot_FirstCommitToEmptyRepo(t *testing.T) {
 	})
 
 	svc := newTestService(t, mux)
-	files := []kumbha.WorkspaceFile{{Path: "index.html", Content: "<html></html>"}}
+	files := []teepinbuild.WorkspaceFile{{Path: "index.html", Content: "<html></html>"}}
 	if err := svc.PushSnapshot(t.Context(), sessionID, files, "Deploy: v1"); err != nil {
 		t.Fatalf("PushSnapshot: %v", err)
 	}
@@ -229,7 +229,7 @@ func TestPushSnapshot_CommitOnTopOfHistory(t *testing.T) {
 	})
 
 	svc := newTestService(t, mux)
-	files := []kumbha.WorkspaceFile{{Path: "index.html", Content: "<html>v2</html>"}}
+	files := []teepinbuild.WorkspaceFile{{Path: "index.html", Content: "<html>v2</html>"}}
 	if err := svc.PushSnapshot(t.Context(), sessionID, files, "Deploy: v2"); err != nil {
 		t.Fatalf("PushSnapshot: %v", err)
 	}

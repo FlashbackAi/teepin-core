@@ -117,34 +117,6 @@ func (h *AdminHandler) UpdateCPUPricing(c *gin.Context) {
 	c.JSON(http.StatusOK, info)
 }
 
-// UpdatePECorePricing sets the P-core/E-core rates for a home-node instance
-// placed with a detected split. Zero is a valid value ("do not charge"), so
-// neither field is required. Kept separate from UpdateCPUPricing (which
-// remains the rate for an instance with no detected split) — same reasoning
-// as every other per-dimension pricing endpoint here.
-// PUT /v1/admin/pricing/cpu-pe
-func (h *AdminHandler) UpdatePECorePricing(c *gin.Context) {
-	var req struct {
-		PCorePricePerHour float64 `json:"p_core_price_per_hour"`
-		ECorePricePerHour float64 `json:"e_core_price_per_hour"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	if err := h.billingService.SetPECorePricing(c.Request.Context(),
-		req.PCorePricePerHour, req.ECorePricePerHour, "admin-api"); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	info, err := h.billingService.GetPricing(c.Request.Context())
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, info)
-}
-
 // UpdateStoragePricing sets the persistent-storage GB-month rate. Zero is
 // valid ("do not charge"). A separate endpoint from UpdatePricing, same
 // reasoning as UpdateCPUPricing: the GPU rate's "must be positive"
@@ -196,12 +168,12 @@ func (h *AdminHandler) UpdateObjectStoragePricing(c *gin.Context) {
 	c.JSON(http.StatusOK, info)
 }
 
-// UpdateLLMPricing sets the Kumbha Gateway's per-million-token input/output
+// UpdateLLMPricing sets the Teepin Build Gateway's per-million-token input/output
 // rates. Zero is valid ("do not charge"), same contract as CPU/storage.
 //
-// service.SetLLMPricing has existed since Kumbha's Gateway shipped, but
+// service.SetLLMPricing has existed since Teepin Build's Gateway shipped, but
 // this handler and its route did not — found live 2026-08-24 when every
-// Kumbha session's "spent" stayed $0.00 regardless of real token usage.
+// Teepin Build session's "spent" stayed $0.00 regardless of real token usage.
 // That was not a calculation bug (Gateway.cost's math was always correct);
 // the configured rate was genuinely $0 because there was no way to set it
 // to anything else short of raw SQL against billing.pricing.

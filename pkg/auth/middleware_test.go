@@ -124,7 +124,7 @@ func TestAuthenticate_JWTWithMalformedProjectHeader(t *testing.T) {
 }
 
 // fakeSessionChecker is a minimal auth.SessionChecker for testing the
-// session-scoped credential path without a real kumbha.Store.
+// session-scoped credential path without a real teepinbuild.Store.
 type fakeSessionChecker struct {
 	open bool
 	err  error

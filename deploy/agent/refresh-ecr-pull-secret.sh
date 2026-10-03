@@ -3,7 +3,7 @@
 # Licensed under the Apache License, Version 2.0
 #
 # Keeps a Kubernetes imagePullSecret current on a non-AWS TEEPIN node
-# (home or datacenter) so its k3s can pull the Kumbha agent image from
+# (home or datacenter) so its k3s can pull the Teepin Build agent image from
 # ECR. See ROADMAP.md's 2026-08-23 decision: ECR directly, not
 # self-hosted Harbor — this script is the piece that decision leaves for
 # the node itself to do, since the ECS-hosted control plane has no way
@@ -19,7 +19,7 @@
 # Secrets Manager itself: fetching FROM Secrets Manager would need its
 # own AWS credential already present (nothing gained), and it keeps the
 # IAM user's permissions to exactly ECR pull (security.tf's
-# kumbha_ecr_puller policy) — no secretsmanager:GetSecretValue grant
+# build_ecr_puller policy) — no secretsmanager:GetSecretValue grant
 # needed just to bootstrap this script.
 #
 # Usage:
@@ -46,7 +46,7 @@ ACCOUNT_ID=""
 REGION="us-east-1"
 SECRET_NAME="teepin-kumbha-ecr"
 NAMESPACE="default"
-CREDS_FILE="/etc/teepin/kumbha-ecr-puller.env"
+CREDS_FILE="/etc/teepin/build-ecr-puller.env"
 INTERVAL="6h"   # well under the 12h token expiry
 
 while [ $# -gt 0 ]; do
@@ -68,7 +68,7 @@ fail() { echo "[ecr-refresh] ERROR: $*" >&2; exit 1; }
 
 [ "$(id -u)" = "0" ] || fail "run as root (sudo)."
 [ -n "$MODE" ] || fail "pass --install (first-time setup) or --once (a single refresh)."
-[ -n "$ACCOUNT_ID" ] || fail "--account-id is required (the AWS account the kumbha-agent ECR repo lives in)."
+[ -n "$ACCOUNT_ID" ] || fail "--account-id is required (the AWS account the build-agent ECR repo lives in)."
 
 # --- the actual refresh, used by both modes -------------------------------
 do_refresh() {
@@ -129,7 +129,7 @@ SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
 cat > /etc/systemd/system/teepin-kumbha-ecr-refresh.service <<EOF
 [Unit]
-Description=Refresh the Kumbha agent image's ECR pull secret
+Description=Refresh the Teepin Build agent image's ECR pull secret
 After=network-online.target k3s.service
 Wants=network-online.target
 
@@ -140,7 +140,7 @@ EOF
 
 cat > /etc/systemd/system/teepin-kumbha-ecr-refresh.timer <<EOF
 [Unit]
-Description=Periodically refresh the Kumbha agent image's ECR pull secret
+Description=Periodically refresh the Teepin Build agent image's ECR pull secret
 
 [Timer]
 # A wall-clock schedule, not OnUnitActiveSec. A monotonic timer stops counting

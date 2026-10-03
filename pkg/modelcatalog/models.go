@@ -3,7 +3,7 @@
 
 // Package modelcatalog is the platform's single model registry and per-model
 // pricing — every model Teepin can serve, self-hosted or third-party, and
-// where each may be used: Teepin Inference's customer API, the Kumbha build
+// where each may be used: Teepin Inference's customer API, the Teepin Build build
 // agent, or both. Distinct from pkg/inference (the stateless runtime
 // Provider seam). Teepin serves several models with very different real
 // per-token costs at once, so pricing is keyed by model, not global.
@@ -117,14 +117,14 @@ type Model struct {
 	Enabled bool `json:"enabled"`
 	// OfferedToCustomers exposes the model on Teepin Inference's public API.
 	OfferedToCustomers bool `json:"offered_to_customers"`
-	// KumbhaEnabled lets the Kumbha build agent use the model; enabled
-	// models are tried in ascending KumbhaPriority order.
-	KumbhaEnabled  bool `json:"kumbha_enabled"`
-	KumbhaPriority int  `json:"kumbha_priority"`
-	// KumbhaImageReader makes the model the one that describes images attached
+	// BuildEnabled lets the Teepin Build build agent use the model; enabled
+	// models are tried in ascending BuildPriority order.
+	BuildEnabled  bool `json:"build_enabled"`
+	BuildPriority int  `json:"build_priority"`
+	// BuildImageReader makes the model the one that describes images attached
 	// to a build, for a builder model that cannot see them. It is independent of
-	// KumbhaEnabled: a model can read images without being offered as a builder.
-	KumbhaImageReader bool `json:"kumbha_image_reader"`
+	// BuildEnabled: a model can read images without being offered as a builder.
+	BuildImageReader bool `json:"build_image_reader"`
 
 	UpdatedBy *string   `json:"updated_by,omitempty"`
 	CreatedAt time.Time `json:"created_at"`

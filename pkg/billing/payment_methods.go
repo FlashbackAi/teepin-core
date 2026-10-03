@@ -63,7 +63,7 @@ func (s *Service) WithStripe(gw StripeGateway) *Service {
 // AccountCanProvision is the single source of truth for the prepaid
 // "no credit, no resources" gate. It answers one question — may this
 // account create resources right now — so every caller (the create
-// handler, Kumbha, the console pre-check) agrees. A card on file is not
+// handler, Teepin Build, the console pre-check) agrees. A card on file is not
 // required: Teepin is prepaid only, so what matters is spendable credit,
 // however it was funded.
 //

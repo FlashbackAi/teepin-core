@@ -31,10 +31,10 @@ func NewBillingHandler(billingService *billing.Service, authService *auth.Servic
 // GetPricing returns the platform's current per-resource rates. Public
 // (any authenticated caller, not admin-only) — a customer can already see
 // what they're paying on every invoice, so exposing the live rate table
-// is transparency, not a leak. This is what the Kumbha MCP tool server's
+// is transparency, not a leak. This is what the Teepin Build MCP tool server's
 // present_deployment_plan verb reads to build the itemized cost table a
 // customer approves before real infrastructure is provisioned
-// (KUMBHA-DESIGN.md's pre-deploy cost approval gate) — the same numbers
+// (TEEPIN-BUILD-DESIGN.md's pre-deploy cost approval gate) — the same numbers
 // GET /v1/admin/pricing shows an operator, never a separate estimate.
 // GET /v1/billing/pricing
 func (h *BillingHandler) GetPricing(c *gin.Context) {

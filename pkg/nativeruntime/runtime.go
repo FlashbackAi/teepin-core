@@ -41,9 +41,12 @@ import (
 // a hard-coded port, and only the host knows what is free right now.
 const PortPlaceholder = "${TEEPIN_PORT}"
 
-// hiddenLabel matches pkg/cluster's private labelKumbhaAgent — see the same
+// hiddenLabel matches pkg/cluster's private labelBuildAgent — see the same
 // note in pkg/inferencereconciler on why it is redeclared, not imported.
-const hiddenLabel = "teepin.io/kumbha-agent"
+const hiddenLabel = "teepin.io/build-agent"
+
+// legacyHiddenLabel is the label's former name, kept until every node and pod carries the new one (ROADMAP: Teepin Build rename).
+const legacyHiddenLabel = "teepin.io/kumbha-agent"
 
 const (
 	statusPending    = "pending"
@@ -330,7 +333,7 @@ func (r *Runtime) statusOf(inst *instance) cluster.InstanceStatus {
 		ObservedAt: time.Now().UTC(),
 		AccountID:  inst.spec.AccountID,
 		ProjectID:  inst.spec.ProjectID,
-		Hidden:     inst.spec.Labels[hiddenLabel] == "true",
+		Hidden:     inst.spec.Labels[hiddenLabel] == "true" || inst.spec.Labels[legacyHiddenLabel] == "true",
 	}
 }
 

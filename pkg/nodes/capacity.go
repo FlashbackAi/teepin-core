@@ -59,26 +59,26 @@ func (s *Service) SetReservation(ctx context.Context, nodeID uuid.UUID, cpuCores
 // running workloads currently HOLD (used), and the derived FREE = rentable -
 // used (never negative).
 type NodeCapacity struct {
-	NodeID        uuid.UUID `json:"node_id"`
-	NodeName      string    `json:"node_name"`
+	NodeID   uuid.UUID `json:"node_id"`
+	NodeName string    `json:"node_name"`
 	// ProviderID is what cluster.Registry keys its live agent sessions by
 	// (see AgentSession.ProviderID) — added specifically so a capacity-
-	// aware caller (kumbha.LaunchAgent) can go from "this node has room"
+	// aware caller (teepinbuild.LaunchAgent) can go from "this node has room"
 	// straight to "dispatch to THIS session", the same identifier
 	// cluster.Client.CreateInstance already accepts via
 	// InstanceSpec.ProviderID. Not previously selected here because
 	// nothing outside this package needed it before now.
-	ProviderID    string    `json:"provider_id"`
-	Class         string    `json:"class"`
-	Status        string    `json:"status"`
-	DetectedCPU   int       `json:"detected_cpu_cores"`
-	DetectedMemGB int       `json:"detected_memory_gb"`
-	RentableCPU   int       `json:"rentable_cpu_cores"`
-	RentableMemGB int       `json:"rentable_memory_gb"`
-	UsedCPU       int       `json:"used_cpu_cores"`
-	UsedMemGB     int       `json:"used_memory_gb"`
-	FreeCPU       int       `json:"free_cpu_cores"`
-	FreeMemGB     int       `json:"free_memory_gb"`
+	ProviderID    string `json:"provider_id"`
+	Class         string `json:"class"`
+	Status        string `json:"status"`
+	DetectedCPU   int    `json:"detected_cpu_cores"`
+	DetectedMemGB int    `json:"detected_memory_gb"`
+	RentableCPU   int    `json:"rentable_cpu_cores"`
+	RentableMemGB int    `json:"rentable_memory_gb"`
+	UsedCPU       int    `json:"used_cpu_cores"`
+	UsedMemGB     int    `json:"used_memory_gb"`
+	FreeCPU       int    `json:"free_cpu_cores"`
+	FreeMemGB     int    `json:"free_memory_gb"`
 }
 
 // HiddenUsage is one node's total footprint from Teepin's own internal
@@ -89,11 +89,11 @@ type HiddenUsage struct {
 }
 
 // HiddenWorkloadCounter reports how much of a node's rentable capacity is
-// currently held by Teepin's own internal workloads: the Kumbha agent
+// currently held by Teepin's own internal workloads: the Teepin Build agent
 // pod, its screenshot-capture pod, and Kaniko build pods. These are
 // deliberately never inserted into compute.instances (see
-// kumbha.LaunchAgent's own doc comment — a customer must never see a
-// mystery "kumbha-agent-xyz" entry in their Compute list), which also
+// teepinbuild.LaunchAgent's own doc comment — a customer must never see a
+// mystery "build-agent-xyz" entry in their Compute list), which also
 // makes them invisible to ListNodeCapacity's compute.instances-based sum.
 // Found live 2026-09-05: a node running an active Kaniko build reported
 // more free capacity than it actually had, because the build pod's own

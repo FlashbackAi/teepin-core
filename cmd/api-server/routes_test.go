@@ -12,8 +12,8 @@ import (
 // Gin panics at registration time when two routes conflict, which neither the
 // compiler nor go vet catches — it would only surface as a crash at startup.
 // Registering every optional handler at once proves the route table is
-// coherent, including the public inference routes beside Kumbha's own
-// /v1/kumbha/chat/completions.
+// coherent, including the public inference routes beside Teepin Build's own
+// /v1/build/chat/completions.
 func TestSetupRouter_RegistersEveryRouteWithoutConflict(t *testing.T) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -32,7 +32,7 @@ func TestSetupRouter_RegistersEveryRouteWithoutConflict(t *testing.T) {
 	want := map[string]bool{
 		"POST /v1/chat/completions":                   false,
 		"GET /v1/models":                              false,
-		"POST /v1/kumbha/chat/completions":            false,
+		"POST /v1/build/chat/completions":             false,
 		"GET /v1/admin/nodes/:id/cached-models":       false,
 		"DELETE /v1/admin/nodes/:id/cached-models":    false,
 		"PUT /v1/admin/inference/models/availability": false,

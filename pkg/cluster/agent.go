@@ -144,7 +144,7 @@ func (c *AgentClient) RecordStatus(status InstanceStatus) {
 		// method is fed from (agentpb.InstanceStatus, via grpcserver.go's
 		// handleMessage) has no Hidden field at all, so status.Hidden is
 		// always the Go zero value (false) here — blindly overwriting
-		// would un-hide a Kaniko build or Kumbha agent pod the moment its
+		// would un-hide a Kaniko build or Teepin Build agent pod the moment its
 		// FIRST status report arrived after creation. Found live
 		// 2026-08-31: fixing reportStatuses to finally include these pods
 		// (AllTenantsIncludingHidden, needed so their status ever reaches
@@ -337,7 +337,7 @@ func (c *AgentClient) createOrReplace(ctx context.Context, spec InstanceSpec, re
 		// excludes it before a status is even constructed) — nothing
 		// downstream will ever overwrite this with a wire update that
 		// forgets to set it.
-		Hidden: spec.Labels[labelKumbhaAgent] == "true",
+		Hidden: spec.Labels[labelBuildAgent] == "true" || spec.Labels[labelLegacyBuildAgent] == "true",
 	})
 
 	return &InstanceResult{
@@ -438,7 +438,7 @@ func (c *AgentClient) GetInstanceStatus(_ context.Context, scope Scope, instance
 		// plane restarted yet, which is not the same fact as "this
 		// instance does not exist". Reported as ErrClusterUnavailable (ask
 		// again later) rather than ErrNotFound during the grace period so
-		// a caller — e.g. redeployKumbhaInstance's provider-recovery path,
+		// a caller — e.g. redeployBuildInstance's provider-recovery path,
 		// which reads this exact call's result to decide whether there is
 		// anything to recover — does not silently treat "hasn't reported
 		// back yet" as "nothing to recover" and skip a real fix. Found
@@ -462,8 +462,8 @@ func (c *AgentClient) GetInstanceStatus(_ context.Context, scope Scope, instance
 	return &status, nil
 }
 
-// hiddenInstanceIDPrefixes are Kumbha's own naming conventions for
-// internal-tooling pods (pkg/kumbha's agent/screenshot pods, pkg/build's
+// hiddenInstanceIDPrefixes are Teepin Build's own naming conventions for
+// internal-tooling pods (pkg/teepinbuild's agent/screenshot pods, pkg/build's
 // Kaniko pods) — duplicated here as plain strings, not imported, since
 // those packages already import pkg/cluster and importing back would
 // cycle. Checked as a FALLBACK alongside InstanceStatus.Hidden in
@@ -480,7 +480,9 @@ func (c *AgentClient) GetInstanceStatus(_ context.Context, scope Scope, instance
 // an already-wrong cached value. A prefix check has no state to
 // corrupt — it is recomputed fresh on every read from the one thing that
 // is always present and immutable: the instance's own ID.
-var hiddenInstanceIDPrefixes = []string{"kumbha-agent-", "kaniko-build-", "kumbha-shot-"}
+//
+// "kumbha-agent-" and "kumbha-shot-" are the former name, kept until every node and pod carries the new one (ROADMAP: Teepin Build rename).
+var hiddenInstanceIDPrefixes = []string{"build-agent-", "kaniko-build-", "build-shot-", "kumbha-agent-", "kumbha-shot-"}
 
 func isHiddenInstanceID(instanceID string) bool {
 	for _, prefix := range hiddenInstanceIDPrefixes {

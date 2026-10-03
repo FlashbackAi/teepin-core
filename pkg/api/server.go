@@ -26,9 +26,9 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/compute"
 	"github.com/FlashbackAi/teepin-core/pkg/gpu"
 	"github.com/FlashbackAi/teepin-core/pkg/imageinfo"
-	"github.com/FlashbackAi/teepin-core/pkg/kumbha"
 	"github.com/FlashbackAi/teepin-core/pkg/models"
 	"github.com/FlashbackAi/teepin-core/pkg/objectstore"
+	"github.com/FlashbackAi/teepin-core/pkg/teepinbuild"
 )
 
 // Server represents the API server
@@ -47,7 +47,7 @@ type ProvisionGate interface {
 	AccountCanProvision(ctx context.Context, accountID uuid.UUID) (bool, string, error)
 }
 
-// GithubStore pushes each Kumbha checkpoint to a Teepin-owned GitHub repo
+// GithubStore pushes each Teepin Build checkpoint to a Teepin-owned GitHub repo
 // — implemented by pkg/githubstore.Service. Defined here (the consumer),
 // not there, same pattern as build.RegistryProvider: pkg/api depends on
 // this narrow surface, never the concrete client, which is what lets a
@@ -59,7 +59,7 @@ type GithubStore interface {
 	// PushSnapshot commits files to sessionID's repo. Returns only error —
 	// deliberately no repo name/URL, so pkg/api has nothing to
 	// accidentally leak into a customer-facing response.
-	PushSnapshot(ctx context.Context, sessionID uuid.UUID, files []kumbha.WorkspaceFile, message string) error
+	PushSnapshot(ctx context.Context, sessionID uuid.UUID, files []teepinbuild.WorkspaceFile, message string) error
 }
 
 type Server struct {
@@ -114,33 +114,33 @@ type Server struct {
 	// 404, matching how home-capacity behaves when home compute is off.
 	execTickets *cluster.TicketStore
 
-	// kumbha is the Kumbha Gateway's business logic (pkg/kumbha) — session
+	// teepinBuild is the Teepin Build Gateway's business logic (pkg/teepinbuild) — session
 	// budgets, routing, metering. Nil disables the feature cleanly: every
-	// Kumbha handler returns 404, matching execTickets' pattern above.
-	kumbha *kumbha.Gateway
+	// Teepin Build handler returns 404, matching execTickets' pattern above.
+	teepinBuild *teepinbuild.Gateway
 
-	// kumbhaEventTickets issues short-lived, single-use credentials for
-	// the Kumbha event-relay WebSocket attach step (pkg/kumbha.EventsHandler
+	// buildEventTickets issues short-lived, single-use credentials for
+	// the Teepin Build event-relay WebSocket attach step (pkg/teepinbuild.EventsHandler
 	// redeems them) — same ticket-auth shape as execTickets, for the same
 	// reason (a WS handshake carries no Authorization header). Nil
 	// disables the feature cleanly.
-	kumbhaEventTickets *kumbha.EventTicketStore
+	buildEventTickets *teepinbuild.EventTicketStore
 
-	// kumbhaBuild runs Kaniko builds of a Kumbha session's workspace
+	// imageBuilder runs Kaniko builds of a Teepin Build session's workspace
 	// (pkg/build) — what the "deploy" MCP verb calls once approved. Nil
-	// disables the feature cleanly: BuildKumbhaSession returns 404, same
-	// as every other optional Kumbha capability.
-	kumbhaBuild *build.Service
+	// disables the feature cleanly: BuildSessionImage returns 404, same
+	// as every other optional Teepin Build capability.
+	imageBuilder *build.Service
 
-	// kumbhaBuildImageRegistryPrefix/kumbhaBuildImagePullSecret together
-	// let a home/datacenter node pull a Kumbha-built image back down
+	// builtImageRegistryPrefix/builtImagePullSecret together
+	// let a home/datacenter node pull a Teepin Build-built image back down
 	// from ECR to actually run it — see instanceSpec's own use of these
-	// and WithKumbhaBuildImagePullSecret's doc comment for why this is
+	// and WithBuiltImagePullSecret's doc comment for why this is
 	// NOT a customer-facing request field.
-	kumbhaBuildImageRegistryPrefix string
-	kumbhaBuildImagePullSecret     string
+	builtImageRegistryPrefix string
+	builtImagePullSecret     string
 
-	// githubStore pushes each Kumbha session's checkpointed workspace to a
+	// githubStore pushes each Teepin Build session's checkpointed workspace to a
 	// Teepin-owned repo (pkg/githubstore) — invisible to the customer, who
 	// only ever gets the existing ZIP download. Nil disables the feature
 	// cleanly: a checkpoint just skips the push, same best-effort posture
@@ -175,12 +175,12 @@ type Server struct {
 	specVault *compute.SpecVault
 	// publicBaseURL is Teepin's own internet-reachable API host (e.g.
 	// "https://dev-api.teepin.com") — deliberately NOT the same value as
-	// TEEPIN_KUMBHA_AGENT_API_BASE_URL, which is cluster-internal and
+	// TEEPIN_BUILD_AGENT_API_BASE_URL, which is cluster-internal and
 	// unreachable from outside (the agent pod's own callback address).
 	// Needed wherever a URL is handed to something OUTSIDE Teepin's own
 	// network that must fetch it back over the public internet — today,
-	// only the signed image-attachment URLs Kumbha embeds in a message
-	// sent to an external LLM provider (see CreateKumbhaAttachment).
+	// only the signed image-attachment URLs Teepin Build embeds in a message
+	// sent to an external LLM provider (see CreateBuildAttachment).
 	// Empty disables attachment uploads outright rather than minting a
 	// URL nothing outside the cluster could ever actually fetch.
 	publicBaseURL string
@@ -242,44 +242,44 @@ func (s *Server) WithExecTickets(tickets *cluster.TicketStore) *Server {
 	return s
 }
 
-// WithKumbha enables the Kumbha Gateway endpoints. Returns the same
+// WithBuild enables the Teepin Build Gateway endpoints. Returns the same
 // *Server for chaining, so existing NewServer call sites compile
-// unchanged — a server built without this call keeps every Kumbha
+// unchanged — a server built without this call keeps every Teepin Build
 // endpoint returning 404, same as execTickets when home compute is off.
-func (s *Server) WithKumbha(gw *kumbha.Gateway) *Server {
-	s.kumbha = gw
+func (s *Server) WithBuild(gw *teepinbuild.Gateway) *Server {
+	s.teepinBuild = gw
 	return s
 }
 
-// WithKumbhaEventTickets enables the event-relay WebSocket's REST half
+// WithBuildEventTickets enables the event-relay WebSocket's REST half
 // (ticket issuance). Returns the same *Server for chaining. The WebSocket
-// attach half is a separate handler (kumbha.EventsHandler) mounted
+// attach half is a separate handler (teepinbuild.EventsHandler) mounted
 // directly in cmd/api-server/main.go, outside gin's JWT-auth group — same
 // reasoning as WithExecTickets.
-func (s *Server) WithKumbhaEventTickets(tickets *kumbha.EventTicketStore) *Server {
-	s.kumbhaEventTickets = tickets
+func (s *Server) WithBuildEventTickets(tickets *teepinbuild.EventTicketStore) *Server {
+	s.buildEventTickets = tickets
 	return s
 }
 
-// WithKumbhaBuild enables the Kumbha "deploy" verb's build step (Kaniko).
+// WithImageBuilder enables the Teepin Build "deploy" verb's build step (Kaniko).
 // Returns the same *Server for chaining, so existing NewServer call sites
 // compile unchanged — a server built without this call keeps
-// BuildKumbhaSession returning 404.
-func (s *Server) WithKumbhaBuild(b *build.Service) *Server {
-	s.kumbhaBuild = b
+// BuildSessionImage returning 404.
+func (s *Server) WithImageBuilder(b *build.Service) *Server {
+	s.imageBuilder = b
 	return s
 }
 
-// WithGithubStore enables pushing each Kumbha checkpoint to a Teepin-owned
+// WithGithubStore enables pushing each Teepin Build checkpoint to a Teepin-owned
 // GitHub repo (pkg/githubstore). Returns the same *Server for chaining —
 // a server built without this call simply never pushes, same posture as
-// every other optional Kumbha capability.
+// every other optional Teepin Build capability.
 func (s *Server) WithGithubStore(gs GithubStore) *Server {
 	s.githubStore = gs
 	return s
 }
 
-// WithKumbhaBuildImagePullSecret configures how a deployed Kumbha app
+// WithBuiltImagePullSecret configures how a deployed Teepin Build app
 // instance pulls its own just-built image back down from ECR to
 // actually run it — a DIFFERENT credential from the one Kaniko uses to
 // PUSH it (pkg/ecrregistry's DockerConfigJSONForBuild, injected into the
@@ -298,16 +298,16 @@ func (s *Server) WithGithubStore(gs GithubStore) *Server {
 // gap not worth opening for this. Instead, instanceSpec auto-attaches
 // this secret ONLY when the image reference itself starts with
 // registryPrefix — the one, stable, control-plane-owned ECR repository
-// every Kumbha build pushes to (see ecrregistry.Service.ImagePrefix,
+// every Teepin Build build pushes to (see ecrregistry.Service.ImagePrefix,
 // which returns the SAME URI regardless of project) — so which secret
 // gets used is a server-side policy keyed off the image string's own
 // structure, never something a request body can influence. A pull
 // secret name with no registry prefix (or vice versa) is a
 // misconfiguration this treats as "feature disabled" rather than
 // guessing: instanceSpec only attaches when BOTH are non-empty.
-func (s *Server) WithKumbhaBuildImagePullSecret(registryPrefix, secretName string) *Server {
-	s.kumbhaBuildImageRegistryPrefix = registryPrefix
-	s.kumbhaBuildImagePullSecret = secretName
+func (s *Server) WithBuiltImagePullSecret(registryPrefix, secretName string) *Server {
+	s.builtImageRegistryPrefix = registryPrefix
+	s.builtImagePullSecret = secretName
 	return s
 }
 
@@ -342,11 +342,7 @@ func (s *Server) WithEphemeralStorageGB(gb int) *Server {
 // main injects the concrete nodes.Service through a thin adapter. Mirrors the
 // ProvisionGate/PricingProvider pattern.
 type NodePlacer interface {
-	// pCores/eCores are the customer's explicit P-core/E-core preference
-	// (both 0 = no preference — see nodes.PlacementReq's own doc comment).
-	// pCoresUsed/eCoresUsed on return are nil unless the chosen node has a
-	// detected split, matching nodes.Placement's own contract.
-	PlaceCPU(ctx context.Context, arch string, cpuUnits, memoryGB, pCores, eCores int) (nodeName, providerID, nodeArch string, pCoresUsed, eCoresUsed *int, err error)
+	PlaceCPU(ctx context.Context, arch string, cpuUnits, memoryGB int) (nodeName, providerID, nodeArch string, err error)
 	// Error classification so the handler can return the right status.
 	IsNoCapacity(err error) bool
 	IsArchUnavailable(err error) bool
@@ -391,9 +387,6 @@ type homeTarget struct {
 	nodeName   string
 	providerID string
 	arch       string
-	// pCoresUsed/eCoresUsed — see NodePlacer.PlaceCPU's own doc comment.
-	pCoresUsed *int
-	eCoresUsed *int
 }
 
 // NewServer creates a new API server. store, pricing and gate may be nil
@@ -428,7 +421,7 @@ func NewServer(clusterClient cluster.Client, gpuAllocator *gpu.Allocator, store 
 // this platform's constraints. Returns status == 0 and a nil body when
 // every port is valid; otherwise the exact status/body the caller should
 // write via c.JSON and return. Shared by CreateInstance and
-// DeployKumbhaSession's redeploy path (see redeployKumbhaInstance) so a
+// DeployBuildSession's redeploy path (see redeployBuildInstance) so a
 // redeploy cannot bypass validation an initial create would have enforced
 // merely by taking a different code path.
 func validatePorts(ports []models.PortMapping) (status int, body gin.H) {
@@ -494,6 +487,46 @@ func scopeFor(projectID uuid.UUID) cluster.Scope {
 		return cluster.AllTenants()
 	}
 	return cluster.ProjectScope(projectID.String())
+}
+
+// computePricer prices an instance's hourly cost from the live compute rates.
+// Implemented by billing.Service; optional, so a Server without one (or a test
+// double) simply quotes no CPU price.
+type computePricer interface {
+	ComputeHourlyPricer(ctx context.Context) func(gpuVRAMGB, cpuUnits, memoryGB, storageGB int) float64
+}
+
+// cpuHourlyPrice is what a CPU instance of this size costs per hour, as billed
+// (cores, memory and disk), or 0 when pricing is unavailable or not yet set.
+func (s *Server) cpuHourlyPrice(ctx context.Context, cpuUnits, memoryGB, storageGB int) float64 {
+	if p, ok := s.pricing.(computePricer); ok && p != nil {
+		return p.ComputeHourlyPricer(ctx)(0, cpuUnits, memoryGB, storageGB)
+	}
+	return 0
+}
+
+// cpuQuoter returns a function that fills in the hourly price of a CPU
+// instance's view from its stored record: what it costs per hour right now, as
+// billed. A running (or starting) instance is quoted for cores, memory and disk;
+// a stopped one only for its disk, which is all it is billed while stopped. A GPU
+// instance keeps the VRAM price statusToInstance already set. The rates are read
+// once per quoter, so pricing a list of fifty instances costs one set of reads.
+func (s *Server) cpuQuoter(ctx context.Context) func(inst *models.Instance, rec *compute.InstanceRecord) {
+	p, ok := s.pricing.(computePricer)
+	if !ok || p == nil {
+		return func(*models.Instance, *compute.InstanceRecord) {}
+	}
+	price := p.ComputeHourlyPricer(ctx)
+	return func(inst *models.Instance, rec *compute.InstanceRecord) {
+		if rec == nil || rec.GPUVRAMGB > 0 {
+			return
+		}
+		if rec.Status == compute.StatusStopped {
+			inst.PricePerHour = price(0, 0, 0, rec.StorageGB)
+			return
+		}
+		inst.PricePerHour = price(0, rec.CPUUnits, rec.MemoryGB, rec.StorageGB)
+	}
 }
 
 // vramRate returns the current platform GPU rate ($/GB-hour). Read on
@@ -608,17 +641,17 @@ func (s *Server) CreateInstance(c *gin.Context) {
 		return
 	}
 	userID, _ := auth.GetUserID(c)
-	// Present only on a Kumbha session-scoped credential (auth.MintSessionToken)
+	// Present only on a Teepin Build session-scoped credential (auth.MintSessionToken)
 	// — a human/API-key request never carries this claim, so it stays
-	// uuid.Nil and record.KumbhaSessionID below is written as SQL NULL
-	// (see nullUUID). This is what lets every instance a Kumbha agent
+	// uuid.Nil and record.BuildSessionID below is written as SQL NULL
+	// (see nullUUID). This is what lets every instance a Teepin Build agent
 	// creates via create_instance be traced back to its session, closing
 	// the gap that let two untracked instances come out of one build
 	// (found live 2026-08-30/31 — see migration 032's own doc comment).
-	kumbhaSessionID, _ := auth.GetSessionID(c)
+	buildSessionID, _ := auth.GetSessionID(c)
 
-	// A Kumbha session that already has a deployed app instance must
-	// redeploy it (the "deploy" MCP tool, redeployKumbhaInstance) rather
+	// A Teepin Build session that already has a deployed app instance must
+	// redeploy it (the "deploy" MCP tool, redeployBuildInstance) rather
 	// than create a second one via this endpoint directly. Enforced here,
 	// server-side, not left to the agent's own good judgment or the MCP
 	// tool description alone — same "never trusted from the agent process
@@ -630,20 +663,20 @@ func (s *Server) CreateInstance(c *gin.Context) {
 	// customer asked for or knew to look for. A same-session self-inflicted
 	// double-instance situation like that must be structurally impossible,
 	// not just something an agent is trusted to avoid.
-	if s.kumbha != nil && kumbhaSessionID != uuid.Nil {
-		sess, err := s.kumbha.GetSession(c.Request.Context(), kumbhaSessionID, accountID)
+	if s.teepinBuild != nil && buildSessionID != uuid.Nil {
+		sess, err := s.teepinBuild.GetSession(c.Request.Context(), buildSessionID, accountID)
 		// Real spend needs the customer's approval, enforced here and not
 		// only in the MCP tool: the token that reaches this endpoint is
 		// readable by the agent's own terminal, so a client-side check in
 		// teepin-mcp-server can be skipped by calling the API directly. Same
-		// gate BuildKumbhaSession/DeployKumbhaSession use.
+		// gate BuildSessionImage/DeployBuildSession use.
 		//
 		// Fails CLOSED. This used to degrade to "allow" on a lookup error,
 		// which was harmless while the check only prevented a duplicate
 		// instance; now that it is the approval gate, an unreadable session
 		// must deny rather than hand out real spend on a database blip.
 		if err != nil {
-			log.Printf("api: could not read Kumbha session %s to check approval: %v", kumbhaSessionID, err)
+			log.Printf("api: could not read Teepin Build session %s to check approval: %v", buildSessionID, err)
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "unable to verify the deployment approval, please retry"})
 			return
 		}
@@ -663,7 +696,7 @@ func (s *Server) CreateInstance(c *gin.Context) {
 		}
 		// What the agent asks for must be covered by the plan the customer
 		// approved, not merely by "some plan was approved".
-		if !s.refuseUnapprovedResources(c, kumbhaSessionID, req.CPUUnits, parseMemoryGB(req.Memory), req.StorageGB) {
+		if !s.refuseUnapprovedResources(c, buildSessionID, req.CPUUnits, parseMemoryGB(req.Memory), req.StorageGB) {
 			return
 		}
 
@@ -671,9 +704,9 @@ func (s *Server) CreateInstance(c *gin.Context) {
 		// environment here, on the control plane: the agent never held their
 		// values. Done before any allocation so a failure to load them
 		// cannot leave anything reserved.
-		mergedEnv, err := s.withKumbhaSecrets(c.Request.Context(), kumbhaSessionID, accountID, req.Env)
+		mergedEnv, err := s.withBuildSecrets(c.Request.Context(), buildSessionID, accountID, req.Env)
 		if err != nil {
-			log.Printf("api: could not load saved secrets for Kumbha session %s: %v", kumbhaSessionID, err)
+			log.Printf("api: could not load saved secrets for Teepin Build session %s: %v", buildSessionID, err)
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not load the app's saved secrets, please retry"})
 			return
 		}
@@ -707,7 +740,7 @@ func (s *Server) CreateInstance(c *gin.Context) {
 	// The customer-facing instance ID is random; the endpoint UUID that
 	// names its Service/Ingress/TLS resources is deterministically derived
 	// FROM it (see endpointUUIDFor) rather than minted separately — that
-	// is what lets a later Kumbha redeploy (DeployKumbhaSession) recompute
+	// is what lets a later Teepin Build redeploy (DeployBuildSession) recompute
 	// the exact same value the original create used, with nothing to
 	// persist or look up, so its endpoint-provisioning call lands on the
 	// SAME already-existing Service/Ingress instead of creating a second,
@@ -734,13 +767,13 @@ func (s *Server) CreateInstance(c *gin.Context) {
 		// Project-level on-demand policy. Checked here, not earlier: this
 		// is specifically about NEW home placement decisions, so it must
 		// never block a redeploy that only threads through an
-		// already-established placement (see redeployKumbhaInstance's own
+		// already-established placement (see redeployBuildInstance's own
 		// existing.ProviderID != "" branch, which never reaches this
 		// handler at all) — turning this off must only affect where a
 		// customer's NEXT instance can land, never an already-running one.
-		// Kumbha's own first-deploy path reaches this same check for free:
+		// Teepin Build's own first-deploy path reaches this same check for free:
 		// it creates its instance through this exact handler (see
-		// DeployKumbhaSession's invokeInternally(s.CreateInstance, ...)),
+		// DeployBuildSession's invokeInternally(s.CreateInstance, ...)),
 		// so there is deliberately only ONE enforcement point for both
 		// surfaces, not two that could drift out of sync.
 		if s.projectPolicy != nil {
@@ -749,7 +782,7 @@ func (s *Server) CreateInstance(c *gin.Context) {
 				// A policy-lookup failure is not a reason to block a
 				// create outright — fails OPEN, same posture as every
 				// other best-effort project-level check in this file
-				// (e.g. the Kumbha double-instance guard above).
+				// (e.g. the Teepin Build double-instance guard above).
 				log.Printf("WARN: could not check on-demand policy for project %s: %v — allowing", projectID, err)
 			} else if !allowed {
 				c.JSON(http.StatusServiceUnavailable, gin.H{
@@ -763,8 +796,8 @@ func (s *Server) CreateInstance(c *gin.Context) {
 		// tier's cpu_units and memory). Placement refuses a node that cannot
 		// fit this size.
 		reqMemGB := parseMemoryGB(req.Memory)
-		nodeName, providerID, nodeArch, pCoresUsed, eCoresUsed, err := s.nodePlacer.PlaceCPU(
-			c.Request.Context(), req.Arch, req.CPUUnits, reqMemGB, req.PCores, req.ECores)
+		nodeName, providerID, nodeArch, err := s.nodePlacer.PlaceCPU(
+			c.Request.Context(), req.Arch, req.CPUUnits, reqMemGB)
 		if err != nil {
 			switch {
 			case s.nodePlacer.IsArchUnavailable(err):
@@ -781,7 +814,6 @@ func (s *Server) CreateInstance(c *gin.Context) {
 		}
 		homePlacement = &homeTarget{
 			nodeName: nodeName, providerID: providerID, arch: nodeArch,
-			pCoresUsed: pCoresUsed, eCoresUsed: eCoresUsed,
 		}
 	}
 
@@ -840,7 +872,7 @@ func (s *Server) CreateInstance(c *gin.Context) {
 		spec.NodeName = homePlacement.nodeName
 		spec.ProviderID = homePlacement.providerID
 	}
-	// Kumbha's own build pipeline tags every image within one session with
+	// Teepin Build's own build pipeline tags every image within one session with
 	// the SAME tag (the session ID prefix — see build.Service/Kaniko's own
 	// destination), not a content hash or version number, so "same tag,
 	// different content" is a routine, expected situation for these
@@ -850,7 +882,7 @@ func (s *Server) CreateInstance(c *gin.Context) {
 	// (spec.AlwaysPullImage unset — see cluster.DirectClient's own pod
 	// spec), so without this, a node that already pulled this tag once
 	// silently reuses the stale, cached image on every later
-	// redeploy — the exact same risk the Kumbha agent/screenshot pods
+	// redeploy — the exact same risk the Teepin Build agent/screenshot pods
 	// already guard against (see LaunchAgent/CaptureScreenshot's own
 	// AlwaysPullImage: true and doc comments), just never extended to the
 	// customer-facing app instance itself. Found live 2026-09-01: a
@@ -858,7 +890,7 @@ func (s *Server) CreateInstance(c *gin.Context) {
 	// live site kept serving the previous version indefinitely, with no
 	// error anywhere — the new pod started fine, it just never had the
 	// new content.
-	if kumbhaSessionID != uuid.Nil {
+	if buildSessionID != uuid.Nil {
 		spec.AlwaysPullImage = true
 	}
 
@@ -898,18 +930,18 @@ func (s *Server) CreateInstance(c *gin.Context) {
 	// the workload must not keep running unbilled: roll back.
 	if s.store != nil {
 		record := &compute.InstanceRecord{
-			ID:              instanceID,
-			AccountID:       accountID,
-			ProjectID:       projectID,
-			UserID:          userID,
-			KumbhaSessionID: kumbhaSessionID,
-			Name:            req.Name,
-			Image:           req.Image,
-			Status:          compute.StatusPending,
-			CPUUnits:        req.CPUUnits,
-			MemoryGB:        parseMemoryGB(req.Memory),
-			K8sPodName:      result.PodName,
-			K8sNamespace:    "default",
+			ID:             instanceID,
+			AccountID:      accountID,
+			ProjectID:      projectID,
+			UserID:         userID,
+			BuildSessionID: buildSessionID,
+			Name:           req.Name,
+			Image:          req.Image,
+			Status:         compute.StatusPending,
+			CPUUnits:       req.CPUUnits,
+			MemoryGB:       parseMemoryGB(req.Memory),
+			K8sPodName:     result.PodName,
+			K8sNamespace:   "default",
 		}
 		if allocation != nil {
 			record.InstanceType = allocation.InstanceType
@@ -921,8 +953,6 @@ func (s *Server) CreateInstance(c *gin.Context) {
 			record.ProviderID = homePlacement.providerID
 			record.NodeName = homePlacement.nodeName
 			record.InstanceType = "cpu.home"
-			record.PCoresUsed = homePlacement.pCoresUsed
-			record.ECoresUsed = homePlacement.eCoresUsed
 		}
 		record.Endpoint = result.EndpointURL
 		record.DNSName = result.DNSName
@@ -956,9 +986,9 @@ func (s *Server) CreateInstance(c *gin.Context) {
 		// can be stopped-and-held rather than deleted if credit runs out.
 		s.persistLaunchSpec(c.Request.Context(), instanceID, spec)
 
-		// A Kumbha session that just provisioned REAL infrastructure needs
+		// A Teepin Build session that just provisioned REAL infrastructure needs
 		// its current workspace draft checkpointed — the same thing
-		// DeployKumbhaSession already does after its own create call, but
+		// DeployBuildSession already does after its own create call, but
 		// this one covers every OTHER way a session-scoped credential can
 		// reach here (create_instance's MCP tool being the live example:
 		// used as a workaround when `deploy` was erroring, it left a real,
@@ -969,9 +999,9 @@ func (s *Server) CreateInstance(c *gin.Context) {
 		// the instance is real either way; only the console's history
 		// view would be short one entry if this fails, not worth undoing
 		// a successful create over.
-		if s.kumbha != nil && kumbhaSessionID != uuid.Nil {
-			if err := s.kumbha.CheckpointWorkspace(c.Request.Context(), kumbhaSessionID); err != nil {
-				log.Printf("WARN: instance %s created for Kumbha session %s but failed to checkpoint its workspace: %v", instanceID, kumbhaSessionID, err)
+		if s.teepinBuild != nil && buildSessionID != uuid.Nil {
+			if err := s.teepinBuild.CheckpointWorkspace(c.Request.Context(), buildSessionID); err != nil {
+				log.Printf("WARN: instance %s created for Teepin Build session %s but failed to checkpoint its workspace: %v", instanceID, buildSessionID, err)
 			}
 		}
 	}
@@ -1023,6 +1053,11 @@ func (s *Server) CreateInstance(c *gin.Context) {
 			instance.StorageWarning = homeStorageWarning
 		}
 	}
+	if allocation == nil {
+		// A CPU instance: quoted at the same rate it will be billed at (a GPU
+		// allocation was priced above).
+		instance.PricePerHour = s.cpuHourlyPrice(c.Request.Context(), req.CPUUnits, parseMemoryGB(req.Memory), req.StorageGB)
+	}
 
 	c.JSON(http.StatusCreated, instance)
 }
@@ -1053,17 +1088,20 @@ func (s *Server) ListInstances(c *gin.Context) {
 	records := s.recordsByID(c.Request.Context(), accountID, projectID)
 
 	rate := s.vramRate(c.Request.Context())
+	quote := s.cpuQuoter(c.Request.Context())
 	instances := make([]models.Instance, 0, len(statuses))
 	seen := make(map[string]bool, len(statuses))
 	for _, st := range statuses {
 		seen[st.InstanceID] = true
-		instances = append(instances, statusToInstance(st, records[st.InstanceID], rate, s.endpointDomain))
+		inst := statusToInstance(st, records[st.InstanceID], rate, s.endpointDomain)
+		quote(&inst, records[st.InstanceID])
+		instances = append(instances, inst)
 	}
 	// Stopped instances have no pod, so the cluster does not list them; they
 	// still exist (their disk is kept) and the customer must see them.
 	for id, rec := range records {
 		if !seen[id] && rec.Status == compute.StatusStopped && rec.TerminatedAt == nil {
-			instances = append(instances, s.stoppedView(c.Request.Context(), rec))
+			instances = append(instances, s.stoppedView(c.Request.Context(), rec, quote))
 		}
 	}
 
@@ -1113,7 +1151,7 @@ func (s *Server) GetInstance(c *gin.Context) {
 
 	// A stopped instance has no pod to ask the cluster about.
 	if rec := s.stoppedRecord(c.Request.Context(), projectID, instanceID); rec != nil {
-		c.JSON(http.StatusOK, s.stoppedView(c.Request.Context(), rec))
+		c.JSON(http.StatusOK, s.stoppedView(c.Request.Context(), rec, nil))
 		return
 	}
 
@@ -1140,7 +1178,9 @@ func (s *Server) GetInstance(c *gin.Context) {
 		record, _ = s.store.Get(c.Request.Context(), instanceID)
 	}
 
-	c.JSON(http.StatusOK, statusToInstance(*st, record, s.vramRate(c.Request.Context()), s.endpointDomain))
+	view := statusToInstance(*st, record, s.vramRate(c.Request.Context()), s.endpointDomain)
+	s.cpuQuoter(c.Request.Context())(&view, record)
+	c.JSON(http.StatusOK, view)
 }
 
 // DeleteInstance deletes an instance. Scoped to the caller's project:
@@ -1385,7 +1425,7 @@ var endpointUUIDNamespace = uuid.MustParse("6f6e8e2e-2f0a-4b8a-9b0f-2c6a2e7c9d1a
 // generateServiceName/generateIngressName) from its stable, customer-
 // facing instance ID — see the CreateInstance call site's own comment for
 // why this must be a pure function of instanceID rather than a randomly
-// minted value: a Kumbha redeploy (DeployKumbhaSession) swaps an
+// minted value: a Teepin Build redeploy (DeployBuildSession) swaps an
 // instance's pod in place under the SAME instanceID and needs to hand
 // UpdateInstance the identical endpoint UUID the original create used, or
 // endpoint provisioning (IsAlreadyExists-tolerant only when the name
@@ -1446,19 +1486,19 @@ func (s *Server) instanceSpec(instanceID string, instanceUUID, projectID, accoun
 	// is standard across most official images (postgres, redis, mysql,
 	// and more) — the "drop ALL capabilities" policy added 2026-08-22
 	// was breaking basic usability for ordinary, non-malicious images,
-	// not just an edge case. Deliberately NOT applied to the Kumbha
+	// not just an edge case. Deliberately NOT applied to the Teepin Build
 	// agent pod itself (LaunchAgent, agent.go) — that workload has no
 	// legitimate need for it, and stays on the fully locked-down default.
 	spec.AllowFilesystemOwnershipChanges = true
 
-	// Auto-attach the Kumbha build registry's pull secret ONLY for an
+	// Auto-attach the Teepin Build build registry's pull secret ONLY for an
 	// image that actually came from there — see
-	// WithKumbhaBuildImagePullSecret's own doc comment for why this is
+	// WithBuiltImagePullSecret's own doc comment for why this is
 	// keyed off the image string itself rather than a customer-settable
 	// field.
-	if s.kumbhaBuildImagePullSecret != "" && s.kumbhaBuildImageRegistryPrefix != "" &&
-		strings.HasPrefix(req.Image, s.kumbhaBuildImageRegistryPrefix) {
-		spec.ImagePullSecret = s.kumbhaBuildImagePullSecret
+	if s.builtImagePullSecret != "" && s.builtImageRegistryPrefix != "" &&
+		strings.HasPrefix(req.Image, s.builtImageRegistryPrefix) {
+		spec.ImagePullSecret = s.builtImagePullSecret
 	}
 
 	if projectID != uuid.Nil {
@@ -1541,13 +1581,13 @@ func statusToInstance(st cluster.InstanceStatus, record *compute.InstanceRecord,
 
 	instance.Name = record.Name
 	instance.Image = record.Image
-	// A Kumbha-built image is Teepin's own internal build artifact — the
+	// A Teepin Build-built image is Teepin's own internal build artifact — the
 	// customer never chose it or interacts with the registry — so it gets
-	// the same redaction the Kumbha-specific endpoints already apply (see
+	// the same redaction the Teepin Build-specific endpoints already apply (see
 	// redactImageRef's own doc comment). A customer's own bring-your-own
 	// image on an ordinary compute instance is legitimately theirs to see
 	// verbatim, so this must stay conditional, not blanket.
-	if record.KumbhaSessionID != uuid.Nil {
+	if record.BuildSessionID != uuid.Nil {
 		instance.Image = redactImageRef(record.Image)
 	}
 	instance.CreatedAt = record.CreatedAt
@@ -1590,12 +1630,12 @@ func statusToInstance(st cluster.InstanceStatus, record *compute.InstanceRecord,
 // genuinely has no endpoint, and deriving one would be a broken link, not
 // a helpful fallback.
 //
-// Pulled out of statusToInstance so GetKumbhaSession's own live-status
+// Pulled out of statusToInstance so GetBuildSession's own live-status
 // enrichment can resolve the SAME endpoint GetInstance would report,
 // rather than trusting cluster.InstanceStatus.EndpointURL directly — that
 // field is only ever populated by DirectClient (statusWithEndpoint);
 // AgentClient's cached status (the actual topology this platform runs in
-// today, home-node placement) never carries it, so a Kumbha deploy's own
+// today, home-node placement) never carries it, so a Teepin Build deploy's own
 // session read came back with a real, running app and an empty endpoint
 // — found live 2026-08-29 against inst-55b4d443, whose
 // /v1/compute/instances/:id response had a working

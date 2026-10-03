@@ -817,7 +817,7 @@ func TestAgentClient_CreateInstance_HidesLabeledPodFromListImmediately(t *testin
 		InstanceID: "kaniko-build-x",
 		ProjectID:  "project-alice",
 		Image:      "gcr.io/kaniko-project/executor:v1.23.2-debug",
-		Labels:     map[string]string{"teepin.io/kumbha-agent": "true"},
+		Labels:     map[string]string{"teepin.io/build-agent": "true"},
 	})
 	if err != nil {
 		t.Fatalf("CreateInstance: %v", err)
@@ -861,7 +861,7 @@ func TestAgentClient_ListInstanceStatuses_HidesByIDPrefixEvenWithoutTheFlag(t *t
 	c := NewAgentClient(registryWith(newFakeAgent(&agentpb.CommandResult{Success: true}).session))
 	c.startedAt = time.Now().Add(-time.Hour) // past statusCacheGracePeriod
 
-	for _, id := range []string{"kumbha-agent-4ab155f0", "kaniko-build-43368ae2", "kumbha-shot-43368ae2"} {
+	for _, id := range []string{"build-agent-4ab155f0", "kaniko-build-43368ae2", "build-shot-43368ae2"} {
 		c.RecordStatus(InstanceStatus{InstanceID: id, Status: "running", ProjectID: "project-alice"})
 	}
 	c.RecordStatus(InstanceStatus{InstanceID: "inst-real0001", Status: "running", ProjectID: "project-alice"})
@@ -926,7 +926,7 @@ func TestAgentClient_ListInstanceStatuses_PartiallyWarmCacheStillUnavailable(t *
 // from the cache during the startup grace period must report
 // ErrClusterUnavailable (ask again later), not ErrNotFound (this
 // instance does not exist) — the two are NOT the same fact, and a caller
-// like redeployKumbhaInstance's provider-recovery path depends on being
+// like redeployBuildInstance's provider-recovery path depends on being
 // able to tell them apart rather than silently treating "hasn't reported
 // back yet" as "nothing to recover".
 func TestAgentClient_GetInstanceStatus_MissingDuringGracePeriodIsUnavailable(t *testing.T) {
@@ -993,7 +993,7 @@ func TestAgentClient_ListInstanceStatuses_EmptyCacheAfterGracePeriodIsTrusted(t 
 // TestAgentClient_RecordStatus_PreservesHiddenAcrossUpdate is the
 // regression test for a live 2026-08-31 incident that directly followed
 // the fix above: making the home-node's own reportStatuses sweep finally
-// include Kaniko/Kumbha-agent pods (so their status could ever reach this
+// include Kaniko/Teepin Build-agent pods (so their status could ever reach this
 // cache at all — see Scope.IncludeHidden) meant RecordStatus started
 // being called for them via a real status push for the first time. The
 // wire message that arrives on that path (agentpb.InstanceStatus, via
@@ -1013,7 +1013,7 @@ func TestAgentClient_RecordStatus_PreservesHiddenAcrossUpdate(t *testing.T) {
 		InstanceID: "kaniko-build-y",
 		ProjectID:  "project-alice",
 		Image:      "gcr.io/kaniko-project/executor:v1.23.2-debug",
-		Labels:     map[string]string{"teepin.io/kumbha-agent": "true"},
+		Labels:     map[string]string{"teepin.io/build-agent": "true"},
 	}); err != nil {
 		t.Fatalf("CreateInstance: %v", err)
 	}

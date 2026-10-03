@@ -98,7 +98,7 @@ func TestPricingIntegration_NoModelGoesLiveWithoutAPrice(t *testing.T) {
 	if err := s.SetAvailability(ctx, route, Availability{OfferedToCustomers: &on}, "it"); !errors.Is(err, ErrPricingRequired) {
 		t.Errorf("offer unpriced: %v", err)
 	}
-	if err := s.SetAvailability(ctx, route, Availability{KumbhaEnabled: &on}, "it"); !errors.Is(err, ErrPricingRequired) {
+	if err := s.SetAvailability(ctx, route, Availability{BuildEnabled: &on}, "it"); !errors.Is(err, ErrPricingRequired) {
 		t.Errorf("add to Teepin Build unpriced: %v", err)
 	}
 	if err := register(t, s, route, true, nil, nil); !errors.Is(err, ErrPricingRequired) {
@@ -112,12 +112,12 @@ func TestPricingIntegration_NoModelGoesLiveWithoutAPrice(t *testing.T) {
 		t.Errorf("enable with only an input price: %v", err)
 	}
 	// (A new row is "offered to customers" by default; it is not live until enabled.)
-	if m := mustGet(t, s, route); m.Enabled || m.KumbhaEnabled {
+	if m := mustGet(t, s, route); m.Enabled || m.BuildEnabled {
 		t.Errorf("a refused change still took effect: %+v", m)
 	}
 
 	// Switching things OFF never needs a price.
-	if err := s.SetAvailability(ctx, route, Availability{OfferedToCustomers: &off, KumbhaEnabled: &off}, "it"); err != nil {
+	if err := s.SetAvailability(ctx, route, Availability{OfferedToCustomers: &off, BuildEnabled: &off}, "it"); err != nil {
 		t.Errorf("switching off needs no price: %v", err)
 	}
 
@@ -128,7 +128,7 @@ func TestPricingIntegration_NoModelGoesLiveWithoutAPrice(t *testing.T) {
 	if err := s.SetEnabled(ctx, route, true, "it"); err != nil {
 		t.Fatalf("enable priced: %v", err)
 	}
-	if err := s.SetAvailability(ctx, route, Availability{OfferedToCustomers: &on, KumbhaEnabled: &on}, "it"); err != nil {
+	if err := s.SetAvailability(ctx, route, Availability{OfferedToCustomers: &on, BuildEnabled: &on}, "it"); err != nil {
 		t.Fatalf("offer priced: %v", err)
 	}
 
@@ -150,7 +150,7 @@ func TestPricingIntegration_NoModelGoesLiveWithoutAPrice(t *testing.T) {
 	if err := s.SetEnabled(ctx, route, false, "it"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetAvailability(ctx, route, Availability{OfferedToCustomers: &off, KumbhaEnabled: &off}, "it"); err != nil {
+	if err := s.SetAvailability(ctx, route, Availability{OfferedToCustomers: &off, BuildEnabled: &off}, "it"); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.SetPricing(ctx, route, 0, 0, "it"); err != nil {
@@ -197,14 +197,14 @@ func TestPricingIntegration_ImageReaderIsItsOwnPricedSwitch(t *testing.T) {
 	if err := register(t, s, route, false, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	if mustGet(t, s, route).KumbhaImageReader {
+	if mustGet(t, s, route).BuildImageReader {
 		t.Fatal("a new model must not be an image reader")
 	}
 	// Unpriced: refused, and nothing changed.
-	if err := s.SetAvailability(ctx, route, Availability{KumbhaImageReader: &on}, "it"); !errors.Is(err, ErrPricingRequired) {
+	if err := s.SetAvailability(ctx, route, Availability{BuildImageReader: &on}, "it"); !errors.Is(err, ErrPricingRequired) {
 		t.Fatalf("image reader on, unpriced: %v, want ErrPricingRequired", err)
 	}
-	if mustGet(t, s, route).KumbhaImageReader {
+	if mustGet(t, s, route).BuildImageReader {
 		t.Fatal("a refused change still took effect")
 	}
 
@@ -212,7 +212,7 @@ func TestPricingIntegration_ImageReaderIsItsOwnPricedSwitch(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Priced but not enabled: the flag can be set, yet the model is not listed as a reader.
-	if err := s.SetAvailability(ctx, route, Availability{KumbhaImageReader: &on}, "it"); err != nil {
+	if err := s.SetAvailability(ctx, route, Availability{BuildImageReader: &on}, "it"); err != nil {
 		t.Fatalf("image reader on, priced: %v", err)
 	}
 	if got := readerRoutes(t, s); contains(got, route) {
@@ -222,8 +222,8 @@ func TestPricingIntegration_ImageReaderIsItsOwnPricedSwitch(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := mustGet(t, s, route)
-	if !m.KumbhaImageReader || m.KumbhaEnabled {
-		t.Fatalf("reader=%v builder=%v: the roles must be independent", m.KumbhaImageReader, m.KumbhaEnabled)
+	if !m.BuildImageReader || m.BuildEnabled {
+		t.Fatalf("reader=%v builder=%v: the roles must be independent", m.BuildImageReader, m.BuildEnabled)
 	}
 	if got := readerRoutes(t, s); !contains(got, route) {
 		t.Fatalf("an enabled reader is not listed: %v", got)
@@ -233,7 +233,7 @@ func TestPricingIntegration_ImageReaderIsItsOwnPricedSwitch(t *testing.T) {
 	}
 
 	// Switching it off needs no price and delists it; the builder flag is untouched.
-	if err := s.SetAvailability(ctx, route, Availability{KumbhaImageReader: &off}, "it"); err != nil {
+	if err := s.SetAvailability(ctx, route, Availability{BuildImageReader: &off}, "it"); err != nil {
 		t.Fatal(err)
 	}
 	if got := readerRoutes(t, s); contains(got, route) {
@@ -252,7 +252,7 @@ func readerRoutes(t *testing.T, s *Service) []string {
 
 func builderRoutes(t *testing.T, s *Service) []string {
 	t.Helper()
-	ms, err := s.ListKumbhaModels(context.Background())
+	ms, err := s.ListBuildModels(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -17,7 +17,7 @@ import (
 
 // fakeCluster is a minimal cluster.Client — records what was created/
 // deleted and returns a scripted sequence of statuses, nothing more.
-// pkg/kumbha has its own equivalent fake; not shared across packages
+// pkg/teepinbuild has its own equivalent fake; not shared across packages
 // since each is small enough that duplicating it costs less than adding
 // a cross-package test-only dependency.
 type fakeCluster struct {
@@ -87,7 +87,7 @@ func (f *fakeCluster) Inventory(context.Context) ([]cluster.NodeInventory, error
 func (f *fakeCluster) InstanceMetrics(context.Context) ([]cluster.InstanceMetric, error) {
 	return nil, nil
 }
-func (f *fakeCluster) Healthy(context.Context) bool                               { return true }
+func (f *fakeCluster) Healthy(context.Context) bool { return true }
 func (f *fakeCluster) ResolveInstanceAddress(context.Context, string, int32) (string, error) {
 	return "", cluster.ErrNotFound
 }
@@ -130,7 +130,7 @@ func TestNewService_PreservesExplicitConfig(t *testing.T) {
 func testRequest() Request {
 	return Request{
 		ProjectID:           uuid.New(),
-		WorkspaceArchiveURL: "http://teepin-api.default.svc.cluster.local:8080/v1/kumbha/sessions/sess1/workspace/archive",
+		WorkspaceArchiveURL: "http://teepin-api.default.svc.cluster.local:8080/v1/build/sessions/sess1/workspace/archive",
 		WorkspaceToken:      "test-fetch-token",
 		DockerfilePath:      "Dockerfile",
 		Tag:                 "sess1",

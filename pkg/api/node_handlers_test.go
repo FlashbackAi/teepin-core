@@ -51,7 +51,7 @@ func newNodeHandlerMock(t *testing.T) (*NodeHandler, sqlmock.Sqlmock, func()) {
 }
 
 // nodeHandlerRequest drives a handler through a real gin.Context, mirroring
-// this package's existing kumbhaRequest helper.
+// this package's existing buildRequest helper.
 func nodeHandlerRequest(handler gin.HandlerFunc, method, path string, params gin.Params) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)
@@ -121,7 +121,7 @@ func TestGetNodeMetrics_Success(t *testing.T) {
 		t.Fatalf("status = %d, want 200, body: %s", w.Code, w.Body.String())
 	}
 	var resp struct {
-		NodeID  uuid.UUID           `json:"node_id"`
+		NodeID  uuid.UUID            `json:"node_id"`
 		Samples []nodes.MetricSample `json:"samples"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {

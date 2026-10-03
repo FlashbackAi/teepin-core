@@ -201,7 +201,7 @@ func TestRunner_HostUtilization_FailedReadDoesNotCorruptBaseline(t *testing.T) {
 
 	r := &Runner{}
 
-	r.hostUtilization()                 // establishes the baseline (call 1)
+	r.hostUtilization()                          // establishes the baseline (call 1)
 	cpuMid, _, _, _, _, _ := r.hostUtilization() // read fails (call 2) — baseline must survive untouched
 	if cpuMid != 0 {
 		t.Errorf("during a failed read, cpuPercent = %v, want 0 (no new data, not corrupted data)", cpuMid)

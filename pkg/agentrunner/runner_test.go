@@ -87,7 +87,7 @@ func (nullCluster) Inventory(context.Context) ([]cluster.NodeInventory, error) {
 func (nullCluster) InstanceMetrics(context.Context) ([]cluster.InstanceMetric, error) {
 	return nil, nil
 }
-func (nullCluster) Healthy(context.Context) bool                               { return true }
+func (nullCluster) Healthy(context.Context) bool { return true }
 func (nullCluster) ResolveInstanceAddress(context.Context, string, int32) (string, error) {
 	return "", cluster.ErrNotFound
 }
@@ -331,7 +331,7 @@ func TestHandleCreate_DecodesInitContainer(t *testing.T) {
 }
 
 // TestHandleCreate_ReplaceExistingRoutesToUpdateInstance is the regression
-// test for the actual point of replace_existing: a Kumbha redeploy's
+// test for the actual point of replace_existing: a Teepin Build redeploy's
 // instance ID ALREADY exists by construction (that's why it's a replace,
 // not a create), so the ordinary "instance already exists -> treat
 // redelivery as success, do nothing" idempotency check (see the comment
@@ -380,7 +380,7 @@ func TestHandleCreate_OrdinaryCreateStillShortCircuitsOnExisting(t *testing.T) {
 }
 
 // TestHandleCreate_FallsThroughWhenExistingIsTerminated is the regression
-// test for a real 2026-09-01 incident: a Kumbha agent pod is one-shot by
+// test for a real 2026-09-01 incident: a Teepin Build agent pod is one-shot by
 // design (NeverRestart — it exits on purpose when its run finishes) and a
 // completed bare Pod is never garbage-collected by Kubernetes on its own,
 // so it keeps matching cmd.InstanceId's label selector indefinitely. The
@@ -392,13 +392,13 @@ func TestHandleCreate_OrdinaryCreateStillShortCircuitsOnExisting(t *testing.T) {
 // message sat queued with nothing left running to read it. A terminated
 // (or failed) existing pod must fall through to an actual create.
 func TestHandleCreate_FallsThroughWhenExistingIsTerminated(t *testing.T) {
-	fc := &capturingCluster{existingStatus: &cluster.InstanceStatus{Status: "terminated", PodName: "kumbha-agent-old-pod"}}
+	fc := &capturingCluster{existingStatus: &cluster.InstanceStatus{Status: "terminated", PodName: "build-agent-old-pod"}}
 	r := New(Config{ProviderID: "test-provider", Cluster: fc})
 	s := newStubStream()
 
 	r.handleCreate(context.Background(), s, "req-1", &agentpb.CreateInstanceCommand{
-		InstanceId: "kumbha-agent-43368ae2",
-		Image:      "kumbha-agent:v1",
+		InstanceId: "build-agent-43368ae2",
+		Image:      "build-agent:v1",
 	})
 
 	if !fc.calledCreate {

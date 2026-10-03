@@ -1,7 +1,7 @@
 // Copyright 2026 TEEPIN Project
 // Licensed under the Apache License, Version 2.0
 
-// Package build turns a Kumbha session's current workspace version into a
+// Package build turns a Teepin Build session's current workspace version into a
 // pushed container image — the piece that lets the `deploy` MCP verb and
 // the console IDE's Deploy button actually deploy something.
 //
@@ -60,14 +60,14 @@ type RegistryProvider interface {
 	// ImageAuth returns the same credential DockerConfigJSONForBuild
 	// wraps into a .dockerconfigjson, as a plain (username, password)
 	// pair — for a caller that wants to authenticate a registry client
-	// directly (see DeployKumbhaSession's use of pkg/imageinfo to
+	// directly (see DeployBuildSession's use of pkg/imageinfo to
 	// resolve a just-pushed image's own declared ports) rather than
 	// write a Kaniko config file.
 	ImageAuth(ctx context.Context, projectID uuid.UUID) (username, password string, err error)
 }
 
 // Config is the operator-fixed policy every build runs under — not
-// customer-selectable, matching the Kumbha agent's own AgentConfig.
+// customer-selectable, matching the Teepin Build agent's own AgentConfig.
 type Config struct {
 	// KanikoImage must be a "debug" (BusyBox-shell) variant — the plain
 	// distroless executor image has no shell, no wget, nothing but the
@@ -95,11 +95,11 @@ type Config struct {
 // hiddenFromComputeListLabel marks a pod as Teepin's own workload rather
 // than a customer-managed compute instance — pkg/cluster's managedSelector
 // (the query behind ListInstances) excludes anything carrying it. MUST
-// match pkg/cluster's own labelKumbhaAgent and pkg/kumbha's own
+// match pkg/cluster's own labelBuildAgent and pkg/teepinbuild's own
 // agentLabel exactly (duplicated rather than imported: pkg/cluster
 // cannot depend on pkg/build, and this package intentionally has no
-// dependency on pkg/kumbha either — see the string's own history at
-// pkg/cluster/direct.go's labelKumbhaAgent for why this label predates
+// dependency on pkg/teepinbuild either — see the string's own history at
+// pkg/cluster/direct.go's labelBuildAgent for why this label predates
 // and is broader than its name suggests).
 //
 // Found live 2026-08-29: a Kaniko build pod (kaniko-build-<session>) had
@@ -107,7 +107,10 @@ type Config struct {
 // wrongly, since it is Teepin's own build tooling, not something the
 // customer created or can meaningfully manage (it always finishes and
 // self-terminates within the build timeout).
-const hiddenFromComputeListLabel = "teepin.io/kumbha-agent"
+const hiddenFromComputeListLabel = "teepin.io/build-agent"
+
+// legacyHiddenLabel is the label's former name, kept until every node and pod carries the new one (ROADMAP: Teepin Build rename).
+const legacyHiddenLabel = "teepin.io/kumbha-agent"
 
 // DefaultConfig is used wherever an operator has not overridden a field —
 // see NewService.
@@ -121,7 +124,7 @@ func DefaultConfig() Config {
 	}
 }
 
-// Service runs Kaniko builds of a Kumbha session's current workspace
+// Service runs Kaniko builds of a Teepin Build session's current workspace
 // version, through cluster.Client — the same transport-neutral interface
 // LaunchAgent/CreateInstance/DeleteInstance already use, so this package
 // works identically whether the control plane is in direct or agent
@@ -162,11 +165,11 @@ type Request struct {
 	ProjectID   uuid.UUID
 	ProjectName string
 	// WorkspaceArchiveURL and WorkspaceToken locate and authorise a GET of
-	// the session's CURRENT workspace version (pkg/kumbha/gateway.go's
+	// the session's CURRENT workspace version (pkg/teepinbuild/gateway.go's
 	// MintWorkspaceFetchToken) — fetched and unpacked by the build
 	// container's own entrypoint script before it invokes kaniko, so a
 	// customer's IDE edit or a version rollback (both of which only ever
-	// change what pkg/kumbha/workspace.go considers "current", never
+	// change what pkg/teepinbuild/workspace.go considers "current", never
 	// anything a Kubernetes volume could already hold) is what actually
 	// gets built.
 	WorkspaceArchiveURL string
@@ -205,7 +208,7 @@ func buildInstanceID(tag string) string {
 // ImageAuth exposes the registry credential a just-built image was
 // pushed with — see RegistryProvider.ImageAuth's own doc comment. A
 // thin delegation so a caller holding only this exported *Service (e.g.
-// pkg/api.DeployKumbhaSession) does not need its own reference to the
+// pkg/api.DeployBuildSession) does not need its own reference to the
 // unexported registry field.
 func (s *Service) ImageAuth(ctx context.Context, projectID uuid.UUID) (username, password string, err error) {
 	return s.registry.ImageAuth(ctx, projectID)
@@ -434,7 +437,7 @@ exec /kaniko/executor --dockerfile="$TEEPIN_DOCKERFILE_PATH" --context=dir:///wo
 		Args:       []string{script},
 		// See hiddenFromComputeListLabel's own doc comment: this is
 		// Teepin's own build tooling, not a customer-managed instance.
-		Labels: map[string]string{hiddenFromComputeListLabel: "true"},
+		Labels: map[string]string{hiddenFromComputeListLabel: "true", legacyHiddenLabel: "true"},
 		Env: map[string]string{
 			"TEEPIN_TOKEN":           req.WorkspaceToken,
 			"TEEPIN_ARCHIVE_URL":     req.WorkspaceArchiveURL,
@@ -449,7 +452,7 @@ exec /kaniko/executor --dockerfile="$TEEPIN_DOCKERFILE_PATH" --context=dir:///wo
 		// re-run the entire build from scratch on any exit, success or
 		// failure alike — the exact "silently re-ran the whole build"
 		// class of incident InstanceSpec.NeverRestart's own doc comment
-		// already documents from the Kumbha agent pod's history.
+		// already documents from the Teepin Build agent pod's history.
 		NeverRestart: true,
 		// Kaniko must chown/chmod arbitrary files it does not own while
 		// unpacking a base image's layers — see the field's own doc

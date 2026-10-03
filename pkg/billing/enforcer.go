@@ -335,7 +335,6 @@ func (e *CreditEnforcer) runningInstances(ctx context.Context) ([]billableInstan
 		SELECT i.id, i.account_id, i.project_id, COALESCE(i.instance_type_id, ''),
 		       COALESCE(i.gpu_vram_gb, 0), COALESCE(i.cpu_units, 0),
 		       COALESCE(i.memory_gb, 0), COALESCE(i.storage_gb, 0),
-		       i.p_cores_used, i.e_cores_used,
 		       i.created_at, i.terminated_at,
 		       GREATEST(COALESCE(b.last_end, i.created_at), COALESCE(i.resumed_at, i.created_at))
 		FROM compute.instances i
@@ -357,7 +356,6 @@ func (e *CreditEnforcer) runningInstances(ctx context.Context) ([]billableInstan
 		var through time.Time
 		if err := rows.Scan(&inst.ID, &inst.AccountID, &inst.ProjectID, &inst.InstanceType,
 			&inst.GPUVRAMGB, &inst.CPUUnits, &inst.MemoryGB, &inst.StorageGB,
-			&inst.PCoresUsed, &inst.ECoresUsed,
 			&inst.CreatedAt, &inst.TerminatedAt, &through); err != nil {
 			return nil, nil, fmt.Errorf("scan failed: %w", err)
 		}

@@ -23,11 +23,11 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/email"
 	"github.com/FlashbackAi/teepin-core/pkg/inference"
 	"github.com/FlashbackAi/teepin-core/pkg/inferencegateway"
-	"github.com/FlashbackAi/teepin-core/pkg/kumbha"
 	"github.com/FlashbackAi/teepin-core/pkg/modelcatalog"
 	"github.com/FlashbackAi/teepin-core/pkg/modelprobe"
 	"github.com/FlashbackAi/teepin-core/pkg/nodes"
 	"github.com/FlashbackAi/teepin-core/pkg/payments"
+	"github.com/FlashbackAi/teepin-core/pkg/teepinbuild"
 )
 
 // The two adapters below translate between the concrete *payments.Client
@@ -187,8 +187,6 @@ func (a *nodeReporterAdapter) ReportSeen(seen cluster.NodeSeen) {
 			MemoryGB:         seen.MemoryGB,
 			OS:               seen.OS,
 			Arch:             seen.Arch,
-			PCores:           seen.PCores,
-			ECores:           seen.ECores,
 			GPUModel:         seen.GPUModel,
 			GPUCount:         seen.GPUCount,
 			MIGCapable:       seen.MIGCapable,
@@ -250,14 +248,12 @@ func newNodePlacerAdapter(svc *nodes.Service) *nodePlacerAdapter {
 	return &nodePlacerAdapter{svc: svc}
 }
 
-func (a *nodePlacerAdapter) PlaceCPU(ctx context.Context, arch string, cpuUnits, memoryGB, pCores, eCores int) (string, string, string, *int, *int, error) {
-	p, err := a.svc.PlaceCPU(ctx, nodes.PlacementReq{
-		Arch: arch, CPUUnits: cpuUnits, MemoryGB: memoryGB, PCores: pCores, ECores: eCores,
-	})
+func (a *nodePlacerAdapter) PlaceCPU(ctx context.Context, arch string, cpuUnits, memoryGB int) (string, string, string, error) {
+	p, err := a.svc.PlaceCPU(ctx, nodes.PlacementReq{Arch: arch, CPUUnits: cpuUnits, MemoryGB: memoryGB})
 	if err != nil {
-		return "", "", "", nil, nil, err
+		return "", "", "", err
 	}
-	return p.NodeName, p.ProviderID, p.Arch, p.PCoresUsed, p.ECoresUsed, nil
+	return p.NodeName, p.ProviderID, p.Arch, nil
 }
 
 func (a *nodePlacerAdapter) IsNoCapacity(err error) bool {
@@ -275,9 +271,9 @@ func (a *nodePlacerAdapter) IsInsufficientCapacity(err error) bool {
 // hiddenWorkloadAdapter makes cluster.Client satisfy
 // nodes.HiddenWorkloadCounter — see that interface's own doc comment for
 // why this exists. Knows the fixed CPU/memory footprint of each of
-// Teepin's three internal pod types (Kumbha agent, its screenshot-capture
+// Teepin's three internal pod types (Teepin Build agent, its screenshot-capture
 // pod, Kaniko builds) via their exported name-prefix constants, so
-// pkg/nodes never needs to import pkg/kumbha or pkg/build just to
+// pkg/nodes never needs to import pkg/teepinbuild or pkg/build just to
 // recognise one.
 type hiddenWorkloadAdapter struct {
 	cluster                        cluster.Client
@@ -291,8 +287,8 @@ func newHiddenWorkloadAdapter(c cluster.Client, agentCPU, agentMemGB, buildCPU, 
 		cluster:         c,
 		agentCPU:        agentCPU,
 		agentMemGB:      agentMemGB,
-		screenshotCPU:   kumbha.ScreenshotCPUUnits,
-		screenshotMemGB: kumbha.ScreenshotMemoryGB,
+		screenshotCPU:   teepinbuild.ScreenshotCPUUnits,
+		screenshotMemGB: teepinbuild.ScreenshotMemoryGB,
 		buildCPU:        buildCPU,
 		buildMemGB:      buildMemGB,
 	}
@@ -322,9 +318,9 @@ func (a *hiddenWorkloadAdapter) HiddenUsageByNode(ctx context.Context) (map[stri
 		switch {
 		case strings.HasPrefix(st.PodName, build.PodNamePrefix):
 			cpu, mem = a.buildCPU, a.buildMemGB
-		case strings.HasPrefix(st.PodName, kumbha.ScreenshotPodNamePrefix):
+		case strings.HasPrefix(st.PodName, teepinbuild.ScreenshotPodNamePrefix):
 			cpu, mem = a.screenshotCPU, a.screenshotMemGB
-		case strings.HasPrefix(st.PodName, kumbha.AgentPodNamePrefix):
+		case strings.HasPrefix(st.PodName, teepinbuild.AgentPodNamePrefix):
 			cpu, mem = a.agentCPU, a.agentMemGB
 		default:
 			// An unrecognised hidden pod (a future addition this adapter
@@ -340,11 +336,11 @@ func (a *hiddenWorkloadAdapter) HiddenUsageByNode(ctx context.Context) (map[stri
 	return out, nil
 }
 
-// kumbhaModelBackend makes the model catalog plus Teepin Inference's gateway
-// satisfy kumbha.ModelBackend: Kumbha's completions are served exactly like
+// buildModelBackend makes the model catalog plus Teepin Inference's gateway
+// satisfy teepinbuild.ModelBackend: Teepin Build's completions are served exactly like
 // a customer's own API call, from whichever catalog models are enabled for
-// Kumbha. Lives here so pkg/kumbha imports neither package.
-type kumbhaModelBackend struct {
+// Teepin Build. Lives here so pkg/teepinbuild imports neither package.
+type buildModelBackend struct {
 	catalog *modelcatalog.Service
 	gateway *inferencegateway.Gateway
 	// reports, when set, is the evidence of what each model was seen to do
@@ -356,9 +352,9 @@ type kumbhaModelBackend struct {
 
 // WithProbeReports makes the builder's model list follow what each model was
 // actually seen to do, not only what an operator ticked.
-func (b *kumbhaModelBackend) WithProbeReports(r interface {
+func (b *buildModelBackend) WithProbeReports(r interface {
 	All(ctx context.Context) (map[string]*modelprobe.Report, error)
-}) *kumbhaModelBackend {
+}) *buildModelBackend {
 	b.reports = r
 	return b
 }
@@ -374,12 +370,12 @@ func builderCapabilities(m modelcatalog.Model, rep *modelprobe.Report, unavailab
 // builds. Phrased for a customer.
 const notBuildCapable = modelprobe.NotBuildCapable
 
-func newKumbhaModelBackend(catalog *modelcatalog.Service, gateway *inferencegateway.Gateway) *kumbhaModelBackend {
-	return &kumbhaModelBackend{catalog: catalog, gateway: gateway}
+func newBuildModelBackend(catalog *modelcatalog.Service, gateway *inferencegateway.Gateway) *buildModelBackend {
+	return &buildModelBackend{catalog: catalog, gateway: gateway}
 }
 
-func (b *kumbhaModelBackend) KumbhaModels(ctx context.Context) ([]kumbha.Model, error) {
-	models, err := b.catalog.ListKumbhaModels(ctx)
+func (b *buildModelBackend) BuildModels(ctx context.Context) ([]teepinbuild.Model, error) {
+	models, err := b.catalog.ListBuildModels(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -387,7 +383,7 @@ func (b *kumbhaModelBackend) KumbhaModels(ctx context.Context) ([]kumbha.Model, 
 	if b.reports != nil {
 		reports, _ = b.reports.All(ctx)
 	}
-	out := make([]kumbha.Model, 0, len(models))
+	out := make([]teepinbuild.Model, 0, len(models))
 	for _, m := range models {
 		unavailable := ""
 		if b.gateway != nil {
@@ -399,7 +395,7 @@ func (b *kumbhaModelBackend) KumbhaModels(ctx context.Context) ([]kumbha.Model, 
 		// declared flag stands.
 		view := builderCapabilities(m, reports[m.ModelRoute], unavailable)
 		unavailable = view.Unavailable
-		out = append(out, kumbha.Model{
+		out = append(out, teepinbuild.Model{
 			Unavailable:           unavailable,
 			Route:                 m.ModelRoute,
 			DisplayName:           m.DisplayName,
@@ -425,7 +421,7 @@ func (b *kumbhaModelBackend) KumbhaModels(ctx context.Context) ([]kumbha.Model, 
 // where there is evidence, else what was declared, the same rule the builder
 // list follows; one that is down is listed with the reason, and skipped by the
 // caller.
-func (b *kumbhaModelBackend) ImageReaders(ctx context.Context) ([]kumbha.Model, error) {
+func (b *buildModelBackend) ImageReaders(ctx context.Context) ([]teepinbuild.Model, error) {
 	models, err := b.catalog.ListImageReaders(ctx)
 	if err != nil {
 		return nil, err
@@ -434,14 +430,14 @@ func (b *kumbhaModelBackend) ImageReaders(ctx context.Context) ([]kumbha.Model, 
 	if b.reports != nil {
 		reports, _ = b.reports.All(ctx)
 	}
-	out := make([]kumbha.Model, 0, len(models))
+	out := make([]teepinbuild.Model, 0, len(models))
 	for _, m := range models {
 		unavailable := ""
 		if b.gateway != nil {
 			unavailable = b.gateway.Status(ctx, m).Unservable()
 		}
 		sees, _ := modelprobe.Effective(reports[m.ModelRoute], modelprobe.CapVision, m.SupportsVision)
-		out = append(out, kumbha.Model{
+		out = append(out, teepinbuild.Model{
 			Route:          m.ModelRoute,
 			DisplayName:    m.DisplayName,
 			Engine:         m.Engine,
@@ -452,10 +448,10 @@ func (b *kumbhaModelBackend) ImageReaders(ctx context.Context) ([]kumbha.Model, 
 	return out, nil
 }
 
-func (b *kumbhaModelBackend) Complete(ctx context.Context, accountID string, req inference.Request) (*inference.Response, error) {
+func (b *buildModelBackend) Complete(ctx context.Context, accountID string, req inference.Request) (*inference.Response, error) {
 	resp, err := b.gateway.Complete(ctx, accountID, req)
 	// The gateway declining to dispatch (a concurrency ceiling already
-	// full) is, to Kumbha, one more reason this model is unavailable right
+	// full) is, to Teepin Build, one more reason this model is unavailable right
 	// now — the signal to try its next model.
 	if errors.Is(err, inferencegateway.ErrThrottled) {
 		return nil, fmt.Errorf("%w: %v", inference.ErrProviderUnavailable, err)
@@ -463,12 +459,12 @@ func (b *kumbhaModelBackend) Complete(ctx context.Context, accountID string, req
 	return resp, err
 }
 
-// nodeCapacityAdapter makes *nodes.Service satisfy kumbha.NodeCapacityLister,
-// translating nodes.NodeCapacity into the neutral kumbha.CapacityCandidate —
-// so pkg/kumbha never imports pkg/nodes. Filters to home nodes currently
+// nodeCapacityAdapter makes *nodes.Service satisfy teepinbuild.NodeCapacityLister,
+// translating nodes.NodeCapacity into the neutral teepinbuild.CapacityCandidate —
+// so pkg/teepinbuild never imports pkg/nodes. Filters to home nodes currently
 // online, the same predicate HomeCapacitySummary applies internally
 // (capacity.go:268) — a datacenter node or an offline home node is never a
-// candidate for Kumbha's own agent pod placement. Exists specifically to
+// candidate for Teepin Build's own agent pod placement. Exists specifically to
 // fix a live incident: LaunchAgent used to dispatch via
 // cluster.Registry.Any() (a capacity-blind, randomized pick among connected
 // sessions), which landed a build on a home node with zero free memory and
@@ -482,17 +478,17 @@ func newNodeCapacityAdapter(svc *nodes.Service) *nodeCapacityAdapter {
 	return &nodeCapacityAdapter{svc: svc}
 }
 
-func (a *nodeCapacityAdapter) ListNodeCapacity(ctx context.Context) ([]kumbha.CapacityCandidate, error) {
+func (a *nodeCapacityAdapter) ListNodeCapacity(ctx context.Context) ([]teepinbuild.CapacityCandidate, error) {
 	all, err := a.svc.ListNodeCapacity(ctx)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]kumbha.CapacityCandidate, 0, len(all))
+	out := make([]teepinbuild.CapacityCandidate, 0, len(all))
 	for _, c := range all {
 		if c.Class != nodes.ClassHome || c.Status != nodes.StatusOnline {
 			continue
 		}
-		out = append(out, kumbha.CapacityCandidate{
+		out = append(out, teepinbuild.CapacityCandidate{
 			ProviderID: c.ProviderID,
 			FreeCPU:    c.FreeCPU,
 			FreeMemGB:  c.FreeMemGB,

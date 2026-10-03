@@ -1,7 +1,7 @@
 // Copyright 2026 TEEPIN Project
 // Licensed under the Apache License, Version 2.0
 
-// Package inference is the model-backend seam for the Kumbha gateway: one
+// Package inference is the model-backend seam for the Teepin Build gateway: one
 // Provider interface with an implementation per backend (vLLM on our own
 // GPUs today; Anthropic/OpenAI and a customer's local model later).
 //
@@ -14,7 +14,7 @@
 // model backend directly. Everything goes through the gateway, because a
 // call we cannot see is one we cannot meter, cap, audit or route — and
 // un-meterable spend is the single most common complaint levelled at this
-// entire product category (see KUMBHA-DESIGN.md).
+// entire product category (see TEEPIN-BUILD-DESIGN.md).
 //
 // Fidelity over modelling. A request is passed to the backend as close to
 // verbatim as possible, and only the fields the gateway must reason about
@@ -109,7 +109,7 @@ type Response struct {
 }
 
 // Chunk is one streamed fragment. Defined now so the Provider interface is
-// stable, though streaming lands later in the build order (KUMBHA-DESIGN.md).
+// stable, though streaming lands later in the build order (TEEPIN-BUILD-DESIGN.md).
 //
 // Usage is set only on the final chunk, and ONLY if the request asked the
 // backend for it (stream_options.include_usage on OpenAI-shaped backends).
@@ -139,7 +139,7 @@ type Capabilities struct {
 }
 
 // CostClass distinguishes inference we run from inference we buy — the
-// distinction the whole margin thesis rests on (KUMBHA-DESIGN.md).
+// distinction the whole margin thesis rests on (TEEPIN-BUILD-DESIGN.md).
 type CostClass string
 
 const (

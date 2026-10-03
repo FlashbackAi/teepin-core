@@ -45,7 +45,7 @@ const tinfoilClientTimeout = 30 * time.Second
 // (github.com/tinfoilsh/tinfoil-go) — verified attestation and encryption to
 // the attested key (EHBP), not plain TLS. See
 // [[confidential-inference-hosting-model]]: the partner hosts the enclave,
-// Teepin is the front end (Kumbha, console, billing), the same leased-
+// Teepin is the front end (Teepin Build, console, billing), the same leased-
 // capacity shape Teepin already uses for GPU/CPU compute.
 //
 // Deliberately built on the SAME raw-HTTP request/response shape as

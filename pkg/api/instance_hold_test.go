@@ -25,18 +25,18 @@ func recordRows() *sqlmock.Rows {
 	return sqlmock.NewRows([]string{
 		"id", "account_id", "project_id", "user_id", "name", "image",
 		"instance_type_id", "status", "gpu_vram_gb",
-		"cpu_units", "memory_gb", "p_cores_used", "e_cores_used", "endpoint",
+		"cpu_units", "memory_gb", "endpoint",
 		"k8s_pod_name", "k8s_namespace",
 		"provider_id", "node_name", "dns_name", "public_ip", "tls_enabled", "tls_ready", "container_port",
 		"storage_gb",
-		"created_at", "updated_at", "started_at", "terminated_at", "kumbha_session_id",
+		"created_at", "updated_at", "started_at", "terminated_at", "build_session_id",
 	})
 }
 
 // addRecord queues one instance row for a store read.
 func addRecord(rows *sqlmock.Rows, id string, project uuid.UUID, status string, gpuVRAM int) *sqlmock.Rows {
 	return rows.AddRow(id, testAccountID, project, uuid.New(), "app", "myorg/app:v1",
-		"cpu.home", status, gpuVRAM, 2, 4, nil, nil, "",
+		"cpu.home", status, gpuVRAM, 2, 4, "",
 		id+"-pod", "default", "provider-7", "node-a", "", "", false, false, 8080,
 		50,
 		time.Now(), time.Now(), nil, nil, nil)
@@ -56,7 +56,7 @@ type holdHarness struct {
 
 func newHoldHarness(t *testing.T, balance float64) *holdHarness {
 	t.Helper()
-	mock, _, cStore := newMockKumbhaDB(t)
+	mock, _, cStore := newMockBuildDB(t)
 	vault, err := compute.NewSpecVault("test-platform-key-test-platform-key")
 	if err != nil {
 		t.Fatal(err)

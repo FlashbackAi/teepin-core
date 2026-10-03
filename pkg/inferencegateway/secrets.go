@@ -40,7 +40,7 @@ func SecretName(environment, ref string) string {
 // inference-model-key- prefix is what the IAM policy granting this process
 // write access is scoped to — never the platform's other secrets (DB
 // password, JWT signing key, Shelby/Stripe credentials); see iam.tf. Keys
-// migrated from Kumbha's old route candidates keep their original
+// migrated from Teepin Build's old route candidates keep their original
 // kumbha-candidate- names, which that policy also covers.
 func NewAPIKeyRef() string {
 	return "inference-model-key-" + uuid.NewString()

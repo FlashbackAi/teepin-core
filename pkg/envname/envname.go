@@ -3,7 +3,7 @@
 
 // Package envname validates the names of environment variables a customer
 // supplies to a deployed app as secrets. It is its own tiny package so the
-// agent's tool server (cmd/kumbha-mcp-server) and the control plane apply the
+// agent's tool server (cmd/build-mcp-server) and the control plane apply the
 // exact same rule without the tool server importing the control plane.
 package envname
 

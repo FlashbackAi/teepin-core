@@ -95,8 +95,8 @@ func resolvePorts(ctx context.Context, imageRef string, allowed map[string]bool)
 // reference IT constructed itself — never customer-supplied input: the
 // SSRF guard ResolvePorts enforces (see allowedRegistries' own doc
 // comment) exists specifically because a customer can put an arbitrary
-// host in a create-instance request; DeployKumbhaSession's imageRef, by
-// contrast, is built entirely server-side (the Kumbha build registry's
+// host in a create-instance request; DeployBuildSession's imageRef, by
+// contrast, is built entirely server-side (the Teepin Build build registry's
 // own resolved prefix + a session tag), so there is nothing here for a
 // customer to redirect.
 //

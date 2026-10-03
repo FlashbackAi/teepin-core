@@ -14,8 +14,8 @@ func TestClassify(t *testing.T) {
 		{"cpu.home", "CPU compute", "CPU compute (on-demand node)"},
 		{"cpu.small", "CPU compute", "CPU Small"},
 		{"gpu.h100.mig-2g", "GPU compute", "GPU H100 MIG 2g"},
-		{"kumbha/teepin/fast:input", "Teepin Build", "teepin/fast — input tokens"},
-		{"kumbha/teepin/fast:output", "Teepin Build", "teepin/fast — output tokens"},
+		{"build/teepin/fast:input", "Teepin Build", "teepin/fast — input tokens"},
+		{"build/teepin/fast:output", "Teepin Build", "teepin/fast — output tokens"},
 		{"inference/teepin/qwen3-30b-a3b:input", "Inference", "teepin/qwen3-30b-a3b — input tokens"},
 		{"inference/teepin/qwen3-30b-a3b:output", "Inference", "teepin/qwen3-30b-a3b — output tokens"},
 		// Rows written before inference usage carried the model in the type.
@@ -41,7 +41,7 @@ func TestClassify(t *testing.T) {
 // A customer must never see an empty row or a raw identifier, whatever the
 // resource type looks like.
 func TestClassify_NeverEmpty(t *testing.T) {
-	for _, rt := range []string{"", " ", "x", "a/b/c", "::", "kumbha/", "inference/", "gpu.", "🙂"} {
+	for _, rt := range []string{"", " ", "x", "a/b/c", "::", "build/", "inference/", "gpu.", "🙂"} {
 		got := Classify(rt)
 		if got.Service == "" || got.Title == "" {
 			t.Errorf("Classify(%q) produced an empty field: %+v", rt, got)
@@ -93,7 +93,7 @@ func TestFormatUnitPrice(t *testing.T) {
 // Token prices are quoted per million and must keep their real precision: a
 // $0.175 rate printed as $0.17 would misstate what the customer is charged.
 func TestFormatUnitPrice_KeepsRealPrecision(t *testing.T) {
-	tokens := Classify("kumbha/teepin/fast:input")
+	tokens := Classify("build/teepin/fast:input")
 	cases := []struct {
 		price float64
 		want  string

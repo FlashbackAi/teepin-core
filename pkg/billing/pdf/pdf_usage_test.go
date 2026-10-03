@@ -52,8 +52,8 @@ func usageInvoice() *billing.Invoice {
 		LineItems: []billing.InvoiceLineItem{
 			item("cpu.home", proj, "Teepin Scrapper", 176.077, "hours", 0.003, 0.53),
 			item("cpu.home", other, "Stevie Intel", 71.2641, "hours", 0.008, 0.57),
-			item("kumbha/teepin/fast:input", proj, "Teepin Scrapper", 45010939, "tokens", 0.000000175, 7.89),
-			item("kumbha/teepin/fast:output", proj, "Teepin Scrapper", 2072459, "tokens", 0.00000081, 1.68),
+			item("build/teepin/fast:input", proj, "Teepin Scrapper", 45010939, "tokens", 0.000000175, 7.89),
+			item("build/teepin/fast:output", proj, "Teepin Scrapper", 2072459, "tokens", 0.00000081, 1.68),
 			// The row that printed with a blank description before the catalog.
 			item("", proj, "Teepin Scrapper", 3, "hours", 0, 0.0),
 		},
@@ -106,7 +106,7 @@ func TestRender_UsageInvoiceShowsCatalogNamesNotRawTypes(t *testing.T) {
 		"45.01M tokens", "2.07M tokens", "176.08 hours",
 	)
 	mustNotContain(t, doc,
-		"cpu.home", "kumbha/teepin/fast:input", "kumbha/teepin/fast:output",
+		"cpu.home", "build/teepin/fast:input", "build/teepin/fast:output",
 		"45010939", // raw, unformatted token count
 	)
 }
@@ -136,7 +136,7 @@ func TestRender_HasTheFieldsAnAccountsDepartmentNeeds(t *testing.T) {
 func TestRender_SummaryGroupsByServiceWithSubtotals(t *testing.T) {
 	doc := render(t, usageInvoice())
 	// Two CPU lines (0.53 + 0.57) subtotal to $1.10 under one heading.
-	mustContain(t, doc, "$1.10", "$9.57") // CPU compute and Kumbha subtotals
+	mustContain(t, doc, "$1.10", "$9.57") // CPU compute and Teepin Build subtotals
 }
 
 func TestRender_TaxLinesAndReverseCharge(t *testing.T) {
@@ -182,10 +182,10 @@ func TestRender_LegacyUsageInvoiceIsClassifiedOnTheFly(t *testing.T) {
 		inv.LineItems[i].Service = ""
 	}
 	inv.LineItems[0].Description = "cpu.home"
-	inv.LineItems[2].Description = "kumbha/teepin/fast:input"
+	inv.LineItems[2].Description = "build/teepin/fast:input"
 	doc := render(t, inv)
 	mustContain(t, doc, "CPU compute", "Teepin Build")
-	mustNotContain(t, doc, "cpu.home", "kumbha/teepin/fast:input")
+	mustNotContain(t, doc, "cpu.home", "build/teepin/fast:input")
 }
 
 // A hand-written manual invoice keeps its own wording.

@@ -28,7 +28,7 @@ const RetentionWindow = 30 * 24 * time.Hour
 // Store.PurgeFullyBilledTerminated's own doc comment for what "fully
 // billed" means. Mirrors billing.UsageCollector's own Start/ticker shape.
 // Found live 2026-09-02: nothing previously purged this table at all, so
-// every instance ever created — including every ephemeral Kumbha
+// every instance ever created — including every ephemeral Teepin Build
 // build/agent/screenshot pod — accumulated as a permanent row.
 type RetentionSweeper struct {
 	store *Store

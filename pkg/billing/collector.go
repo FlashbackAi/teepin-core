@@ -221,11 +221,6 @@ type billableInstance struct {
 	CPUUnits     int
 	MemoryGB     int
 	StorageGB    int
-	// PCoresUsed/ECoresUsed are nil unless this instance was placed with a
-	// detected P-core/E-core split (migration 045) — nil means "bill via
-	// CPUUnits*CPUCoreRate exactly as before this feature," never a guess.
-	PCoresUsed   *int
-	ECoresUsed   *int
 	CreatedAt    time.Time
 	TerminatedAt *time.Time
 }
@@ -242,7 +237,6 @@ func (c *UsageCollector) getBillableInstances(ctx context.Context, accountID *uu
 		SELECT i.id, i.account_id, i.project_id, COALESCE(i.instance_type_id, ''),
 		       COALESCE(i.gpu_vram_gb, 0), COALESCE(i.cpu_units, 0),
 		       COALESCE(i.memory_gb, 0), COALESCE(i.storage_gb, 0),
-		       i.p_cores_used, i.e_cores_used,
 		       i.created_at,
 		       COALESCE(i.terminated_at, CASE WHEN i.status = 'stopped' THEN i.stopped_at END)
 		FROM compute.instances i
@@ -269,7 +263,6 @@ func (c *UsageCollector) getBillableInstances(ctx context.Context, accountID *uu
 		var inst billableInstance
 		if err := rows.Scan(&inst.ID, &inst.AccountID, &inst.ProjectID, &inst.InstanceType,
 			&inst.GPUVRAMGB, &inst.CPUUnits, &inst.MemoryGB, &inst.StorageGB,
-			&inst.PCoresUsed, &inst.ECoresUsed,
 			&inst.CreatedAt, &inst.TerminatedAt); err != nil {
 			return nil, fmt.Errorf("scan failed: %w", err)
 		}

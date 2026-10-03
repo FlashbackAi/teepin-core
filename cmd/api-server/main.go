@@ -42,7 +42,6 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/harbor"
 	"github.com/FlashbackAi/teepin-core/pkg/inferencegateway"
 	"github.com/FlashbackAi/teepin-core/pkg/inferencereconciler"
-	"github.com/FlashbackAi/teepin-core/pkg/kumbha"
 	"github.com/FlashbackAi/teepin-core/pkg/modelcatalog"
 	"github.com/FlashbackAi/teepin-core/pkg/modelprobe"
 	"github.com/FlashbackAi/teepin-core/pkg/networking"
@@ -56,6 +55,7 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/solana"
 	"github.com/FlashbackAi/teepin-core/pkg/statuspage"
 	s3storage "github.com/FlashbackAi/teepin-core/pkg/storage/s3"
+	"github.com/FlashbackAi/teepin-core/pkg/teepinbuild"
 )
 
 const (
@@ -739,13 +739,13 @@ func main() {
 	if billingService != nil {
 		apiServer = apiServer.WithCreditGuard(billingService)
 	}
-	// Hidden-workload capacity accounting: without this, an active Kumbha
+	// Hidden-workload capacity accounting: without this, an active Teepin Build
 	// agent/screenshot/build pod's CPU/memory is invisible to
 	// ListNodeCapacity's used-count (see nodes.HiddenWorkloadCounter's own
 	// doc comment) — a node running one could report more free capacity
 	// than it actually has. Sizes are read from the SAME env vars
 	// WithAgent configures further down (duplicated here rather than
-	// reordering the whole Kumbha wiring block earlier in this function —
+	// reordering the whole Teepin Build wiring block earlier in this function —
 	// same env var, same default, so the two reads cannot disagree); the
 	// Kaniko build size comes straight from build.DefaultConfig(), which
 	// nothing in this file overrides.
@@ -753,7 +753,7 @@ func main() {
 		buildDefaults := build.DefaultConfig()
 		nodeService = nodeService.WithHiddenWorkloadCounter(newHiddenWorkloadAdapter(
 			clusterClient,
-			getEnvInt("TEEPIN_KUMBHA_AGENT_CPU_UNITS", 2), getEnvInt("TEEPIN_KUMBHA_AGENT_MEMORY_GB", 4),
+			getEnvInt("TEEPIN_BUILD_AGENT_CPU_UNITS", 2), getEnvInt("TEEPIN_BUILD_AGENT_MEMORY_GB", 4),
 			buildDefaults.CPUUnits, buildDefaults.MemoryGB,
 		))
 	}
@@ -769,7 +769,7 @@ func main() {
 	// pluggable backend (MinIO today; Shelby and AWS S3 land as their own
 	// backend packages later — see ROADMAP/plan). Backend selection is an
 	// EXPLICIT named switch on TEEPIN_OBJECTSTORE_BACKEND, deliberately
-	// NOT the first-configured-wins pattern the Kumbha registry chain uses
+	// NOT the first-configured-wins pattern the Teepin Build registry chain uses
 	// below: silently picking a different storage backend would strand a
 	// customer's data somewhere the catalog doesn't point at, unlike a
 	// registry fallback that only costs a rebuild.
@@ -838,15 +838,15 @@ func main() {
 
 			// Teepin's own internet-reachable API host — needed wherever a
 			// URL is handed to a party OUTSIDE Teepin's network that must
-			// fetch it back (today: Kumbha's image-attachment URLs, sent to
+			// fetch it back (today: Teepin Build's image-attachment URLs, sent to
 			// whichever external LLM provider serves the customer's
 			// chosen tier). Deliberately distinct from
-			// TEEPIN_KUMBHA_AGENT_API_BASE_URL, which is cluster-internal.
+			// TEEPIN_BUILD_AGENT_API_BASE_URL, which is cluster-internal.
 			if publicBaseURL := getEnv("TEEPIN_PUBLIC_API_BASE_URL", ""); publicBaseURL != "" {
 				apiServer = apiServer.WithPublicBaseURL(publicBaseURL)
-				log.Println("✅ Kumbha attachments enabled")
+				log.Println("✅ Teepin Build attachments enabled")
 			} else {
-				log.Println("Kumbha attachments not configured (set TEEPIN_PUBLIC_API_BASE_URL)")
+				log.Println("Teepin Build attachments not configured (set TEEPIN_PUBLIC_API_BASE_URL)")
 			}
 
 			// Billing/metering — GB-stored (hourly, all buckets) and
@@ -885,61 +885,61 @@ func main() {
 		apiServer = apiServer.WithStorageHolds(billingService)
 	}
 
-	// kumbhaEventTickets is set inside the Kumbha Gateway block below, but
-	// declared out here because kumbhaEventsHandler (the WS half) is built
+	// buildEventTickets is set inside the Teepin Build Gateway block below, but
+	// declared out here because buildEventsHandler (the WS half) is built
 	// later, once checkOrigin exists — mirroring execTickets/execHandler's
 	// own two-stage construction for the same reason.
-	var kumbhaEventTickets *kumbha.EventTicketStore
+	var buildEventTickets *teepinbuild.EventTicketStore
 	// The agent's activity feed is kept in the database (migration 068), so it
 	// outlives the pod. The recorder tails each agent pod's log itself; the
 	// store is shared with the relay for replay.
-	var kumbhaEventStore *kumbha.Store
-	var kumbhaRecorder *kumbha.Recorder
+	var buildEventStore *teepinbuild.Store
+	var buildRecorder *teepinbuild.Recorder
 
-	// Kumbha Gateway: Teepin auth + sessions + credits around the build
-	// agent's model calls (KUMBHA-DESIGN.md). Kumbha has no models of its
+	// Teepin Build Gateway: Teepin auth + sessions + credits around the build
+	// agent's model calls (TEEPIN-BUILD-DESIGN.md). Teepin Build has no models of its
 	// own: it uses whichever catalog models are enabled for it (Control
-	// Center -> Kumbha), served through Teepin Inference's gateway exactly
+	// Center -> Teepin Build), served through Teepin Inference's gateway exactly
 	// like a customer's own API call. Needs the database (sessions, credits,
 	// pricing — billingService doubles as PricingProvider and UsageRecorder,
 	// same "one service, two interfaces" pattern as the compute pricing/gate
-	// above) and Teepin Inference; off unless TEEPIN_KUMBHA_ENABLED=true,
-	// leaving every Kumbha endpoint returning 404, same as execTickets when
+	// above) and Teepin Inference; off unless TEEPIN_BUILD_ENABLED=true,
+	// leaving every Teepin Build endpoint returning 404, same as execTickets when
 	// home compute is off.
-	if !getEnvBool("TEEPIN_KUMBHA_ENABLED", false) {
-		log.Println("Kumbha Gateway not enabled (TEEPIN_KUMBHA_ENABLED unset)")
+	if !getEnvBool("TEEPIN_BUILD_ENABLED", false) {
+		log.Println("Teepin Build Gateway not enabled (TEEPIN_BUILD_ENABLED unset)")
 	} else if billingService == nil || inferenceGateway == nil {
-		log.Println("WARN: TEEPIN_KUMBHA_ENABLED is set, but Kumbha needs the database and Teepin Inference — Kumbha Gateway disabled")
+		log.Println("WARN: TEEPIN_BUILD_ENABLED is set, but Teepin Build needs the database and Teepin Inference — Teepin Build Gateway disabled")
 	} else {
-		kumbhaStore := kumbha.NewStore(dbClient.DB())
-		kumbhaEventStore = kumbhaStore
+		buildStore := teepinbuild.NewStore(dbClient.DB())
+		buildEventStore = buildStore
 		// Secrets a customer enters for their app are stored sealed under
 		// the platform encryption key. Without it the console cannot offer
 		// a secure field at all (saving answers 404) and the agent's
 		// request_secret has nothing to point at.
 		if key := os.Getenv("ENCRYPTION_KEY"); key != "" {
-			secretVault, secretErr := kumbha.NewSecretVault(key)
+			secretVault, secretErr := teepinbuild.NewSecretVault(key)
 			if secretErr != nil {
-				log.Fatalf("Kumbha secret vault: %v", secretErr)
+				log.Fatalf("Teepin Build secret vault: %v", secretErr)
 			}
-			kumbhaStore.WithSecretVault(secretVault)
+			buildStore.WithSecretVault(secretVault)
 		} else {
-			log.Println("ENCRYPTION_KEY not set: Kumbha builds cannot store customer secrets")
+			log.Println("ENCRYPTION_KEY not set: Teepin Build builds cannot store customer secrets")
 		}
-		kumbhaModels := newKumbhaModelBackend(modelCatalogService, inferenceGateway)
+		buildModels := newBuildModelBackend(modelCatalogService, inferenceGateway)
 		// The builder's model list follows what each model was seen to do.
 		// TEEPIN_MODEL_PROBE_GATING=false is the way out if a check ever
 		// misjudges a model: the builder then goes back to the declared flags.
 		if modelProbeStore != nil && getEnvBool("TEEPIN_MODEL_PROBE_GATING", true) {
-			kumbhaModels = kumbhaModels.WithProbeReports(modelProbeStore)
+			buildModels = buildModels.WithProbeReports(modelProbeStore)
 		}
-		kumbhaGateway := kumbha.NewGateway(kumbhaStore, kumbhaModels,
+		buildGateway := teepinbuild.NewGateway(buildStore, buildModels,
 			billingService, billingService, billingService).
 			WithModelPricing(modelCatalogService).
 			WithVendorCost(modelCatalogService).
 			WithCreditGuard(billingService)
 
-		// Capacity-aware placement for Kumbha's own agent/screenshot
+		// Capacity-aware placement for Teepin Build's own agent/screenshot
 		// pods (LaunchAgent/CaptureScreenshot) — see
 		// nodeCapacityAdapter's own doc comment for the live
 		// incident this fixes. nodeService is nil only in a
@@ -948,78 +948,78 @@ func main() {
 		// capacity-blind cluster.Registry.Any() dispatch exactly as
 		// before this existed.
 		if nodeService != nil {
-			kumbhaGateway = kumbhaGateway.WithNodeCapacity(newNodeCapacityAdapter(nodeService))
+			buildGateway = buildGateway.WithNodeCapacity(newNodeCapacityAdapter(nodeService))
 		}
 
-		// A Kumbha agent credential (auth.MintSessionToken) is
+		// A Teepin Build agent credential (auth.MintSessionToken) is
 		// validated against session-open status on every request —
 		// see auth.Middleware.WithSessionChecker. Without this, a
-		// deployment with Kumbha enabled would still reject every
+		// deployment with Teepin Build enabled would still reject every
 		// agent credential outright (fail-closed default), so this
 		// is not optional the way WithAgent below is.
 		if authMiddleware != nil {
-			authMiddleware.WithSessionChecker(kumbhaStore)
+			authMiddleware.WithSessionChecker(buildStore)
 		}
 
 		// Agent pod orchestration (LaunchAgent) stays off until a
-		// real Kumbha agent image exists to run — see the Kumbha
-		// plan's M3. Configuring TEEPIN_KUMBHA_AGENT_IMAGE turns it
+		// real Teepin Build agent image exists to run — see the Teepin Build
+		// plan's M3. Configuring TEEPIN_BUILD_AGENT_IMAGE turns it
 		// on; until then LaunchAgent returns ErrAgentNotConfigured
 		// cleanly rather than launching pods with no image to run.
-		if agentImage := getEnv("TEEPIN_KUMBHA_AGENT_IMAGE", ""); agentImage != "" && os.Getenv("TEEPIN_KUMBHA_AGENT_API_BASE_URL") == "" {
-			log.Println("WARN: TEEPIN_KUMBHA_AGENT_IMAGE is set but TEEPIN_KUMBHA_AGENT_API_BASE_URL is not — agent pods would have no way to call back; Kumbha agent orchestration disabled")
+		if agentImage := getEnv("TEEPIN_BUILD_AGENT_IMAGE", ""); agentImage != "" && os.Getenv("TEEPIN_BUILD_AGENT_API_BASE_URL") == "" {
+			log.Println("WARN: TEEPIN_BUILD_AGENT_IMAGE is set but TEEPIN_BUILD_AGENT_API_BASE_URL is not — agent pods would have no way to call back; Teepin Build agent orchestration disabled")
 		} else if agentImage != "" {
 			mintToken := func(accountID, projectID, sessionID uuid.UUID, ttl time.Duration) (string, error) {
 				return auth.MintSessionToken(accountID, projectID, sessionID, ttl, jwtSecret)
 			}
-			kumbhaGateway = kumbhaGateway.WithAgent(clusterClient, mintToken, kumbha.AgentConfig{
+			buildGateway = buildGateway.WithAgent(clusterClient, mintToken, teepinbuild.AgentConfig{
 				Image:              agentImage,
-				CPUUnits:           getEnvInt("TEEPIN_KUMBHA_AGENT_CPU_UNITS", 2),
-				MemoryGB:           getEnvInt("TEEPIN_KUMBHA_AGENT_MEMORY_GB", 4),
-				StorageGB:          getEnvInt("TEEPIN_KUMBHA_AGENT_STORAGE_GB", 10),
-				EphemeralStorageGB: getEnvInt("TEEPIN_KUMBHA_AGENT_EPHEMERAL_STORAGE_GB", 10),
-				SessionTokenTTL:    time.Duration(getEnvInt("TEEPIN_KUMBHA_AGENT_TOKEN_TTL_MINUTES", 120)) * time.Minute,
-				APIBaseURL:         getEnv("TEEPIN_KUMBHA_AGENT_API_BASE_URL", ""),
+				CPUUnits:           getEnvInt("TEEPIN_BUILD_AGENT_CPU_UNITS", 2),
+				MemoryGB:           getEnvInt("TEEPIN_BUILD_AGENT_MEMORY_GB", 4),
+				StorageGB:          getEnvInt("TEEPIN_BUILD_AGENT_STORAGE_GB", 10),
+				EphemeralStorageGB: getEnvInt("TEEPIN_BUILD_AGENT_EPHEMERAL_STORAGE_GB", 10),
+				SessionTokenTTL:    time.Duration(getEnvInt("TEEPIN_BUILD_AGENT_TOKEN_TTL_MINUTES", 120)) * time.Minute,
+				APIBaseURL:         getEnv("TEEPIN_BUILD_AGENT_API_BASE_URL", ""),
 				// Set once a Harbor project + robot account for the
 				// agent image itself has been provisioned directly
 				// against the target cluster (see AgentConfig's own
 				// doc comment) — empty leaves Image expected to be
 				// publicly pullable, same as before this existed.
-				ImagePullSecret: getEnv("TEEPIN_KUMBHA_AGENT_IMAGE_PULL_SECRET", ""),
+				ImagePullSecret: getEnv("TEEPIN_BUILD_AGENT_IMAGE_PULL_SECRET", ""),
 				// Off by default — see AgentConfig.VisionCapable's own
 				// doc comment on why this is operator-confirmed, not
-				// auto-detected. Set TEEPIN_KUMBHA_VISION_CAPABLE=true
+				// auto-detected. Set TEEPIN_BUILD_VISION_CAPABLE=true
 				// only once the hosted route's model is confirmed to
 				// accept multimodal (image) input.
-				VisionCapable: getEnvBool("TEEPIN_KUMBHA_VISION_CAPABLE", false),
+				VisionCapable: getEnvBool("TEEPIN_BUILD_VISION_CAPABLE", false),
 			})
-			log.Printf("✅ Kumbha agent pod orchestration enabled (image %s)", agentImage)
+			log.Printf("✅ Teepin Build agent pod orchestration enabled (image %s)", agentImage)
 			// Deployment-thumbnail capture (console Preview tab) rides
 			// along on this SAME image — no separate image/registry/
-			// deploy pipeline: deploy/kumbha-agent/Dockerfile already
+			// deploy pipeline: deploy/build-agent/Dockerfile already
 			// installs Chromium for the agent's own browser tool and
-			// now also builds the small kumbha-screenshot binary
+			// now also builds the small build-screenshot binary
 			// (CaptureScreenshot launches it via a Command override,
 			// see that method's own doc comment). Automatically
 			// available whenever agent orchestration is, nothing
 			// further to configure.
-			log.Println("Kumbha deployment screenshot capture enabled (reuses the agent image)")
+			log.Println("Teepin Build deployment screenshot capture enabled (reuses the agent image)")
 		} else {
-			log.Println("Kumbha agent pod orchestration not configured (TEEPIN_KUMBHA_AGENT_IMAGE unset) — LaunchAgent unavailable")
+			log.Println("Teepin Build agent pod orchestration not configured (TEEPIN_BUILD_AGENT_IMAGE unset) — LaunchAgent unavailable")
 		}
 
 		// Start recording each agent pod's feed the moment it launches. The
 		// recorder itself is built with the event relay below; Ensure is a
 		// no-op until then.
-		kumbhaGateway = kumbhaGateway.WithAgentLaunchHook(func(sess *kumbha.Session, launchSeq int) {
-			kumbhaRecorder.Ensure(sess.ID, sess.ProjectID, sess.AgentInstanceID, launchSeq)
+		buildGateway = buildGateway.WithAgentLaunchHook(func(sess *teepinbuild.Session, launchSeq int) {
+			buildRecorder.Ensure(sess.ID, sess.ProjectID, sess.AgentInstanceID, launchSeq)
 		})
 
-		apiServer = apiServer.WithKumbha(kumbhaGateway)
+		apiServer = apiServer.WithBuild(buildGateway)
 
-		kumbhaEventTickets = kumbha.NewEventTicketStore()
-		go kumbhaEventTickets.Reap(context.Background())
-		apiServer = apiServer.WithKumbhaEventTickets(kumbhaEventTickets)
+		buildEventTickets = teepinbuild.NewEventTicketStore()
+		go buildEventTickets.Reap(context.Background())
+		apiServer = apiServer.WithBuildEventTickets(buildEventTickets)
 
 		// The "deploy" MCP verb's build step (Kaniko) — needs a
 		// registry to push to, Harbor or ECR (pkg/build.RegistryProvider
@@ -1030,26 +1030,26 @@ func main() {
 		// Harbor takes priority when configured (existing behaviour,
 		// unchanged); TEEPIN_ECR_BUILD_REPOSITORY is the fallback for
 		// a deployment with no Harbor server at all — reusing ECR,
-		// already live for the control-plane and kumbha-agent images
+		// already live for the control-plane and build-agent images
 		// themselves, rather than standing up a second registry (see
 		// ROADMAP.md's 2026-08-25 (night) decision). Absent both, the
 		// verb stays an honest stub (teepin-mcp-server's own
 		// fallback message), not a broken endpoint.
-		var kumbhaRegistry build.RegistryProvider
+		var buildRegistry build.RegistryProvider
 		switch {
 		case harborService != nil:
-			kumbhaRegistry = harborService
+			buildRegistry = harborService
 		case getEnv("TEEPIN_ECR_BUILD_REPOSITORY", "") != "":
 			ecrRepo := getEnv("TEEPIN_ECR_BUILD_REPOSITORY", "")
 			ecrSvc, err := ecrregistry.NewService(context.Background(), ecrRepo)
 			if err != nil {
 				log.Printf("⚠️  ECR build registry initialization failed: %v", err)
 			} else {
-				kumbhaRegistry = ecrSvc
+				buildRegistry = ecrSvc
 
-				// A deployed Kumbha app's own instance must be able to
+				// A deployed Teepin Build app's own instance must be able to
 				// PULL the image Kaniko just PUSHED — a different
-				// credential (see WithKumbhaBuildImagePullSecret's own
+				// credential (see WithBuiltImagePullSecret's own
 				// doc comment for why this is resolved here, once, from
 				// the image's own registry prefix, rather than a
 				// customer-settable field). Found live 2026-08-26: a
@@ -1061,29 +1061,29 @@ func main() {
 				// exactly as they did before this fix for a private
 				// one) rather than blocking the whole build pipeline
 				// from starting.
-				if secretName := getEnv("TEEPIN_KUMBHA_BUILD_IMAGE_PULL_SECRET", ""); secretName != "" {
+				if secretName := getEnv("TEEPIN_BUILD_APP_IMAGE_PULL_SECRET", ""); secretName != "" {
 					prefix, err := ecrSvc.ImagePrefix(context.Background(), uuid.Nil, "")
 					if err != nil {
-						log.Printf("⚠️  could not resolve the Kumbha build registry's own URI (deploys of a Kumbha-built private image will fail to pull): %v", err)
+						log.Printf("⚠️  could not resolve the Teepin Build build registry's own URI (deploys of a Teepin Build-built private image will fail to pull): %v", err)
 					} else {
-						apiServer = apiServer.WithKumbhaBuildImagePullSecret(prefix, secretName)
+						apiServer = apiServer.WithBuiltImagePullSecret(prefix, secretName)
 					}
 				}
 			}
 		}
-		if kumbhaRegistry != nil {
-			kumbhaBuildService := build.NewService(clusterClient, kumbhaRegistry, build.DefaultConfig())
-			apiServer = apiServer.WithKumbhaBuild(kumbhaBuildService)
-			log.Println("✅ Kumbha build pipeline enabled (Kaniko -> registry)")
+		if buildRegistry != nil {
+			imageBuildService := build.NewService(clusterClient, buildRegistry, build.DefaultConfig())
+			apiServer = apiServer.WithImageBuilder(imageBuildService)
+			log.Println("✅ Teepin Build build pipeline enabled (Kaniko -> registry)")
 		} else {
-			log.Println("Kumbha build pipeline not configured (no registry available — set HARBOR_ADMIN_PASSWORD or TEEPIN_ECR_BUILD_REPOSITORY) — the deploy MCP verb stays a stub")
+			log.Println("Teepin Build build pipeline not configured (no registry available — set HARBOR_ADMIN_PASSWORD or TEEPIN_ECR_BUILD_REPOSITORY) — the deploy MCP verb stays a stub")
 		}
 
 		// GitHub-backed code storage (pkg/githubstore): pushes each
 		// checkpointed deploy to a Teepin-owned repo, invisible to
 		// the customer — see that package's own doc comment.
 		// Optional, same fully-off-when-unconfigured posture as
-		// every other Kumbha capability above.
+		// every other Teepin Build capability above.
 		githubAppID := getEnvInt("TEEPIN_GITHUB_APP_ID", 0)
 		githubInstallationID := getEnvInt("TEEPIN_GITHUB_APP_INSTALLATION_ID", 0)
 		githubPrivateKey := getEnv("TEEPIN_GITHUB_APP_PRIVATE_KEY", "")
@@ -1103,7 +1103,7 @@ func main() {
 			log.Println("GitHub code storage not configured (set TEEPIN_GITHUB_APP_ID, TEEPIN_GITHUB_APP_INSTALLATION_ID, TEEPIN_GITHUB_APP_PRIVATE_KEY) — deploys are not backed up to GitHub")
 		}
 
-		log.Println("✅ Kumbha Gateway enabled (models: catalog entries enabled for Kumbha)")
+		log.Println("✅ Teepin Build Gateway enabled (models: catalog entries enabled for Teepin Build)")
 	}
 
 	// Admin API (pricing management): only enabled with an explicit
@@ -1141,7 +1141,7 @@ func main() {
 		log.Println("Stage 3 tunnel edge enabled (instance traffic proxied over agent sessions)")
 	}
 
-	// Shared by both WebSocket endpoints below (exec and Kumbha's event
+	// Shared by both WebSocket endpoints below (exec and Teepin Build's event
 	// relay) — defense in depth alongside the ticket auth each already
 	// requires, since the issuing POST is already CORS-protected and needs
 	// a JWT.
@@ -1173,30 +1173,30 @@ func main() {
 		log.Println("Interactive exec enabled (terminal sessions tunneled over agent sessions)")
 	}
 
-	// Kumbha's event-relay WebSocket — the console's live activity feed.
+	// Teepin Build's event-relay WebSocket — the console's live activity feed.
 	// Unlike exec, this does NOT need the agent registry/tunnel: it tails
 	// cluster.Client.StreamLogs, which already works in both "direct" and
-	// "agent" cluster modes, so the only gate is Kumbha itself being
-	// configured (kumbhaEventTickets is non-nil only then).
-	var kumbhaEventsHandler *kumbha.EventsHandler
-	if kumbhaEventTickets != nil {
-		kumbhaEventsHandler = kumbha.NewEventsHandler(clusterClient, kumbhaEventTickets, checkOrigin)
-		if kumbhaEventStore != nil {
-			kumbhaRecorder = kumbha.NewRecorder(kumbhaEventsHandler, kumbhaEventStore)
-			kumbhaEventsHandler.WithHistory(kumbhaEventStore, kumbhaRecorder)
+	// "agent" cluster modes, so the only gate is Teepin Build itself being
+	// configured (buildEventTickets is non-nil only then).
+	var buildEventsHandler *teepinbuild.EventsHandler
+	if buildEventTickets != nil {
+		buildEventsHandler = teepinbuild.NewEventsHandler(clusterClient, buildEventTickets, checkOrigin)
+		if buildEventStore != nil {
+			buildRecorder = teepinbuild.NewRecorder(buildEventsHandler, buildEventStore)
+			buildEventsHandler.WithHistory(buildEventStore, buildRecorder)
 		}
-		log.Println("Kumbha event relay enabled (agent activity streamed over the existing log pipeline)")
+		log.Println("Teepin Build event relay enabled (agent activity streamed over the existing log pipeline)")
 	}
 
 	// Image-pull credentials for the nodes, minted here and pushed to each agent
 	// (see startRegistryAuthSync): ECR tokens last 12 hours, and a per-node timer
 	// misses refreshes whenever the machine sleeps.
 	startRegistryAuthSync(context.Background(), agentRegistry,
-		getEnv("TEEPIN_KUMBHA_AGENT_IMAGE", ""),
-		getEnv("TEEPIN_KUMBHA_AGENT_IMAGE_PULL_SECRET", ""), getEnv("TEEPIN_KUMBHA_BUILD_IMAGE_PULL_SECRET", ""))
+		getEnv("TEEPIN_BUILD_AGENT_IMAGE", ""),
+		getEnv("TEEPIN_BUILD_AGENT_IMAGE_PULL_SECRET", ""), getEnv("TEEPIN_BUILD_APP_IMAGE_PULL_SECRET", ""))
 
 	// Setup router
-	router := setupRouter(apiServer, authHandler, accountHandler, authMiddleware, billingHandler, registryHandler, adminHandler, webhookHandler, nodeHandler, modelCatalogHandler, nodeServicesHandler, playgroundHandler, nodeModelCacheHandler, publicInferenceHandler, rateLimitMiddleware, proxyHandler, execHandler, kumbhaEventsHandler, getEnv("TEEPIN_DOMAIN", "teepin.com"))
+	router := setupRouter(apiServer, authHandler, accountHandler, authMiddleware, billingHandler, registryHandler, adminHandler, webhookHandler, nodeHandler, modelCatalogHandler, nodeServicesHandler, playgroundHandler, nodeModelCacheHandler, publicInferenceHandler, rateLimitMiddleware, proxyHandler, execHandler, buildEventsHandler, getEnv("TEEPIN_DOMAIN", "teepin.com"))
 
 	// Create HTTP server
 	port := getEnv("PORT", "8080")
@@ -1419,7 +1419,7 @@ func initRateLimiting() *ratelimit.Config {
 	return config
 }
 
-func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHandler *api.AccountHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler, registryHandler *api.RegistryHandler, adminHandler *api.AdminHandler, webhookHandler *api.WebhookHandler, nodeHandler *api.NodeHandler, modelCatalogHandler *api.ModelCatalogHandler, nodeServicesHandler *api.NodeServicesHandler, playgroundHandler *api.InferencePlaygroundHandler, nodeModelCacheHandler *api.NodeModelCacheHandler, publicInferenceHandler *api.InferenceHandler, rateLimitMiddleware *ratelimit.Middleware, proxyHandler *cluster.ProxyHandler, execHandler *cluster.ExecHandler, kumbhaEventsHandler *kumbha.EventsHandler, instanceDomain string) *gin.Engine {
+func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHandler *api.AccountHandler, authMiddleware *auth.Middleware, billingHandler *api.BillingHandler, registryHandler *api.RegistryHandler, adminHandler *api.AdminHandler, webhookHandler *api.WebhookHandler, nodeHandler *api.NodeHandler, modelCatalogHandler *api.ModelCatalogHandler, nodeServicesHandler *api.NodeServicesHandler, playgroundHandler *api.InferencePlaygroundHandler, nodeModelCacheHandler *api.NodeModelCacheHandler, publicInferenceHandler *api.InferenceHandler, rateLimitMiddleware *ratelimit.Middleware, proxyHandler *cluster.ProxyHandler, execHandler *cluster.ExecHandler, buildEventsHandler *teepinbuild.EventsHandler, instanceDomain string) *gin.Engine {
 	// Set Gin to release mode in production
 	if os.Getenv("GIN_MODE") == "" {
 		gin.SetMode(gin.ReleaseMode)
@@ -1487,15 +1487,18 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 			})
 		}
 
-		// Kumbha's event-relay WebSocket attach — UNAUTHENTICATED at the
+		// Teepin Build's event-relay WebSocket attach — UNAUTHENTICATED at the
 		// router for the same reason as exec's above: no Authorization
 		// header on a WS handshake, the single-use ticket (see
 		// EventsHandler.ServeSession) IS the credential. Must share the
-		// param name ":id" with the /kumbha group below, same gin
+		// param name ":id" with the /build group below, same gin
 		// wildcard-conflict reasoning as exec's shared ":id" with /compute.
-		if kumbhaEventsHandler != nil {
-			v1.GET("/kumbha/sessions/:id/events/attach", func(c *gin.Context) {
-				kumbhaEventsHandler.ServeSession(c.Writer, c.Request, c.Param("id"))
+		if buildEventsHandler != nil {
+			v1.GET("/build/sessions/:id/events/attach", func(c *gin.Context) {
+				buildEventsHandler.ServeSession(c.Writer, c.Request, c.Param("id"))
+			})
+			v1.GET("/kumbha/sessions/:id/events/attach", func(c *gin.Context) { // former name, see the /build group
+				buildEventsHandler.ServeSession(c.Writer, c.Request, c.Param("id"))
 			})
 		}
 
@@ -1620,86 +1623,91 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 			}
 		}
 
-		// Kumbha Gateway endpoints — same auth requirement as compute (an
+		// Teepin Build Gateway endpoints — same auth requirement as compute (an
 		// unscoped caller is rejected by requireScope regardless). Every
 		// handler here already 404s cleanly when apiServer was built
-		// without WithKumbha, so the group is registered unconditionally
+		// without WithBuild, so the group is registered unconditionally
 		// rather than gated on a nil check here too.
-		kumbhaGroup := v1.Group("/kumbha")
-		if authMiddleware != nil {
-			kumbhaGroup.Use(authMiddleware.RequireAuth())
-		}
-		{
-			kumbhaGroup.POST("/sessions", apiServer.CreateKumbhaSession)
-			kumbhaGroup.GET("/sessions", apiServer.ListKumbhaSessions)
-			kumbhaGroup.POST("/sessions/bulk-delete", apiServer.DeleteKumbhaSessions)
-			kumbhaGroup.GET("/sessions/:id", apiServer.GetKumbhaSession)
-			kumbhaGroup.GET("/sessions/:id/instances", apiServer.ListKumbhaSessionInstances)
-			// Stop: interrupt a currently-running agent turn (hard kill,
-			// not a graceful pause — see Gateway.StopAgent's own doc
-			// comment). Replaces the old "Close session" endpoint, which
-			// bundled this with billing settlement (now continuous, see
-			// Gateway.Complete) and permanently blocking further chat
-			// (removed — a session is always resumable via a new message).
-			kumbhaGroup.POST("/sessions/:id/stop", apiServer.StopKumbhaAgent)
-			kumbhaGroup.POST("/sessions/:id/approve-deploy", apiServer.ApproveKumbhaDeploy)
-			// The agent records each deployment plan it presents; the
-			// customer's approval then names one of them.
-			kumbhaGroup.POST("/sessions/:id/plans", apiServer.RecordKumbhaPlan)
-			kumbhaGroup.POST("/sessions/:id/describe-image", apiServer.DescribeKumbhaImage)
-			kumbhaGroup.PATCH("/sessions/:id/budget", apiServer.UpdateKumbhaBudget)
-			// Secrets the customer enters for their app. Deliberately NOT on
-			// the agent's route allowlist: the value must never pass through
-			// the agent.
-			kumbhaGroup.GET("/sessions/:id/secrets", apiServer.ListKumbhaSecrets)
-			kumbhaGroup.PUT("/sessions/:id/secrets/:name", apiServer.PutKumbhaSecret)
-			kumbhaGroup.DELETE("/sessions/:id/secrets/:name", apiServer.DeleteKumbhaSecret)
-			kumbhaGroup.POST("/sessions/:id/events", apiServer.CreateKumbhaEventTicket)
-			kumbhaGroup.POST("/sessions/:id/build", apiServer.BuildKumbhaSession)
-			// Deploy: build + create (or replace) a real, customer-facing
-			// compute instance — the console IDE's Deploy button. See
-			// DeployKumbhaSession's own doc comment for why each call
-			// creates a fresh instance and tears down the session's
-			// previous one, rather than updating in place.
-			kumbhaGroup.POST("/sessions/:id/deploy", apiServer.DeployKumbhaSession)
-			// Chat + resume: the customer POSTs a follow-up (ordinary JWT);
-			// the agent's own poll loop (run.py's wait_for_next_instruction)
-			// GETs it with its session-scoped credential — same auth split
-			// as the workspace endpoints just below, and for the same
-			// reason (the agent may only ever touch its OWN session).
-			kumbhaGroup.POST("/sessions/:id/messages", apiServer.SendKumbhaMessage)
-			kumbhaGroup.GET("/sessions/:id/messages/poll", apiServer.PollKumbhaMessages)
-			kumbhaGroup.POST("/chat/completions", apiServer.KumbhaChatCompletions)
-			// Attachments: project-scoped, not session-scoped — the composer
-			// uploads before a session exists (the initial prompt has no
-			// session id yet). See CreateKumbhaAttachment's own doc comment.
-			kumbhaGroup.POST("/attachments", apiServer.CreateKumbhaAttachment)
-			// Workspace: versioned, not overwrite-in-place — every save (agent
-			// or customer) creates a new version and moves the "current"
-			// pointer, so an editable IDE with a Deploy button that can break
-			// a working app always has a way back. The agent PUTs
-			// (session-scoped credential, may only write its own session,
-			// recorded as created_by=agent); the customer POSTs its own edits
-			// (ordinary JWT, account-scoped, created_by=customer) via the
-			// console IDE's Save button. See kumbha_workspace_handlers.go's
-			// own note on why the auth differs between them.
-			kumbhaGroup.PUT("/sessions/:id/workspace", apiServer.UploadKumbhaWorkspace)
-			kumbhaGroup.POST("/sessions/:id/workspace", apiServer.SaveKumbhaWorkspace)
-			kumbhaGroup.GET("/sessions/:id/workspace", apiServer.GetKumbhaWorkspace)
-			kumbhaGroup.GET("/sessions/:id/workspace/versions", apiServer.ListKumbhaWorkspaceVersions)
-			kumbhaGroup.POST("/sessions/:id/workspace/rollback", apiServer.RollbackKumbhaWorkspace)
-			kumbhaGroup.GET("/sessions/:id/workspace/archive", apiServer.DownloadKumbhaWorkspace)
-			// Screenshot: the console Preview tab's thumbnail. The capture
-			// pod POSTs (session-scoped credential, may only write its own
-			// session, same restriction as the workspace upload above); the
-			// customer GETs its own account-scoped read.
-			kumbhaGroup.POST("/sessions/:id/screenshot", apiServer.UploadKumbhaScreenshot)
-			kumbhaGroup.GET("/sessions/:id/screenshot", apiServer.GetKumbhaScreenshot)
+		// "/kumbha" is Teepin Build's former name. The same routes stay reachable
+		// under it only until every running agent image calls "/build"; remove
+		// it after the next agent image deploy (ROADMAP: Teepin Build rename).
+		for _, prefix := range []string{"/build", "/kumbha"} {
+			buildGroup := v1.Group(prefix)
+			if authMiddleware != nil {
+				buildGroup.Use(authMiddleware.RequireAuth())
+			}
+			{
+				buildGroup.POST("/sessions", apiServer.CreateBuildSession)
+				buildGroup.GET("/sessions", apiServer.ListBuildSessions)
+				buildGroup.POST("/sessions/bulk-delete", apiServer.DeleteBuildSessions)
+				buildGroup.GET("/sessions/:id", apiServer.GetBuildSession)
+				buildGroup.GET("/sessions/:id/instances", apiServer.ListBuildSessionInstances)
+				// Stop: interrupt a currently-running agent turn (hard kill,
+				// not a graceful pause — see Gateway.StopAgent's own doc
+				// comment). Replaces the old "Close session" endpoint, which
+				// bundled this with billing settlement (now continuous, see
+				// Gateway.Complete) and permanently blocking further chat
+				// (removed — a session is always resumable via a new message).
+				buildGroup.POST("/sessions/:id/stop", apiServer.StopBuildAgent)
+				buildGroup.POST("/sessions/:id/approve-deploy", apiServer.ApproveBuildDeploy)
+				// The agent records each deployment plan it presents; the
+				// customer's approval then names one of them.
+				buildGroup.POST("/sessions/:id/plans", apiServer.RecordBuildPlan)
+				buildGroup.POST("/sessions/:id/describe-image", apiServer.DescribeBuildImage)
+				buildGroup.PATCH("/sessions/:id/budget", apiServer.UpdateBuildBudget)
+				// Secrets the customer enters for their app. Deliberately NOT on
+				// the agent's route allowlist: the value must never pass through
+				// the agent.
+				buildGroup.GET("/sessions/:id/secrets", apiServer.ListBuildSecrets)
+				buildGroup.PUT("/sessions/:id/secrets/:name", apiServer.PutBuildSecret)
+				buildGroup.DELETE("/sessions/:id/secrets/:name", apiServer.DeleteBuildSecret)
+				buildGroup.POST("/sessions/:id/events", apiServer.CreateBuildEventTicket)
+				buildGroup.POST("/sessions/:id/build", apiServer.BuildSessionImage)
+				// Deploy: build + create (or replace) a real, customer-facing
+				// compute instance — the console IDE's Deploy button. See
+				// DeployBuildSession's own doc comment for why each call
+				// creates a fresh instance and tears down the session's
+				// previous one, rather than updating in place.
+				buildGroup.POST("/sessions/:id/deploy", apiServer.DeployBuildSession)
+				// Chat + resume: the customer POSTs a follow-up (ordinary JWT);
+				// the agent's own poll loop (run.py's wait_for_next_instruction)
+				// GETs it with its session-scoped credential — same auth split
+				// as the workspace endpoints just below, and for the same
+				// reason (the agent may only ever touch its OWN session).
+				buildGroup.POST("/sessions/:id/messages", apiServer.SendBuildMessage)
+				buildGroup.GET("/sessions/:id/messages/poll", apiServer.PollBuildMessages)
+				buildGroup.POST("/chat/completions", apiServer.BuildChatCompletions)
+				// Attachments: project-scoped, not session-scoped — the composer
+				// uploads before a session exists (the initial prompt has no
+				// session id yet). See CreateBuildAttachment's own doc comment.
+				buildGroup.POST("/attachments", apiServer.CreateBuildAttachment)
+				// Workspace: versioned, not overwrite-in-place — every save (agent
+				// or customer) creates a new version and moves the "current"
+				// pointer, so an editable IDE with a Deploy button that can break
+				// a working app always has a way back. The agent PUTs
+				// (session-scoped credential, may only write its own session,
+				// recorded as created_by=agent); the customer POSTs its own edits
+				// (ordinary JWT, account-scoped, created_by=customer) via the
+				// console IDE's Save button. See build_workspace_handlers.go's
+				// own note on why the auth differs between them.
+				buildGroup.PUT("/sessions/:id/workspace", apiServer.UploadBuildWorkspace)
+				buildGroup.POST("/sessions/:id/workspace", apiServer.SaveBuildWorkspace)
+				buildGroup.GET("/sessions/:id/workspace", apiServer.GetBuildWorkspace)
+				buildGroup.GET("/sessions/:id/workspace/versions", apiServer.ListBuildWorkspaceVersions)
+				buildGroup.POST("/sessions/:id/workspace/rollback", apiServer.RollbackBuildWorkspace)
+				buildGroup.GET("/sessions/:id/workspace/archive", apiServer.DownloadBuildWorkspace)
+				// Screenshot: the console Preview tab's thumbnail. The capture
+				// pod POSTs (session-scoped credential, may only write its own
+				// session, same restriction as the workspace upload above); the
+				// customer GETs its own account-scoped read.
+				buildGroup.POST("/sessions/:id/screenshot", apiServer.UploadBuildScreenshot)
+				buildGroup.GET("/sessions/:id/screenshot", apiServer.GetBuildScreenshot)
+			}
 		}
 
 		// Teepin S3 (pkg/objectstore) — every handler 404s when
 		// s.objectStore is nil (feature not configured), same posture as
-		// the Kumbha group above.
+		// the Teepin Build group above.
 		// Teepin Inference's public, OpenAI-compatible API: one base URL for
 		// every model, chosen per request, authenticated with a project API
 		// key (permission: inference:invoke) or a signed-in session.
@@ -1711,7 +1719,8 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 			v1.POST("/chat/completions", append(inferenceAuth, publicInferenceHandler.ChatCompletions)...)
 			v1.GET("/models", append(inferenceAuth, publicInferenceHandler.ListModels)...)
 			v1.GET("/models/attestation", append(inferenceAuth, publicInferenceHandler.GetAttestation)...)
-			v1.GET("/kumbha/models", append(inferenceAuth, publicInferenceHandler.GetKumbhaModels)...)
+			v1.GET("/build/models", append(inferenceAuth, publicInferenceHandler.GetBuildModels)...)
+			v1.GET("/kumbha/models", append(inferenceAuth, publicInferenceHandler.GetBuildModels)...) // former name
 		}
 
 		storageGroup := v1.Group("/storage")
@@ -1778,7 +1787,6 @@ func setupRouter(apiServer *api.Server, authHandler *api.AuthHandler, accountHan
 				admin.GET("/pricing", adminHandler.GetPricing)
 				admin.PUT("/pricing", adminHandler.UpdatePricing)
 				admin.PUT("/pricing/cpu", adminHandler.UpdateCPUPricing)
-				admin.PUT("/pricing/cpu-pe", adminHandler.UpdatePECorePricing)
 				admin.PUT("/pricing/storage", adminHandler.UpdateStoragePricing)
 				admin.PUT("/pricing/object-storage", adminHandler.UpdateObjectStoragePricing)
 				admin.PUT("/pricing/llm", adminHandler.UpdateLLMPricing)

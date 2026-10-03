@@ -22,8 +22,8 @@ import (
 // key, and the Stage 3 tunnel's routing lookup — not a cosmetic alias
 // layered on top of the old scheme. Nothing anywhere in this codebase
 // parses or depends on the OLD "inst-" prefix (confirmed: the only prefix
-// checks in pkg/cluster.hiddenInstanceIDPrefixes match "kumbha-agent-" /
-// "kaniko-build-" / "kumbha-shot-", Kumbha's own internal-tooling pods,
+// checks in pkg/cluster.hiddenInstanceIDPrefixes match "build-agent-" /
+// "kaniko-build-" / "build-shot-", Teepin Build's own internal-tooling pods,
 // never a customer instance's own ID) — every consumer treats the ID as
 // an opaque string, so the format is free to change here without touching
 // anything downstream.

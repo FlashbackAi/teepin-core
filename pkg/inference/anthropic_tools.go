@@ -19,7 +19,7 @@ import (
 // with its own "tool" role. Before this existed the adapter dropped all of
 // it — tools were never sent, tool_use blocks were discarded, tool results
 // were flattened to user text — and an agent harness saw a model that only
-// ever answered in prose. Found live 2026-09-23: a Kumbha build agent on a
+// ever answered in prose. Found live 2026-09-23: a Teepin Build build agent on a
 // Claude-backed route wrote pseudo tool calls as XML text (with guessed tool
 // names and invented results), never ran a single command, and so never
 // wrote a file.

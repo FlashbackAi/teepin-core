@@ -20,7 +20,7 @@
 #
 # Also (re)installs the ECR pull-secret refresh timer (refresh-ecr-pull-secret.sh,
 # bundled next to this script) on EVERY run, install or update alike — a
-# Kumbha deploy to this node pulls its built image from a private ECR
+# Teepin Build deploy to this node pulls its built image from a private ECR
 # repository, which needs a token refreshed well inside its 12-hour expiry.
 # This is done here, unconditionally, rather than left as a separate step an
 # operator has to remember to run once and then forget about: found live
@@ -28,7 +28,7 @@
 # weeks earlier with no recurring refresh ever set up, and image pulls
 # started failing with a 403 the moment that token finally expired. The one
 # piece that stays manual is populating the AWS credential itself
-# (/etc/teepin/kumbha-ecr-puller.env) — this script prints exactly what to
+# (/etc/teepin/build-ecr-puller.env) — this script prints exactly what to
 # run if that file is still empty.
 #
 # Usage:
@@ -72,37 +72,20 @@ done
 info() { echo "[install] $*"; }
 fail() { echo "[install] ERROR: $*" >&2; exit 1; }
 
-# apply_pe_core_env (idempotently) writes TEEPIN_PCORES/TEEPIN_ECORES into
-# the given systemd unit's [Service] Environment lines and reloads systemd
-# so the change is picked up on the unit's next start. A no-op when
-# TEEPIN_PCORES/TEEPIN_ECORES are not both set in THIS script's own
-# environment — the bootstrap script only exports them when
-# teepin-hostprobe actually reported a usable split (see
-# bootstrap-windows.ps1/bootstrap-macos.sh's own P/E-core detection step).
-#
-# Called on EVERY run of this script — fresh install AND update alike —
-# so a fixed detector, a hardware change, or simply re-running the
-# bootstrap script is enough to correct a bad reading, with no fresh
-# enrollment token required. Persisting into the unit file (rather than
-# leaving these only exported in the one-time `enroll` shell) is what
-# lets detectPECores() see the same value on every later `teepin-agent
-# run` too — see that function's own doc comment in cmd/teepin-agent.
-apply_pe_core_env() {
+# remove_pe_core_env strips the TEEPIN_PCORES/TEEPIN_ECORES lines that older
+# versions of this script wrote into the agent's systemd unit. The P-core/E-core
+# split was removed from the platform (2026-10-03); the agent no longer reads
+# them. Idempotent: a no-op once the lines are gone.
+remove_pe_core_env() {
     local unit_file="$1"
-    [ -n "${TEEPIN_PCORES:-}" ] && [ -n "${TEEPIN_ECORES:-}" ] || return 0
     [ -f "$unit_file" ] || return 0
+    grep -q -E '^Environment=TEEPIN_(P|E)CORES=' "$unit_file" || return 0
 
-    info "recording P/E-core split in $unit_file (P=$TEEPIN_PCORES E=$TEEPIN_ECORES)..."
+    info "removing the old P/E-core settings from $unit_file..."
     local tmp
     tmp="$(mktemp)"
-    # Strip any TEEPIN_PCORES/TEEPIN_ECORES lines a PREVIOUS run of this
-    # function wrote, then insert the current values fresh right after
-    # [Service] — idempotent regardless of how many times this runs.
     grep -v -E '^Environment=TEEPIN_(P|E)CORES=' "$unit_file" > "$tmp"
-    awk -v p="$TEEPIN_PCORES" -v e="$TEEPIN_ECORES" '
-        { print }
-        /^\[Service\]/ { print "Environment=TEEPIN_PCORES=" p; print "Environment=TEEPIN_ECORES=" e }
-    ' "$tmp" > "$unit_file"
+    cat "$tmp" > "$unit_file"
     rm -f "$tmp"
     systemctl daemon-reload
 }
@@ -114,19 +97,19 @@ apply_pe_core_env() {
 # remembers to make recurring. Found live 2026-09-07: srialla's pull secret
 # was a single manual `--once` run from 2026-08-23 with no timer ever
 # installed; it silently went stale after 12 hours and stayed that way for
-# two weeks before a real Kumbha deploy failed to pull its image with a 403.
+# two weeks before a real Teepin Build deploy failed to pull its image with a 403.
 #
 # Best-effort throughout: a problem here must never fail the agent
 # install/update itself — the agent's OWN image pull (for the agent binary
 # this script just installed) does not depend on this secret at all, only a
-# LATER Kumbha deploy to this node does, so failing loudly-but-not-fatally
+# LATER Teepin Build deploy to this node does, so failing loudly-but-not-fatally
 # here is strictly better than either silently skipping it or blocking
 # everything else over a credential that can be fixed after the fact.
 ensure_ecr_pull_secret() {
     local ecr_script
     ecr_script="$(dirname "$0")/refresh-ecr-pull-secret.sh"
     if [ ! -f "$ecr_script" ]; then
-        info "WARNING: refresh-ecr-pull-secret.sh not found next to this script — skipping ECR pull-secret setup. Kumbha deploys to this node may fail to pull images with a 403."
+        info "WARNING: refresh-ecr-pull-secret.sh not found next to this script — skipping ECR pull-secret setup. Teepin Build deploys to this node may fail to pull images with a 403."
         return
     fi
 
@@ -134,17 +117,17 @@ ensure_ecr_pull_secret() {
     if ! bash "$ecr_script" --install \
         --account-id "$ECR_ACCOUNT_ID" --region "$ECR_REGION" \
         --secret-name teepin-kumbha-ecr --namespace default; then
-        info "WARNING: ECR pull-secret timer setup failed (see the error above) — Kumbha deploys to this node may fail to pull images."
+        info "WARNING: ECR pull-secret timer setup failed (see the error above) — Teepin Build deploys to this node may fail to pull images."
         return
     fi
 
-    local creds_file=/etc/teepin/kumbha-ecr-puller.env
+    local creds_file=/etc/teepin/build-ecr-puller.env
     if [ -s "$creds_file" ] && grep -q "^AWS_ACCESS_KEY_ID=.\+" "$creds_file" 2>/dev/null; then
         info "credential file already populated — forcing an immediate refresh to confirm it works..."
         systemctl start teepin-kumbha-ecr-refresh.service \
             || info "WARNING: the ECR pull-secret refresh failed to run — check: journalctl -u teepin-kumbha-ecr-refresh.service -n 50"
     else
-        info "IMPORTANT: $creds_file has no AWS credentials yet — Kumbha image pulls to this node WILL fail (403) until you populate it:"
+        info "IMPORTANT: $creds_file has no AWS credentials yet — Teepin Build image pulls to this node WILL fail (403) until you populate it:"
         info "  aws iam create-access-key --user-name teepin-kumbha-ecr-puller-<env>"
         info "  sudo nano $creds_file   # then: sudo systemctl start teepin-kumbha-ecr-refresh.service"
     fi
@@ -194,7 +177,7 @@ if [ -f "$CONFIG_FILE_DEFAULT" ] && [ -f "$UNIT_FILE" ]; then
 
     install -m 0755 "$NEW_BIN" "$AGENT_BIN"
 
-    apply_pe_core_env "$UNIT_FILE"
+    remove_pe_core_env "$UNIT_FILE"
 
     info "starting the agent..."
     systemctl start teepin-agent.service
@@ -297,7 +280,7 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-apply_pe_core_env /etc/systemd/system/teepin-agent.service
+remove_pe_core_env /etc/systemd/system/teepin-agent.service
 
 info "starting the agent service..."
 systemctl daemon-reload

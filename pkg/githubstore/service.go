@@ -1,13 +1,13 @@
 // Copyright 2026 TEEPIN Project
 // Licensed under the Apache License, Version 2.0
 
-// Package githubstore pushes each Kumbha session's checkpointed workspace
+// Package githubstore pushes each Teepin Build session's checkpointed workspace
 // to a Teepin-owned repo under the TeepinWebServices GitHub org — a
 // backing store using git as a robust, diffable version-storage backend,
 // not a customer-facing collaboration surface. The repo this package
 // creates is NEVER exposed to the customer: they only ever get the
-// existing ZIP download (kumbha.Store.BuildArchive /
-// GET /v1/kumbha/sessions/:id/workspace/archive). Both exported methods
+// existing ZIP download (teepinbuild.Store.BuildArchive /
+// GET /v1/build/sessions/:id/workspace/archive). Both exported methods
 // below return only what a caller needs to keep working, never a repo
 // name/URL in a form pkg/api could accidentally surface in a customer
 // response — PushSnapshot returns only error, and the repo name is
@@ -34,7 +34,7 @@ import (
 	"github.com/google/go-github/v88/github"
 	"github.com/google/uuid"
 
-	"github.com/FlashbackAi/teepin-core/pkg/kumbha"
+	"github.com/FlashbackAi/teepin-core/pkg/teepinbuild"
 )
 
 // defaultBranch matches GitHub's own platform-wide default (since 2020)
@@ -42,7 +42,7 @@ import (
 // so this must track whatever a fresh repo under the org actually gets.
 const defaultBranch = "main"
 
-// Service pushes Kumbha workspace snapshots to Teepin's own GitHub org.
+// Service pushes Teepin Build workspace snapshots to Teepin's own GitHub org.
 type Service struct {
 	client *github.Client
 	org    string
@@ -69,9 +69,9 @@ func NewService(appID, installationID int64, privateKeyPEM []byte, org string) (
 
 // repoName derives THE deterministic repo name for a session — the same
 // value on every call, so ProvisionRepo/PushSnapshot never need it passed
-// in or looked up. Mirrors the existing "kumbha-agent-<short-id>" /
+// in or looked up. Mirrors the existing "build-agent-<short-id>" /
 // "inst-<short-id>" naming convention already used elsewhere in this
-// codebase (pkg/kumbha/agent.go's LaunchAgent, pkg/compute's instance
+// codebase (pkg/teepinbuild/agent.go's LaunchAgent, pkg/compute's instance
 // IDs).
 func repoName(sessionID uuid.UUID) string {
 	return "kumbha-" + sessionID.String()[:8]
@@ -81,7 +81,7 @@ func repoName(sessionID uuid.UUID) string {
 // already exist, and returns its name either way — idempotent, same
 // "already provisioned" short-circuit pattern as
 // harbor.Service.ProvisionProjectRegistry. Callers are expected to persist
-// the result (kumbha.Store.SetGithubRepo) and only call this again for a
+// the result (teepinbuild.Store.SetGithubRepo) and only call this again for a
 // session that has never been provisioned, so the common case never pays
 // this existence check at all — but calling it redundantly is still safe.
 func (s *Service) ProvisionRepo(ctx context.Context, sessionID uuid.UUID) (string, error) {
@@ -129,12 +129,12 @@ func (s *Service) ProvisionRepo(ctx context.Context, sessionID uuid.UUID) (strin
 // push after that, including the rest of THIS snapshot, goes through the
 // ordinary tree-based flow against that bootstrap commit as its parent.
 //
-// files is exactly the []kumbha.WorkspaceFile shape SaveVersion already
+// files is exactly the []teepinbuild.WorkspaceFile shape SaveVersion already
 // builds — plain decoded text, no encoding step needed here. Binary files
-// are already excluded upstream (kumbha.SkippedFile), matching the
+// are already excluded upstream (teepinbuild.SkippedFile), matching the
 // existing ZIP/version-history behaviour — this does not introduce a new
 // limitation.
-func (s *Service) PushSnapshot(ctx context.Context, sessionID uuid.UUID, files []kumbha.WorkspaceFile, message string) error {
+func (s *Service) PushSnapshot(ctx context.Context, sessionID uuid.UUID, files []teepinbuild.WorkspaceFile, message string) error {
 	name := repoName(sessionID)
 
 	ref, resp, err := s.client.Git.GetRef(ctx, s.org, name, "refs/heads/"+defaultBranch)

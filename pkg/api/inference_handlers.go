@@ -76,13 +76,13 @@ type InferenceHandler struct {
 	credit  creditChecker
 	status  ModelStatusSource
 	// reports, when set, is what each model was seen to do (pkg/modelprobe);
-	// the Kumbha model list follows it instead of the declared flags alone.
+	// the Teepin Build model list follows it instead of the declared flags alone.
 	reports interface {
 		All(ctx context.Context) (map[string]*modelprobe.Report, error)
 	}
 }
 
-// WithProbeReports makes the Kumbha model list follow the evidence of what each
+// WithProbeReports makes the Teepin Build model list follow the evidence of what each
 // model can do: a model that cannot call tools is shown as unavailable for
 // building, with the reason, and is never the default.
 func (h *InferenceHandler) WithProbeReports(r interface {
@@ -92,7 +92,7 @@ func (h *InferenceHandler) WithProbeReports(r interface {
 	return h
 }
 
-// WithModelStatus lets the Kumbha model list say which models can serve right
+// WithModelStatus lets the Teepin Build model list say which models can serve right
 // now, so the picker can disable the ones that cannot.
 func (h *InferenceHandler) WithModelStatus(src ModelStatusSource) *InferenceHandler {
 	h.status = src
@@ -187,7 +187,7 @@ func (a inferenceAccess) permits(route string) bool { return a.allowed == nil ||
 // resolveAccess applies the credential's permissions. ok is false when the
 // response has already been written.
 func resolveAccess(c *gin.Context) (inferenceAccess, bool) {
-	// A Kumbha agent credential is the platform's most narrowly scoped
+	// A Teepin Build agent credential is the platform's most narrowly scoped
 	// token; it must never reach a paid model API.
 	if _, isSession := auth.GetSessionID(c); isSession {
 		writeInferenceError(c, http.StatusForbidden, "permission_error", "forbidden", "this credential cannot call inference models")
@@ -319,7 +319,7 @@ func (h *InferenceHandler) ChatCompletions(c *gin.Context) {
 	}
 
 	// Same answer whether the model does not exist, is not offered to
-	// customers (e.g. one reserved for the Kumbha build agent), or this key
+	// customers (e.g. one reserved for the Teepin Build build agent), or this key
 	// may not use it: a caller must not learn what else exists.
 	model, err := h.catalog.GetModel(c.Request.Context(), req.model)
 	if err != nil && !errors.Is(err, modelcatalog.ErrNotFound) {
@@ -605,7 +605,7 @@ func (h *InferenceHandler) GetAttestation(c *gin.Context) {
 	c.JSON(http.StatusOK, doc)
 }
 
-// kumbhaModelView describes one Kumbha-enabled model for the build
+// buildModelView describes one Teepin Build-enabled model for the build
 // composer's model picker: its real route and display name, plus badges
 // computed from its own Provider — never a fixed Fast/Deep/Confidential
 // bucket, since a model can be both tool-capable and confidential, or
@@ -618,7 +618,7 @@ func (h *InferenceHandler) GetAttestation(c *gin.Context) {
 // to the customer, same as leased GPU/CPU compute — "third-party" is
 // reserved for a vendor's own API Teepin merely calls (Anthropic, an
 // arbitrary OpenAI-compatible endpoint).
-type kumbhaModelView struct {
+type buildModelView struct {
 	Route         string  `json:"route"`
 	DisplayName   string  `json:"display_name"`
 	Confidential  bool    `json:"confidential"`
@@ -633,39 +633,39 @@ type kumbhaModelView struct {
 	Unavailable string `json:"unavailable_reason,omitempty"`
 }
 
-// GetKumbhaModels is GET /v1/kumbha/models: every enabled, Kumbha-enabled
+// GetBuildModels is GET /v1/build/models: every enabled, Teepin Build-enabled
 // model the build composer's picker can offer directly, ordered by
-// KumbhaPriority (the picker's default/recommendation order — no longer a
-// failover sequence; see pkg/kumbha/gateway.go's resolveModel). Confidential
+// BuildPriority (the picker's default/recommendation order — no longer a
+// failover sequence; see pkg/teepinbuild/gateway.go's resolveModel). Confidential
 // and SelfHosted are computed independently from Provider, not mutually
 // exclusive categories, so a customer sees exactly what a model actually
 // guarantees instead of a lossy bucket label.
-func (h *InferenceHandler) GetKumbhaModels(c *gin.Context) {
+func (h *InferenceHandler) GetBuildModels(c *gin.Context) {
 	if _, ok := resolveAccess(c); !ok {
 		return
 	}
 	models, err := h.catalog.ListModels(c.Request.Context())
 	if err != nil {
-		log.Printf("inference: list models for kumbha picker: %v", err)
+		log.Printf("inference: list models for build picker: %v", err)
 		writeInferenceError(c, http.StatusInternalServerError, "api_error", "internal_error", "could not list models")
 		return
 	}
 
 	enabled := make([]modelcatalog.Model, 0, len(models))
 	for _, m := range models {
-		if m.Enabled && m.KumbhaEnabled {
+		if m.Enabled && m.BuildEnabled {
 			enabled = append(enabled, m)
 		}
 	}
 	sort.Slice(enabled, func(i, j int) bool {
-		return enabled[i].KumbhaPriority < enabled[j].KumbhaPriority
+		return enabled[i].BuildPriority < enabled[j].BuildPriority
 	})
 
 	var reports map[string]*modelprobe.Report
 	if h.reports != nil {
 		reports, _ = h.reports.All(c.Request.Context())
 	}
-	out := make([]kumbhaModelView, 0, len(enabled))
+	out := make([]buildModelView, 0, len(enabled))
 	for _, m := range enabled {
 		unavailable := ""
 		if h.status != nil {
@@ -676,7 +676,7 @@ func (h *InferenceHandler) GetKumbhaModels(c *gin.Context) {
 			v := modelprobe.Builder(tools, vision, audio, reports[m.ModelRoute], unavailable)
 			tools, vision, audio, unavailable = v.Tools, v.Vision, v.Audio, v.Unavailable
 		}
-		out = append(out, kumbhaModelView{
+		out = append(out, buildModelView{
 			Available: unavailable == "", Unavailable: unavailable,
 			Route: m.ModelRoute, DisplayName: m.DisplayName,
 			Confidential:  m.Provider == modelcatalog.ProviderTinfoilConfidential,

@@ -19,18 +19,3 @@ func nativeMemoryGB() int {
 	const gib = 1024 * 1024 * 1024
 	return int((bytes + gib/2) / gib)
 }
-
-// nativePECores uses the same sysctl names as cmd/teepin-hostprobe:
-// hw.perflevel0 is the performance cluster, hw.perflevel1 the efficiency
-// cluster. Missing perflevel0 (an Intel Mac) means "no split detected".
-func nativePECores() (pCores, eCores int) {
-	p, err := unix.SysctlUint32("hw.perflevel0.physicalcpu")
-	if err != nil {
-		return 0, 0
-	}
-	e, err := unix.SysctlUint32("hw.perflevel1.physicalcpu")
-	if err != nil {
-		return int(p), 0
-	}
-	return int(p), int(e)
-}

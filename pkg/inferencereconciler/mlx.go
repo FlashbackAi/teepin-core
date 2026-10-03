@@ -54,7 +54,7 @@ func buildMLXSpec(instanceID string, cfg inferencegateway.ModelServiceConfig, im
 		NodeName:   nodeName,
 		NodeClass:  "home",
 		ProviderID: providerID,
-		Labels:     map[string]string{hiddenLabel: "true"},
+		Labels:     map[string]string{hiddenLabel: "true", legacyHiddenLabel: "true"},
 		Ports:      []cluster.PortMapping{{Container: servePort, Protocol: "tcp"}},
 	}, nil
 }

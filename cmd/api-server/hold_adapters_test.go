@@ -67,15 +67,15 @@ func activeRows(ids ...string) *sqlmock.Rows {
 	rows := sqlmock.NewRows([]string{
 		"id", "account_id", "project_id", "user_id", "name", "image",
 		"instance_type_id", "status", "gpu_vram_gb",
-		"cpu_units", "memory_gb", "p_cores_used", "e_cores_used", "endpoint",
+		"cpu_units", "memory_gb", "endpoint",
 		"k8s_pod_name", "k8s_namespace",
 		"provider_id", "node_name", "dns_name", "public_ip", "tls_enabled", "tls_ready", "container_port",
 		"storage_gb",
-		"created_at", "updated_at", "started_at", "terminated_at", "kumbha_session_id",
+		"created_at", "updated_at", "started_at", "terminated_at", "build_session_id",
 	})
 	for _, id := range ids {
 		rows.AddRow(id, uuid.New(), uuid.New(), uuid.New(), "app", "img",
-			"cpu.home", "running", 0, 2, 4, nil, nil, "",
+			"cpu.home", "running", 0, 2, 4, "",
 			id+"-pod", "default", "provider-7", "node-a", "", "", false, false, 8080,
 			50, time.Now(), time.Now(), nil, nil, nil)
 	}

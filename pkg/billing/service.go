@@ -144,7 +144,7 @@ func (s *Service) RecordUsage(ctx context.Context, record *UsageRecord) error {
 // GetUsageRecords retrieves usage records for a project
 func (s *Service) GetUsageRecords(ctx context.Context, projectID uuid.UUID, start, end time.Time) ([]UsageRecord, error) {
 	// COALESCE instance_id: after migration 024 a usage record's subject is
-	// not always an instance (a Kumbha inference session, e.g.), so the
+	// not always an instance (a Teepin Build inference session, e.g.), so the
 	// column is nullable — scanning a NULL straight into UsageRecord's
 	// plain string field would error.
 	query := `

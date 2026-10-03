@@ -52,13 +52,18 @@ func (s *Server) persistLaunchSpec(ctx context.Context, instanceID string, spec 
 
 // stoppedView is the customer-facing view of a stopped instance. It has no
 // pod, so there is no cluster status to build it from.
-func (s *Server) stoppedView(ctx context.Context, rec *compute.InstanceRecord) models.Instance {
+func (s *Server) stoppedView(ctx context.Context, rec *compute.InstanceRecord, quote func(*models.Instance, *compute.InstanceRecord)) models.Instance {
 	st := cluster.InstanceStatus{
 		InstanceID: rec.ID,
 		Status:     compute.StatusStopped,
 		Message:    stoppedMessage,
 	}
-	return statusToInstance(st, rec, s.vramRate(ctx), s.endpointDomain)
+	view := statusToInstance(st, rec, s.vramRate(ctx), s.endpointDomain)
+	if quote == nil {
+		quote = s.cpuQuoter(ctx)
+	}
+	quote(&view, rec)
+	return view
 }
 
 // stoppedRecord returns the caller's stopped instance with this id, or nil.
@@ -234,5 +239,7 @@ func (s *Server) StartInstance(c *gin.Context) {
 		updated = rec
 	}
 	st := cluster.InstanceStatus{InstanceID: rec.ID, Status: compute.StatusPending}
-	c.JSON(http.StatusOK, statusToInstance(st, updated, s.vramRate(ctx), s.endpointDomain))
+	view := statusToInstance(st, updated, s.vramRate(ctx), s.endpointDomain)
+	s.cpuQuoter(ctx)(&view, updated)
+	c.JSON(http.StatusOK, view)
 }

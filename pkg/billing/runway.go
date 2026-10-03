@@ -175,7 +175,7 @@ const gbMonthHoursForRunway = 730.0
 func (s *Service) runningComputeBurn(ctx context.Context, accountID uuid.UUID, rates computeRates) (float64, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT COALESCE(gpu_vram_gb, 0), COALESCE(cpu_units, 0), COALESCE(memory_gb, 0),
-		       COALESCE(storage_gb, 0), p_cores_used, e_cores_used
+		       COALESCE(storage_gb, 0)
 		FROM compute.instances
 		WHERE account_id = $1 AND status = 'running' AND terminated_at IS NULL`, accountID)
 	if err != nil {
@@ -185,7 +185,7 @@ func (s *Service) runningComputeBurn(ctx context.Context, accountID uuid.UUID, r
 	var total float64
 	for rows.Next() {
 		var inst billableInstance
-		if err := rows.Scan(&inst.GPUVRAMGB, &inst.CPUUnits, &inst.MemoryGB, &inst.StorageGB, &inst.PCoresUsed, &inst.ECoresUsed); err != nil {
+		if err := rows.Scan(&inst.GPUVRAMGB, &inst.CPUUnits, &inst.MemoryGB, &inst.StorageGB); err != nil {
 			return 0, err
 		}
 		total += rates.hourly(inst)

@@ -27,58 +27,6 @@ func newMock(t *testing.T) (*Service, sqlmock.Sqlmock, func()) {
 	return NewService(db), mock, func() { db.Close() }
 }
 
-// TestListNodes_ReturnsPECoreSplit is the regression test for a real bug
-// found live: p_cores/e_cores were written to compute.nodes correctly at
-// enroll and on every reconnect (Enroll, RecordHeartbeat, UpsertSeen all
-// handle them), but ListNodes' own SELECT never named either column, so
-// the console's node list/detail pages silently showed no split for any
-// node no matter what the database actually held — a read-side gap, not
-// a write-side one, and easy to miss because every other symptom (agent
-// logs, server logs, the write path itself) looked completely healthy.
-func TestListNodes_ReturnsPECoreSplit(t *testing.T) {
-	s, mock, done := newMock(t)
-	defer done()
-
-	nodeID := uuid.New()
-	now := time.Now()
-	lat, lng := 12.9716, 77.5946
-	mock.ExpectQuery(`SELECT id, node_name, provider_id, class`).
-		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "node_name", "provider_id", "class", "region",
-			"cpu_cores", "memory_gb", "p_cores", "e_cores", "gpu_model",
-			"gpu_count", "mig_capable", "os", "arch",
-			"agent_version", "status", "last_seen_at", "revoked_at",
-			"rentable_cpu_cores", "rentable_memory_gb", "k8s_ready",
-			"latitude", "longitude", "location_label",
-			"created_at", "updated_at",
-		}).AddRow(
-			nodeID, "Srialla", "srialla", "home", "home",
-			30, 42, 8, 16, "",
-			0, false, "linux", "amd64",
-			"dev", "online", &now, nil,
-			18, 42, true,
-			&lat, &lng, "Bengaluru, India",
-			now, now,
-		))
-
-	nodes, err := s.ListNodes(context.Background())
-	if err != nil {
-		t.Fatalf("ListNodes: %v", err)
-	}
-	if len(nodes) != 1 {
-		t.Fatalf("got %d nodes, want 1", len(nodes))
-	}
-	if nodes[0].PCores != 8 || nodes[0].ECores != 16 {
-		t.Errorf("PCores/ECores = %d/%d, want 8/16", nodes[0].PCores, nodes[0].ECores)
-	}
-	if nodes[0].Latitude == nil || nodes[0].Longitude == nil || *nodes[0].Latitude != lat || *nodes[0].Longitude != lng {
-		t.Errorf("Latitude/Longitude = %v/%v, want %v/%v", nodes[0].Latitude, nodes[0].Longitude, lat, lng)
-	}
-	if nodes[0].LocationLabel != "Bengaluru, India" {
-		t.Errorf("LocationLabel = %q, want %q", nodes[0].LocationLabel, "Bengaluru, India")
-	}
-}
-
 // TestPublicNodeLocations_ReturnsRoundedCoordinatesAndLabel is the
 // regression guard for the public status/marketing globe's
 // data-minimization guarantee: the query must select exactly rounded
@@ -233,7 +181,7 @@ func TestEnroll_ClassComesFromToken(t *testing.T) {
 			AddRow(tokenID, hash, "datacenter", time.Now().Add(time.Hour), nil))
 	mock.ExpectQuery(`INSERT INTO compute\.nodes`).
 		WithArgs("node-a", "prov-a", "datacenter", sqlmock.AnyArg(), sqlmock.AnyArg(),
-			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(),
 			0, false, sqlmock.AnyArg(), sqlmock.AnyArg(),
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "node_name", "created_at", "updated_at"}).
@@ -394,7 +342,7 @@ func TestUpsertSeen(t *testing.T) {
 	nodeID := uuid.New()
 	mock.ExpectQuery(`(?s)INSERT INTO compute\.nodes.*ON CONFLICT \(provider_id\) DO UPDATE`).
 		WithArgs("gpu-node-1", "dc-provider", "datacenter", sqlmock.AnyArg(),
-			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(),
 			sqlmock.AnyArg(), 8, true,
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), true).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(nodeID))
@@ -434,7 +382,7 @@ func TestUpsertSeen_KeyedByProviderIDNotNodeName(t *testing.T) {
 	nodeID := uuid.New()
 	mock.ExpectQuery(`(?s)INSERT INTO compute\.nodes.*ON CONFLICT \(provider_id\) DO UPDATE`).
 		WithArgs("stale-agent-reported-name", "stable-provider-id", "home", sqlmock.AnyArg(),
-			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(),
 			sqlmock.AnyArg(), 0, false,
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), true).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(nodeID))
@@ -470,7 +418,7 @@ func TestUpsertSeen_RecordsUtilizationHistory(t *testing.T) {
 	nodeID := uuid.New()
 	mock.ExpectQuery(`(?s)INSERT INTO compute\.nodes.*ON CONFLICT \(provider_id\) DO UPDATE`).
 		WithArgs("srialla", "srialla", "home", sqlmock.AnyArg(),
-			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(),
 			sqlmock.AnyArg(), 0, false,
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), true).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(nodeID))
@@ -506,7 +454,7 @@ func TestUpsertSeen_MetricsHistoryFailureIsNonFatal(t *testing.T) {
 	nodeID := uuid.New()
 	mock.ExpectQuery(`(?s)INSERT INTO compute\.nodes.*ON CONFLICT \(provider_id\) DO UPDATE`).
 		WithArgs("srialla", "srialla", "home", sqlmock.AnyArg(),
-			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(),
 			sqlmock.AnyArg(), 0, false,
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), true).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(nodeID))

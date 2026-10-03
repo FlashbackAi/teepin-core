@@ -571,7 +571,7 @@ func (s *Server) MintObjectDownloadURL(c *gin.Context) {
 
 // RedeemObjectDownloadURL handles GET /v1/storage/d/:token — mounted
 // OUTSIDE authentication at the router (see main.go): the token itself is
-// the credential, the same posture as the exec/Kumbha-event ticket
+// the credential, the same posture as the exec/Teepin Build-event ticket
 // handlers ("the WS handshake carries no Authorization header").
 func (s *Server) RedeemObjectDownloadURL(c *gin.Context) {
 	if s.objectStore == nil || s.objectStoreSigner == nil {

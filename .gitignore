@@ -21,12 +21,9 @@ go.work
 *.o
 *.a
 
-# Locally-built helper binaries the bootstrap scripts drop next to
-# themselves (teepin-hostprobe has no extension on macOS/Linux, so *.exe
-# above doesn't catch it; teepin-agent-linux-* is bootstrap-windows.ps1/
-# bootstrap-macos.sh's cross-compiled agent binary passed to install.sh
-# via --binary).
-/deploy/agent/teepin-hostprobe
+# The cross-compiled agent binary the bootstrap scripts (bootstrap-windows.ps1,
+# bootstrap-macos.sh) drop next to themselves and pass to install.sh via
+# --binary.
 /deploy/agent/teepin-agent-linux-*
 
 # IDE specific

@@ -49,9 +49,9 @@ Verify: `systemctl status teepin-agent`, or watch the control centre.
 `install.sh` also (re)installs `refresh-ecr-pull-secret.sh`'s systemd timer
 automatically, every run — you never run that script yourself. The one
 manual piece it cannot do for you is the AWS credential
-(`/etc/teepin/kumbha-ecr-puller.env`): `install.sh` prints the exact
+(`/etc/teepin/build-ecr-puller.env`): `install.sh` prints the exact
 `aws iam create-access-key` command to run if that file is still empty.
-Without it, the node enrolls and runs fine, but a Kumbha deploy TO this
+Without it, the node enrolls and runs fine, but a Teepin Build deploy TO this
 node will fail to pull its image with a 403 until the credential is filled
 in.
 

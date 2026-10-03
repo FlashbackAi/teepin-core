@@ -20,7 +20,7 @@ import (
 //
 // This is the backend Teepin owns, so it is the default route for the bulk
 // of traffic — the high-volume, low-ambiguity work where the tokens (and
-// therefore the margin) actually are. See KUMBHA-DESIGN.md's routing table
+// therefore the margin) actually are. See TEEPIN-BUILD-DESIGN.md's routing table
 // for what deliberately does NOT come here.
 type VLLMProvider struct {
 	baseURL string
@@ -74,9 +74,9 @@ type VLLMConfig struct {
 // wait for response HEADERS, which is what actually catches a dead backend.
 //
 // ResponseHeaderTimeout specifically was 60s until this was found live
-// (2026-08-23): for a NON-streaming completion (Kumbha does not support
+// (2026-08-23): for a NON-streaming completion (Teepin Build does not support
 // streaming yet — see the "streaming is not yet available" 400 in
-// kumbha_handlers.go), vLLM sends nothing at all, headers included, until
+// build_handlers.go), vLLM sends nothing at all, headers included, until
 // the entire response has finished generating. A high-reasoning-effort
 // agentic turn on a single home-hosted GPU legitimately took longer than
 // that, so every retry hit the exact same 60s wall and the agent looked

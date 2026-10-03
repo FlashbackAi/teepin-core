@@ -132,49 +132,6 @@ already_enrolled="$(limactl shell "$VM_NAME" -- bash -c \
     '[ -f /etc/teepin/agent.json ] && [ -f /etc/systemd/system/teepin-agent.service ] && echo yes || echo no' \
     2>/dev/null || echo no)"
 
-# --- P-core/E-core detection (host side) --------------------------------
-# Runs on EVERY invocation of this script -- fresh install AND an update of
-# an already-enrolled node alike -- not just the first. P/E-cores are
-# capacity, refreshed on every agent reconnect the same as CPU/memory/OS/
-# arch (see RegisterRequest.p_cores' own proto comment): install.sh's
-# apply_pe_core_env persists whatever this probe finds into the agent's
-# systemd unit regardless of which branch below actually runs, so a fixed
-# detector, a hardware change, or simply re-running this script is enough
-# to correct a bad reading -- no fresh enrollment token required.
-#
-# Must happen HERE, on the real macOS host, not inside the VM: the agent
-# (built GOOS=linux only) always runs inside this Lima guest, and the
-# guest's own view of CPU topology is not reliably the host's real one --
-# Lima/QEMU may not expose true core-type info to it at all. See
-# cmd/teepin-hostprobe's own doc comment for the full reasoning.
-pcores_env=""
-ecores_env=""
-probe_bin="$here/teepin-hostprobe"
-if [ ! -x "$probe_bin" ]; then
-    if command -v go >/dev/null 2>&1; then
-        info "building teepin-hostprobe from source..."
-        repo_root="$(cd "$here/../.." && pwd)"
-        probe_bin="$(mktemp)"
-        ( cd "$repo_root" && go build -o "$probe_bin" ./cmd/teepin-hostprobe ) \
-            || { info "note: could not build teepin-hostprobe -- P/E-core detection skipped."; probe_bin=""; }
-    else
-        info "note: teepin-hostprobe not found and Go is not installed to build it -- P/E-core detection skipped."
-        probe_bin=""
-    fi
-fi
-if [ -n "$probe_bin" ]; then
-    probe_json="$("$probe_bin" 2>/dev/null)" || probe_json=""
-    pcores="$(printf '%s' "$probe_json" | grep -o '"p_cores":[0-9]*' | grep -o '[0-9]*$')"
-    ecores="$(printf '%s' "$probe_json" | grep -o '"e_cores":[0-9]*' | grep -o '[0-9]*$')"
-    if [ -n "$pcores" ] && [ -n "$ecores" ]; then
-        info "detected CPU: ${pcores} P-cores / ${ecores} E-cores"
-        pcores_env="TEEPIN_PCORES=$pcores"
-        ecores_env="TEEPIN_ECORES=$ecores"
-    else
-        info "note: teepin-hostprobe did not report a usable P/E-core split -- this CPU will be treated as homogeneous."
-    fi
-fi
-
 if [ "$already_enrolled" = "yes" ]; then
     info "existing enrollment found inside the VM -- updating the agent binary only (--token/--control-plane not needed)."
     install_args=""
@@ -189,8 +146,7 @@ fi
 # --- teepin-agent binary (host side, cross-compiled for Linux) ----------
 # Built HERE, on the host, rather than requiring a SECOND full Go
 # toolchain inside the disposable Lima VM just to build the one binary
-# install.sh needs -- this host already needs Go for teepin-hostprobe
-# above, and install.sh's own "no --binary given and Go is not installed"
+# install.sh needs -- install.sh's own "no --binary given and Go is not installed"
 # fallback otherwise forces every node operator to also set up Go inside
 # their Linux guest for no reason beyond this one build. Passed to
 # install.sh unconditionally whenever this succeeds, in BOTH the
@@ -214,8 +170,7 @@ if command -v go >/dev/null 2>&1; then
         # lines below), and a /tmp or /var/folders mktemp path would be
         # invisible inside the guest, silently breaking --binary. $here is
         # already known-reachable there -- it's exactly what the existing
-        # `cp -r '$here'/.` step a few lines down already relies on, the
-        # same place teepin-hostprobe's own binary lives (probe_bin above).
+        # `cp -r '$here'/.` step a few lines down already relies on.
         agent_bin="$here/teepin-agent-linux-$go_arch"
         if ( cd "$repo_root_for_agent" && GOOS=linux GOARCH="$go_arch" go build -o "$agent_bin" ./cmd/teepin-agent ); then
             install_args="$install_args --binary '$agent_bin'"
@@ -229,15 +184,12 @@ fi
 
 info "running the Linux installer inside the VM..."
 # Lima mounts the host home read-only by default; copy the script dir into the
-# VM's writable /tmp, then run it there as root. TEEPIN_PCORES/TEEPIN_ECORES
-# (set as literal VAR=val words right on the sudo command line) are exactly
-# how sudo passes explicit variables through regardless of env_reset -- see
-# cmd/teepin-agent/enroll.go's peCoresFromEnv for how the agent reads them.
+# VM's writable /tmp, then run it there as root.
 limactl shell "$VM_NAME" -- bash -c "
     set -e
     rm -rf /tmp/teepin-agent-install && mkdir -p /tmp/teepin-agent-install
     cp -r '$here'/. /tmp/teepin-agent-install/
-    sudo $pcores_env $ecores_env bash /tmp/teepin-agent-install/install.sh $install_args
+    sudo bash /tmp/teepin-agent-install/install.sh $install_args
 "
 
 info "done. The node should appear in the control centre (Nodes) as online within a minute."

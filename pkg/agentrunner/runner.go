@@ -105,14 +105,6 @@ type Config struct {
 	MemoryGB int
 	OS       string
 	Arch     string
-
-	// PCores/ECores: this home node's detected P-core/E-core split,
-	// refreshed on every reconnect the same as the fields above — see
-	// RegisterRequest.p_cores' own proto comment for why this is
-	// deliberately NOT enroll-time-only. 0/0 is "no split detected" and
-	// leaves whatever the control plane already has on file untouched.
-	PCores int
-	ECores int
 }
 
 // Runner owns one control-plane connection.
@@ -236,8 +228,6 @@ func (r *Runner) Run(ctx context.Context, s stream) error {
 				MemoryGb:     int32(r.cfg.MemoryGB),
 				Os:           r.cfg.OS,
 				Arch:         r.cfg.Arch,
-				PCores:       int32(r.cfg.PCores),
-				ECores:       int32(r.cfg.ECores),
 			},
 		},
 	}); err != nil {
@@ -445,7 +435,7 @@ func (r *Runner) handleCreate(ctx context.Context, s stream, requestID string, c
 	//
 	// existing.Status must also be checked, not just existence: a bare
 	// Pod object is never garbage-collected by Kubernetes on its own, so
-	// a one-shot instance (Kumbha's own agent/build pods, which exit
+	// a one-shot instance (Teepin Build's own agent/build pods, which exit
 	// intentionally when finished — see LaunchAgent's NeverRestart doc
 	// comment) leaves a Completed pod sitting in the cluster
 	// indefinitely under the same instance ID. Before this check, that
@@ -457,7 +447,7 @@ func (r *Runner) handleCreate(ctx context.Context, s stream, requestID string, c
 	// session's agent pod had been Completed for over two hours, and
 	// every subsequent chat message silently went nowhere. "pending"/
 	// "running" mirrors isAgentRunning's own definition of "still alive"
-	// on the control-plane side (pkg/kumbha/agent.go).
+	// on the control-plane side (pkg/teepinbuild/agent.go).
 	if !cmd.ReplaceExisting {
 		if existing, err := r.cfg.Cluster.GetInstanceStatus(
 			ctx, cluster.AllTenants(), cmd.InstanceId); err == nil && existing != nil &&
@@ -1328,7 +1318,7 @@ func (r *Runner) hostUtilization() (cpuPercent, memUsedGB, netRxMBps, netTxMBps,
 // reportStatuses pushes changed instance statuses. Uses
 // AllTenantsIncludingHidden, not AllTenants — see Scope.IncludeHidden's
 // own doc comment: this is the ONLY thing that ever refreshes the
-// control plane's cached status for Kumbha's own agent/build pods
+// control plane's cached status for Teepin Build's own agent/build pods
 // (AgentClient.GetInstanceStatus is a pure cache read), and excluding
 // them here — even though that exclusion is correct for a customer-
 // facing list — left their cached status frozen at its initial "pending"

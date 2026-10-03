@@ -49,8 +49,8 @@ func modelRows() []string {
 		"input_price_per_million", "output_price_per_million",
 		"vendor_input_cost_per_million", "vendor_output_cost_per_million",
 		"enabled", "provider", "provider_model", "base_url", "max_output_tokens", "reasoning_effort",
-		"api_key_ref", "offered_to_customers", "kumbha_enabled", "kumbha_priority",
-		"kumbha_image_reader", "updated_by", "created_at", "updated_at",
+		"api_key_ref", "offered_to_customers", "build_enabled", "build_priority",
+		"build_image_reader", "updated_by", "created_at", "updated_at",
 	}
 }
 
@@ -121,7 +121,7 @@ func TestRegisterModel_InvalidBody(t *testing.T) {
 
 // Registering an external model with its key and availability in one call:
 // the key goes to Secrets Manager under a fresh inference-model-key- name
-// (never into the database), and the model is placed on Kumbha without
+// (never into the database), and the model is placed on Teepin Build without
 // being offered to customers.
 func TestRegisterModel_ExternalModelStoresKeyAndAvailability(t *testing.T) {
 	h, mock, done := newModelCatalogHandlerMock(t)
@@ -143,7 +143,7 @@ func TestRegisterModel_ExternalModelStoresKeyAndAvailability(t *testing.T) {
 
 	body := []byte(`{"model_route":"anthropic/claude-haiku-4-5","display_name":"Claude Haiku 4.5","cost_class":"frontier","engine":"anthropic",` +
 		`"provider":"anthropic","provider_model":"claude-haiku-4-5-20251001","api_key":"sk-ant-test","enabled":true,"input_price_per_million":1,"output_price_per_million":4,` +
-		`"offered_to_customers":false,"kumbha_enabled":true}`)
+		`"offered_to_customers":false,"build_enabled":true}`)
 	w := jsonRequest(h.RegisterModel, "POST", "/v1/admin/inference/models", body, nil)
 	if w.Code != 200 {
 		t.Fatalf("status = %d, body: %s", w.Code, w.Body.String())
@@ -282,7 +282,7 @@ func TestSetAvailability_UpdatesOnlyWhatWasSent(t *testing.T) {
 		WithArgs(nil, nil, &priority, nil, "admin-api", "teepin/a", false).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	w := jsonRequest(h.SetAvailability, "PUT", "/v1/admin/inference/models/availability?model_route=teepin/a", []byte(`{"kumbha_priority":2}`), nil)
+	w := jsonRequest(h.SetAvailability, "PUT", "/v1/admin/inference/models/availability?model_route=teepin/a", []byte(`{"build_priority":2}`), nil)
 	if w.Code != 200 {
 		t.Fatalf("status = %d, body: %s", w.Code, w.Body.String())
 	}
@@ -312,7 +312,7 @@ func TestSetAvailability_ImageReaderNeedsAModelThatCanSee(t *testing.T) {
 	defer done()
 	expectVisionModelRow(mock, "teepin/glm", false)
 
-	w := jsonRequest(h.SetAvailability, "PUT", "/v1/admin/inference/models/availability?model_route=teepin/glm", []byte(`{"kumbha_image_reader":true}`), nil)
+	w := jsonRequest(h.SetAvailability, "PUT", "/v1/admin/inference/models/availability?model_route=teepin/glm", []byte(`{"build_image_reader":true}`), nil)
 	if w.Code != 400 || !strings.Contains(w.Body.String(), "not_vision_capable") {
 		t.Fatalf("status = %d body = %s, want 400 not_vision_capable", w.Code, w.Body.String())
 	}
@@ -326,11 +326,11 @@ func TestSetAvailability_ImageReaderOnForAModelThatCanSee(t *testing.T) {
 	defer done()
 	expectVisionModelRow(mock, "teepin/omni", true)
 	on := true
-	mock.ExpectExec(`kumbha_image_reader`).
+	mock.ExpectExec(`build_image_reader`).
 		WithArgs(nil, nil, nil, &on, "admin-api", "teepin/omni", true).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	w := jsonRequest(h.SetAvailability, "PUT", "/v1/admin/inference/models/availability?model_route=teepin/omni", []byte(`{"kumbha_image_reader":true}`), nil)
+	w := jsonRequest(h.SetAvailability, "PUT", "/v1/admin/inference/models/availability?model_route=teepin/omni", []byte(`{"build_image_reader":true}`), nil)
 	if w.Code != 200 {
 		t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
 	}
@@ -344,11 +344,11 @@ func TestSetAvailability_ImageReaderOffNeedsNoCheck(t *testing.T) {
 	h, mock, done := newModelCatalogHandlerMock(t)
 	defer done()
 	off := false
-	mock.ExpectExec(`kumbha_image_reader`).
+	mock.ExpectExec(`build_image_reader`).
 		WithArgs(nil, nil, nil, &off, "admin-api", "teepin/glm", false).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	w := jsonRequest(h.SetAvailability, "PUT", "/v1/admin/inference/models/availability?model_route=teepin/glm", []byte(`{"kumbha_image_reader":false}`), nil)
+	w := jsonRequest(h.SetAvailability, "PUT", "/v1/admin/inference/models/availability?model_route=teepin/glm", []byte(`{"build_image_reader":false}`), nil)
 	if w.Code != 200 {
 		t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
 	}
@@ -452,7 +452,7 @@ func TestPricingIsRequiredBeforeAModelCanBeMadeAvailable(t *testing.T) {
 				m.ExpectExec(`SET offered_to_customers`).WillReturnResult(sqlmock.NewResult(0, 0))
 				notEnabledRow(m, "teepin/a")
 			}},
-		{"add to Teepin Build", func(h *ModelCatalogHandler) gin.HandlerFunc { return h.SetAvailability }, "/x/availability?model_route=teepin/a", `{"kumbha_enabled":true}`, "PUT",
+		{"add to Teepin Build", func(h *ModelCatalogHandler) gin.HandlerFunc { return h.SetAvailability }, "/x/availability?model_route=teepin/a", `{"build_enabled":true}`, "PUT",
 			func(m sqlmock.Sqlmock) {
 				m.ExpectExec(`SET offered_to_customers`).WillReturnResult(sqlmock.NewResult(0, 0))
 				notEnabledRow(m, "teepin/a")

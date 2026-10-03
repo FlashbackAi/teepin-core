@@ -30,7 +30,7 @@ func TestCreate_PersistsGPUInstance(t *testing.T) {
 
 	mock.ExpectQuery(`INSERT INTO compute\.instances`).
 		WithArgs("inst-abc12345", accountID, projectID, userID, "my-app", "nginx:latest",
-			"gpu.h100.2g.20gb", StatusPending, int64(20), 8, 32, nil, nil,
+			"gpu.h100.2g.20gb", StatusPending, int64(20), 8, 32,
 			nil, "my-app-x1y2z", "default", nil, nil, nil, nil, false, false, nil, 0, nil).
 		WillReturnRows(sqlmock.NewRows([]string{"created_at", "updated_at"}).
 			AddRow(time.Now(), time.Now()))
@@ -63,7 +63,7 @@ func TestCreate_PersistsGPUInstance(t *testing.T) {
 }
 
 // TestCreate_NilUserIDStoresNull proves a credential with no attributable
-// human user (a Kumbha session token, a project API key — both leave
+// human user (a Teepin Build session token, a project API key — both leave
 // InstanceRecord.UserID at uuid.Nil) inserts SQL NULL for user_id rather
 // than the literal all-zeros UUID, which would violate
 // instances_user_id_fkey (no user row has that id). Regression test for
@@ -74,7 +74,7 @@ func TestCreate_NilUserIDStoresNull(t *testing.T) {
 
 	mock.ExpectQuery(`INSERT INTO compute\.instances`).
 		WithArgs("inst-noattr001", accountID, projectID, nil, "web", "nginx:latest",
-			"", StatusPending, nil, 2, 4, nil, nil, nil, "web-abcde", "default", nil, nil, nil, nil, false, false, nil, 0, nil).
+			"", StatusPending, nil, 2, 4, nil, "web-abcde", "default", nil, nil, nil, nil, false, false, nil, 0, nil).
 		WillReturnRows(sqlmock.NewRows([]string{"created_at", "updated_at"}).
 			AddRow(time.Now(), time.Now()))
 
@@ -99,7 +99,7 @@ func TestCreate_CPUInstanceStoresNullVRAM(t *testing.T) {
 	// gpu_vram_gb must be NULL (not 0) for CPU-only instances.
 	mock.ExpectQuery(`INSERT INTO compute\.instances`).
 		WithArgs("inst-cpu00001", accountID, projectID, userID, "web", "nginx:latest",
-			"", StatusPending, nil, 2, 4, nil, nil, nil, "web-abcde", "default", nil, nil, nil, nil, false, false, nil, 0, nil).
+			"", StatusPending, nil, 2, 4, nil, "web-abcde", "default", nil, nil, nil, nil, false, false, nil, 0, nil).
 		WillReturnRows(sqlmock.NewRows([]string{"created_at", "updated_at"}).
 			AddRow(time.Now(), time.Now()))
 
@@ -117,39 +117,39 @@ func TestCreate_CPUInstanceStoresNullVRAM(t *testing.T) {
 	}
 }
 
-// TestListByKumbhaSession_ReturnsOnlyThatSessionsInstances proves the new
-// tracking query round-trips a real kumbha_session_id — the linkage
-// migration 032 added specifically so a Kumbha agent's create_instance
+// TestListByBuildSession_ReturnsOnlyThatSessionsInstances proves the new
+// tracking query round-trips a real build_session_id — the linkage
+// migration 032 added specifically so a Teepin Build agent's create_instance
 // fallback can no longer create an instance the session has no record of
 // (found live 2026-08-30/31: two untracked instances from one build).
-func TestListByKumbhaSession_ReturnsOnlyThatSessionsInstances(t *testing.T) {
+func TestListByBuildSession_ReturnsOnlyThatSessionsInstances(t *testing.T) {
 	store, mock := newMockStore(t)
 	accountID, projectID, sessionID := uuid.New(), uuid.New(), uuid.New()
 
-	mock.ExpectQuery(`SELECT .+ FROM compute\.instances WHERE kumbha_session_id = \$1`).
+	mock.ExpectQuery(`SELECT .+ FROM compute\.instances WHERE build_session_id = \$1`).
 		WithArgs(sessionID).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"id", "account_id", "project_id", "user_id", "name", "image",
 			"instance_type_id", "status", "gpu_vram_gb", "cpu_units", "memory_gb",
-			"p_cores_used", "e_cores_used", "endpoint",
+			"endpoint",
 			"k8s_pod_name", "k8s_namespace", "provider_id", "node_name", "dns_name", "public_ip",
 			"tls_enabled", "tls_ready", "container_port", "storage_gb",
-			"created_at", "updated_at", "started_at", "terminated_at", "kumbha_session_id",
+			"created_at", "updated_at", "started_at", "terminated_at", "build_session_id",
 		}).AddRow("inst-broken01", accountID, projectID, uuid.Nil, "web", "nginx:1.27-alpine",
-			"", StatusRunning, 0, 1, 1, nil, nil, "https://inst-broken01.teepin.com",
+			"", StatusRunning, 0, 1, 1, "https://inst-broken01.teepin.com",
 			"inst-broken01-pod", "default", "", "", "", "",
 			true, true, 80, 0,
 			time.Now(), time.Now(), nil, nil, sessionID))
 
-	records, err := store.ListByKumbhaSession(context.Background(), sessionID)
+	records, err := store.ListByBuildSession(context.Background(), sessionID)
 	if err != nil {
-		t.Fatalf("ListByKumbhaSession failed: %v", err)
+		t.Fatalf("ListByBuildSession failed: %v", err)
 	}
 	if len(records) != 1 {
 		t.Fatalf("len(records) = %d, want 1", len(records))
 	}
-	if records[0].KumbhaSessionID != sessionID {
-		t.Errorf("KumbhaSessionID = %s, want %s", records[0].KumbhaSessionID, sessionID)
+	if records[0].BuildSessionID != sessionID {
+		t.Errorf("BuildSessionID = %s, want %s", records[0].BuildSessionID, sessionID)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Error(err)
@@ -216,7 +216,7 @@ func TestUpdateImage(t *testing.T) {
 // cluster.ProxyTarget.ResolveProvider checks terminated_at directly, so
 // the customer-facing edge kept returning "this instance is not
 // currently reachable" forever, on an instance that was actually up.
-// UpdateImage's only caller (redeployKumbhaInstance) reaches this call
+// UpdateImage's only caller (redeployBuildInstance) reaches this call
 // having just gotten a successful cluster.UpdateInstance back — positive
 // proof the pod is alive — so this must succeed and clear terminated_at
 // even when the row was previously terminated, not silently no-op.
@@ -267,7 +267,7 @@ func TestUpdateNodePlacement_ResolvesNodeID(t *testing.T) {
 // (SELECT id FROM compute.nodes WHERE provider_id = $1)` directly inside
 // the UPDATE — when that subselect matched nothing, Postgres silently set
 // node_id to NULL and the UPDATE still reported one row affected, so
-// callers (redeployKumbhaInstance) logged a successful persist while
+// callers (redeployBuildInstance) logged a successful persist while
 // nodes.ListNodeCapacity's used-count for that node never moved. Resolving
 // the node id in its own SELECT first means an unmatched provider_id is a
 // distinct, loud error — and critically, NO UPDATE to compute.instances is
@@ -313,11 +313,11 @@ func instanceRows() *sqlmock.Rows {
 	return sqlmock.NewRows([]string{
 		"id", "account_id", "project_id", "user_id", "name", "image",
 		"instance_type_id", "status", "gpu_vram_gb",
-		"cpu_units", "memory_gb", "p_cores_used", "e_cores_used", "endpoint",
+		"cpu_units", "memory_gb", "endpoint",
 		"k8s_pod_name", "k8s_namespace",
 		"provider_id", "node_name", "dns_name", "public_ip", "tls_enabled", "tls_ready", "container_port",
 		"storage_gb",
-		"created_at", "updated_at", "started_at", "terminated_at", "kumbha_session_id",
+		"created_at", "updated_at", "started_at", "terminated_at", "build_session_id",
 	})
 }
 
@@ -361,7 +361,7 @@ func TestListActive(t *testing.T) {
 		WillReturnRows(instanceRows().AddRow(
 			"inst-abc12345", accountID, projectID, userID, "my-app", "nginx:latest",
 			"gpu.h100.custom-25gb", StatusRunning, 25,
-			8, 32, nil, nil, "https://inst-abc12345.teepin.io",
+			8, 32, "https://inst-abc12345.teepin.io",
 			"my-app-x1y2z", "default",
 			"", "", "", "", false, false, 0,
 			0,
@@ -401,7 +401,7 @@ func TestListActive_ReadsBackNodeName(t *testing.T) {
 		WillReturnRows(instanceRows().AddRow(
 			"inst-home0001", accountID, projectID, userID, "my-app", "nginx:latest",
 			"cpu.home", StatusRunning, 0,
-			2, 4, nil, nil, "https://inst-home0001.teepin.io",
+			2, 4, "https://inst-home0001.teepin.io",
 			"my-app-x1y2z", "default",
 			"", "srialla", "", "", false, false, 0,
 			0,

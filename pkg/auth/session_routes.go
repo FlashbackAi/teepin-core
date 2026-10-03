@@ -5,19 +5,20 @@ package auth
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
 
-// sessionAllowedRoutes is the complete list of API routes a Kumbha
+// sessionAllowedRoutes is the complete list of API routes a Teepin Build
 // session-scoped credential (MintSessionToken) may call. Everything else is
 // refused with 403 before any handler runs.
 //
 // Why an allowlist: the agent pod holds this token in its environment and
 // runs a terminal tool, so anything a prompt-injected agent can read it can
 // also replay directly against the API, without going through the MCP tools
-// that carry the "customer approved the plan" check. Most Kumbha handlers
+// that carry the "customer approved the plan" check. Most Teepin Build handlers
 // only require "a project and an account" (Server.requireScope), which a
 // session token satisfies — so without this, the agent could approve its own
 // deploys, raise its own budget, or create sessions and instances at will.
@@ -37,35 +38,35 @@ import (
 //   - the Kaniko build init container (workspace archive fetch).
 var sessionAllowedRoutes = map[string]bool{
 	// LLM gateway — the agent's model calls.
-	"POST /v1/kumbha/chat/completions": true,
+	"POST /v1/build/chat/completions": true,
 
 	// Session status and follow-up messages (run.py's poll loop; the MCP
 	// server's deploy_approved read).
-	"GET /v1/kumbha/sessions/:id":               true,
-	"GET /v1/kumbha/sessions/:id/messages/poll": true,
+	"GET /v1/build/sessions/:id":               true,
+	"GET /v1/build/sessions/:id/messages/poll": true,
 
 	// Workspace: agent upload, and the archive fetch the build init
 	// container and screenshot flow use.
-	"PUT /v1/kumbha/sessions/:id/workspace":         true,
-	"GET /v1/kumbha/sessions/:id/workspace/archive": true,
+	"PUT /v1/build/sessions/:id/workspace":         true,
+	"GET /v1/build/sessions/:id/workspace/archive": true,
 
 	// Screenshot pod upload.
-	"POST /v1/kumbha/sessions/:id/screenshot": true,
+	"POST /v1/build/sessions/:id/screenshot": true,
 
 	// The agent records each deployment plan it presents, so the customer's
 	// approval can name it. (Approving is the customer's, and not here.)
-	"POST /v1/kumbha/sessions/:id/plans": true,
+	"POST /v1/build/sessions/:id/plans": true,
 
 	// The agent has the platform's image reader describe an image the customer
 	// attached, because the builder model cannot see images. Billed to the build.
-	"POST /v1/kumbha/sessions/:id/describe-image": true,
+	"POST /v1/build/sessions/:id/describe-image": true,
 
 	// teepin-mcp-server verbs. deploy and create_instance are additionally
 	// gated server-side on the session's deploy_approved flag.
-	"POST /v1/kumbha/sessions/:id/deploy": true,
-	"GET /v1/billing/pricing":             true,
-	"POST /v1/compute/instances":          true,
-	"GET /v1/compute/instances/:id":       true,
+	"POST /v1/build/sessions/:id/deploy": true,
+	"GET /v1/billing/pricing":            true,
+	"POST /v1/compute/instances":         true,
+	"GET /v1/compute/instances/:id":      true,
 }
 
 // SessionMayCall reports whether a session-scoped credential is allowed to
@@ -74,6 +75,11 @@ var sessionAllowedRoutes = map[string]bool{
 func SessionMayCall(method, routePattern string) bool {
 	if routePattern == "" {
 		return false
+	}
+	// "/v1/kumbha/" is Teepin Build's former route prefix, still served until
+	// every running agent image calls "/v1/build/" (see cmd/api-server).
+	if strings.HasPrefix(routePattern, "/v1/kumbha/") {
+		routePattern = "/v1/build/" + strings.TrimPrefix(routePattern, "/v1/kumbha/")
 	}
 	return sessionAllowedRoutes[method+" "+routePattern]
 }

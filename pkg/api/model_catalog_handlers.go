@@ -19,7 +19,7 @@ import (
 
 // ModelCatalogHandler serves the admin-only model registry: every model the
 // platform can serve, how each is reached, its pricing, and where it may be
-// used (Teepin Inference's customer API, the Kumbha build agent, or both).
+// used (Teepin Inference's customer API, the Teepin Build build agent, or both).
 // Mounted under /v1/admin, same operator-token guard as the rest of that
 // group (see AdminHandler.RequireAdminToken).
 type ModelCatalogHandler struct {
@@ -117,22 +117,22 @@ func writePricingRequired(c *gin.Context) {
 // it is (see modelcatalog.Availability).
 type availabilityRequest struct {
 	OfferedToCustomers *bool `json:"offered_to_customers"`
-	KumbhaEnabled      *bool `json:"kumbha_enabled"`
-	KumbhaPriority     *int  `json:"kumbha_priority"`
-	KumbhaImageReader  *bool `json:"kumbha_image_reader"`
+	BuildEnabled       *bool `json:"build_enabled"`
+	BuildPriority      *int  `json:"build_priority"`
+	BuildImageReader   *bool `json:"build_image_reader"`
 }
 
 func (r availabilityRequest) toAvailability() modelcatalog.Availability {
 	return modelcatalog.Availability{
 		OfferedToCustomers: r.OfferedToCustomers,
-		KumbhaEnabled:      r.KumbhaEnabled,
-		KumbhaPriority:     r.KumbhaPriority,
-		KumbhaImageReader:  r.KumbhaImageReader,
+		BuildEnabled:       r.BuildEnabled,
+		BuildPriority:      r.BuildPriority,
+		BuildImageReader:   r.BuildImageReader,
 	}
 }
 
 func (r availabilityRequest) any() bool {
-	return r.OfferedToCustomers != nil || r.KumbhaEnabled != nil || r.KumbhaPriority != nil || r.KumbhaImageReader != nil
+	return r.OfferedToCustomers != nil || r.BuildEnabled != nil || r.BuildPriority != nil || r.BuildImageReader != nil
 }
 
 // RegisterModel is POST /v1/admin/inference/models — creates or updates a
@@ -276,7 +276,7 @@ func (h *ModelCatalogHandler) ListModels(c *gin.Context) {
 
 // SetAvailability is PUT /v1/admin/inference/models/availability?model_route=...
 // — whether a model is offered to customers, and whether (and in what
-// order) the Kumbha build agent may use it. Omitted fields are unchanged.
+// order) the Teepin Build build agent may use it. Omitted fields are unchanged.
 func (h *ModelCatalogHandler) SetAvailability(c *gin.Context) {
 	route := c.Query("model_route")
 	if route == "" {
@@ -289,10 +289,10 @@ func (h *ModelCatalogHandler) SetAvailability(c *gin.Context) {
 		return
 	}
 	if !req.any() {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "set at least one of offered_to_customers, kumbha_enabled, kumbha_priority, kumbha_image_reader"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "set at least one of offered_to_customers, build_enabled, build_priority, build_image_reader"})
 		return
 	}
-	if req.KumbhaImageReader != nil && *req.KumbhaImageReader {
+	if req.BuildImageReader != nil && *req.BuildImageReader {
 		if msg := h.cannotReadImages(c.Request.Context(), route); msg != "" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": msg, "code": "not_vision_capable"})
 			return

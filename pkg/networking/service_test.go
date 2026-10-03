@@ -289,4 +289,3 @@ func TestProvisionEndpoint_IngressRoutesToCustomerPort(t *testing.T) {
 		t.Errorf("Service port = %d, want 8080", k8sSvc.Spec.Ports[0].Port)
 	}
 }
-

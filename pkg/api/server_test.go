@@ -22,8 +22,8 @@ import (
 	"github.com/FlashbackAi/teepin-core/pkg/cluster"
 	"github.com/FlashbackAi/teepin-core/pkg/compute"
 	"github.com/FlashbackAi/teepin-core/pkg/gpu"
-	"github.com/FlashbackAi/teepin-core/pkg/kumbha"
 	"github.com/FlashbackAi/teepin-core/pkg/models"
+	"github.com/FlashbackAi/teepin-core/pkg/teepinbuild"
 )
 
 func init() {
@@ -703,15 +703,15 @@ type fakePlacer struct {
 	insuffCap bool
 }
 
-func (p *fakePlacer) PlaceCPU(_ context.Context, arch string, cpuUnits, memoryGB, _, _ int) (string, string, string, *int, *int, error) {
+func (p *fakePlacer) PlaceCPU(_ context.Context, arch string, cpuUnits, memoryGB int) (string, string, string, error) {
 	p.called = true
 	p.lastArch = arch
 	p.lastCPU = cpuUnits
 	p.lastMem = memoryGB
 	if p.err != nil {
-		return "", "", "", nil, nil, p.err
+		return "", "", "", p.err
 	}
-	return p.nodeName, p.provider, p.arch, nil, nil, nil
+	return p.nodeName, p.provider, p.arch, nil
 }
 func (p *fakePlacer) IsNoCapacity(error) bool           { return p.noCap }
 func (p *fakePlacer) IsArchUnavailable(error) bool      { return p.archUnav }
@@ -848,7 +848,7 @@ func TestCreateInstance_HomeAllowedWhenProjectAllowsOnDemand(t *testing.T) {
 // A policy lookup failure must fail OPEN — a database blip on this check
 // must never be a new way to block every home-class create on the
 // platform, matching every other best-effort project-level check in this
-// file (e.g. the Kumbha double-instance guard).
+// file (e.g. the Teepin Build double-instance guard).
 func TestCreateInstance_HomeProceedsWhenPolicyLookupErrors(t *testing.T) {
 	placer := &fakePlacer{nodeName: "home-1", provider: "prov-home", arch: "amd64"}
 	policy := &fakeProjectPolicy{err: errors.New("db unreachable")}
@@ -1244,7 +1244,7 @@ func TestCreateInstance_PersistsEndpointFields(t *testing.T) {
 		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
-			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
 			sqlmock.AnyArg(), "203.0.113.20", true, false, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"created_at", "updated_at"}).
 			AddRow(time.Now(), time.Now()))
@@ -1260,22 +1260,22 @@ func TestCreateInstance_PersistsEndpointFields(t *testing.T) {
 	}
 }
 
-// TestCreateInstance_CheckspointsKumbhaWorkspaceWhenSessionLinked is the
-// regression test for a live 2026-08-31 incident: a Kumbha agent's real,
+// TestCreateInstance_CheckspointsBuildWorkspaceWhenSessionLinked is the
+// regression test for a live 2026-08-31 incident: a Teepin Build agent's real,
 // successfully-built workspace never showed up in the console's History
 // list because it was never checkpointed — CheckpointWorkspace only ever
-// ran inside DeployKumbhaSession's own handler, so an instance created via
+// ran inside DeployBuildSession's own handler, so an instance created via
 // the create_instance MCP tool (used as a workaround when `deploy` itself
 // was erroring) left the customer's only saved draft permanently filtered
 // out of ListVersions' is_checkpoint-only query, even though the file
 // content was safe in Postgres the whole time. CreateInstance must now
 // checkpoint the calling session's workspace whenever the request carries
-// a Kumbha session credential (auth.SessionIDKey) — the same signal
+// a Teepin Build session credential (auth.SessionIDKey) — the same signal
 // migration 032's instance/session linkage already introduced.
-func TestCreateInstance_CheckspointsKumbhaWorkspaceWhenSessionLinked(t *testing.T) {
-	mock, kStore, cStore := newMockKumbhaDB(t)
-	gw := kumbha.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{in: 1, out: 1}, noopUsageRecorder{})
-	server := NewServer(newFakeCluster(), nil, cStore, nil, allowGate{}).WithKumbha(gw)
+func TestCreateInstance_CheckspointsBuildWorkspaceWhenSessionLinked(t *testing.T) {
+	mock, kStore, cStore := newMockBuildDB(t)
+	gw := teepinbuild.NewGateway(kStore, nil, allowGate{}, &fakeKPricing{in: 1, out: 1}, noopUsageRecorder{})
+	server := NewServer(newFakeCluster(), nil, cStore, nil, allowGate{}).WithBuild(gw)
 
 	sessionID := uuid.New()
 
@@ -1291,10 +1291,10 @@ func TestCreateInstance_CheckspointsKumbhaWorkspaceWhenSessionLinked(t *testing.
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
-			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+			sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"created_at", "updated_at"}).
 			AddRow(time.Now(), time.Now()))
-	mock.ExpectExec(`UPDATE billing\.kumbha_workspace_versions`).
+	mock.ExpectExec(`UPDATE billing\.build_workspace_versions`).
 		WithArgs(sessionID).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`UPDATE billing\.inference_sessions\s+SET last_deployed_version = current_workspace_version`).
@@ -1366,38 +1366,38 @@ func TestImagePorts_UnresolvableImageReturns200WithEmptyPorts(t *testing.T) {
 	}
 }
 
-// TestInstanceSpec_AutoAttachesKumbhaBuildPullSecretOnlyForItsOwnImages
-// is the regression test for a real 2026-08-26 incident: a Kumbha
+// TestInstanceSpec_AutoAttachesBuiltImagePullSecretOnlyForItsOwnImages
+// is the regression test for a real 2026-08-26 incident: a Teepin Build
 // deploy built and pushed its own image cleanly, then failed to create
 // the resulting instance with "pull access denied ... no basic auth
 // credentials" — nothing had ever wired a pull credential for it.
 // Confirms the fix (instanceSpec auto-attaching
-// kumbhaBuildImagePullSecret) is scoped strictly to images whose
-// reference starts with the configured Kumbha build registry prefix —
+// builtImagePullSecret) is scoped strictly to images whose
+// reference starts with the configured Teepin Build build registry prefix —
 // an ordinary customer image (any other registry) must never get it.
-func TestInstanceSpec_AutoAttachesKumbhaBuildPullSecretOnlyForItsOwnImages(t *testing.T) {
-	s := (&Server{}).WithKumbhaBuildImagePullSecret(
+func TestInstanceSpec_AutoAttachesBuiltImagePullSecretOnlyForItsOwnImages(t *testing.T) {
+	s := (&Server{}).WithBuiltImagePullSecret(
 		"880254196251.dkr.ecr.us-east-1.amazonaws.com/teepin/kumbha-builds-dev",
 		"teepin-kumbha-ecr",
 	)
 
-	kumbhaSpec := s.instanceSpec("inst-1", uuid.New(), uuid.New(), uuid.New(), &models.CreateInstanceRequest{
+	buildSpec := s.instanceSpec("inst-1", uuid.New(), uuid.New(), uuid.New(), &models.CreateInstanceRequest{
 		Image: "880254196251.dkr.ecr.us-east-1.amazonaws.com/teepin/kumbha-builds-dev:4ab155f0",
 	}, nil)
-	if kumbhaSpec.ImagePullSecret != "teepin-kumbha-ecr" {
-		t.Errorf("Kumbha-built image: ImagePullSecret = %q, want \"teepin-kumbha-ecr\"", kumbhaSpec.ImagePullSecret)
+	if buildSpec.ImagePullSecret != "teepin-kumbha-ecr" {
+		t.Errorf("Teepin Build-built image: ImagePullSecret = %q, want \"teepin-kumbha-ecr\"", buildSpec.ImagePullSecret)
 	}
 
 	ordinarySpec := s.instanceSpec("inst-2", uuid.New(), uuid.New(), uuid.New(), &models.CreateInstanceRequest{
 		Image: "nginx:latest",
 	}, nil)
 	if ordinarySpec.ImagePullSecret != "" {
-		t.Errorf("ordinary customer image: ImagePullSecret = %q, want empty — must never borrow the Kumbha build secret", ordinarySpec.ImagePullSecret)
+		t.Errorf("ordinary customer image: ImagePullSecret = %q, want empty — must never borrow the Teepin Build build secret", ordinarySpec.ImagePullSecret)
 	}
 }
 
 func TestInstanceSpec_NoPullSecretWhenNotConfigured(t *testing.T) {
-	s := &Server{} // WithKumbhaBuildImagePullSecret never called
+	s := &Server{} // WithBuiltImagePullSecret never called
 
 	spec := s.instanceSpec("inst-1", uuid.New(), uuid.New(), uuid.New(), &models.CreateInstanceRequest{
 		Image: "nginx:latest",
@@ -1430,8 +1430,8 @@ func TestInstanceSpec_GrantsFilesystemOwnershipChangesToEveryCustomerInstance(t 
 }
 
 // TestEndpointUUIDFor_DeterministicFromInstanceID is the property the
-// whole Kumbha in-place-redeploy path depends on (see
-// redeployKumbhaInstance in kumbha_handlers.go): a redeploy recomputes
+// whole Teepin Build in-place-redeploy path depends on (see
+// redeployBuildInstance in build_handlers.go): a redeploy recomputes
 // this value from nothing but the instance's already-known ID and must
 // land on the EXACT same UUID the original create used, or
 // UpdateInstance's endpoint provisioning would create a second,

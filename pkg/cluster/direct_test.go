@@ -133,7 +133,7 @@ func TestCreateInstance_NoServiceAccountToken(t *testing.T) {
 
 // A bare Pod defaults to RestartPolicy: Always when left unset — correct
 // for a customer's persistent compute instance (this test's baseline
-// case), catastrophic for a one-shot workload like Kumbha's agent (see
+// case), catastrophic for a one-shot workload like Teepin Build's agent (see
 // TestCreateInstance_NeverRestartSetsPodRestartPolicyNever). Found live
 // 2026-08-24: an agent pod silently restarted mid-build and re-ran the
 // entire build from scratch against the same original prompt.
@@ -163,8 +163,8 @@ func TestCreateInstance_NeverRestartSetsPodRestartPolicyNever(t *testing.T) {
 	c := newTestClient()
 
 	_, err := c.CreateInstance(context.Background(), InstanceSpec{
-		InstanceID:   "kumbha-agent-abc123",
-		Image:        "teepin/kumbha-agent:latest",
+		InstanceID:   "build-agent-abc123",
+		Image:        "teepin/build-agent:latest",
 		CPUUnits:     2,
 		MemoryGB:     4,
 		NeverRestart: true,
@@ -287,42 +287,42 @@ func TestCreateInstance_CommandAndArgsPreserved(t *testing.T) {
 	}
 }
 
-// TestDeleteInstance_PreservesKumbhaAgentPVC is the regression test for a
-// live 2026-08-31 incident: a relaunched Kumbha agent found its own
+// TestDeleteInstance_PreservesBuildAgentPVC is the regression test for a
+// live 2026-08-31 incident: a relaunched Teepin Build agent found its own
 // workspace completely empty — hours of prior work gone — because
 // DeleteInstance (called by StopAgent's hard-kill, or LaunchAgent's own
 // launch-failed cleanup) wiped the PVC unconditionally, contradicting
 // StopAgent's own documented promise that the workspace survives a kill.
-// A pod carrying the teepin.io/kumbha-agent label (LaunchAgent stamps
+// A pod carrying the teepin.io/build-agent label (LaunchAgent stamps
 // this on every agent pod it creates) must keep its PVC through delete.
-func TestDeleteInstance_PreservesKumbhaAgentPVC(t *testing.T) {
+func TestDeleteInstance_PreservesBuildAgentPVC(t *testing.T) {
 	c := newTestClient()
 	ctx := context.Background()
 
 	if _, err := c.CreateInstance(ctx, InstanceSpec{
-		InstanceID: "kumbha-agent-abcd1234",
-		Image:      "teepin/kumbha-agent:latest",
+		InstanceID: "build-agent-abcd1234",
+		Image:      "teepin/build-agent:latest",
 		CPUUnits:   2,
 		MemoryGB:   4,
 		StorageGB:  10,
-		Labels:     map[string]string{labelKumbhaAgent: "true"},
+		Labels:     map[string]string{labelBuildAgent: "true"},
 	}); err != nil {
 		t.Fatalf("CreateInstance: %v", err)
 	}
 
-	if err := c.DeleteInstance(ctx, AllTenants(), "kumbha-agent-abcd1234"); err != nil {
+	if err := c.DeleteInstance(ctx, AllTenants(), "build-agent-abcd1234"); err != nil {
 		t.Fatalf("DeleteInstance: %v", err)
 	}
 
 	if _, err := c.k8s.CoreV1().PersistentVolumeClaims(workloadNamespace).
-		Get(ctx, pvcName("kumbha-agent-abcd1234"), metav1.GetOptions{}); err != nil {
-		t.Errorf("PVC was deleted along with a Kumbha agent pod, want it preserved: %v", err)
+		Get(ctx, pvcName("build-agent-abcd1234"), metav1.GetOptions{}); err != nil {
+		t.Errorf("PVC was deleted along with a Teepin Build agent pod, want it preserved: %v", err)
 	}
 }
 
 // TestDeleteInstance_DeletesOrdinaryInstancePVC locks in the UNCHANGED
 // behaviour for everything else: a customer deleting their own compute
-// instance must still wipe its storage — only a Kumbha agent pod's own
+// instance must still wipe its storage — only a Teepin Build agent pod's own
 // workspace gets the exception above.
 func TestDeleteInstance_DeletesOrdinaryInstancePVC(t *testing.T) {
 	c := newTestClient()
@@ -476,7 +476,7 @@ func TestPodStatus_FreshPodUnknownIsPending(t *testing.T) {
 }
 
 // TestPodStatus_LongPodUnknownIsTerminated is the regression test for the
-// live 2026-09-05 incident: a stale kumbha-agent-* pod stuck reporting
+// live 2026-09-05 incident: a stale build-agent-* pod stuck reporting
 // PodUnknown for days after its node vanished, permanently holding its
 // CPU/memory hostage because "pending" (what the old default case mapped
 // PodUnknown to) never frees capacity — only "terminated" does (see
@@ -566,7 +566,7 @@ func TestPodStatus_PodUnknownClockResetsOnRecovery(t *testing.T) {
 	}
 }
 
-// TestListInstanceStatuses_IncludeHiddenSeesKumbhaAgentAndBuildPods is
+// TestListInstanceStatuses_IncludeHiddenSeesBuildAgentAndBuildPods is
 // the regression test for a live 2026-08-31 incident: a Kaniko build pod
 // completed and pushed its image successfully in 11 seconds, but the
 // control plane never learned it finished — waitForCompletion polled
@@ -574,14 +574,14 @@ func TestPodStatus_PodUnknownClockResetsOnRecovery(t *testing.T) {
 // ONLY thing that ever refreshes that cache is the home-node agent's own
 // reportStatuses sweep, which discovers instances via
 // ListInstanceStatuses(AllTenants()) — a selector that (correctly, for a
-// customer-facing list) excludes every teepin.io/kumbha-agent pod,
+// customer-facing list) excludes every teepin.io/build-agent pod,
 // Kaniko builds included. The cached status stayed frozen at its initial
 // "pending" seed forever, and every deploy eventually reported "context
 // deadline exceeded" for a build that had, in fact, already succeeded.
 // AllTenantsIncludingHidden is the fix: the ONE caller (reportStatuses)
 // that needs these pods to keep the cache honest, without touching what
 // a customer's own Compute list shows.
-func TestListInstanceStatuses_IncludeHiddenSeesKumbhaAgentAndBuildPods(t *testing.T) {
+func TestListInstanceStatuses_IncludeHiddenSeesBuildAgentAndBuildPods(t *testing.T) {
 	c := newTestClient()
 	ctx := context.Background()
 
@@ -590,7 +590,7 @@ func TestListInstanceStatuses_IncludeHiddenSeesKumbhaAgentAndBuildPods(t *testin
 		Image:      "gcr.io/kaniko-project/executor:latest",
 		CPUUnits:   2,
 		MemoryGB:   4,
-		Labels:     map[string]string{labelKumbhaAgent: "true"},
+		Labels:     map[string]string{labelBuildAgent: "true"},
 	}); err != nil {
 		t.Fatalf("CreateInstance: %v", err)
 	}
@@ -781,7 +781,7 @@ func TestListInstanceStatuses_AllTenantsSeesEverything(t *testing.T) {
 // pod (often already Succeeded — its container exits 0 on SIGTERM) and the
 // NEW pod can carry the SAME instance ID at once. Reporting both let the
 // stale "terminated" status win in the reconciler's naive
-// map[instanceID]status collapse, killing two real Kumbha instances'
+// map[instanceID]status collapse, killing two real Teepin Build instances'
 // database rows seconds after a genuinely successful redeploy. The newest
 // pod (by CreationTimestamp) must always be the one reported, regardless
 // of which order Kubernetes happens to return them in.
@@ -849,7 +849,7 @@ func TestListInstanceStatuses_PrefersNewestPodWhenReplaceOverlaps(t *testing.T) 
 
 // TestGetInstanceStatus_PrefersNewestPodWhenReplaceOverlaps is the
 // single-instance-lookup counterpart of the ListInstanceStatuses
-// regression above — redeployKumbhaInstance's own provider-recovery path
+// regression above — redeployBuildInstance's own provider-recovery path
 // calls GetInstanceStatus directly during exactly this replace window.
 func TestGetInstanceStatus_PrefersNewestPodWhenReplaceOverlaps(t *testing.T) {
 	older := metav1.NewTime(time.Now().Add(-time.Minute))
@@ -1218,7 +1218,7 @@ func TestCreateInstance_ProvisioningFailureIsNonFatal(t *testing.T) {
 }
 
 // TestUpdateInstance_ReplacesPodKeepsEndpoint is the core guarantee
-// UpdateInstance exists for (a Kumbha redeploy): the pod is swapped for a
+// UpdateInstance exists for (a Teepin Build redeploy): the pod is swapped for a
 // new one running the new image, but the Service/Ingress the customer's
 // hostname resolves to is never recreated — same DNSName, same endpoint,
 // because CreateInstance's own Service/Ingress creation is

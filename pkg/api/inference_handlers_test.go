@@ -92,8 +92,8 @@ func testCatalog() fakeCatalog {
 		"teepin/a":        {ModelRoute: "teepin/a", DisplayName: "A", Engine: "mlx", Enabled: true, OfferedToCustomers: true, InputPricePerMillion: 2, OutputPricePerMillion: 10},
 		"teepin/b":        {ModelRoute: "teepin/b", DisplayName: "B", Engine: "mlx", Enabled: true, OfferedToCustomers: true},
 		"teepin/disabled": {ModelRoute: "teepin/disabled", Enabled: false},
-		// Enabled but reserved for the Kumbha build agent: invisible here.
-		"anthropic/kumbha-only": {ModelRoute: "anthropic/kumbha-only", Enabled: true, KumbhaEnabled: true},
+		// Enabled but reserved for the Teepin Build build agent: invisible here.
+		"anthropic/build-only": {ModelRoute: "anthropic/build-only", Enabled: true, BuildEnabled: true},
 	}}
 }
 
@@ -219,7 +219,7 @@ func TestChat_UnknownDisabledAndRestrictedModelsAreIndistinguishable(t *testing.
 	h := NewInferenceHandler(&fakeGW{completeResp: okResponse()}, testCatalog(), nil)
 	key := caller{viaKey: true, scopes: []string{ScopeInferenceInvoke, scopeInferenceModel + "teepin/a"}}
 
-	for name, model := range map[string]string{"unknown": "teepin/nope", "disabled": "teepin/disabled", "not offered to customers": "anthropic/kumbha-only", "not permitted to this key": "teepin/b"} {
+	for name, model := range map[string]string{"unknown": "teepin/nope", "disabled": "teepin/disabled", "not offered to customers": "anthropic/build-only", "not permitted to this key": "teepin/b"} {
 		body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"x"}]}`, model)
 		rec := serve(t, h, key, "POST", "/v1/chat/completions", body)
 		if rec.Code != 404 || errCode(t, rec) != "model_not_found" {
@@ -679,12 +679,12 @@ func (s statusByRoute) Status(_ context.Context, m modelcatalog.Model) inference
 
 // The build composer's picker is told which models can serve right now, so it
 // can disable the rest; a model whose state is merely unknown stays usable.
-func TestGetKumbhaModels_ReportsWhichModelsCanServe(t *testing.T) {
+func TestGetBuildModels_ReportsWhichModelsCanServe(t *testing.T) {
 	cat := fakeCatalog{models: map[string]modelcatalog.Model{
-		"teepin/up":      {ModelRoute: "teepin/up", DisplayName: "Up", Enabled: true, KumbhaEnabled: true, KumbhaPriority: 1},
-		"teepin/down":    {ModelRoute: "teepin/down", DisplayName: "Down", Enabled: true, KumbhaEnabled: true, KumbhaPriority: 2},
-		"teepin/sick":    {ModelRoute: "teepin/sick", DisplayName: "Sick", Enabled: true, KumbhaEnabled: true, KumbhaPriority: 3},
-		"teepin/unknown": {ModelRoute: "teepin/unknown", DisplayName: "Unknown", Enabled: true, KumbhaEnabled: true, KumbhaPriority: 4},
+		"teepin/up":      {ModelRoute: "teepin/up", DisplayName: "Up", Enabled: true, BuildEnabled: true, BuildPriority: 1},
+		"teepin/down":    {ModelRoute: "teepin/down", DisplayName: "Down", Enabled: true, BuildEnabled: true, BuildPriority: 2},
+		"teepin/sick":    {ModelRoute: "teepin/sick", DisplayName: "Sick", Enabled: true, BuildEnabled: true, BuildPriority: 3},
+		"teepin/unknown": {ModelRoute: "teepin/unknown", DisplayName: "Unknown", Enabled: true, BuildEnabled: true, BuildPriority: 4},
 	}}
 	h := NewInferenceHandler(&fakeGW{}, cat, nil).WithModelStatus(statusByRoute{
 		"teepin/up":   {State: inferencegateway.StateServing},
@@ -698,12 +698,12 @@ func TestGetKumbhaModels_ReportsWhichModelsCanServe(t *testing.T) {
 		c.Set(string(auth.AccountIDKey), uuid.New())
 		c.Next()
 	})
-	r.GET("/v1/kumbha/models", h.GetKumbhaModels)
+	r.GET("/v1/build/models", h.GetBuildModels)
 	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/kumbha/models", nil))
+	r.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/build/models", nil))
 
 	var out struct {
-		Data []kumbhaModelView `json:"data"`
+		Data []buildModelView `json:"data"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || rec.Code != 200 {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
@@ -733,12 +733,12 @@ func (r reportsByRoute) All(context.Context) (map[string]*modelprobe.Report, err
 // tools is unavailable for building (with a reason a customer can read) however
 // its checkbox is ticked, and one that passed its check is available even if it
 // was never ticked. Vision and audio follow the evidence per model too.
-func TestGetKumbhaModels_FollowsCapabilityEvidence(t *testing.T) {
+func TestGetBuildModels_FollowsCapabilityEvidence(t *testing.T) {
 	cat := fakeCatalog{models: map[string]modelcatalog.Model{
-		"teepin/omni":     {ModelRoute: "teepin/omni", Enabled: true, KumbhaEnabled: true, KumbhaPriority: 1, SupportsTools: false, SupportsVision: true},
-		"teepin/liar":     {ModelRoute: "teepin/liar", Enabled: true, KumbhaEnabled: true, KumbhaPriority: 2, SupportsTools: true},
-		"teepin/modest":   {ModelRoute: "teepin/modest", Enabled: true, KumbhaEnabled: true, KumbhaPriority: 3, SupportsTools: false},
-		"teepin/untested": {ModelRoute: "teepin/untested", Enabled: true, KumbhaEnabled: true, KumbhaPriority: 4, SupportsTools: true},
+		"teepin/omni":     {ModelRoute: "teepin/omni", Enabled: true, BuildEnabled: true, BuildPriority: 1, SupportsTools: false, SupportsVision: true},
+		"teepin/liar":     {ModelRoute: "teepin/liar", Enabled: true, BuildEnabled: true, BuildPriority: 2, SupportsTools: true},
+		"teepin/modest":   {ModelRoute: "teepin/modest", Enabled: true, BuildEnabled: true, BuildPriority: 3, SupportsTools: false},
+		"teepin/untested": {ModelRoute: "teepin/untested", Enabled: true, BuildEnabled: true, BuildPriority: 4, SupportsTools: true},
 	}}
 	check := func(c modelprobe.Capability, s modelprobe.Status) modelprobe.Check {
 		return modelprobe.Check{Capability: c, Status: s}
@@ -752,16 +752,16 @@ func TestGetKumbhaModels_FollowsCapabilityEvidence(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	r.Use(func(c *gin.Context) { c.Set(string(auth.AccountIDKey), uuid.New()); c.Next() })
-	r.GET("/v1/kumbha/models", h.GetKumbhaModels)
+	r.GET("/v1/build/models", h.GetBuildModels)
 	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/kumbha/models", nil))
+	r.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/build/models", nil))
 	var out struct {
-		Data []kumbhaModelView `json:"data"`
+		Data []buildModelView `json:"data"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || rec.Code != 200 {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
 	}
-	byRoute := map[string]kumbhaModelView{}
+	byRoute := map[string]buildModelView{}
 	for _, m := range out.Data {
 		byRoute[m.Route] = m
 	}

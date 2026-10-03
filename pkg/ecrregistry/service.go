@@ -2,12 +2,12 @@
 // Licensed under the Apache License, Version 2.0
 
 // Package ecrregistry provisions and authenticates access to a single,
-// shared ECR repository for Kumbha build output — the ECR-backed
+// shared ECR repository for Teepin Build build output — the ECR-backed
 // implementation of pkg/build.RegistryProvider, chosen over standing up a
 // self-hosted Harbor server on any deployment where Harbor is not already
 // configured. Same reasoning ROADMAP.md's 2026-08-23 decision already
-// applied to the Kumbha agent image itself: ECR is already live
-// infrastructure (control-plane and kumbha-agent both already push/pull
+// applied to the Teepin Build agent image itself: ECR is already live
+// infrastructure (control-plane and build-agent both already push/pull
 // through it), so reusing it here is less new infrastructure to build and
 // operate than a second registry server would be.
 //

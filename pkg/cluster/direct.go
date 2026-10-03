@@ -68,19 +68,21 @@ const (
 	labelProjectID = "teepin.io/project-id"
 	labelAccountID = "teepin.io/account-id"
 
-	// MUST match pkg/kumbha's agentLabel exactly. Kumbha's own agent pod
+	// MUST match pkg/teepinbuild's agentLabel exactly. Teepin Build's own agent pod
 	// carries the same account/project tenancy labels as any customer
 	// instance (correctly, for billing/scoping) and is otherwise
 	// indistinguishable from one at this layer — the "never appears in
-	// the customer's Compute list" guarantee (pkg/kumbha/agent.go's own
+	// the customer's Compute list" guarantee (pkg/teepinbuild/agent.go's own
 	// doc comment) was never actually true: ListInstances is cluster-
 	// authoritative (server.go's ListInstances queries the live cluster,
 	// merging in compute.instances only for extra metadata), not
 	// database-authoritative, and nothing excluded this label from that
 	// query until it was excluded here. Found live 2026-08-23: a
-	// customer's CPU compute list showed "kumbha-agent-<id>" with a
+	// customer's CPU compute list showed "build-agent-<id>" with a
 	// working Delete button.
-	labelKumbhaAgent = "teepin.io/kumbha-agent"
+	labelBuildAgent = "teepin.io/build-agent"
+	// labelLegacyBuildAgent is the label's former name, kept until every node and pod carries the new one (ROADMAP: Teepin Build rename).
+	labelLegacyBuildAgent = "teepin.io/kumbha-agent"
 
 	// Consumed by the networking Service selector.
 	labelInstanceShort = "teepin.io/instance"
@@ -435,7 +437,7 @@ func instanceSelector(scope Scope, instanceID string) string {
 }
 
 // managedSelector matches every TEEPIN-managed instance in a scope, for
-// LISTING — excludes Kumbha's own agent pods (see labelKumbhaAgent) by
+// LISTING — excludes Teepin Build's own agent pods (see labelBuildAgent) by
 // default, unlike instanceSelector: a caller that already knows a pod's
 // exact instance ID (CloseSession's teardown, the event relay's
 // StreamLogs) must still find it. Only the customer-facing list must
@@ -445,7 +447,7 @@ func instanceSelector(scope Scope, instanceID string) string {
 func managedSelector(scope Scope) string {
 	selector := fmt.Sprintf("%s=true", labelManaged)
 	if !scope.IncludeHidden {
-		selector += fmt.Sprintf(",%s!=true", labelKumbhaAgent)
+		selector += fmt.Sprintf(",%s!=true,%s!=true", labelBuildAgent, labelLegacyBuildAgent)
 	}
 	return appendScope(selector, scope)
 }
@@ -484,7 +486,7 @@ func (c *DirectClient) remove(ctx context.Context, scope Scope, instanceID strin
 		return fmt.Errorf("list pods: %w", err)
 	}
 
-	// A Kumbha agent pod's PVC is its customer's actual workspace — the
+	// A Teepin Build agent pod's PVC is its customer's actual workspace — the
 	// files it wrote, meant to survive the pod being killed and relaunched
 	// (StopAgent's own doc comment: "Whatever the agent had written to the
 	// workspace (PVC) up to the moment of the kill is kept"). But every
@@ -497,14 +499,14 @@ func (c *DirectClient) remove(ctx context.Context, scope Scope, instanceID strin
 	// from a build that had deployed successfully hours earlier — because
 	// this method deleted the PVC unconditionally, silently breaking the
 	// promise StopAgent's own comment makes. Detected via the pod's own
-	// label (the same teepin.io/kumbha-agent marker LaunchAgent stamps on
+	// label (the same teepin.io/build-agent marker LaunchAgent stamps on
 	// it and ListInstanceStatuses already filters on — an established
 	// precedent for this exact kind of special-casing, not a new one) so
 	// a customer's ordinary instance delete is entirely unaffected.
-	isKumbhaAgent := false
+	isBuildAgent := false
 	for _, pod := range pods.Items {
-		if pod.Labels[labelKumbhaAgent] == "true" {
-			isKumbhaAgent = true
+		if pod.Labels[labelBuildAgent] == "true" || pod.Labels[labelLegacyBuildAgent] == "true" {
+			isBuildAgent = true
 		}
 		if delErr := c.k8s.CoreV1().Pods(workloadNamespace).Delete(
 			ctx, pod.Name, metav1.DeleteOptions{}); delErr != nil && !apierrors.IsNotFound(delErr) {
@@ -526,7 +528,7 @@ func (c *DirectClient) remove(ctx context.Context, scope Scope, instanceID strin
 	// delete by name, same idempotent IsNotFound-is-success idiom as the
 	// pod delete above. A PVC delete when StorageGB was never set simply
 	// finds nothing, which is not an error.
-	if !isKumbhaAgent && !keepVolume {
+	if !isBuildAgent && !keepVolume {
 		if err := c.k8s.CoreV1().PersistentVolumeClaims(workloadNamespace).Delete(
 			ctx, pvcName(instanceID), metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("delete pvc: %w", err)
@@ -810,7 +812,7 @@ func (c *DirectClient) ListInstanceStatuses(ctx context.Context, scope Scope) ([
 	// same instance ID here, and why reporting both let a stale "terminated"
 	// status from the pod BEING REPLACED silently win over the healthy new
 	// one in the reconciler's naive map[instanceID]status collapse. Found
-	// live 2026-09-15: two real Kumbha redeploys (inst-55b4d443,
+	// live 2026-09-15: two real Teepin Build redeploys (inst-55b4d443,
 	// inst-5ed29952) got their compute.instances rows marked terminated
 	// seconds-to-tens-of-seconds after a genuinely successful redeploy,
 	// because UpdateInstance's delete-then-create replace is not atomic —
@@ -1145,7 +1147,7 @@ func (c *DirectClient) buildPod(spec InstanceSpec) (*corev1.Pod, error) {
 			// unset — correct for a customer's persistent compute
 			// instance, catastrophic for a one-shot workload (see
 			// InstanceSpec.NeverRestart's own doc comment for the live
-			// incident this guards against: Kumbha's agent pod silently
+			// incident this guards against: Teepin Build's agent pod silently
 			// restarting mid-build and re-running the whole thing from
 			// scratch against the same prompt, on repeat).
 			RestartPolicy: func() corev1.RestartPolicy {
@@ -1348,7 +1350,7 @@ func pvcName(instanceID string) string           { return PVCName(instanceID) }
 func networkPolicyName(instanceID string) string { return "netpol-" + instanceID }
 
 // PVCName is pvcName exported: callers outside this package that know an
-// instance ID (e.g. pkg/build, mounting a Kumbha agent's workspace volume
+// instance ID (e.g. pkg/build, mounting a Teepin Build agent's workspace volume
 // into a Kaniko pod) need to derive the same PVC name buildPod already
 // mounts, without duplicating the "pvc-" convention a second time where
 // it could silently drift from this one.
@@ -1479,7 +1481,7 @@ func buildNetworkPolicy(spec InstanceSpec, podCIDR string) *networkingv1.Network
 // a real termination — this only fires once the node's own absence has
 // already stood for a while.
 //
-// Found live 2026-09-05: several days-old stale kumbha-agent-* pods sat
+// Found live 2026-09-05: several days-old stale build-agent-* pods sat
 // stuck reporting PodUnknown after their node vanished, with the default
 // case below folding that into the SAME "pending" bucket a genuinely-
 // still-starting pod uses — which both nodes.ListNodeCapacity and the

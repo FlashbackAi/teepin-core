@@ -26,11 +26,11 @@ const (
 	ViaAPIKeyKey contextKey = "via_api_key"
 )
 
-// SessionChecker answers whether a Kumbha session-scoped credential
+// SessionChecker answers whether a Teepin Build session-scoped credential
 // (minted by MintSessionToken) is still usable — i.e. the session it
-// names is open. Implemented by kumbha.Store; injected via
+// names is open. Implemented by teepinbuild.Store; injected via
 // WithSessionChecker rather than imported directly so pkg/auth has no
-// dependency on pkg/kumbha, the same ProvisionGate/PricingProvider
+// dependency on pkg/teepinbuild, the same ProvisionGate/PricingProvider
 // pattern used throughout pkg/api.
 type SessionChecker interface {
 	// IsSessionOpen reports whether sessionID belongs to accountID and is
@@ -62,7 +62,7 @@ type Principal struct {
 	// ProjectID is set when the credential is scoped to one project —
 	// always for API keys, optionally for JWTs.
 	ProjectID uuid.UUID
-	// SessionID is set only for a Kumbha agent credential (MintSessionToken)
+	// SessionID is set only for a Teepin Build agent credential (MintSessionToken)
 	// — nil for every human login or API key.
 	SessionID uuid.UUID
 	// ViaAPIKey is true when the caller authenticated with an API key, and
@@ -75,7 +75,7 @@ type Principal struct {
 type Middleware struct {
 	authService *Service
 	jwtSecret   string
-	// sessionChecker validates a Kumbha session-scoped credential's
+	// sessionChecker validates a Teepin Build session-scoped credential's
 	// SessionID claim on every request. Nil disables the capability
 	// cleanly: a token carrying a SessionID claim is treated as invalid
 	// rather than trusted unconditionally, matching how every other
@@ -90,7 +90,7 @@ func NewMiddleware(authService *Service, jwtSecret string) *Middleware {
 	}
 }
 
-// WithSessionChecker enables validating Kumbha session-scoped credentials.
+// WithSessionChecker enables validating Teepin Build session-scoped credentials.
 // Returns the same *Middleware for chaining, so existing NewMiddleware
 // call sites compile unchanged.
 func (m *Middleware) WithSessionChecker(checker SessionChecker) *Middleware {
@@ -150,7 +150,7 @@ func (m *Middleware) authenticate(c *gin.Context) *Principal {
 	// carrying this claim with no checker wired, or whose session has
 	// closed or errors on lookup, is rejected outright: this is the
 	// platform's most narrowly-scoped credential and the one most exposed
-	// to prompt injection (KUMBHA-DESIGN.md's Topology section), so it
+	// to prompt injection (TEEPIN-BUILD-DESIGN.md's Topology section), so it
 	// fails closed rather than falling back to ordinary JWT trust.
 	if claims.SessionID != uuid.Nil {
 		if m.sessionChecker == nil {
@@ -192,7 +192,7 @@ func (m *Middleware) authenticate(c *gin.Context) *Principal {
 
 // store publishes the principal into the request context.
 func store(c *gin.Context, p *Principal) {
-	// Guarded like every other field below: a Kumbha session token
+	// Guarded like every other field below: a Teepin Build session token
 	// (auth.MintSessionToken) never sets Claims.UserID, leaving it at the
 	// zero value. Setting the key unconditionally made GetUserID report
 	// "present" (ok=true) with value uuid.Nil for such a credential,
@@ -300,7 +300,7 @@ func GetProjectID(c *gin.Context) (uuid.UUID, bool) {
 	return uuidFromContext(c, ProjectIDKey)
 }
 
-// GetSessionID extracts the Kumbha session a credential is scoped to, if
+// GetSessionID extracts the Teepin Build session a credential is scoped to, if
 // any — set only for an agent credential minted by MintSessionToken.
 func GetSessionID(c *gin.Context) (uuid.UUID, bool) {
 	return uuidFromContext(c, SessionIDKey)

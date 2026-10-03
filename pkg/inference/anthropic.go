@@ -17,7 +17,7 @@ import (
 // AnthropicProvider talks to Claude over the official Anthropic Messages
 // API — a genuinely different wire shape from vLLM's OpenAI-compatible
 // endpoint, which is exactly why this provider exists: it is the proof
-// that "adding a model costs one adapter" (KUMBHA-DESIGN.md) is a real
+// that "adding a model costs one adapter" (TEEPIN-BUILD-DESIGN.md) is a real
 // property of pkg/inference, not just a claim. Everything provider-
 // specific is translated at the edges: Request's OpenAI-shaped messages
 // go in, an OpenAI-chat-completion-shaped Response.Body comes out — a
@@ -378,7 +378,7 @@ func (p *AnthropicProvider) Complete(ctx context.Context, req Request) (*Respons
 }
 
 // Stream is not implemented yet. Anthropic's own build order lands after
-// vLLM's (KUMBHA-DESIGN.md's Gateway build order sequences streaming
+// vLLM's (TEEPIN-BUILD-DESIGN.md's Gateway build order sequences streaming
 // against the backend already proven end to end); an explicit error beats
 // a silent fallback to Complete, same precedent as vLLM's Stream before it
 // was implemented.

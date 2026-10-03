@@ -42,18 +42,12 @@ func NewNodeHandler(svc *nodes.Service, rates CPURateProvider) *NodeHandler {
 // enrollRequest is what an agent posts to redeem its one-time token. It
 // deliberately has NO class field — class is fixed by the token, server-side.
 type enrollRequest struct {
-	Token      string `json:"token" binding:"required"`
-	NodeName   string `json:"node_name" binding:"required"`
-	ProviderID string `json:"provider_id" binding:"required"`
-	Region     string `json:"region"`
-	CPUCores   int    `json:"cpu_cores"`
-	MemoryGB   int    `json:"memory_gb"`
-	// PCores/ECores are optional — 0 (the default when the field is
-	// omitted) means "no split detected," the same meaning it has
-	// everywhere else in this feature. See nodes.NodeSpecs' own doc
-	// comment.
-	PCores       int    `json:"p_cores"`
-	ECores       int    `json:"e_cores"`
+	Token        string `json:"token" binding:"required"`
+	NodeName     string `json:"node_name" binding:"required"`
+	ProviderID   string `json:"provider_id" binding:"required"`
+	Region       string `json:"region"`
+	CPUCores     int    `json:"cpu_cores"`
+	MemoryGB     int    `json:"memory_gb"`
 	GPUModel     string `json:"gpu_model"`
 	GPUCount     int    `json:"gpu_count"`
 	MIGCapable   bool   `json:"mig_capable"`
@@ -78,8 +72,6 @@ func (h *NodeHandler) Enroll(c *gin.Context) {
 		Region:       req.Region,
 		CPUCores:     req.CPUCores,
 		MemoryGB:     req.MemoryGB,
-		PCores:       req.PCores,
-		ECores:       req.ECores,
 		GPUModel:     req.GPUModel,
 		GPUCount:     req.GPUCount,
 		MIGCapable:   req.MIGCapable,

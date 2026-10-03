@@ -144,8 +144,8 @@ type InstanceSpec struct {
 	// decided unilaterally, given it weakens isolation for every
 	// customer workload, not only Kaniko's own trusted tooling.
 	//
-	// Still deliberately NOT set for the Kumbha agent pod itself
-	// (LaunchAgent, pkg/kumbha/agent.go) — that workload has no
+	// Still deliberately NOT set for the Teepin Build agent pod itself
+	// (LaunchAgent, pkg/teepinbuild/agent.go) — that workload has no
 	// legitimate need for it and stays on the fully locked-down default.
 	AllowFilesystemOwnershipChanges bool
 
@@ -238,7 +238,7 @@ type InstanceStatus struct {
 	TLSReady    bool
 
 	// Hidden marks a pod as Teepin's own workload (Kaniko builds, the
-	// Kumbha agent pod, the screenshot capture pod — anything carrying
+	// Teepin Build agent pod, the screenshot capture pod — anything carrying
 	// the "hide from Compute list" label) rather than something the
 	// customer manages. DirectClient never needs this: it excludes such
 	// pods at the k8s API level via managedSelector's own label
@@ -347,7 +347,7 @@ type Scope struct {
 	// AccountID restricts to one account. Nil means unrestricted.
 	AccountID string
 
-	// IncludeHidden includes pods carrying labelKumbhaAgent — Kumbha's own
+	// IncludeHidden includes pods carrying labelBuildAgent — Teepin Build's own
 	// agent pods AND Kaniko build pods, both deliberately excluded from
 	// DirectClient.ListInstanceStatuses' default selector (managedSelector)
 	// so a customer's Compute list never shows Teepin's own tooling. That
@@ -374,7 +374,7 @@ type Scope struct {
 // decision at the call site rather than an empty struct literal.
 func AllTenants() Scope { return Scope{} }
 
-// AllTenantsIncludingHidden is AllTenants but also includes Kumbha's own
+// AllTenantsIncludingHidden is AllTenants but also includes Teepin Build's own
 // agent/build pods — see Scope.IncludeHidden's own doc comment. Only ever
 // used by the home-node agent's own status-reporting sweep
 // (pkg/agentrunner's reportStatuses), never by anything customer-facing.

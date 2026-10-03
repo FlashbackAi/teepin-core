@@ -15,8 +15,6 @@ type computeRates struct {
 	cpuCoreHour    float64
 	memoryGBHour   float64
 	storageGBMonth float64
-	pCoreHour      float64
-	eCoreHour      float64
 }
 
 // loadComputeRates reads the current rates. Never cached across calls:
@@ -27,8 +25,6 @@ func (s *Service) loadComputeRates(ctx context.Context) computeRates {
 		cpuCoreHour:    s.CPUCoreRate(ctx),
 		memoryGBHour:   s.MemoryGBRate(ctx),
 		storageGBMonth: s.StorageGBMonthRate(ctx),
-		pCoreHour:      s.PCoreRate(ctx),
-		eCoreHour:      s.ECoreRate(ctx),
 	}
 }
 
@@ -37,20 +33,12 @@ func (s *Service) loadComputeRates(ctx context.Context) computeRates {
 //
 // A GPU instance is linear on allocated VRAM. A CPU-only instance (home
 // compute) is linear on cores + memory; its rates default to 0, so it costs
-// nothing until an operator sets a price. A CPU instance placed with a
-// DETECTED P/E split (PCoresUsed/ECoresUsed both non-nil — see
-// billableInstance) prices via the separate P-core/E-core rates instead of
-// the single undifferentiated CPU rate; an instance with no detected split
-// is billed exactly as before that feature.
+// nothing until an operator sets a price.
 func (r computeRates) unitPrice(inst billableInstance) float64 {
-	switch {
-	case inst.GPUVRAMGB > 0:
+	if inst.GPUVRAMGB > 0 {
 		return float64(inst.GPUVRAMGB) * r.vramPerGBHour
-	case inst.PCoresUsed != nil && inst.ECoresUsed != nil:
-		return float64(*inst.PCoresUsed)*r.pCoreHour + float64(*inst.ECoresUsed)*r.eCoreHour + float64(inst.MemoryGB)*r.memoryGBHour
-	default:
-		return float64(inst.CPUUnits)*r.cpuCoreHour + float64(inst.MemoryGB)*r.memoryGBHour
 	}
+	return float64(inst.CPUUnits)*r.cpuCoreHour + float64(inst.MemoryGB)*r.memoryGBHour
 }
 
 // storagePerHour is the storage component of an instance's hourly cost.
@@ -76,4 +64,25 @@ func (r computeRates) hourly(inst billableInstance) float64 {
 func (r computeRates) cost(inst billableInstance, hours float64) (unitPrice, total float64) {
 	unitPrice = r.unitPrice(inst)
 	return unitPrice, unitPrice*hours + r.storagePerHour(inst)*hours
+}
+
+// ComputeHourlyPrice is what an instance of this size costs per hour right now,
+// storage included: the very formula the usage collector charges and the credit
+// enforcer projects, so a price shown to a customer cannot differ from the bill.
+// Zero while the relevant rates have not been set (every price starts at $0).
+// Read from the live rates on every call, like every other quote.
+func (s *Service) ComputeHourlyPrice(ctx context.Context, gpuVRAMGB, cpuUnits, memoryGB, storageGB int) float64 {
+	return s.ComputeHourlyPricer(ctx)(gpuVRAMGB, cpuUnits, memoryGB, storageGB)
+}
+
+// ComputeHourlyPricer reads the live rates ONCE and returns a function that
+// prices any number of instances from them, for a caller pricing a whole list
+// (one set of rate reads, not one per row). Same formula as ComputeHourlyPrice.
+func (s *Service) ComputeHourlyPricer(ctx context.Context) func(gpuVRAMGB, cpuUnits, memoryGB, storageGB int) float64 {
+	rates := s.loadComputeRates(ctx)
+	return func(gpuVRAMGB, cpuUnits, memoryGB, storageGB int) float64 {
+		return rates.hourly(billableInstance{
+			GPUVRAMGB: gpuVRAMGB, CPUUnits: cpuUnits, MemoryGB: memoryGB, StorageGB: storageGB,
+		})
+	}
 }

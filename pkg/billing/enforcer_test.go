@@ -131,7 +131,7 @@ func (f *fakeSettler) CollectAccount(_ context.Context, id uuid.UUID) error {
 func runningRows() *sqlmock.Rows {
 	return sqlmock.NewRows([]string{
 		"id", "account_id", "project_id", "instance_type_id", "gpu_vram_gb",
-		"cpu_units", "memory_gb", "storage_gb", "p_cores_used", "e_cores_used",
+		"cpu_units", "memory_gb", "storage_gb",
 		"created_at", "terminated_at", "billed_through",
 	})
 }
@@ -148,7 +148,7 @@ func newTestEnforcer(t *testing.T, mode EnforcementMode) (*CreditEnforcer, sqlmo
 }
 
 // expectTick queues the reads one Tick performs for a single account:
-// running instances, the six rate reads, then the balance.
+// running instances, the rate reads, then the balance.
 func expectTick(mock sqlmock.Sqlmock, acct uuid.UUID, rows *sqlmock.Rows, balance float64) {
 	mock.ExpectQuery(`FROM compute\.instances i`).WillReturnRows(rows)
 	expectPricingRead(mock, 0.10)
@@ -162,7 +162,7 @@ func TestTick_StopsDisklessInstancesWhenCreditGone(t *testing.T) {
 	now := time.Now()
 	// 20GB = $2/hour, metered 30 minutes ago => $1.00 accrued. A $1.05
 	// balance leaves $0.05, under the 2-minute horizon ($0.067).
-	rows := runningRows().AddRow("i-1", acct, uuid.New(), "", 20, 0, 0, 0, nil, nil, now.Add(-time.Hour), nil, now.Add(-30*time.Minute))
+	rows := runningRows().AddRow("i-1", acct, uuid.New(), "", 20, 0, 0, 0, now.Add(-time.Hour), nil, now.Add(-30*time.Minute))
 	expectTick(mock, acct, rows, 1.05)
 
 	e.Tick(context.Background())
@@ -182,7 +182,7 @@ func TestTick_LeavesAffordableAccountsAlone(t *testing.T) {
 	e, mock, stopper, _ := newTestEnforcer(t, EnforceOn)
 	acct := uuid.New()
 	now := time.Now()
-	rows := runningRows().AddRow("i-1", acct, uuid.New(), "", 20, 0, 0, 0, nil, nil, now.Add(-time.Hour), nil, now.Add(-time.Minute))
+	rows := runningRows().AddRow("i-1", acct, uuid.New(), "", 20, 0, 0, 0, now.Add(-time.Hour), nil, now.Add(-time.Minute))
 	expectTick(mock, acct, rows, 50.00)
 
 	e.Tick(context.Background())
@@ -196,7 +196,7 @@ func TestTick_DryRunStopsNothing(t *testing.T) {
 	e, mock, stopper, settler := newTestEnforcer(t, EnforceDryRun)
 	acct := uuid.New()
 	now := time.Now()
-	rows := runningRows().AddRow("i-1", acct, uuid.New(), "", 20, 0, 0, 0, nil, nil, now.Add(-time.Hour), nil, now.Add(-30*time.Minute))
+	rows := runningRows().AddRow("i-1", acct, uuid.New(), "", 20, 0, 0, 0, now.Add(-time.Hour), nil, now.Add(-30*time.Minute))
 	expectTick(mock, acct, rows, 0)
 
 	e.Tick(context.Background())
@@ -212,8 +212,8 @@ func TestTick_HoldsDiskBackedInstancesInsteadOfDeletingThem(t *testing.T) {
 	now := time.Now()
 	// i-disk has a 50GB persistent disk; i-plain does not. Both are out of credit.
 	rows := runningRows().
-		AddRow("i-disk", acct, uuid.New(), "", 20, 0, 0, 50, nil, nil, now.Add(-time.Hour), nil, now.Add(-30*time.Minute)).
-		AddRow("i-plain", acct, uuid.New(), "", 20, 0, 0, 0, nil, nil, now.Add(-time.Hour), nil, now.Add(-30*time.Minute))
+		AddRow("i-disk", acct, uuid.New(), "", 20, 0, 0, 50, now.Add(-time.Hour), nil, now.Add(-30*time.Minute)).
+		AddRow("i-plain", acct, uuid.New(), "", 20, 0, 0, 0, now.Add(-time.Hour), nil, now.Add(-30*time.Minute))
 	expectTick(mock, acct, rows, 0)
 
 	e.Tick(context.Background())
@@ -236,7 +236,7 @@ func TestTick_UnholdableInstanceKeepsRunningAndIsReported(t *testing.T) {
 	stopper.holdFailing = true
 	acct := uuid.New()
 	now := time.Now()
-	rows := runningRows().AddRow("i-disk", acct, uuid.New(), "", 20, 0, 0, 50, nil, nil, now.Add(-time.Hour), nil, now.Add(-30*time.Minute))
+	rows := runningRows().AddRow("i-disk", acct, uuid.New(), "", 20, 0, 0, 50, now.Add(-time.Hour), nil, now.Add(-30*time.Minute))
 	expectTick(mock, acct, rows, 0)
 
 	e.Tick(context.Background())
@@ -256,7 +256,7 @@ func TestTick_UnreadableBalanceKeepsWorkloadsRunning(t *testing.T) {
 	e, mock, stopper, _ := newTestEnforcer(t, EnforceOn)
 	acct := uuid.New()
 	now := time.Now()
-	rows := runningRows().AddRow("i-1", acct, uuid.New(), "", 20, 0, 0, 0, nil, nil, now.Add(-time.Hour), nil, now.Add(-30*time.Minute))
+	rows := runningRows().AddRow("i-1", acct, uuid.New(), "", 20, 0, 0, 0, now.Add(-time.Hour), nil, now.Add(-30*time.Minute))
 	mock.ExpectQuery(`FROM compute\.instances i`).WillReturnRows(rows)
 	expectPricingRead(mock, 0.10)
 	mock.ExpectQuery(`billing\.credit_balance`).WithArgs(acct).WillReturnError(errors.New("db down"))
@@ -273,7 +273,7 @@ func TestTick_FailedStopIsNotSettled(t *testing.T) {
 	stopper.failing = true
 	acct := uuid.New()
 	now := time.Now()
-	rows := runningRows().AddRow("i-1", acct, uuid.New(), "", 20, 0, 0, 0, nil, nil, now.Add(-time.Hour), nil, now.Add(-30*time.Minute))
+	rows := runningRows().AddRow("i-1", acct, uuid.New(), "", 20, 0, 0, 0, now.Add(-time.Hour), nil, now.Add(-30*time.Minute))
 	expectTick(mock, acct, rows, 0)
 
 	e.Tick(context.Background())
@@ -321,7 +321,7 @@ func TestTick_TellsTheCustomerWhenItStopsCompute(t *testing.T) {
 	e.WithNotifier(n)
 	acct := uuid.New()
 	now := time.Now()
-	rows := runningRows().AddRow("i-1", acct, uuid.New(), "", 20, 0, 0, 0, nil, nil, now.Add(-time.Hour), nil, now.Add(-30*time.Minute))
+	rows := runningRows().AddRow("i-1", acct, uuid.New(), "", 20, 0, 0, 0, now.Add(-time.Hour), nil, now.Add(-30*time.Minute))
 	expectTick(mock, acct, rows, 0)
 
 	e.Tick(context.Background())
@@ -338,7 +338,7 @@ func TestTick_DoesNotNotifyWhenNothingWasStopped(t *testing.T) {
 	e.WithNotifier(n)
 	acct := uuid.New()
 	now := time.Now()
-	rows := runningRows().AddRow("i-1", acct, uuid.New(), "", 20, 0, 0, 0, nil, nil, now.Add(-time.Hour), nil, now.Add(-30*time.Minute))
+	rows := runningRows().AddRow("i-1", acct, uuid.New(), "", 20, 0, 0, 0, now.Add(-time.Hour), nil, now.Add(-30*time.Minute))
 	expectTick(mock, acct, rows, 0)
 
 	e.Tick(context.Background())

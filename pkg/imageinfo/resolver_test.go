@@ -155,7 +155,7 @@ func TestResolvePorts_MissingImageOnAllowlistedRegistryReturnsEmpty(t *testing.T
 }
 
 // TestResolvePortsWithAuth_BypassesAllowlist is the regression test for
-// the actual point of this function: DeployKumbhaSession's own image
+// the actual point of this function: DeployBuildSession's own image
 // reference (TEEPIN's private build registry, e.g. ECR) is never on
 // allowedRegistries — that allowlist exists for arbitrary customer-typed
 // image strings, a threat model that does not apply to a reference the

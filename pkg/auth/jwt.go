@@ -18,7 +18,7 @@ type Claims struct {
 	AccountAlias string    `json:"account_alias,omitempty"`
 	Role         string    `json:"role,omitempty"`
 	ProjectID    uuid.UUID `json:"project_id,omitempty"`
-	// SessionID is set ONLY on a Kumbha agent credential (see
+	// SessionID is set ONLY on a Teepin Build agent credential (see
 	// MintSessionToken) — never on a human login token. Its presence is
 	// what makes Middleware.authenticate check the session's own
 	// open/closed status on every request, so the credential is revoked
@@ -31,7 +31,7 @@ type Claims struct {
 	// call, silently defeating the whole point of a 15-minute access
 	// token. Middleware.authenticate rejects "refresh" outright; only
 	// the /v1/auth/refresh endpoint accepts one. Empty/absent (older
-	// already-issued tokens, and Kumbha's own MintSessionToken credential)
+	// already-issued tokens, and Teepin Build's own MintSessionToken credential)
 	// is treated as "access" — those are distinguished by SessionID
 	// instead and this field does not apply to them.
 	TokenType string `json:"token_type,omitempty"`
@@ -83,8 +83,8 @@ func GenerateJWT(user *User, accountAlias, secret string) (accessToken, refreshT
 }
 
 // MintSessionToken creates a short-lived credential scoped to one project
-// AND one Kumbha build session, for the agent workload processing that
-// session to call teepin.* APIs with (KUMBHA-DESIGN.md's Topology
+// AND one Teepin Build build session, for the agent workload processing that
+// session to call teepin.* APIs with (TEEPIN-BUILD-DESIGN.md's Topology
 // section). Deliberately not GenerateJWT's login token shape: there is no
 // human user behind it (UserID stays uuid.Nil, same convention exec
 // tickets already use for a userless credential), it carries the
@@ -107,7 +107,7 @@ func MintSessionToken(accountID, projectID, sessionID uuid.UUID, ttl time.Durati
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(ttl)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
-			Issuer:    "teepin-kumbha",
+			Issuer:    "teepin-build",
 			Subject:   sessionID.String(),
 		},
 	}

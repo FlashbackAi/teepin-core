@@ -30,11 +30,11 @@ func TestGetCreditStatus_ReportsRunwayAndLevel(t *testing.T) {
 	// $24 left at a $1/hour trailing spend = a day.
 	mock.ExpectQuery(`billing\.credit_balance`).WillReturnRows(sqlmock.NewRows([]string{"b"}).AddRow(24.0))
 	for _, col := range []string{"vram_price_per_gb_hour", "cpu_price_per_core_hour", "memory_price_per_gb_hour",
-		"storage_price_per_gb_month", "p_core_price_per_hour", "e_core_price_per_hour", "object_storage_price_per_gb_month"} {
+		"storage_price_per_gb_month", "object_storage_price_per_gb_month"} {
 		mock.ExpectQuery(`SELECT ` + col + ` FROM billing\.pricing`).WillReturnRows(sqlmock.NewRows([]string{col}).AddRow(0.0))
 	}
 	mock.ExpectQuery(`FROM compute\.instances\s+WHERE account_id = \$1 AND status = 'running'`).
-		WillReturnRows(sqlmock.NewRows([]string{"a", "b", "c", "d", "e", "f"}))
+		WillReturnRows(sqlmock.NewRows([]string{"a", "b", "c", "d"}))
 	mock.ExpectQuery(`FROM compute\.instances\s+WHERE account_id = \$1 AND status = 'stopped'`).
 		WillReturnRows(sqlmock.NewRows([]string{"gb", "n"}).AddRow(0, 0))
 	mock.ExpectQuery(`SELECT SUM\(total_bytes\) FROM storage\.buckets`).

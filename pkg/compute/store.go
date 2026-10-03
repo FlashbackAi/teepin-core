@@ -46,12 +46,6 @@ type InstanceRecord struct {
 	GPUVRAMGB    int // 0 for CPU-only instances
 	CPUUnits     int
 	MemoryGB     int
-	// PCoresUsed/ECoresUsed are nil unless this instance was placed with a
-	// detected P-core/E-core split (nodes.Placement) — nil means bill and
-	// report via CPUUnits alone, exactly as before this feature. See
-	// migration 045's own comment.
-	PCoresUsed   *int
-	ECoresUsed   *int
 	Endpoint     string
 	K8sPodName   string
 	K8sNamespace string
@@ -86,20 +80,20 @@ type InstanceRecord struct {
 	// means no volume was provisioned. Not called PersistentStorageGB —
 	// matches the JSON/proto field name used everywhere else in this flow.
 	StorageGB int
-	// KumbhaSessionID records which Kumbha build session (if any) created
+	// BuildSessionID records which Teepin Build build session (if any) created
 	// this instance — set from the creating credential's own SessionID
-	// claim (a Kumbha session token) or threaded explicitly through
-	// invokeInternally for the deploy path, so NO instance a Kumbha agent
+	// claim (a Teepin Build session token) or threaded explicitly through
+	// invokeInternally for the deploy path, so NO instance a Teepin Build agent
 	// provisions — via create_instance, deploy, or any future verb — can
 	// ever go untracked. Deliberately independent of AppInstanceID on
-	// kumbha.Session (which designates the ONE instance that IS "the
-	// app"): this column answers "did Kumbha create this" for every
+	// teepinbuild.Session (which designates the ONE instance that IS "the
+	// app"): this column answers "did Teepin Build create this" for every
 	// instance, sidecars included, whether or not it ever becomes the app.
-	KumbhaSessionID uuid.UUID
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
-	StartedAt       *time.Time
-	TerminatedAt    *time.Time
+	BuildSessionID uuid.UUID
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+	StartedAt      *time.Time
+	TerminatedAt   *time.Time
 }
 
 // Store provides CRUD access to compute.instances.
@@ -120,13 +114,13 @@ func (s *Store) Create(ctx context.Context, rec *InstanceRecord) error {
 	query := `
 		INSERT INTO compute.instances
 		(id, account_id, project_id, user_id, name, image, instance_type_id, status,
-		 gpu_vram_gb, cpu_units, memory_gb, p_cores_used, e_cores_used, endpoint,
+		 gpu_vram_gb, cpu_units, memory_gb, endpoint,
 		 k8s_pod_name, k8s_namespace,
 		 provider_id, node_id, dns_name, public_ip, tls_enabled, tls_ready, container_port,
-		 storage_gb, kumbha_session_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-		 $17, (SELECT id FROM compute.nodes WHERE node_name = $18), $19, $20, $21, $22, $23,
-		 $24, $25)
+		 storage_gb, build_session_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+		 $15, (SELECT id FROM compute.nodes WHERE node_name = $16), $17, $18, $19, $20, $21,
+		 $22, $23)
 		RETURNING created_at, updated_at
 	`
 
@@ -142,11 +136,10 @@ func (s *Store) Create(ctx context.Context, rec *InstanceRecord) error {
 	err := s.db.QueryRowContext(ctx, query,
 		rec.ID, rec.AccountID, rec.ProjectID, nullUUID(rec.UserID), rec.Name, rec.Image,
 		rec.InstanceType, rec.Status, vram, rec.CPUUnits, rec.MemoryGB,
-		rec.PCoresUsed, rec.ECoresUsed,
 		nullIfEmpty(rec.Endpoint), nullIfEmpty(rec.K8sPodName), rec.K8sNamespace,
 		nullIfEmpty(rec.ProviderID), nullIfEmpty(rec.NodeName),
 		nullIfEmpty(rec.DNSName), nullIfEmpty(rec.PublicIP), rec.TLSEnabled, rec.TLSReady,
-		containerPort, rec.StorageGB, nullUUID(rec.KumbhaSessionID),
+		containerPort, rec.StorageGB, nullUUID(rec.BuildSessionID),
 	).Scan(&rec.CreatedAt, &rec.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("failed to persist instance %s: %w", rec.ID, err)
@@ -215,7 +208,7 @@ func (s *Store) UpdateStatus(ctx context.Context, id, status string) error {
 
 // UpdateImage records a redeploy that swapped an existing instance's pod
 // in place — same id, new image/pod/container port. The only caller
-// today is DeployKumbhaSession's redeploy path (a Kumbha customer's app
+// today is DeployBuildSession's redeploy path (a Teepin Build customer's app
 // hostname must not change just because new code shipped — see
 // cluster.Client.UpdateInstance's own doc comment for the cluster-layer
 // half of this).
@@ -231,7 +224,7 @@ func (s *Store) UpdateStatus(ctx context.Context, id, status string) error {
 //
 // terminated_at is explicitly cleared, and the WHERE clause no longer
 // excludes an already-terminated row (it did, previously — see below).
-// UpdateImage's ONLY caller (redeployKumbhaInstance) reaches this line
+// UpdateImage's ONLY caller (redeployBuildInstance) reaches this line
 // having just gotten a SUCCESSFUL cluster.UpdateInstance back — positive,
 // first-hand confirmation that a real pod is running right now — so a
 // terminated_at from some earlier gap (the reconciler correctly marking
@@ -269,8 +262,8 @@ func (s *Store) UpdateImage(ctx context.Context, id, image, podName string, cont
 }
 
 // UpdateNodePlacement backfills provider_id/node_id on an EXISTING row whose
-// original create never set them (see kumbha_handlers.go's
-// redeployKumbhaInstance — a historical gap, not a current one: new
+// original create never set them (see build_handlers.go's
+// redeployBuildInstance — a historical gap, not a current one: new
 // deploys already set these at create time). node_id is resolved by
 // provider_id, not node_name — provider_id is the STABLE identity that
 // survives an operator rename (see pkg/nodes' own RenameNode/UpsertSeen
@@ -321,10 +314,10 @@ func (s *Store) UpdateNodePlacement(ctx context.Context, id, providerID string) 
 // function's own doc comment), found on the SAME two legacy rows
 // (inst-55b4d443, inst-5ed29952): their instance_type_id was never
 // persisted at create time, so the console's CPU-compute list has shown a
-// blank Type column for them ever since — COALESCE(instance_type_id, '')
+// blank Type column for them ever since — COALESCE(instance_type_id, ”)
 // in selectColumns turns the missing value into an empty string, which
 // the console's `?? "—"` fallback does not catch (that only catches
-// null/undefined, not ""). Called by redeployKumbhaInstance's own
+// null/undefined, not ""). Called by redeployBuildInstance's own
 // provider-recovery path, which already knows definitively that this is
 // a home-class instance the moment it resolves spec.NodeClass == "home"
 // for one with no instance_type recorded.
@@ -466,15 +459,15 @@ func (s *Store) ListByProject(ctx context.Context, accountID, projectID uuid.UUI
 		accountID, projectID)
 }
 
-// ListByKumbhaSession returns every instance (running or terminated) a
-// Kumbha session has ever created — see KumbhaSessionID's own doc comment
+// ListByBuildSession returns every instance (running or terminated) a
+// Teepin Build session has ever created — see BuildSessionID's own doc comment
 // on why this exists: without it, an instance created via create_instance
 // as a deploy workaround is invisible to the session and the console both.
 // No terminated_at filter, unlike ListByProject: a terminated row here is
 // still worth showing (e.g. "this session's earlier attempt, cleaned up"),
 // not silently dropped.
-func (s *Store) ListByKumbhaSession(ctx context.Context, sessionID uuid.UUID) ([]InstanceRecord, error) {
-	return s.query(ctx, "WHERE kumbha_session_id = $1 ORDER BY created_at DESC", sessionID)
+func (s *Store) ListByBuildSession(ctx context.Context, sessionID uuid.UUID) ([]InstanceRecord, error) {
+	return s.query(ctx, "WHERE build_session_id = $1 ORDER BY created_at DESC", sessionID)
 }
 
 // selectColumns previously omitted provider_id even though Create wrote
@@ -496,13 +489,13 @@ func (s *Store) ListByKumbhaSession(ctx context.Context, sessionID uuid.UUID) ([
 const selectColumns = `
 	SELECT id, account_id, project_id, user_id, name, image,
 	       COALESCE(instance_type_id, ''), status, COALESCE(gpu_vram_gb, 0),
-	       cpu_units, memory_gb, p_cores_used, e_cores_used, COALESCE(endpoint, ''),
+	       cpu_units, memory_gb, COALESCE(endpoint, ''),
 	       COALESCE(k8s_pod_name, ''), COALESCE(k8s_namespace, ''),
 	       COALESCE(provider_id, ''),
 	       COALESCE((SELECT node_name FROM compute.nodes WHERE compute.nodes.id = compute.instances.node_id), ''),
 	       COALESCE(dns_name, ''), COALESCE(public_ip, ''),
 	       tls_enabled, tls_ready, COALESCE(container_port, 0), storage_gb,
-	       created_at, updated_at, started_at, terminated_at, kumbha_session_id
+	       created_at, updated_at, started_at, terminated_at, build_session_id
 	FROM compute.instances
 `
 
@@ -519,11 +512,11 @@ func (s *Store) query(ctx context.Context, where string, args ...interface{}) ([
 		if err := rows.Scan(
 			&rec.ID, &rec.AccountID, &rec.ProjectID, &rec.UserID, &rec.Name, &rec.Image,
 			&rec.InstanceType, &rec.Status, &rec.GPUVRAMGB,
-			&rec.CPUUnits, &rec.MemoryGB, &rec.PCoresUsed, &rec.ECoresUsed, &rec.Endpoint,
+			&rec.CPUUnits, &rec.MemoryGB, &rec.Endpoint,
 			&rec.K8sPodName, &rec.K8sNamespace,
 			&rec.ProviderID, &rec.NodeName, &rec.DNSName, &rec.PublicIP, &rec.TLSEnabled, &rec.TLSReady,
 			&rec.ContainerPort, &rec.StorageGB,
-			&rec.CreatedAt, &rec.UpdatedAt, &rec.StartedAt, &rec.TerminatedAt, &rec.KumbhaSessionID,
+			&rec.CreatedAt, &rec.UpdatedAt, &rec.StartedAt, &rec.TerminatedAt, &rec.BuildSessionID,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan instance: %w", err)
 		}
@@ -541,7 +534,7 @@ func nullIfEmpty(s string) sql.NullString {
 }
 
 // nullUUID converts the zero UUID into SQL NULL. A credential with no
-// attributable human user — a Kumbha session token (auth.MintSessionToken
+// attributable human user — a Teepin Build session token (auth.MintSessionToken
 // never sets Claims.UserID) or a project API key — carries uuid.Nil for
 // UserID; inserting that literal all-zeros value violated
 // instances_user_id_fkey, since no user row has that id (see migration

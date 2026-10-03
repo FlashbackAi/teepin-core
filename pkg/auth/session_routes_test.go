@@ -18,13 +18,13 @@ import (
 // by accident fails here rather than as a broken build in production.
 func TestSessionMayCall_AllowsTheAgentsOwnRoutes(t *testing.T) {
 	allowed := []struct{ method, pattern string }{
-		{"POST", "/v1/kumbha/chat/completions"},
-		{"GET", "/v1/kumbha/sessions/:id"},
-		{"GET", "/v1/kumbha/sessions/:id/messages/poll"},
-		{"PUT", "/v1/kumbha/sessions/:id/workspace"},
-		{"GET", "/v1/kumbha/sessions/:id/workspace/archive"},
-		{"POST", "/v1/kumbha/sessions/:id/screenshot"},
-		{"POST", "/v1/kumbha/sessions/:id/deploy"},
+		{"POST", "/v1/build/chat/completions"},
+		{"GET", "/v1/build/sessions/:id"},
+		{"GET", "/v1/build/sessions/:id/messages/poll"},
+		{"PUT", "/v1/build/sessions/:id/workspace"},
+		{"GET", "/v1/build/sessions/:id/workspace/archive"},
+		{"POST", "/v1/build/sessions/:id/screenshot"},
+		{"POST", "/v1/build/sessions/:id/deploy"},
 		{"GET", "/v1/billing/pricing"},
 		{"POST", "/v1/compute/instances"},
 		{"GET", "/v1/compute/instances/:id"},
@@ -40,21 +40,21 @@ func TestSessionMayCall_AllowsTheAgentsOwnRoutes(t *testing.T) {
 // budget are the two that let it lift its own spending limits.
 func TestSessionMayCall_DeniesEverythingElse(t *testing.T) {
 	denied := []struct{ method, pattern string }{
-		{"POST", "/v1/kumbha/sessions/:id/approve-deploy"},
-		{"PATCH", "/v1/kumbha/sessions/:id/budget"},
-		{"POST", "/v1/kumbha/sessions"},
-		{"GET", "/v1/kumbha/sessions"},
-		{"POST", "/v1/kumbha/sessions/bulk-delete"},
-		{"POST", "/v1/kumbha/sessions/:id/stop"},
-		{"POST", "/v1/kumbha/sessions/:id/build"},
-		{"POST", "/v1/kumbha/sessions/:id/messages"},
-		{"POST", "/v1/kumbha/sessions/:id/workspace"},
-		{"POST", "/v1/kumbha/sessions/:id/workspace/rollback"},
-		{"POST", "/v1/kumbha/attachments"},
+		{"POST", "/v1/build/sessions/:id/approve-deploy"},
+		{"PATCH", "/v1/build/sessions/:id/budget"},
+		{"POST", "/v1/build/sessions"},
+		{"GET", "/v1/build/sessions"},
+		{"POST", "/v1/build/sessions/bulk-delete"},
+		{"POST", "/v1/build/sessions/:id/stop"},
+		{"POST", "/v1/build/sessions/:id/build"},
+		{"POST", "/v1/build/sessions/:id/messages"},
+		{"POST", "/v1/build/sessions/:id/workspace"},
+		{"POST", "/v1/build/sessions/:id/workspace/rollback"},
+		{"POST", "/v1/build/attachments"},
 		// Secrets must never pass through the agent.
-		{"PUT", "/v1/kumbha/sessions/:id/secrets/:name"},
-		{"GET", "/v1/kumbha/sessions/:id/secrets"},
-		{"DELETE", "/v1/kumbha/sessions/:id/secrets/:name"},
+		{"PUT", "/v1/build/sessions/:id/secrets/:name"},
+		{"GET", "/v1/build/sessions/:id/secrets"},
+		{"DELETE", "/v1/build/sessions/:id/secrets/:name"},
 		{"DELETE", "/v1/compute/instances/:id"},
 		{"POST", "/v1/compute/instances/:id/exec"},
 		{"GET", "/v1/compute/instances"},
@@ -64,8 +64,8 @@ func TestSessionMayCall_DeniesEverythingElse(t *testing.T) {
 		{"POST", "/v1/chat/completions"},
 		{"PUT", "/v1/storage/buckets/:bucket/object"},
 		// Right path, wrong verb: the allowlist is per method.
-		{"DELETE", "/v1/kumbha/sessions/:id"},
-		{"POST", "/v1/kumbha/sessions/:id/messages/poll"},
+		{"DELETE", "/v1/build/sessions/:id"},
+		{"POST", "/v1/build/sessions/:id/messages/poll"},
 		// A route gin did not match has an empty pattern.
 		{"GET", ""},
 	}
@@ -89,11 +89,11 @@ func TestRequireAuth_SessionTokenRouteAllowlist(t *testing.T) {
 
 	r := gin.New()
 	v1 := r.Group("/v1", m.RequireAuth())
-	v1.POST("/kumbha/chat/completions", ok)
-	v1.GET("/kumbha/sessions/:id", ok)
-	v1.POST("/kumbha/sessions", ok)
-	v1.POST("/kumbha/sessions/:id/approve-deploy", ok)
-	v1.PATCH("/kumbha/sessions/:id/budget", ok)
+	v1.POST("/build/chat/completions", ok)
+	v1.GET("/build/sessions/:id", ok)
+	v1.POST("/build/sessions", ok)
+	v1.POST("/build/sessions/:id/approve-deploy", ok)
+	v1.PATCH("/build/sessions/:id/budget", ok)
 	v1.POST("/compute/instances", ok)
 	v1.DELETE("/compute/instances/:id", ok)
 
@@ -107,12 +107,12 @@ func TestRequireAuth_SessionTokenRouteAllowlist(t *testing.T) {
 		method, path string
 		want         int
 	}{
-		{"POST", "/v1/kumbha/chat/completions", http.StatusOK},
-		{"GET", "/v1/kumbha/sessions/" + sid, http.StatusOK},
+		{"POST", "/v1/build/chat/completions", http.StatusOK},
+		{"GET", "/v1/build/sessions/" + sid, http.StatusOK},
 		{"POST", "/v1/compute/instances", http.StatusOK},
-		{"POST", "/v1/kumbha/sessions/" + sid + "/approve-deploy", http.StatusForbidden},
-		{"PATCH", "/v1/kumbha/sessions/" + sid + "/budget", http.StatusForbidden},
-		{"POST", "/v1/kumbha/sessions", http.StatusForbidden},
+		{"POST", "/v1/build/sessions/" + sid + "/approve-deploy", http.StatusForbidden},
+		{"PATCH", "/v1/build/sessions/" + sid + "/budget", http.StatusForbidden},
+		{"POST", "/v1/build/sessions", http.StatusForbidden},
 		{"DELETE", "/v1/compute/instances/some-instance", http.StatusForbidden},
 	}
 	for _, tc := range cases {
@@ -140,7 +140,7 @@ func TestRequireAuth_HumanCredentialsAreNotRestricted(t *testing.T) {
 	m := NewMiddleware(svc, "test-secret").WithSessionChecker(fakeSessionChecker{open: true})
 
 	r := gin.New()
-	r.POST("/v1/kumbha/sessions/:id/approve-deploy", m.RequireAuth(), func(c *gin.Context) { c.Status(http.StatusOK) })
+	r.POST("/v1/build/sessions/:id/approve-deploy", m.RequireAuth(), func(c *gin.Context) { c.Status(http.StatusOK) })
 
 	user := &User{ID: uuid.New(), AccountID: uuid.New(), Email: "a@b.com", Role: RoleOwner}
 	access, _, err := GenerateJWT(user, "acme", "test-secret")
@@ -149,7 +149,7 @@ func TestRequireAuth_HumanCredentialsAreNotRestricted(t *testing.T) {
 	}
 
 	w := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/v1/kumbha/sessions/"+uuid.NewString()+"/approve-deploy", nil)
+	req := httptest.NewRequest("POST", "/v1/build/sessions/"+uuid.NewString()+"/approve-deploy", nil)
 	req.Header.Set("Authorization", "Bearer "+access)
 	r.ServeHTTP(w, req)
 
@@ -166,18 +166,29 @@ func TestOptionalAuth_SessionTokenRouteAllowlist(t *testing.T) {
 	m := NewMiddleware(svc, "test-secret").WithSessionChecker(fakeSessionChecker{open: true})
 
 	r := gin.New()
-	r.POST("/v1/kumbha/sessions/:id/approve-deploy", m.OptionalAuth(), func(c *gin.Context) { c.Status(http.StatusOK) })
+	r.POST("/v1/build/sessions/:id/approve-deploy", m.OptionalAuth(), func(c *gin.Context) { c.Status(http.StatusOK) })
 
 	token, err := MintSessionToken(uuid.New(), uuid.New(), uuid.New(), time.Hour, "test-secret")
 	if err != nil {
 		t.Fatalf("MintSessionToken: %v", err)
 	}
 	w := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/v1/kumbha/sessions/"+uuid.NewString()+"/approve-deploy", nil)
+	req := httptest.NewRequest("POST", "/v1/build/sessions/"+uuid.NewString()+"/approve-deploy", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 	r.ServeHTTP(w, req)
 
 	if w.Code != http.StatusForbidden {
 		t.Errorf("status = %d, want 403", w.Code)
+	}
+}
+
+// An agent image still using the former "/v1/kumbha/" prefix keeps exactly the
+// same access during the rename, and no more.
+func TestSessionMayCall_FormerPrefixMapsToTheSameAllowlist(t *testing.T) {
+	if !SessionMayCall("POST", "/v1/kumbha/chat/completions") || !SessionMayCall("GET", "/v1/kumbha/sessions/:id/messages/poll") {
+		t.Error("an allowed route under the former prefix was refused")
+	}
+	if SessionMayCall("PUT", "/v1/kumbha/sessions/:id/secrets/:name") || SessionMayCall("POST", "/v1/kumbha/sessions/:id/approve-deploy") {
+		t.Error("the former prefix granted a route that is not on the allowlist")
 	}
 }

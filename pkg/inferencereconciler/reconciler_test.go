@@ -120,7 +120,7 @@ func nodeServiceColumns() []string {
 func nodeColumns() []string {
 	return []string{
 		"id", "node_name", "provider_id", "class", "region",
-		"cpu_cores", "memory_gb", "p_cores", "e_cores", "gpu_model",
+		"cpu_cores", "memory_gb", "gpu_model",
 		"gpu_count", "mig_capable", "os", "arch",
 		"agent_version", "status", "last_seen_at", "revoked_at",
 		"rentable_cpu_cores", "rentable_memory_gb", "k8s_ready",
@@ -164,7 +164,7 @@ func TestReconcile_MountsPendingRow(t *testing.T) {
 	nodesMock.ExpectQuery(`SELECT id, node_name, provider_id, class`).
 		WillReturnRows(sqlmock.NewRows(nodeColumns()).AddRow(
 			nodeID, "srialla", "provider-srialla", "home", "home",
-			30, 42, 8, 16, "",
+			30, 42, "",
 			0, false, "linux", "amd64",
 			"dev", "online", &now, nil,
 			18, 42, true,
@@ -328,7 +328,7 @@ func TestReconcile_ClusterFailureReportsErrorState(t *testing.T) {
 	nodesMock.ExpectQuery(`SELECT id, node_name, provider_id, class`).
 		WillReturnRows(sqlmock.NewRows(nodeColumns()).AddRow(
 			nodeID, "srialla", "provider-srialla", "home", "home",
-			30, 42, 8, 16, "",
+			30, 42, "",
 			0, false, "linux", "amd64",
 			"dev", "online", &now, nil,
 			18, 42, true,
@@ -369,7 +369,7 @@ func expectRowAndNode(nsMock, nodesMock sqlmock.Sqlmock, rowID, nodeID uuid.UUID
 	nodesMock.ExpectQuery(`SELECT id, node_name, provider_id, class`).
 		WillReturnRows(sqlmock.NewRows(nodeColumns()).AddRow(
 			nodeID, "mac", "provider-mac", class, class,
-			10, 24, 4, 6, "",
+			10, 24, "",
 			0, false, "darwin", "arm64",
 			"dev", "online", &now, nil,
 			8, 24, false,
@@ -591,7 +591,7 @@ func TestReconcile_MLXEvictsOlderModelToMakeRoom(t *testing.T) {
 	nodesMock.ExpectQuery(`SELECT id, node_name, provider_id, class`).
 		WillReturnRows(sqlmock.NewRows(nodeColumns()).AddRow(
 			nodeID, "mac", "provider-mac", "home", "home",
-			10, 24, 4, 6, "", 0, false, "darwin", "arm64",
+			10, 24, "", 0, false, "darwin", "arm64",
 			"dev", "online", &now, nil, 8, 24, false, nil, nil, "", now, now))
 
 	// Order in this pass: the old row is reconciled first only for drift

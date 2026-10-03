@@ -24,13 +24,15 @@ const (
 	// about model serving, deliberately: its only job is fetching bytes.
 	downloaderImage = "curlimages/curl:8.10.1"
 
-	// hiddenLabel MUST match pkg/cluster's own private labelKumbhaAgent
+	// hiddenLabel MUST match pkg/cluster's own private labelBuildAgent
 	// constant (direct.go) — that package excludes anything carrying it
 	// from a customer's Compute list. No shared exported constant exists
-	// for this; pkg/kumbha/agent.go's own agentLabel redeclares the same
+	// for this; pkg/teepinbuild/agent.go's own agentLabel redeclares the same
 	// string for the same reason, so this follows that established
 	// convention rather than inventing a different one.
-	hiddenLabel = "teepin.io/kumbha-agent"
+	hiddenLabel = "teepin.io/build-agent"
+	// legacyHiddenLabel is the label's former name, kept until every node and pod carries the new one (ROADMAP: Teepin Build rename).
+	legacyHiddenLabel = "teepin.io/kumbha-agent"
 )
 
 // engineConfig names the container image that serves each engine this
@@ -206,7 +208,7 @@ func buildInstanceSpec(instanceID string, cfg inferencegateway.ModelServiceConfi
 		MemoryGB:   cfg.MemoryGB,
 		StorageGB:  cfg.StorageGB,
 		NodeName:   nodeName,
-		Labels:     map[string]string{hiddenLabel: "true"},
+		Labels:     map[string]string{hiddenLabel: "true", legacyHiddenLabel: "true"},
 		Ports:      []cluster.PortMapping{{Container: servePort, Protocol: "tcp"}},
 	}
 	if nodeClass == "home" {

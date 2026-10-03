@@ -60,13 +60,13 @@ func TestSummaryIntegration_UsesTheServiceCatalog(t *testing.T) {
 	itUsageFull(t, db, acct, proj, a, "cpu.home", "hours", 10, 1.00, at)
 	itUsageFull(t, db, acct, proj, b, "cpu.home", "hours", 5, 0.50, at)
 	itUsageFull(t, db, acct, proj, b, "cpu.small", "hours", 2, 0.20, at)
-	// Compute whose instance type was never recorded (legacy Kumbha apps).
+	// Compute whose instance type was never recorded (legacy Teepin Build apps).
 	itUsageFull(t, db, acct, proj, c, "", "hours", 100, 0.30, at)
 	// A stopped disk, and object storage: neither is "Other".
 	itUsageFull(t, db, acct, proj, a, "cpu.home (stopped, disk only)", "hours", 1, 0.05, at)
 	itUsageFull(t, db, acct, proj, "", "object_storage_gb_month", "gb", 3, 0.40, at)
 	itUsageFull(t, db, acct, proj, "", "object_storage_gb_egress", "gb", 1, 0.09, at)
-	itUsageFull(t, db, acct, proj, "", "kumbha/teepin/fast:input", "tokens", 1000, 0.02, at)
+	itUsageFull(t, db, acct, proj, "", "build/teepin/fast:input", "tokens", 1000, 0.02, at)
 
 	sum, err := s.GetAccountSummary(ctx, acct, at.Add(-time.Hour), at.Add(time.Hour))
 	if err != nil {

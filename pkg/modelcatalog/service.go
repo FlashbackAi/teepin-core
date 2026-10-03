@@ -117,7 +117,7 @@ func ValidReasoningEffort(v string) bool {
 // it is served. Pricing, availability and the API key are intentionally
 // NOT part of this call - SetPricing, SetVendorCost, SetAvailability and
 // SetAPIKeyRef are separate, so editing a model's capabilities can never
-// disturb a price, a Kumbha ordering, or a stored key an admin already set
+// disturb a price, a Teepin Build ordering, or a stored key an admin already set
 // (the upsert below leaves those columns alone).
 //
 // A model registered as enabled must already be priced; use
@@ -198,29 +198,29 @@ func (s *Service) RegisterModelWithPricing(ctx context.Context, m Model, inputPr
 // field is left as it is.
 type Availability struct {
 	OfferedToCustomers *bool
-	KumbhaEnabled      *bool
-	KumbhaPriority     *int
-	KumbhaImageReader  *bool
+	BuildEnabled       *bool
+	BuildPriority      *int
+	BuildImageReader   *bool
 }
 
 // SetAvailability updates whether a model is offered to customers and
-// whether (and in what order) the Kumbha build agent may use it.
+// whether (and in what order) the Teepin Build build agent may use it.
 //
 // Turning either availability ON requires the model to be priced; the check is
 // part of the UPDATE itself, so there is no window between checking and changing.
 func (s *Service) SetAvailability(ctx context.Context, modelRoute string, a Availability, updatedBy string) error {
 	switchingOn := (a.OfferedToCustomers != nil && *a.OfferedToCustomers) ||
-		(a.KumbhaEnabled != nil && *a.KumbhaEnabled) ||
-		(a.KumbhaImageReader != nil && *a.KumbhaImageReader)
+		(a.BuildEnabled != nil && *a.BuildEnabled) ||
+		(a.BuildImageReader != nil && *a.BuildImageReader)
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE inference.models
 		SET offered_to_customers = COALESCE($1, offered_to_customers),
-		    kumbha_enabled       = COALESCE($2, kumbha_enabled),
-		    kumbha_priority      = COALESCE($3, kumbha_priority),
-		    kumbha_image_reader  = COALESCE($4, kumbha_image_reader),
+		    build_enabled       = COALESCE($2, build_enabled),
+		    build_priority      = COALESCE($3, build_priority),
+		    build_image_reader  = COALESCE($4, build_image_reader),
 		    updated_by = $5, updated_at = NOW()
 		WHERE model_route = $6 AND (NOT $7::boolean OR `+pricedSQL+`)
-	`, a.OfferedToCustomers, a.KumbhaEnabled, a.KumbhaPriority, a.KumbhaImageReader, updatedBy, modelRoute, switchingOn)
+	`, a.OfferedToCustomers, a.BuildEnabled, a.BuildPriority, a.BuildImageReader, updatedBy, modelRoute, switchingOn)
 	if err != nil {
 		return fmt.Errorf("failed to set availability for %q: %w", modelRoute, err)
 	}
@@ -248,22 +248,22 @@ func (s *Service) SetAPIKeyRef(ctx context.Context, modelRoute, ref, updatedBy s
 	return nil
 }
 
-// ListKumbhaModels returns every enabled, Kumbha-enabled model right now, in
-// the order the build composer's picker should default to (kumbha_priority,
-// then route). Kumbha's gateway resolves a customer's directly-chosen route
-// against this same list (see pkg/kumbha/gateway.go's resolveModel) — there
+// ListBuildModels returns every enabled, Teepin Build-enabled model right now, in
+// the order the build composer's picker should default to (build_priority,
+// then route). Teepin Build's gateway resolves a customer's directly-chosen route
+// against this same list (see pkg/teepinbuild/gateway.go's resolveModel) — there
 // is no alias/tier filter: a customer addresses one exact model, never a
 // bucket that could silently resolve to a different one.
-func (s *Service) ListKumbhaModels(ctx context.Context) ([]Model, error) {
+func (s *Service) ListBuildModels(ctx context.Context) ([]Model, error) {
 	return s.queryModels(ctx,
-		selectModelsSQL+` WHERE enabled AND kumbha_enabled ORDER BY kumbha_priority, model_route`)
+		selectModelsSQL+` WHERE enabled AND build_enabled ORDER BY build_priority, model_route`)
 }
 
 // ListImageReaders returns every enabled model set as an image reader, in
-// kumbha_priority order. The caller uses the first one that can serve.
+// build_priority order. The caller uses the first one that can serve.
 func (s *Service) ListImageReaders(ctx context.Context) ([]Model, error) {
 	return s.queryModels(ctx,
-		selectModelsSQL+` WHERE enabled AND kumbha_image_reader ORDER BY kumbha_priority, model_route`)
+		selectModelsSQL+` WHERE enabled AND build_image_reader ORDER BY build_priority, model_route`)
 }
 
 // SetPricing updates a model's customer-facing per-million-token rates.
@@ -341,7 +341,7 @@ func (s *Service) SetEnabled(ctx context.Context, modelRoute string, enabled boo
 }
 
 // ModelPricing returns a route's customer-facing per-million-token rates,
-// for a caller (Kumbha's own gateway) that wants to price a completion by
+// for a caller (Teepin Build's own gateway) that wants to price a completion by
 // route rather than read the whole catalog entry. ok is false when the
 // route has no catalog entry at all — the caller should fall back to
 // whatever flat default it has, rather than silently billing $0 for a real
@@ -356,7 +356,7 @@ func (s *Service) ModelPricing(ctx context.Context, modelRoute string) (input, o
 
 // ModelVendorCost returns what a route costs Teepin per million tokens, nil for
 // whichever is unrecorded (and for both on a model Teepin runs itself). Lets
-// Kumbha's gateway record the margin on each usage line.
+// Teepin Build's gateway record the margin on each usage line.
 func (s *Service) ModelVendorCost(ctx context.Context, modelRoute string) (input, output *float64) {
 	m, err := s.GetModel(ctx, modelRoute)
 	if err != nil {
@@ -426,8 +426,8 @@ const selectModelsSQL = `
 	       input_price_per_million, output_price_per_million,
 	       vendor_input_cost_per_million, vendor_output_cost_per_million,
 	       enabled, provider, provider_model, base_url, max_output_tokens, reasoning_effort,
-	       COALESCE(api_key_ref, ''), offered_to_customers, kumbha_enabled, kumbha_priority,
-	       kumbha_image_reader, updated_by, created_at, updated_at
+	       COALESCE(api_key_ref, ''), offered_to_customers, build_enabled, build_priority,
+	       build_image_reader, updated_by, created_at, updated_at
 	FROM inference.models`
 
 // row is satisfied by both *sql.Row and *sql.Rows, so scanModel/scanModelRow
@@ -447,8 +447,8 @@ func scanModelRow(r row) (*Model, error) {
 		&m.InputPricePerMillion, &m.OutputPricePerMillion,
 		&m.VendorInputCostPerMillion, &m.VendorOutputCostPerMillion,
 		&m.Enabled, &provider, &m.ProviderModel, &m.BaseURL, &m.MaxOutputTokens, &m.ReasoningEffort,
-		&m.APIKeyRef, &m.OfferedToCustomers, &m.KumbhaEnabled, &m.KumbhaPriority,
-		&m.KumbhaImageReader, &m.UpdatedBy, &m.CreatedAt, &m.UpdatedAt,
+		&m.APIKeyRef, &m.OfferedToCustomers, &m.BuildEnabled, &m.BuildPriority,
+		&m.BuildImageReader, &m.UpdatedBy, &m.CreatedAt, &m.UpdatedAt,
 	); err != nil {
 		return nil, err
 	}

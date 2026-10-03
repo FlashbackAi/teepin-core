@@ -218,4 +218,3 @@ func (s *Service) generateServiceName(instanceID uuid.UUID) string {
 func (s *Service) generateIngressName(instanceID uuid.UUID) string {
 	return fmt.Sprintf("inst-%s-ingress", instanceID.String()[:8])
 }
-

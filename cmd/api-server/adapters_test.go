@@ -9,9 +9,9 @@ import (
 
 	"github.com/FlashbackAi/teepin-core/pkg/cluster"
 	"github.com/FlashbackAi/teepin-core/pkg/compute"
-	"github.com/FlashbackAi/teepin-core/pkg/kumbha"
 	"github.com/FlashbackAi/teepin-core/pkg/modelcatalog"
 	"github.com/FlashbackAi/teepin-core/pkg/modelprobe"
+	"github.com/FlashbackAi/teepin-core/pkg/teepinbuild"
 )
 
 // fakeStatusCluster implements only ListInstanceStatuses — the only
@@ -34,8 +34,8 @@ func (f *fakeStatusCluster) ListInstanceStatuses(context.Context, cluster.Scope)
 // counted by ListNodeCapacity's own compute.instances sum.
 func TestHiddenWorkloadAdapter_RecognisesEachPodType(t *testing.T) {
 	fc := &fakeStatusCluster{statuses: []cluster.InstanceStatus{
-		{PodName: "kumbha-agent-abcd1234-f3a91", NodeName: "srialla", Hidden: true, Status: compute.StatusRunning},
-		{PodName: "kumbha-shot-abcd1234-f3a91", NodeName: "srialla", Hidden: true, Status: compute.StatusRunning},
+		{PodName: "build-agent-abcd1234-f3a91", NodeName: "srialla", Hidden: true, Status: compute.StatusRunning},
+		{PodName: "build-shot-abcd1234-f3a91", NodeName: "srialla", Hidden: true, Status: compute.StatusRunning},
 		{PodName: "kaniko-build-session1-f3a91", NodeName: "fblabs01", Hidden: true, Status: compute.StatusPending},
 		// A normal customer instance — Hidden=false — must never be
 		// counted here; it's already in the DB-based sum.
@@ -51,11 +51,11 @@ func TestHiddenWorkloadAdapter_RecognisesEachPodType(t *testing.T) {
 	}
 
 	srialla := usage["srialla"]
-	wantCPU := 2 + kumbha.ScreenshotCPUUnits
-	wantMem := 4 + kumbha.ScreenshotMemoryGB
+	wantCPU := 2 + teepinbuild.ScreenshotCPUUnits
+	wantMem := 4 + teepinbuild.ScreenshotMemoryGB
 	if srialla.CPUCores != wantCPU || srialla.MemoryGB != wantMem {
 		t.Errorf("srialla usage = %+v, want agent(2/4) + screenshot(%d/%d) = %d/%d",
-			srialla, kumbha.ScreenshotCPUUnits, kumbha.ScreenshotMemoryGB, wantCPU, wantMem)
+			srialla, teepinbuild.ScreenshotCPUUnits, teepinbuild.ScreenshotMemoryGB, wantCPU, wantMem)
 	}
 
 	fblabs := usage["fblabs01"]
